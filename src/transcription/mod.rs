@@ -12,6 +12,7 @@ use tracing::debug;
 mod aliyun;
 mod tencent_cloud;
 mod voiceapi;
+mod deepgram; //deepgram
 
 pub use aliyun::AliyunAsrClient;
 pub use aliyun::AliyunAsrClientBuilder;
@@ -19,6 +20,9 @@ pub use tencent_cloud::TencentCloudAsrClient;
 pub use tencent_cloud::TencentCloudAsrClientBuilder;
 pub use voiceapi::VoiceApiAsrClient;
 pub use voiceapi::VoiceApiAsrClientBuilder;
+
+pub use deepgram::DeepgramAsrClient;
+pub use deepgram::DeepgramAsrClientBuilder;
 
 /// Common helper function for handling wait_for_answer logic with audio dropping
 pub async fn handle_wait_for_answer_with_audio_drop(
@@ -64,6 +68,8 @@ pub enum TranscriptionType {
     VoiceApi,
     #[serde(rename = "aliyun")]
     Aliyun,
+    #[serde(rename = "deepgram")]
+    Deepgram,
     Other(String),
 }
 
@@ -90,6 +96,7 @@ impl std::fmt::Display for TranscriptionType {
             TranscriptionType::TencentCloud => write!(f, "tencent"),
             TranscriptionType::VoiceApi => write!(f, "voiceapi"),
             TranscriptionType::Aliyun => write!(f, "aliyun"),
+            TranscriptionType::Deepgram => write!(f, "deepgram"),
             TranscriptionType::Other(provider) => write!(f, "{}", provider),
         }
     }
@@ -105,6 +112,7 @@ impl<'de> Deserialize<'de> for TranscriptionType {
             "tencent" => Ok(TranscriptionType::TencentCloud),
             "voiceapi" => Ok(TranscriptionType::VoiceApi),
             "aliyun" => Ok(TranscriptionType::Aliyun),
+            "deepgram" => Ok(TranscriptionType::Deepgram),
             _ => Ok(TranscriptionType::Other(value)),
         }
     }
@@ -154,6 +162,21 @@ impl TranscriptionOption {
                     self.secret_key = std::env::var("DASHSCOPE_API_KEY").ok();
                 }
             }
+            //deegram API KEY
+             Some(TranscriptionType::Deepgram) => {
+                // Deepgram: key + optional endpoint override
+                if self.secret_key.is_none() {
+                    self.secret_key = std::env::var("DEEPGRAM_API_KEY").ok();
+                }
+                if self.endpoint.is_none() {
+                    // Use default if not provided; can be overridden by env var if you want
+                    // e.g., std::env::var("DEEPGRAM_ENDPOINT").ok()
+                    self.endpoint = Some("wss://api.deepgram.com/v1/listen".to_string());
+                    // self.endpoint = td::env::var("DEEPGRAM_ENDPOINT").ok();
+
+                }
+            }
+
             _ => {}
         }
         self

@@ -157,7 +157,11 @@ impl B2bua {
                 {
                     Ok(_) => {}
                     Err(_) => {
-                        dialog_ref.reject().ok();
+                        // dialog_ref.reject().ok();
+                        dialog_ref.reject(
+                            Some(rsip::StatusCode::BusyHere), 
+                            Some("Call Rejected".to_string())
+                        ).ok();
                     }
                 }
             },
@@ -173,7 +177,11 @@ impl B2bua {
                 session_id = self.session_id,
                 "pending dialog still exists, cleaning up"
             );
-            pending.dialog.reject().ok();
+            // pending.dialog.reject().ok();
+            pending.dialog.reject(
+                Some(rsip::StatusCode::BusyHere), 
+                Some("Call Rejected".to_string())
+            ).ok();
         }
         app_state.active_calls.lock().await.remove(&self.session_id);
         Ok(())

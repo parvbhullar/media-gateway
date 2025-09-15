@@ -140,6 +140,8 @@
                                     class="border p-2 rounded w-full">
                                     <option value="tencent">Tencent Cloud</option>
                                     <option value="aliyun">Aliyun</option>
+                                    <option value="deepgram">Deepgram</option>
+
                                 </select>
                             </div>
 
@@ -176,6 +178,24 @@
                                         placeholder="Enter Aliyun API Key" class="border p-2 rounded w-full">
                                 </div>
                             </div>
+                            <div x-show="config.tts.provider === 'deepgram'" class="border-t pt-3 space-y-2">
+                                <p class="text-xs text-gray-600 mb-2">Deepgram 配置</p>
+                                <div>
+                                    <label for="ttsApiKey" class="text-sm">API Key</label>
+                                    <input type="password" id="ttsApiKey" x-model="config.tts.apiKey"
+                                        placeholder="Enter Deepgram API Key" class="border p-2 rounded w-full">
+                                </div>
+                                <div>
+                                    <label for="ttsVoice" class="text-sm">Voice</label>
+                                    <select id="ttsVoice" x-model="config.tts.voice"
+                                        class="border p-2 rounded w-full">
+                                        <option value="aura-aria-en">Aria (Female, English)</option>
+                                        <option value="aura-stella-en">Stella (Female, English)</option>
+                                        <option value="aura-echo-en">Echo (Male, English)</option>
+                                        <!-- you can extend with Deepgram's available voices -->
+                                    </select>
+                                </div>
+                            </div>
 
                             <div class="border-t pt-3 space-y-2">
                                 <div>
@@ -209,6 +229,8 @@
                                     class="border p-2 rounded w-full">
                                     <option value="tencent">Tencent Cloud</option>
                                     <option value="aliyun">Aliyun</option>
+                                    <option value="deepgram">Deepgram</option>
+                                    
                                 </select>
                             </div>
 
@@ -261,6 +283,41 @@
                                         <option value="de">Deutsch</option>
                                         <option value="fr">Français</option>
                                         <option value="ru">Русский</option>
+                                    </select>
+                                </div>
+                            </div>
+
+                            <div x-show="config.asr.provider === 'deepgram'" class="border-t pt-3 space-y-2">
+                                <p class="text-xs text-gray-600 mb-2">Deepgram 配置</p>
+                                <div>
+                                    <label for="asrApiKey" class="text-sm">API Key</label>
+                                    <input type="password" id="asrApiKey" x-model="config.asr.apiKey"
+                                        placeholder="Enter Deepgram API Key" class="border p-2 rounded w-full">
+                                </div>
+                                <div>
+                                    <label for="asrModel" class="text-sm">Model</label>
+                                    <select id="asrModel" x-model="config.asr.model"
+                                        class="border p-2 rounded w-full">
+                                        <option value="nova-2-general">nova-2-general</option>
+                                        <option value="nova-2-phonecall">nova-2-phonecall</option>
+                                        <option value="nova-2-meeting">nova-2-meeting</option>
+                                        <option value="nova-2-medical">nova-2-medical</option>
+                                        <!-- Add more Deepgram models if needed -->
+                                    </select>
+                                </div>
+                                <div>
+                                    <label for="asrLanguage" class="text-sm">Language</label>
+                                    <select id="asrLanguage" x-model="config.asr.language"
+                                        class="border p-2 rounded w-full">
+                                        <option value="en">English</option>
+                                        <option value="es">Español</option>
+                                        <option value="hi">हिन्दी</option>
+                                        <option value="ja">日本語</option>
+                                        <option value="fr">Français</option>
+                                        <option value="de">Deutsch</option>
+                                        <option value="zh">中文</option>
+                                        <option value="pt">Português</option>
+                                        <!-- extend with Deepgram supported languages -->
                                     </select>
                                 </div>
                             </div>

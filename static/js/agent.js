@@ -33,7 +33,11 @@ function mainApp() {
                 model: '',
                 language: 'zh-cn',
                 endpoint: '',
-                inactivityTimeout: 35000 // 35 seconds timeout for ASR inactivity
+                inactivityTimeout: 35000, // 35 seconds timeout for ASR inactivity
+                // Deepgram-specific
+                apiKey: '',
+                tier: 'nova',   // optional: 'nova', 'enhanced'
+                interimResults: true
             },
             tts: {
                 provider: 'tencent', // 'tencent' or 'voiceapi'
@@ -827,6 +831,14 @@ function mainApp() {
                     if (this.config.asr.endpoint) asrConfig.endpoint = this.config.asr.endpoint;
                     if (this.config.asr.model) asrConfig.modelType = this.config.asr.model;
                     if (this.config.asr.language) asrConfig.language = this.config.asr.language;
+                }else if (this.config.asr.provider === 'deepgram') {
+                    if (this.config.asr.apiKey) asrConfig.apiKey = this.config.asr.apiKey;
+                    if (this.config.asr.model) asrConfig.model = this.config.asr.model;
+                    if (this.config.asr.language) asrConfig.language = this.config.asr.language;
+                    if (this.config.asr.tier) asrConfig.tier = this.config.asr.tier;
+                    if (this.config.asr.interimResults !== undefined) {
+                        asrConfig.interimResults = this.config.asr.interimResults;
+                    }
                 }
 
                 // Build TTS configuration
