@@ -13,9 +13,8 @@ RustPBX is a high-performance, secure software-defined PBX (Private Branch Excha
 - **Call Recording**: Built-in call recording with multiple storage backends
 - **User Management**: Flexible user authentication and registration system
 
-### AI Voice Agent Services
-- **Speech-to-Text (ASR)**: Real-time speech recognition with multiple providers (Tencent Cloud, VoiceAPI)
-- **Text-to-Speech (TTS)**: High-quality speech synthesis with emotion and speaker control
+- **Speech-to-Text (ASR)**: Real-time speech recognition with multiple providers (Tencent Cloud, VoiceAPI, Deepgram)
+- **Text-to-Speech (TTS)**: High-quality speech synthesis with emotion and speaker control (Tencent Cloud, VoiceAPI, Deepgram)
 - **LLM Integration**: OpenAI-compatible LLM proxy for intelligent conversation handling
 - **Voice Activity Detection**: WebRTC and Silero VAD support for optimal speech processing
 - **Noise Suppression**: Real-time audio denoising for crystal-clear conversations
@@ -156,15 +155,46 @@ docker run -d \
 - SIP Proxy: localhost:15060
 - User Agent: localhost:13050
 
+
 ### Environment Variables
 
-The following environment variables are required for Tencent Cloud ASR/TTS services:
-
+#### Tencent Cloud ASR/TTS
 | Variable | Description | Required |
 |----------|-------------|----------|
 | `TENCENT_APPID` | Your Tencent Cloud App ID | Yes |
 | `TENCENT_SECRET_ID` | Your Tencent Cloud Secret ID | Yes |
 | `TENCENT_SECRET_KEY` | Your Tencent Cloud Secret Key | Yes |
+
+#### Deepgram ASR/TTS
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `DEEPGRAM_API_KEY` | Your Deepgram API Key | Yes (if using Deepgram) |
+
+Alternatively, you can set the Deepgram API key in `config.toml`:
+
+```
+deepgram_api_key = "YOUR_DEEPGRAM_API_KEY_HERE"
+```
+
+#### Example: Using Deepgram for ASR or TTS
+
+In your `config.toml`:
+```
+deepgram_api_key = "YOUR_DEEPGRAM_API_KEY_HERE"
+
+[transcription]
+provider = "deepgram"
+
+[synthesis]
+provider = "deepgram"
+```
+
+Or set via environment variable:
+```
+export DEEPGRAM_API_KEY=your_deepgram_api_key
+```
+
+You can now use Deepgram for both speech-to-text and text-to-speech in your voice pipelines.
 
 ### Configuration Options
 

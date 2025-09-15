@@ -91,11 +91,11 @@ impl Invitation {
     pub async fn hangup(&self, dialog_id: DialogId) -> Result<()> {
         let dialog_id_str = dialog_id.to_string();
         if let Some(call) = self.pending_dialogs.lock().await.remove(&dialog_id_str) {
-            // call.dialog.reject().ok();
-            call.dialog.reject(
-                Some(rsip::StatusCode::BusyHere), 
-                Some("Call Rejected".to_string())
-            ).ok();
+             call.dialog.reject().ok();
+            // call.dialog.reject(
+            //     Some(rsip::StatusCode::BusyHere), 
+            //     Some("Call Rejected".to_string())
+            // ).ok();
 
             call.token.cancel();
         }

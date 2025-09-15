@@ -14,11 +14,11 @@ use crate::{
     event::EventSender,
     synthesis::{
         AliyunTtsClient, SynthesisClient, SynthesisOption, SynthesisType, TencentCloudTtsClient,
-        VoiceApiTtsClient,
+        VoiceApiTtsClient,DeepgramTtsClient,
     },
     transcription::{
         AliyunAsrClientBuilder, TencentCloudAsrClientBuilder, TranscriptionClient,
-        TranscriptionOption, TranscriptionType, VoiceApiAsrClientBuilder,
+        TranscriptionOption, TranscriptionType, VoiceApiAsrClientBuilder, DeepgramAsrClientBuilder,
     },
 };
 use anyhow::Result;
@@ -93,9 +93,14 @@ impl Default for StreamEngine {
             TranscriptionType::Aliyun,
             Box::new(AliyunAsrClientBuilder::create),
         );
+        engine.register_asr(
+            TranscriptionType::Deepgram,
+            Box::new(DeepgramAsrClientBuilder::create),
+        );
         engine.register_tts(SynthesisType::Aliyun, AliyunTtsClient::create);
         engine.register_tts(SynthesisType::TencentCloud, TencentCloudTtsClient::create);
         engine.register_tts(SynthesisType::VoiceApi, VoiceApiTtsClient::create);
+        engine.register_tts(SynthesisType::Deepgram, DeepgramTtsClient::create);
         engine
     }
 }

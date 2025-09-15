@@ -5,14 +5,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
 mod aliyun;
 mod tencent_cloud;
 mod voiceapi;
+mod deepgram;
 
 pub use aliyun::AliyunTtsClient;
 pub use tencent_cloud::TencentCloudTtsClient;
 // pub use tencent_cloud_streaming::TencentCloudStreamingTtsClient;
 pub use voiceapi::VoiceApiTtsClient;
+pub use deepgram::DeepgramTtsClient;
 
 #[derive(Clone, Default)]
 pub struct SynthesisCommand {
@@ -36,6 +39,8 @@ pub enum SynthesisType {
     VoiceApi,
     #[serde(rename = "aliyun")]
     Aliyun,
+    #[serde(rename = "deepgram")]
+    Deepgram,
     #[serde(rename = "other")]
     Other(String),
 }
@@ -46,6 +51,7 @@ impl std::fmt::Display for SynthesisType {
             SynthesisType::TencentCloud => write!(f, "tencent"),
             SynthesisType::VoiceApi => write!(f, "voiceapi"),
             SynthesisType::Aliyun => write!(f, "aliyun"),
+            SynthesisType::Deepgram => write!(f, "deepgram"),
             SynthesisType::Other(provider) => write!(f, "{}", provider),
         }
     }
@@ -61,6 +67,7 @@ impl<'de> Deserialize<'de> for SynthesisType {
             "tencent" => Ok(SynthesisType::TencentCloud),
             "voiceapi" => Ok(SynthesisType::VoiceApi),
             "aliyun" => Ok(SynthesisType::Aliyun),
+            "deepgram" => Ok(SynthesisType::Deepgram),
             _ => Ok(SynthesisType::Other(value)),
         }
     }
@@ -274,6 +281,10 @@ pub fn create_synthesis_client(option: SynthesisOption) -> Result<Box<dyn Synthe
         }
         SynthesisType::Aliyun => {
             let client = AliyunTtsClient::new(option);
+            Ok(Box::new(client))
+        }
+        SynthesisType::Deepgram => {
+            let client = DeepgramTtsClient::new(option);
             Ok(Box::new(client))
         }
         SynthesisType::Other(provider) => {

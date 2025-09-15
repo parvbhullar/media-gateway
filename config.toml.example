@@ -9,6 +9,9 @@ stun_server = "stun.l.google.com:19302"
 recorder_path = "/tmp/recorders"
 media_cache_path = "/tmp/mediacache"
 
+# Deepgram API key for ASR and TTS
+deepgram_api_key = "YOUR_DEEPGRAM_API_KEY_HERE"
+
 [ua]
 addr="0.0.0.0"
 udp_port=13050 # don't use 5060

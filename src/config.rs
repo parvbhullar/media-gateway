@@ -50,6 +50,8 @@ pub struct Config {
     pub restsend_token: Option<String>,
     pub ice_servers: Option<Vec<IceServer>>,
     pub ami: Option<AmiConfig>,
+    /// Deepgram API key for ASR and TTS
+    pub deepgram_api_key: Option<String>,
 }
 
 #[derive(Default, Debug, Serialize, Deserialize, Clone)]
@@ -373,6 +375,7 @@ impl Default for Config {
             restsend_token: None,
             ice_servers: None,
             ami: Some(AmiConfig::default()),
+            deepgram_api_key: None,
         }
     }
 }
