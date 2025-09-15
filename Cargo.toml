@@ -20,6 +20,7 @@ default = ["vad_webrtc", "vad_silero", "vad_ten", "opus", "g729"]
 not_vad = []
 
 [dependencies]
+deepgram = "0.4"  # Check for latest version
 anyhow = "1.0.99"
 async-trait = "0.1.88"
 async-stream = "0.3.6"
