@@ -117,3 +117,7 @@ path = "examples/webrtc-demo/src/main.rs"
 [[example]]
 name = "voice-demo"
 path = "examples/voice_demo.rs"
+
+[[example]]
+name = "deepgram-demo"
+path = "examples/deepgram_demo.rs"

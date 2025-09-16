@@ -214,7 +214,7 @@ impl Default for SynthesisOption {
             secret_key: None,
             volume: Some(5), // 0-10
             speaker: None,
-            codec: Some("pcm".to_string()),
+            codec: Some("linear16".to_string()),
             subtitle: None,
             emotion: None,
             endpoint: None,
@@ -255,6 +255,22 @@ impl SynthesisOption {
             Some(SynthesisType::Aliyun) => {
                 if self.secret_key.is_none() {
                     self.secret_key = std::env::var("DASHSCOPE_API_KEY").ok();
+                }
+            }
+            Some(SynthesisType::Deepgram) => {
+                if self.secret_key.is_none() {
+                    self.secret_key = std::env::var("DEEPGRAM_API_KEY").ok();
+                }
+                if self.endpoint.is_none() {
+                    self.endpoint = Some("https://api.deepgram.com/v1/speak".to_string());
+                }
+                // Set default speaker/model if not specified
+                if self.speaker.is_none() {
+                    self.speaker = Some("aura-asteria-en".to_string());
+                }
+                // Ensure we use the correct codec for Deepgram
+                if self.codec.as_deref() == Some("pcm") || self.codec.is_none() {
+                    self.codec = Some("linear16".to_string());
                 }
             }
             _ => {}

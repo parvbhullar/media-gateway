@@ -71,3 +71,29 @@ dest = "wuhoo"
 "to.host" = "123.456.789.00:1234"
 "from.user" = "12345"
 "from.host" = "123.456.789.00:1234"
+
+# Deepgram AI Configuration
+[deepgram]
+# API key for Deepgram services (can also be set via DEEPGRAM_API_KEY environment variable)
+# api_key = "your_deepgram_api_key_here"
+
+# ASR (Automatic Speech Recognition) Configuration
+[deepgram.asr]
+model = "nova-2-general"
+language = "en"
+encoding = "linear16"
+sample_rate = 16000
+channels = 1
+interim_results = true
+punctuate = true
+smart_format = true
+endpointing = 1000
+vad_events = true
+# endpoint = "wss://api.deepgram.com/v1/listen"  # Optional custom endpoint
+
+# TTS (Text-to-Speech) Configuration  
+[deepgram.tts]
+model = "aura-asteria-en"  # Deepgram Aura voice model
+encoding = "linear16"  # Valid options: linear16, mp3, flac, opus, aac, mulaw, alaw
+sample_rate = 16000
+# endpoint = "https://api.deepgram.com/v1/speak"  # Optional custom endpoint
