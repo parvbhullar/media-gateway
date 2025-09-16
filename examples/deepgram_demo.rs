@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use tokio::select;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber;
 use rustpbx::{
     event::SessionEvent,
@@ -46,14 +46,14 @@ pub struct Args {
     sample_rate: u32,
 
     /// Deepgram model for ASR
-    #[arg(long, default_value = "nova-2-general")]
+    #[arg(long, default_value = "nova")]
     asr_model: String,
 
     /// Deepgram voice model for TTS  
     #[arg(long, default_value = "aura-asteria-en")]
     tts_model: String,
 
-    /// Language for ASR
+    /// Language for ASR (English default)
     #[arg(short, long, default_value = "en")]
     language: String,
 }
@@ -133,6 +133,7 @@ async fn main() -> Result<()> {
     if let Some(input_path) = &args.input {
         info!("Testing Deepgram ASR with file: {}", input_path);
         
+        info!("Configuring Deepgram ASR with language: {}", args.language);
         let transcription_config = TranscriptionOption {
             provider: Some(TranscriptionType::Deepgram),
             secret_key: Some(api_key.clone()),
@@ -191,27 +192,47 @@ async fn main() -> Result<()> {
                 }
                 sleep(Duration::from_millis(100)).await; // Simulate real-time
             }
+            
+            // Send a final silence to signal end of speech
+            info!("Sending final silence to trigger final results...");
+            let silence = vec![0i16; args.sample_rate as usize / 2]; // 0.5 seconds of silence
+            if let Err(e) = asr_client_clone.send_audio(&silence) {
+                error!("Failed to send final silence: {}", e);
+            }
+            
+            sleep(Duration::from_millis(1000)).await; // Wait for final processing
             info!("Finished sending audio data");
         });
 
         // Listen for transcription events
         let mut transcriptions = Vec::new();
+        let mut interim_count = 0;
+        let mut total_events = 0;
+        
+        info!("Listening for transcription events...");
         loop {
             select! {
                 result = event_receiver.recv() => {
+                    total_events += 1;
                     match result {
-                        Ok(SessionEvent::AsrFinal { text, .. }) => {
-                            info!("Final transcription: {}", text);
+                        Ok(SessionEvent::AsrFinal { text, track_id, timestamp, .. }) => {
+                            info!("✅ FINAL transcription [{}]: '{}'", track_id, text);
                             transcriptions.push(text);
                         }
-                        Ok(SessionEvent::AsrDelta { text, .. }) => {
-                            info!("Interim transcription: {}", text);
+                        Ok(SessionEvent::AsrDelta { text, track_id, timestamp, .. }) => {
+                            interim_count += 1;
+                            info!("🔄 INTERIM transcription #{} [{}]: '{}'", interim_count, track_id, text);
                         }
-                        Ok(SessionEvent::Error { error, .. }) => {
-                            error!("ASR Error: {}", error);
+                        Ok(SessionEvent::Error { error, track_id, sender, code, .. }) => {
+                            error!("❌ ASR Error from {} [{}]: {} (code: {:?})", sender, track_id, error, code);
                             break;
                         }
-                        Ok(_) => {} // Ignore other events
+                        Ok(SessionEvent::Metrics { key, data, duration, .. }) => {
+                            info!("📊 Metrics [{}]: {:?} ({}ms)", key, data, duration);
+                        }
+                        Ok(other_event) => {
+                            info!("📨 Other event: {:?}", other_event);
+                        }
                         Err(e) => {
                             error!("Event receiver error: {}", e);
                             break;
@@ -230,13 +251,24 @@ async fn main() -> Result<()> {
         }
 
         info!(
-            "ASR test completed in {}ms, received {} final transcriptions",
-            start_time.elapsed().as_millis(),
-            transcriptions.len()
+            "🏁 ASR test completed in {}ms",
+            start_time.elapsed().as_millis()
         );
+        info!("📊 Summary: {} total events, {} interim results, {} final transcriptions", 
+              total_events, interim_count, transcriptions.len());
 
-        for (i, transcription) in transcriptions.iter().enumerate() {
-            info!("Transcription {}: {}", i + 1, transcription);
+        if transcriptions.is_empty() {
+            warn!("⚠️  No final transcriptions received!");
+            warn!("   This could indicate:");
+            warn!("   1. Audio file is too short or silent");
+            warn!("   2. WebSocket connection issues");
+            warn!("   3. Deepgram API configuration problems");
+            warn!("   4. Audio format/encoding issues");
+        } else {
+            info!("✅ Final transcriptions received:");
+            for (i, transcription) in transcriptions.iter().enumerate() {
+                info!("   {}: '{}'", i + 1, transcription);
+            }
         }
     }
 

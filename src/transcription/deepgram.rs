@@ -117,11 +117,26 @@ impl DeepgramAsrClientInner {
             .secret_key
             .as_deref()
             .ok_or_else(|| anyhow!("No DEEPGRAM_API_KEY provided"))?;
+            
+        debug!(voice_id, "Using API key: {}...", &api_key[..std::cmp::min(8, api_key.len())]);
+        
+        if api_key.trim().is_empty() {
+            return Err(anyhow!("DEEPGRAM_API_KEY is empty"));
+        }
 
         // Build query parameters with proper defaults
-        let model = self.option.model_type.clone().unwrap_or_else(|| "nova-2-general".to_string());
+        let model = self.option.model_type.clone().unwrap_or_else(|| "nova".to_string());
         let sample_rate = self.option.samplerate.unwrap_or(16_000);
         let language = self.option.language.clone().unwrap_or_else(|| "en".to_string());
+        
+        // Validate known good models
+        let valid_models = ["nova", "nova-2", "nova-2-general", "nova-2-phonecall", "nova-2-finance", "nova-2-conversationalai", 
+                          "nova-2-voicemail", "nova-2-video", "nova-2-meeting", "nova-2-medical", "nova-2-drivethru"];
+        if !valid_models.contains(&model.as_str()) {
+            warn!(voice_id, "Unknown Deepgram model '{}', proceeding anyway", model);
+        }
+        
+        debug!(voice_id, "Deepgram ASR Config - Model: '{}', Language: '{}', Sample Rate: {}", model, language, sample_rate);
         
         // Set transcription features (using sensible defaults since TranscriptionOption doesn't have these fields)
         let interim_results = true;
@@ -147,12 +162,30 @@ impl DeepgramAsrClientInner {
             endpoint = endpointing
         );
 
-        let mut request = ws_url.into_client_request()?;
+        debug!(
+            voice_id,
+            "Connecting to Deepgram with language '{}' and model '{}'", language, model
+        );
+        debug!(voice_id, "WebSocket URL: {}", ws_url);
+
+        let mut request = ws_url.clone().into_client_request()?;
         let headers = request.headers_mut();
         headers.insert("Authorization", format!("Token {}", api_key).parse()?);
         headers.insert("User-Agent", "DeepgramRustSDK/1.0.0".parse()?);
 
-        let (ws_stream, response) = connect_async(request).await?;
+        debug!(voice_id, "Attempting WebSocket connection...");
+        let (ws_stream, response) = match connect_async(request).await {
+            Ok((stream, resp)) => {
+                debug!(voice_id, "WebSocket connected successfully, status: {}", resp.status());
+                (stream, resp)
+            }
+            Err(e) => {
+                error!(voice_id, "WebSocket connection failed: {}", e);
+                error!(voice_id, "Connection URL was: {}", ws_url);
+                error!(voice_id, "Model: {}, Language: {}, Sample Rate: {}", model, language, sample_rate);
+                return Err(anyhow!("Failed to connect to Deepgram WebSocket: {}", e));
+            }
+        };
         
         debug!(
             voice_id,

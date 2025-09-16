@@ -405,7 +405,7 @@ impl ActiveCall {
     }
 
     async fn invite_or_accept(&self, mut option: CallOption, sender: String) -> Result<CallOption> {
-        option.check_default();
+        option.check_default_with_config(&self.app_state.config);
         if let Some(opt) = self.build_record_option(&option) {
             self.media_stream.update_recorder_option(opt).await;
         }
@@ -460,7 +460,7 @@ impl ActiveCall {
         if self.ready_to_answer.lock().await.is_none() {
             option = self.invite_or_accept(option, "accept".to_string()).await?;
         } else {
-            option.check_default();
+            option.check_default_with_config(&self.app_state.config);
             self.call_state
                 .write()
                 .as_mut()

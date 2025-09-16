@@ -246,7 +246,7 @@ impl TencentCloudAsrClientInner {
             .as_ref()
             .ok_or_else(|| anyhow!("No appid provided"))?;
 
-        let engine_model_type = self.option.model_type.as_deref().unwrap_or("16k_zh_en");
+        let engine_model_type = self.option.model_type.as_deref().unwrap_or("16k_en");
 
         let timestamp = chrono::Utc::now().timestamp() as u64;
         let nonce = timestamp.to_string(); // Use timestamp as nonce

@@ -2,6 +2,8 @@ use crate::{
     call::user::SipUser,
     proxy::routing::{DefaultRoute, RouteRule, TrunkConfig},
     useragent::RegisterOption,
+    transcription::{TranscriptionOption, TranscriptionType},
+    synthesis::{SynthesisOption, SynthesisType},
 };
 use anyhow::{Error, Result};
 use clap::Parser;
@@ -52,6 +54,8 @@ pub struct Config {
     pub ami: Option<AmiConfig>,
     /// Deepgram API key for ASR and TTS
     pub deepgram_api_key: Option<String>,
+    /// Structured Deepgram configuration
+    pub deepgram: Option<DeepgramConfig>,
 }
 
 #[derive(Default, Debug, Serialize, Deserialize, Clone)]
@@ -376,6 +380,7 @@ impl Default for Config {
             ice_servers: None,
             ami: Some(AmiConfig::default()),
             deepgram_api_key: None,
+            deepgram: None,
         }
     }
 }
@@ -457,5 +462,152 @@ mod tests {
         config.ice_servers = Some(ice_servers);
         let config_str = toml::to_string(&config).unwrap();
         println!("{}", config_str);
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct DeepgramConfig {
+    /// Deepgram API key (can also be set via DEEPGRAM_API_KEY env var)
+    pub api_key: Option<String>,
+    /// ASR configuration
+    pub asr: Option<DeepgramAsrConfig>,
+    /// TTS configuration
+    pub tts: Option<DeepgramTtsConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct DeepgramAsrConfig {
+    /// Model to use for ASR (default: nova-2-general)
+    pub model: Option<String>,
+    /// Language code (default: en)
+    pub language: Option<String>,
+    /// Audio encoding (default: linear16)
+    pub encoding: Option<String>,
+    /// Sample rate (default: 16000)
+    pub sample_rate: Option<u32>,
+    /// Number of channels (default: 1)
+    pub channels: Option<u32>,
+    /// Enable interim results (default: true)
+    pub interim_results: Option<bool>,
+    /// Enable punctuation (default: true)
+    pub punctuate: Option<bool>,
+    /// Enable smart formatting (default: true)
+    pub smart_format: Option<bool>,
+    /// Endpointing timeout in milliseconds (default: 1000)
+    pub endpointing: Option<u32>,
+    /// Enable VAD events (default: true)
+    pub vad_events: Option<bool>,
+    /// Custom endpoint URL
+    pub endpoint: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct DeepgramTtsConfig {
+    /// Voice model to use (default: aura-asteria-en)
+    pub model: Option<String>,
+    /// Audio encoding (default: linear16)
+    pub encoding: Option<String>,
+    /// Sample rate (default: 16000)
+    pub sample_rate: Option<u32>,
+    /// Custom endpoint URL
+    pub endpoint: Option<String>,
+}
+
+impl Default for DeepgramConfig {
+    fn default() -> Self {
+        Self {
+            api_key: None,
+            asr: Some(DeepgramAsrConfig::default()),
+            tts: Some(DeepgramTtsConfig::default()),
+        }
+    }
+}
+
+impl Default for DeepgramAsrConfig {
+    fn default() -> Self {
+        Self {
+            model: Some("nova".to_string()),
+            language: Some("en".to_string()),
+            encoding: Some("linear16".to_string()),
+            sample_rate: Some(16000),
+            channels: Some(1),
+            interim_results: Some(true),
+            punctuate: Some(true),
+            smart_format: Some(true),
+            endpointing: Some(1000),
+            vad_events: Some(true),
+            endpoint: None,
+        }
+    }
+}
+
+impl Default for DeepgramTtsConfig {
+    fn default() -> Self {
+        Self {
+            model: Some("aura-asteria-en".to_string()),
+            encoding: Some("linear16".to_string()),
+            sample_rate: Some(16000),
+            endpoint: None,
+        }
+    }
+}
+
+impl Config {
+    /// Create a default Deepgram TranscriptionOption from config
+    pub fn create_deepgram_asr_option(&self) -> Option<TranscriptionOption> {
+        // Check if we have Deepgram API key (from structured config or legacy field)
+        let api_key = self.deepgram.as_ref()
+            .and_then(|dg| dg.api_key.as_ref())
+            .or(self.deepgram_api_key.as_ref())
+            .cloned()
+            .or_else(|| std::env::var("DEEPGRAM_API_KEY").ok());
+
+        if api_key.is_some() {
+            let asr_config = self.deepgram.as_ref()
+                .and_then(|dg| dg.asr.as_ref())
+                .cloned()
+                .unwrap_or_default();
+
+            Some(TranscriptionOption {
+                provider: Some(TranscriptionType::Deepgram),
+                secret_key: api_key,
+                language: asr_config.language,
+                model_type: asr_config.model,
+                samplerate: asr_config.sample_rate,
+                endpoint: asr_config.endpoint,
+                ..Default::default()
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Create a default Deepgram SynthesisOption from config
+    pub fn create_deepgram_tts_option(&self) -> Option<SynthesisOption> {
+        // Check if we have Deepgram API key (from structured config or legacy field)
+        let api_key = self.deepgram.as_ref()
+            .and_then(|dg| dg.api_key.as_ref())
+            .or(self.deepgram_api_key.as_ref())
+            .cloned()
+            .or_else(|| std::env::var("DEEPGRAM_API_KEY").ok());
+
+        if api_key.is_some() {
+            let tts_config = self.deepgram.as_ref()
+                .and_then(|dg| dg.tts.as_ref())
+                .cloned()
+                .unwrap_or_default();
+
+            Some(SynthesisOption {
+                provider: Some(SynthesisType::Deepgram),
+                secret_key: api_key,
+                speaker: tts_config.model,
+                codec: tts_config.encoding,
+                samplerate: tts_config.sample_rate.map(|r| r as i32),
+                endpoint: tts_config.endpoint,
+                ..Default::default()
+            })
+        } else {
+            None
+        }
     }
 }

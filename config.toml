@@ -79,8 +79,8 @@ dest = "wuhoo"
 
 # ASR (Automatic Speech Recognition) Configuration
 [deepgram.asr]
-model = "nova-2-general"
-language = "en"
+model = "nova"
+language = "en"  # English language default
 encoding = "linear16"
 sample_rate = 16000
 channels = 1

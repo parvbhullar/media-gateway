@@ -23,7 +23,7 @@ struct Args {
     input_file: PathBuf,
 
     /// Language code (default: zh-CN)
-    #[arg(short, long, default_value = "zh-CN")]
+    #[arg(short, long, default_value = "en-US")]
     language: String,
 
     /// Engine type (default: 16k_zh for Chinese)

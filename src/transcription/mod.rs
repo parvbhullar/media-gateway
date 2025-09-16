@@ -150,6 +150,14 @@ impl TranscriptionOption {
                 if self.secret_key.is_none() {
                     self.secret_key = std::env::var("TENCENT_SECRET_KEY").ok();
                 }
+                // Set default language to English if not specified
+                if self.language.is_none() {
+                    self.language = Some("en".to_string());
+                }
+                // Set default model to English if not specified
+                if self.model_type.is_none() {
+                    self.model_type = Some("16k_en".to_string());
+                }
             }
             Some(TranscriptionType::VoiceApi) => {
                 // Set the host from environment variable if not already set
@@ -162,18 +170,25 @@ impl TranscriptionOption {
                     self.secret_key = std::env::var("DASHSCOPE_API_KEY").ok();
                 }
             }
-            //deegram API KEY
-             Some(TranscriptionType::Deepgram) => {
+            Some(TranscriptionType::Deepgram) => {
                 // Deepgram: key + optional endpoint override
                 if self.secret_key.is_none() {
                     self.secret_key = std::env::var("DEEPGRAM_API_KEY").ok();
                 }
                 if self.endpoint.is_none() {
-                    // Use default if not provided; can be overridden by env var if you want
-                    // e.g., std::env::var("DEEPGRAM_ENDPOINT").ok()
                     self.endpoint = Some("wss://api.deepgram.com/v1/listen".to_string());
-                    // self.endpoint = td::env::var("DEEPGRAM_ENDPOINT").ok();
-
+                }
+                // Set default language to English if not specified
+                if self.language.is_none() {
+                    self.language = Some("en".to_string());
+                }
+                // Set default model if not specified
+                if self.model_type.is_none() {
+                    self.model_type = Some("nova".to_string());
+                }
+                // Set default sample rate if not specified
+                if self.samplerate.is_none() {
+                    self.samplerate = Some(16000);
                 }
             }
 

@@ -91,6 +91,31 @@ impl CallOption {
         self
     }
 
+    pub fn check_default_with_config(&mut self, config: &crate::config::Config) -> &CallOption {
+        // Auto-configure Deepgram ASR if no ASR is specified but Deepgram key is available
+        if self.asr.is_none() {
+            if let Some(deepgram_asr) = config.create_deepgram_asr_option() {
+                self.asr = Some(deepgram_asr);
+            }
+        }
+        
+        // Auto-configure Deepgram TTS if no TTS is specified but Deepgram key is available
+        if self.tts.is_none() {
+            if let Some(deepgram_tts) = config.create_deepgram_tts_option() {
+                self.tts = Some(deepgram_tts);
+            }
+        }
+        
+        // Apply existing defaults
+        if let Some(tts) = &mut self.tts {
+            tts.check_default();
+        }
+        if let Some(asr) = &mut self.asr {
+            asr.check_default();
+        }
+        self
+    }
+
     pub fn build_invite_option(&self) -> Result<InviteOption> {
         let mut invite_option = InviteOption::default();
         if let Some(offer) = &self.offer {

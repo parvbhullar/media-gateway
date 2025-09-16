@@ -2,6 +2,7 @@ function mainApp() {
     return {
         // Configuration state
         config: {
+            version: '2.0', // Configuration version for migration
             callType: 'webrtc', // Default to WebRTC, can be 'webrtc' or 'sip'
             sip: {
                 caller: '',
@@ -26,12 +27,12 @@ function mainApp() {
                 samplerate: 16000,
             },
             asr: {
-                provider: 'tencent', // 'tencent' or 'voiceapi'
+                provider: 'deepgram', // 'deepgram', 'tencent' or 'voiceapi'
                 appId: '',
                 secretId: '',
                 secretKey: '',
                 model: '',
-                language: 'zh-cn',
+                language: 'en', // Default to English
                 endpoint: '',
                 inactivityTimeout: 35000, // 35 seconds timeout for ASR inactivity
                 // Deepgram-specific
@@ -40,12 +41,12 @@ function mainApp() {
                 interimResults: true
             },
             tts: {
-                provider: 'tencent', // 'tencent' or 'voiceapi'
+                provider: 'deepgram', // 'deepgram', 'tencent' or 'voiceapi'
                 appId: '',
                 secretId: '',
                 secretKey: '',
                 endpoint: '',
-                speaker: '601003', // '301030'
+                speaker: 'aura-asteria-en', // Deepgram voice model
                 speed: 1.0,
                 volume: 5,
                 greeting: "Hello, how can I help you today?"
@@ -832,8 +833,8 @@ function mainApp() {
                     if (this.config.asr.model) asrConfig.modelType = this.config.asr.model;
                     if (this.config.asr.language) asrConfig.language = this.config.asr.language;
                 }else if (this.config.asr.provider === 'deepgram') {
-                    if (this.config.asr.apiKey) asrConfig.apiKey = this.config.asr.apiKey;
-                    if (this.config.asr.model) asrConfig.model = this.config.asr.model;
+                    if (this.config.asr.apiKey) asrConfig.secretKey = this.config.asr.apiKey;
+                    if (this.config.asr.model) asrConfig.modelType = this.config.asr.model;
                     if (this.config.asr.language) asrConfig.language = this.config.asr.language;
                     if (this.config.asr.tier) asrConfig.tier = this.config.asr.tier;
                     if (this.config.asr.interimResults !== undefined) {
@@ -856,6 +857,10 @@ function mainApp() {
                     if (this.config.tts.volume) ttsConfig.volume = this.config.tts.volume;
                 } else if (this.config.tts.provider === 'voiceapi') {
                     if (this.config.tts.endpoint) ttsConfig.endpoint = this.config.tts.endpoint;
+                } else if (this.config.tts.provider === 'deepgram') {
+                    // For Deepgram TTS, we need to map apiKey to secretKey and speaker to the correct field
+                    if (this.config.asr.apiKey) ttsConfig.secretKey = this.config.asr.apiKey; // Use same API key as ASR
+                    if (this.config.tts.speaker) ttsConfig.speaker = this.config.tts.speaker;
                 }
 
                 const invite = {
@@ -909,9 +914,29 @@ function mainApp() {
             if (savedConfig) {
                 try {
                     const parsedConfig = JSON.parse(savedConfig);
-                    // Deep merge to preserve defaults for any new config options
-                    this.config = this.deepMerge(this.config, parsedConfig);
-                    this.addLogEntry('info', 'Loaded configuration from local storage');
+                    
+                    // Check configuration version and migrate if needed
+                    if (!parsedConfig.version || parsedConfig.version !== this.config.version) {
+                        this.addLogEntry('info', `Configuration version mismatch (saved: ${parsedConfig.version || 'old'}, current: ${this.config.version}). Resetting to new defaults.`);
+                        
+                        // Force new defaults for ASR and TTS to fix language issues
+                        this.config.asr.provider = 'deepgram';
+                        this.config.asr.language = 'en';
+                        this.config.tts.provider = 'deepgram';
+                        this.config.tts.speaker = 'aura-asteria-en';
+                        
+                        // Preserve user credentials if they exist
+                        if (parsedConfig.asr && parsedConfig.asr.apiKey) {
+                            this.config.asr.apiKey = parsedConfig.asr.apiKey;
+                        }
+                        
+                        this.saveConfigToLocalStorage();
+                        this.addLogEntry('info', 'Configuration migrated to new defaults (Deepgram + English)');
+                    } else {
+                        // Deep merge to preserve defaults for any new config options
+                        this.config = this.deepMerge(this.config, parsedConfig);
+                        this.addLogEntry('info', 'Loaded configuration from local storage');
+                    }
                 } catch (error) {
                     this.addLogEntry('error', `Error loading configuration: ${error.message}`);
                 }
