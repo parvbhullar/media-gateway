@@ -25,3 +25,9 @@ Cargo.lock
 cdr/
 .vscode/launch.json
 .gitignore
+examples/webrtc-demo/Cargo.toml
+pipecat_server/__pycache__/ai_services.cpython-313.pyc
+pipecat_server/__pycache__/config.cpython-313.pyc
+pipecat_server/__pycache__/models.cpython-313.pyc
+pipecat_server/__pycache__/server.cpython-313.pyc
+pipecat_server/__pycache__/websocket_manager.cpython-313.pyc

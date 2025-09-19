@@ -91,11 +91,10 @@ impl Invitation {
     pub async fn hangup(&self, dialog_id: DialogId) -> Result<()> {
         let dialog_id_str = dialog_id.to_string();
         if let Some(call) = self.pending_dialogs.lock().await.remove(&dialog_id_str) {
-             call.dialog.reject().ok();
-            // call.dialog.reject(
-            //     Some(rsip::StatusCode::BusyHere), 
-            //     Some("Call Rejected".to_string())
-            // ).ok();
+            call.dialog.reject(
+                Some(rsip::StatusCode::BusyHere), 
+                Some("Call Rejected".to_string())
+            ).ok();
 
             call.token.cancel();
         }
@@ -129,6 +128,7 @@ impl Invitation {
                     return Err(rsipstack::Error::DialogError(
                         resp.status_code.to_string(),
                         dialog.id(),
+                        resp.status_code,
                     ));
                 }
             },
@@ -136,6 +136,7 @@ impl Invitation {
                 return Err(rsipstack::Error::DialogError(
                     "No response received".to_string(),
                     dialog.id(),
+                    rsip::StatusCode::RequestTimeout,
                 ));
             }
         };
@@ -162,14 +163,8 @@ fn on_dialog_terminated(
         TerminatedReason::UasBye => 200,
         TerminatedReason::UasBusy => 486,
         TerminatedReason::UasDecline => 603,
-        TerminatedReason::UacOther(code) => code
-            .clone()
-            .unwrap_or(rsip::StatusCode::ServerInternalError)
-            .code(),
-        TerminatedReason::UasOther(code) => code
-            .clone()
-            .unwrap_or(rsip::StatusCode::ServerInternalError)
-            .code(),
+        TerminatedReason::UacOther(code) => code.code(),
+        TerminatedReason::UasOther(code) => code.code(),
         _ => 500, // Default to internal server error
     };
 
