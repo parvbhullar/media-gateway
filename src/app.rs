@@ -194,6 +194,22 @@ impl AppStateBuilder {
                 None
             }
         };
+        // Log Pipecat configuration
+        if let Some(ref pipecat_config) = config.pipecat {
+            if pipecat_config.enabled {
+                info!(
+                    "✅ Pipecat integration enabled - Server: {}, UseForAI: {}, Fallback: {}",
+                    pipecat_config.server_url.as_deref().unwrap_or("ws://localhost:8765/ws/rustpbx"),
+                    pipecat_config.use_for_ai,
+                    pipecat_config.fallback_to_internal
+                );
+            } else {
+                info!("⚠️  Pipecat integration configured but disabled");
+            }
+        } else {
+            debug!("Pipecat integration not configured - using internal AI services");
+        }
+
         let app_state = Arc::new(AppStateInner {
             config: config.clone(),
             useragent,

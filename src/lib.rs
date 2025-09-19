@@ -9,6 +9,7 @@ pub mod handler;
 pub mod llm;
 pub mod media;
 pub mod net_tool;
+pub mod pipecat;
 pub mod proxy;
 pub mod synthesis;
 pub mod transcription;

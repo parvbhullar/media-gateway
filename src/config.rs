@@ -56,6 +56,8 @@ pub struct Config {
     pub deepgram_api_key: Option<String>,
     /// Structured Deepgram configuration
     pub deepgram: Option<DeepgramConfig>,
+    /// Pipecat media server configuration
+    pub pipecat: Option<crate::pipecat::config::PipecatConfig>,
 }
 
 #[derive(Default, Debug, Serialize, Deserialize, Clone)]
@@ -381,15 +383,27 @@ impl Default for Config {
             ami: Some(AmiConfig::default()),
             deepgram_api_key: None,
             deepgram: None,
+            pipecat: None,
         }
     }
 }
 
 impl Config {
     pub fn load(path: &str) -> Result<Self, Error> {
-        let config = toml::from_str(
-            &std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("{}: {}", e, path))?,
-        )?;
+        let config_str = std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("{}: {}", e, path))?;
+        let config: Config = toml::from_str(&config_str)?;
+        
+        // Debug: Log Pipecat configuration loading
+        println!("🔧 DEBUG: Loaded configuration from {}", path);
+        if let Some(ref pipecat_config) = config.pipecat {
+            println!("🔧 DEBUG: Pipecat config found - enabled: {}, use_for_ai: {}, server_url: {:?}", 
+                pipecat_config.enabled, 
+                pipecat_config.use_for_ai, 
+                pipecat_config.server_url);
+        } else {
+            println!("🔧 DEBUG: No Pipecat configuration found in config file");
+        }
+        
         Ok(config)
     }
 }

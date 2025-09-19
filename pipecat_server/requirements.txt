@@ -1,0 +1,32 @@
+# Core Pipecat Framework
+pipecat-ai>=0.0.40
+
+# Web Framework
+fastapi>=0.104.0
+uvicorn>=0.24.0
+
+# WebSocket support
+websockets>=12.0
+
+# HTTP client
+aiohttp>=3.9.0
+
+# Environment management
+python-dotenv>=1.0.0
+
+# AI Services
+openai>=1.0.0
+deepgram-sdk>=3.0.0
+
+# Audio processing
+audioop-lts>=0.2.1
+
+# Logging
+loguru>=0.7.0
+
+# Configuration
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+
+# Async utilities
+asyncio-mqtt>=0.16.0

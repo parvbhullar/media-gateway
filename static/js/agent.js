@@ -58,6 +58,13 @@ function mainApp() {
                 model: 'qwen-turbo',
                 prompt: 'You are a helpful assistant.'
             },
+            pipecat: {
+                enabled: false,
+                serverUrl: 'ws://localhost:8765/ws/rustpbx',
+                useForAI: false,
+                fallbackToInternal: true,
+                systemPrompt: 'You are a helpful AI assistant in a voice conversation. Respond naturally and conversationally. Keep responses brief but informative.'
+            },
             // Add UI state for tabbed interface
             uiState: {
                 activeTab: 'llm'
@@ -816,62 +823,95 @@ function mainApp() {
                 } : undefined;
                 let denoise = this.config.denoise.enabled ? true : undefined;
 
-                // Build ASR configuration
-                let asrConfig = {
-                    provider: this.config.asr.provider
-                };
+                // Build ASR configuration only if Pipecat is not handling AI processing
+                let asrConfig = undefined;
+                if (!this.config.pipecat.enabled || !this.config.pipecat.useForAI) {
+                    asrConfig = {
+                        provider: this.config.asr.provider
+                    };
 
-                // Add provider-specific ASR configuration
-                if (this.config.asr.provider === 'tencent') {
-                    if (this.config.asr.appId) asrConfig.appId = this.config.asr.appId;
-                    if (this.config.asr.secretId) asrConfig.secretId = this.config.asr.secretId;
-                    if (this.config.asr.secretKey) asrConfig.secretKey = this.config.asr.secretKey;
-                    if (this.config.asr.model) asrConfig.modelType = this.config.asr.model;
-                    if (this.config.asr.language) asrConfig.language = this.config.asr.language;
-                } else if (this.config.asr.provider === 'voiceapi') {
-                    if (this.config.asr.endpoint) asrConfig.endpoint = this.config.asr.endpoint;
-                    if (this.config.asr.model) asrConfig.modelType = this.config.asr.model;
-                    if (this.config.asr.language) asrConfig.language = this.config.asr.language;
-                }else if (this.config.asr.provider === 'deepgram') {
-                    if (this.config.asr.apiKey) asrConfig.secretKey = this.config.asr.apiKey;
-                    if (this.config.asr.model) asrConfig.modelType = this.config.asr.model;
-                    if (this.config.asr.language) asrConfig.language = this.config.asr.language;
-                    if (this.config.asr.tier) asrConfig.tier = this.config.asr.tier;
-                    if (this.config.asr.interimResults !== undefined) {
-                        asrConfig.interimResults = this.config.asr.interimResults;
+                    // Add provider-specific ASR configuration
+                    if (this.config.asr.provider === 'tencent') {
+                        if (this.config.asr.appId) asrConfig.appId = this.config.asr.appId;
+                        if (this.config.asr.secretId) asrConfig.secretId = this.config.asr.secretId;
+                        if (this.config.asr.secretKey) asrConfig.secretKey = this.config.asr.secretKey;
+                        if (this.config.asr.model) asrConfig.modelType = this.config.asr.model;
+                        if (this.config.asr.language) asrConfig.language = this.config.asr.language;
+                    } else if (this.config.asr.provider === 'voiceapi') {
+                        if (this.config.asr.endpoint) asrConfig.endpoint = this.config.asr.endpoint;
+                        if (this.config.asr.model) asrConfig.modelType = this.config.asr.model;
+                        if (this.config.asr.language) asrConfig.language = this.config.asr.language;
+                    }else if (this.config.asr.provider === 'deepgram') {
+                        if (this.config.asr.apiKey) asrConfig.secretKey = this.config.asr.apiKey;
+                        if (this.config.asr.model) asrConfig.modelType = this.config.asr.model;
+                        if (this.config.asr.language) asrConfig.language = this.config.asr.language;
+                        if (this.config.asr.tier) asrConfig.tier = this.config.asr.tier;
+                        if (this.config.asr.interimResults !== undefined) {
+                            asrConfig.interimResults = this.config.asr.interimResults;
+                        }
                     }
                 }
 
-                // Build TTS configuration
-                let ttsConfig = {
-                    provider: this.config.tts.provider,
-                    speaker: this.config.tts.speaker || '601003'
+                // Build TTS configuration only if Pipecat is not handling AI processing
+                let ttsConfig = undefined;
+                if (!this.config.pipecat.enabled || !this.config.pipecat.useForAI) {
+                    ttsConfig = {
+                        provider: this.config.tts.provider,
+                        speaker: this.config.tts.speaker || '601003'
+                    };
+
+                    // Add provider-specific TTS configuration
+                    if (this.config.tts.provider === 'tencent' || this.config.tts.provider === 'tencent_streaming') {
+                        if (this.config.tts.appId) ttsConfig.appId = this.config.tts.appId;
+                        if (this.config.tts.secretId) ttsConfig.secretId = this.config.tts.secretId;
+                        if (this.config.tts.secretKey) ttsConfig.secretKey = this.config.tts.secretKey;
+                        if (this.config.tts.speed) ttsConfig.speed = this.config.tts.speed;
+                        if (this.config.tts.volume) ttsConfig.volume = this.config.tts.volume;
+                    } else if (this.config.tts.provider === 'voiceapi') {
+                        if (this.config.tts.endpoint) ttsConfig.endpoint = this.config.tts.endpoint;
+                    } else if (this.config.tts.provider === 'deepgram') {
+                        // For Deepgram TTS, we need to map apiKey to secretKey and speaker to the correct field
+                        if (this.config.asr.apiKey) ttsConfig.secretKey = this.config.asr.apiKey; // Use same API key as ASR
+                        if (this.config.tts.speaker) ttsConfig.speaker = this.config.tts.speaker;
+                    }
+                }
+
+                // Build Pipecat configuration if enabled
+                let pipecatConfig = undefined;
+                if (this.config.pipecat.enabled) {
+                    pipecatConfig = {
+                        enabled: this.config.pipecat.enabled,
+                        serverUrl: this.config.pipecat.serverUrl,
+                        useForAI: this.config.pipecat.useForAI,
+                        fallbackToInternal: this.config.pipecat.fallbackToInternal,
+                        systemPrompt: this.config.pipecat.systemPrompt
+                    };
+                    this.addLogEntry('info', `Pipecat enabled - Server: ${this.config.pipecat.serverUrl}`);
+                    
+                    if (this.config.pipecat.useForAI) {
+                        this.addLogEntry('info', 'Internal ASR/TTS disabled - AI processing handled by Pipecat');
+                    }
+                }
+
+                // Build the invite option object
+                const inviteOption = {
+                    recorder,
+                    vad,
+                    denoise,
+                    pipecat: pipecatConfig
                 };
 
-                // Add provider-specific TTS configuration
-                if (this.config.tts.provider === 'tencent' || this.config.tts.provider === 'tencent_streaming') {
-                    if (this.config.tts.appId) ttsConfig.appId = this.config.tts.appId;
-                    if (this.config.tts.secretId) ttsConfig.secretId = this.config.tts.secretId;
-                    if (this.config.tts.secretKey) ttsConfig.secretKey = this.config.tts.secretKey;
-                    if (this.config.tts.speed) ttsConfig.speed = this.config.tts.speed;
-                    if (this.config.tts.volume) ttsConfig.volume = this.config.tts.volume;
-                } else if (this.config.tts.provider === 'voiceapi') {
-                    if (this.config.tts.endpoint) ttsConfig.endpoint = this.config.tts.endpoint;
-                } else if (this.config.tts.provider === 'deepgram') {
-                    // For Deepgram TTS, we need to map apiKey to secretKey and speaker to the correct field
-                    if (this.config.asr.apiKey) ttsConfig.secretKey = this.config.asr.apiKey; // Use same API key as ASR
-                    if (this.config.tts.speaker) ttsConfig.speaker = this.config.tts.speaker;
+                // Only add ASR and TTS if they are configured (not handled by Pipecat)
+                if (asrConfig) {
+                    inviteOption.asr = asrConfig;
+                }
+                if (ttsConfig) {
+                    inviteOption.tts = ttsConfig;
                 }
 
                 const invite = {
                     command: 'invite',
-                    option: {
-                        asr: asrConfig,
-                        recorder,
-                        tts: ttsConfig,
-                        vad,
-                        denoise
-                    },
+                    option: inviteOption,
                 };
 
                 // Add different parameters based on call type

@@ -97,3 +97,39 @@ model = "aura-asteria-en"  # Deepgram Aura voice model
 encoding = "linear16"  # Valid options: linear16, mp3, flac, opus, aac, mulaw, alaw
 sample_rate = 16000
 # endpoint = "https://api.deepgram.com/v1/speak"  # Optional custom endpoint
+
+# Pipecat Media Server Configuration
+[pipecat]
+# Enable Pipecat integration (set to true to use external AI processing)
+enabled = true
+# Pipecat server WebSocket URL
+server_url = "ws://localhost:8765/ws/rustpbx"
+# Use Pipecat for AI processing instead of internal services
+use_for_ai = true
+# Fallback to internal AI processing if Pipecat is unavailable
+fallback_to_internal = true
+# Connection timeout in seconds
+connection_timeout = 30
+# Default system prompt for AI conversations
+default_system_prompt = "You are a helpful AI assistant in a voice conversation. Respond naturally and conversationally. Keep responses brief but informative."
+# Enable metrics collection
+enable_metrics = true
+# Enable debug logging for Pipecat communication
+debug_logging = false
+
+# Pipecat reconnection settings
+[pipecat.reconnect]
+enabled = true
+max_attempts = 5
+initial_delay = 1
+max_delay = 30
+backoff_multiplier = 2.0
+
+# Pipecat audio processing settings
+[pipecat.audio]
+sample_rate = 16000
+channels = 1
+frame_size = 160  # 10ms at 16kHz
+buffer_size = 10
+enable_compression = false
+encoding = "linear16"

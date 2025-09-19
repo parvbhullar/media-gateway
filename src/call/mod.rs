@@ -92,26 +92,37 @@ impl CallOption {
     }
 
     pub fn check_default_with_config(&mut self, config: &crate::config::Config) -> &CallOption {
-        // Auto-configure Deepgram ASR if no ASR is specified but Deepgram key is available
-        if self.asr.is_none() {
-            if let Some(deepgram_asr) = config.create_deepgram_asr_option() {
-                self.asr = Some(deepgram_asr);
+        // Skip auto-configuring internal AI services if Pipecat is handling AI processing
+        let use_pipecat = crate::pipecat::should_use_pipecat(config);
+        tracing::debug!("check_default_with_config: should_use_pipecat={}, pipecat_enabled={:?}, pipecat_use_for_ai={:?}", 
+            use_pipecat,
+            config.pipecat.as_ref().map(|p| p.enabled),
+            config.pipecat.as_ref().map(|p| p.use_for_ai));
+        
+        if !use_pipecat {
+            // Auto-configure Deepgram ASR if no ASR is specified but Deepgram key is available
+            if self.asr.is_none() {
+                if let Some(deepgram_asr) = config.create_deepgram_asr_option() {
+                    self.asr = Some(deepgram_asr);
+                }
+            }
+            
+            // Auto-configure Deepgram TTS if no TTS is specified but Deepgram key is available
+            if self.tts.is_none() {
+                if let Some(deepgram_tts) = config.create_deepgram_tts_option() {
+                    self.tts = Some(deepgram_tts);
+                }
             }
         }
         
-        // Auto-configure Deepgram TTS if no TTS is specified but Deepgram key is available
-        if self.tts.is_none() {
-            if let Some(deepgram_tts) = config.create_deepgram_tts_option() {
-                self.tts = Some(deepgram_tts);
+        // Apply existing defaults only if not using Pipecat
+        if !crate::pipecat::should_use_pipecat(config) {
+            if let Some(tts) = &mut self.tts {
+                tts.check_default();
             }
-        }
-        
-        // Apply existing defaults
-        if let Some(tts) = &mut self.tts {
-            tts.check_default();
-        }
-        if let Some(asr) = &mut self.asr {
-            asr.check_default();
+            if let Some(asr) = &mut self.asr {
+                asr.check_default();
+            }
         }
         self
     }

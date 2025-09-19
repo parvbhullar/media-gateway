@@ -123,6 +123,11 @@
                             :class="config.uiState.activeTab === 'vad' ? 'border-blue-500 text-blue-600' : 'border-transparent hover:text-blue-500'">
                             VAD
                         </button>
+                        <button @click="config.uiState.activeTab = 'pipecat'"
+                            class="py-2 px-4 font-medium border-b-2 transition-colors duration-200"
+                            :class="config.uiState.activeTab === 'pipecat' ? 'border-blue-500 text-blue-600' : 'border-transparent hover:text-blue-500'">
+                            Pipecat
+                        </button>
                         <button @click="config.uiState.activeTab = 'metrics'"
                             class="py-2 px-4 font-medium border-b-2 transition-colors duration-200"
                             :class="config.uiState.activeTab === 'metrics' ? 'border-blue-500 text-blue-600' : 'border-transparent hover:text-blue-500'">
@@ -134,10 +139,27 @@
                     <div class="py-4">
                         <!-- TTS Tab -->
                         <div x-show="config.uiState.activeTab === 'tts'" class="space-y-3">
+                            <!-- Pipecat Override Notice -->
+                            <div x-show="config.pipecat.enabled && config.pipecat.useForAI" 
+                                 class="bg-blue-50 p-3 rounded border border-blue-200">
+                                <div class="flex items-center">
+                                    <i class="fas fa-info-circle text-blue-500 mr-2"></i>
+                                    <span class="text-sm text-blue-800 font-medium">
+                                        TTS is handled by Pipecat Media Server when enabled
+                                    </span>
+                                </div>
+                                <p class="text-xs text-blue-700 mt-1">
+                                    These settings are overridden by Pipecat configuration
+                                </p>
+                            </div>
+                            
                             <div>
                                 <label for="ttsProvider" class="text-sm font-medium">Provider</label>
                                 <select id="ttsProvider" x-model="config.tts.provider"
-                                    class="border p-2 rounded w-full">
+                                    :disabled="config.pipecat.enabled && config.pipecat.useForAI"
+                                    :class="config.pipecat.enabled && config.pipecat.useForAI ? 
+                                           'border p-2 rounded w-full bg-gray-100 text-gray-500' : 
+                                           'border p-2 rounded w-full'">
                                     <option value="tencent">Tencent Cloud</option>
                                     <option value="aliyun">Aliyun</option>
                                     <option value="deepgram">Deepgram</option>
@@ -223,10 +245,27 @@
 
                         <!-- ASR Tab -->
                         <div x-show="config.uiState.activeTab === 'asr'" class="space-y-3">
+                            <!-- Pipecat Override Notice -->
+                            <div x-show="config.pipecat.enabled && config.pipecat.useForAI" 
+                                 class="bg-blue-50 p-3 rounded border border-blue-200">
+                                <div class="flex items-center">
+                                    <i class="fas fa-info-circle text-blue-500 mr-2"></i>
+                                    <span class="text-sm text-blue-800 font-medium">
+                                        ASR is handled by Pipecat Media Server when enabled
+                                    </span>
+                                </div>
+                                <p class="text-xs text-blue-700 mt-1">
+                                    These settings are overridden by Pipecat configuration
+                                </p>
+                            </div>
+                            
                             <div>
                                 <label for="asrProvider" class="text-sm font-medium">Provider</label>
                                 <select id="asrProvider" x-model="config.asr.provider"
-                                    class="border p-2 rounded w-full">
+                                    :disabled="config.pipecat.enabled && config.pipecat.useForAI"
+                                    :class="config.pipecat.enabled && config.pipecat.useForAI ? 
+                                           'border p-2 rounded w-full bg-gray-100 text-gray-500' : 
+                                           'border p-2 rounded w-full'">
                                     <option value="tencent">Tencent Cloud</option>
                                     <option value="aliyun">Aliyun</option>
                                     <option value="deepgram">Deepgram</option>
@@ -234,27 +273,44 @@
                                 </select>
                             </div>
 
-                            <div x-show="config.asr.provider === 'tencent'" class="border-t pt-3 space-y-2">
+                            <div x-show="config.asr.provider === 'tencent'" class="border-t pt-3 space-y-2"
+                                 :class="config.pipecat.enabled && config.pipecat.useForAI ? 'opacity-50' : ''">
                                 <p class="text-xs text-gray-600 mb-2">Tencent Cloud 配置</p>
                                 <div>
                                     <label for="asrAppId" class="text-sm">App ID</label>
                                     <input type="text" id="asrAppId" x-model="config.asr.appId"
-                                        placeholder="Enter Tencent App ID" class="border p-2 rounded w-full">
+                                        :disabled="config.pipecat.enabled && config.pipecat.useForAI"
+                                        placeholder="Enter Tencent App ID" 
+                                        :class="config.pipecat.enabled && config.pipecat.useForAI ? 
+                                               'border p-2 rounded w-full bg-gray-100 text-gray-500' : 
+                                               'border p-2 rounded w-full'">
                                 </div>
                                 <div>
                                     <label for="asrSecretId" class="text-sm">Secret ID</label>
                                     <input type="text" id="asrSecretId" x-model="config.asr.secretId"
-                                        placeholder="Enter Tencent Secret ID" class="border p-2 rounded w-full">
+                                        :disabled="config.pipecat.enabled && config.pipecat.useForAI"
+                                        placeholder="Enter Tencent Secret ID" 
+                                        :class="config.pipecat.enabled && config.pipecat.useForAI ? 
+                                               'border p-2 rounded w-full bg-gray-100 text-gray-500' : 
+                                               'border p-2 rounded w-full'">
                                 </div>
                                 <div>
                                     <label for="asrSecretKey" class="text-sm">Secret Key</label>
                                     <input type="password" id="asrSecretKey" x-model="config.asr.secretKey"
-                                        placeholder="Enter Tencent Secret Key" class="border p-2 rounded w-full">
+                                        :disabled="config.pipecat.enabled && config.pipecat.useForAI"
+                                        placeholder="Enter Tencent Secret Key" 
+                                        :class="config.pipecat.enabled && config.pipecat.useForAI ? 
+                                               'border p-2 rounded w-full bg-gray-100 text-gray-500' : 
+                                               'border p-2 rounded w-full'">
                                 </div>
                                 <div>
                                     <label for="asrModel" class="text-sm">Model</label>
                                     <input type="text" id="asrModel" x-model="config.asr.model"
-                                        placeholder="e.g. 16k_zh" class="border p-2 rounded w-full">
+                                        :disabled="config.pipecat.enabled && config.pipecat.useForAI"
+                                        placeholder="e.g. 16k_zh" 
+                                        :class="config.pipecat.enabled && config.pipecat.useForAI ? 
+                                               'border p-2 rounded w-full bg-gray-100 text-gray-500' : 
+                                               'border p-2 rounded w-full'">
                                 </div>
                             </div>
 
@@ -335,9 +391,28 @@
 
                         <!-- LLM Tab -->
                         <div x-show="config.uiState.activeTab === 'llm'" class="space-y-2">
+                            <!-- Pipecat Override Notice -->
+                            <div x-show="config.pipecat.enabled && config.pipecat.useForAI" 
+                                 class="bg-blue-50 p-3 rounded border border-blue-200 mb-4">
+                                <div class="flex items-center">
+                                    <i class="fas fa-info-circle text-blue-500 mr-2"></i>
+                                    <span class="text-sm text-blue-800 font-medium">
+                                        LLM is handled by Pipecat Media Server when enabled
+                                    </span>
+                                </div>
+                                <p class="text-xs text-blue-700 mt-1">
+                                    These settings are overridden by Pipecat configuration. Configure LLM in Pipecat tab.
+                                </p>
+                            </div>
+                            
                             <div class="flex items-center mb-4">
-                                <input type="checkbox" id="useLlmProxy" x-model="config.llm.useProxy" class="mr-2">
-                                <label for="useLlmProxy" class="font-medium">Use qwen3-14b model</label>
+                                <input type="checkbox" id="useLlmProxy" x-model="config.llm.useProxy" 
+                                       :disabled="config.pipecat.enabled && config.pipecat.useForAI"
+                                       class="mr-2">
+                                <label for="useLlmProxy" class="font-medium"
+                                       :class="config.pipecat.enabled && config.pipecat.useForAI ? 'text-gray-500' : ''">
+                                    Use qwen3-14b model
+                                </label>
                                 <span class="ml-2 text-xs text-gray-600">He is not the smartest guy</span>
                             </div>
 
@@ -413,6 +488,56 @@
                                     <input type="range" id="vadSilencePadding" x-model="config.vad.silencePadding"
                                         min="50" max="600" step="50" class="w-full">
                                     <span class="text-xs text-right" x-text="config.vad.silencePadding"></span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Pipecat Tab -->
+                        <div x-show="config.uiState.activeTab === 'pipecat'" class="space-y-3">
+                            <div class="bg-blue-50 p-4 rounded border border-blue-200">
+                                <h4 class="text-sm font-semibold text-blue-800 mb-2">🤖 Pipecat AI Media Server</h4>
+                                <p class="text-xs text-blue-700">
+                                    Use external Pipecat server for AI processing (STT, LLM, TTS) instead of internal services.
+                                    <br>When enabled, audio will be sent to Pipecat for processing.
+                                </p>
+                            </div>
+                            
+                            <div class="flex items-center mb-4">
+                                <input type="checkbox" id="pipecatEnabled" x-model="config.pipecat.enabled" class="mr-2">
+                                <label for="pipecatEnabled" class="text-sm font-medium">Enable Pipecat Media Server</label>
+                            </div>
+
+                            <div x-show="config.pipecat.enabled" class="border-t pt-3 space-y-3">
+                                <div>
+                                    <label for="pipecatServerUrl" class="text-sm font-medium">Server URL</label>
+                                    <input type="text" id="pipecatServerUrl" x-model="config.pipecat.serverUrl"
+                                        placeholder="ws://localhost:8765/ws/rustpbx" class="border p-2 rounded w-full">
+                                    <p class="text-xs text-gray-600 mt-1">WebSocket URL of the Pipecat media server</p>
+                                </div>
+                                
+                                <div class="flex items-center">
+                                    <input type="checkbox" id="pipecatUseForAI" x-model="config.pipecat.useForAI" class="mr-2">
+                                    <label for="pipecatUseForAI" class="text-sm">Replace internal AI services with Pipecat</label>
+                                </div>
+                                
+                                <div class="flex items-center">
+                                    <input type="checkbox" id="pipecatFallback" x-model="config.pipecat.fallbackToInternal" class="mr-2">
+                                    <label for="pipecatFallback" class="text-sm">Fallback to internal AI if Pipecat fails</label>
+                                </div>
+                                
+                                <div>
+                                    <label for="pipecatSystemPrompt" class="text-sm font-medium">System Prompt</label>
+                                    <textarea id="pipecatSystemPrompt" x-model="config.pipecat.systemPrompt"
+                                        placeholder="You are a helpful AI assistant in a voice conversation. Respond naturally and conversationally."
+                                        class="border p-2 rounded w-full h-20 resize-none"></textarea>
+                                    <p class="text-xs text-gray-600 mt-1">Initial prompt sent to the AI assistant</p>
+                                </div>
+                                
+                                <div class="bg-yellow-50 p-3 rounded border border-yellow-200">
+                                    <p class="text-xs text-yellow-800">
+                                        <strong>Note:</strong> Make sure your Pipecat server is running before starting calls.
+                                        The server should be accessible at the configured URL.
+                                    </p>
                                 </div>
                             </div>
                         </div>

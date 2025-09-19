@@ -17,6 +17,7 @@ use crate::{
             Track, TrackConfig,
             file::FileTrack,
             media_pass::MediaPassTrack,
+            pipecat::{PipecatTrack, PipecatTrackBuilder},
             rtp::{RtpTrack, RtpTrackBuilder},
             tts::SynthesisHandle,
             webrtc::WebrtcTrack,
@@ -38,7 +39,7 @@ use std::{
 };
 use tokio::{fs::File, select, sync::Mutex, time::sleep};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Deserialize)]
 pub struct CallParams {
@@ -1106,12 +1107,24 @@ impl ActiveCall {
         option: &CallOption,
         mut track: Box<dyn Track>,
     ) -> Result<()> {
+        // If Pipecat is handling AI processing, remove ASR/TTS from CallOption
+        // to prevent internal AI services from running in parallel
+        let mut processed_option = option.clone();
+        if crate::pipecat::should_use_pipecat(&app_state.config) {
+            debug!(
+                session_id,
+                "Pipecat enabled for AI processing - disabling internal ASR/TTS processors"
+            );
+            processed_option.asr = None;
+            processed_option.tts = None;
+        }
+
         let processors = match StreamEngine::create_processors(
             app_state.stream_engine.clone(),
             track.as_ref(),
             cancel_token.clone(),
             event_sender.clone(),
-            option,
+            &processed_option,
         )
         .await
         {
@@ -1186,6 +1199,55 @@ impl ActiveCall {
             )
         };
 
+        // Check if Pipecat integration is enabled and should be used for AI processing
+        let use_pipecat = crate::pipecat::should_use_pipecat(&self.app_state.config);
+        debug!(
+            session_id = self.session_id,
+            use_pipecat = use_pipecat,
+            "Checking if Pipecat should be used for AI processing"
+        );
+        
+        if use_pipecat {
+            info!(
+                session_id = self.session_id,
+                "Creating Pipecat track for AI processing"
+            );
+            
+            // Get Pipecat configuration
+            debug!(
+                session_id = self.session_id,
+                has_pipecat_config = self.app_state.config.pipecat.is_some(),
+                "Checking Pipecat configuration availability"
+            );
+            
+            if let Some(pipecat_config) = self.app_state.config.pipecat.as_ref() {
+                info!(
+                    session_id = self.session_id,
+                    server_url = pipecat_config.server_url,
+                    "Found Pipecat configuration, creating PipecatTrack"
+                );
+                let pipecat_track = PipecatTrackBuilder::new()
+                    .with_id(self.session_id.clone())
+                    .with_ssrc(ssrc)
+                    .with_config(self.track_config.clone())
+                    .with_pipecat_config(pipecat_config.clone())
+                    .build(self.cancel_token.child_token())
+                    .await?;
+                
+                return Ok(Box::new(pipecat_track));
+            } else {
+                warn!(
+                    session_id = self.session_id,
+                    "Pipecat enabled but no configuration found, falling back to WebRTC track"
+                );
+            }
+        }
+
+        info!(
+            session_id = self.session_id,
+            "Creating WebRTC track (Pipecat not used)"
+        );
+        
         let mut webrtc_track = WebrtcTrack::new(
             self.cancel_token.child_token(),
             self.session_id.clone(),

@@ -52,6 +52,7 @@ impl TrackConfig {
 
 pub mod file;
 pub mod media_pass;
+pub mod pipecat;
 pub mod rtp;
 pub mod track_codec;
 pub mod tts;
