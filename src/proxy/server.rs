@@ -9,6 +9,7 @@ use crate::{
     callrecord::CallRecordSender,
     config::ProxyConfig,
     proxy::{
+        FnCreateRouteInvite,
         auth::AuthBackend,
         call::{CallRouter, DialplanInspector},
     },
@@ -51,6 +52,7 @@ pub struct SipServerInner {
     pub callrecord_sender: Option<CallRecordSender>,
     pub endpoint: Endpoint,
     pub location_inspector: Arc<Option<Box<dyn LocationInspector>>>,
+    pub create_route_invite: Option<FnCreateRouteInvite>,
 }
 
 pub type SipServerRef = Arc<SipServerInner>;
@@ -73,6 +75,7 @@ pub struct SipServerBuilder {
     message_inspector: Option<Box<dyn MessageInspector>>,
     location_inspector: Option<Box<dyn LocationInspector>>,
     dialplan_inspector: Option<Box<dyn DialplanInspector>>,
+    create_route_invite: Option<FnCreateRouteInvite>,
 }
 
 impl SipServerBuilder {
@@ -89,6 +92,7 @@ impl SipServerBuilder {
             message_inspector: None,
             location_inspector: None,
             dialplan_inspector: None,
+            create_route_invite: None,
         }
     }
 
@@ -125,6 +129,11 @@ impl SipServerBuilder {
     }
     pub fn with_cancel_token(mut self, cancel_token: CancellationToken) -> Self {
         self.cancel_token = Some(cancel_token);
+        self
+    }
+
+    pub fn with_create_route_invite(mut self, f: FnCreateRouteInvite) -> Self {
+        self.create_route_invite = Some(f);
         self
     }
 
@@ -264,6 +273,7 @@ impl SipServerBuilder {
             endpoint,
             location_inspector: Arc::new(location_inspector),
             dialplan_inspector: Arc::new(dialplan_inspector),
+            create_route_invite: self.create_route_invite,
         });
 
         let mut allow_methods = Vec::new();
@@ -384,8 +394,7 @@ impl SipServer {
     async fn handle_incoming(&self, mut incoming: TransactionReceiver) -> Result<()> {
         let runnings_tx = Arc::new(AtomicUsize::new(0));
         while let Some(mut tx) = incoming.recv().await {
-            let key = tx.key.to_string();
-            debug!(key, "Received transaction");
+            debug!(key = %tx.key, "received transaction");
             let modules = self.modules.clone();
 
             let token = self.inner.cancel_token.child_token();
@@ -394,9 +403,9 @@ impl SipServer {
             if let Some(max_concurrency) = self.inner.config.max_concurrency {
                 if runnings_tx.load(Ordering::Relaxed) >= max_concurrency {
                     info!(
-                        key,
+                        key = %tx.key,
                         runnings = runnings_tx.load(Ordering::Relaxed),
-                        "Max concurrency reached, not process this transaction"
+                        "max concurrency reached, not process this transaction"
                     );
                     tx.reply(rsip::StatusCode::ServiceUnavailable).await.ok();
                     continue;
@@ -404,7 +413,13 @@ impl SipServer {
             }
             // Spam protection for OPTIONS requests
             // If the OPTIONS request is out-of-dialog and the tag is not present, ignore it
-            if matches!(tx.original.method, rsip::Method::Options) {
+            if matches!(
+                tx.original.method,
+                rsip::Method::Options
+                    | rsip::method::Method::Info
+                    | rsip::method::Method::Refer
+                    | rsip::method::Method::Update
+            ) {
                 if tx.endpoint_inner.option.ignore_out_of_dialog_option {
                     let to_tag = tx
                         .original
@@ -413,7 +428,7 @@ impl SipServer {
                         .ok()
                         .flatten();
                     if to_tag.is_none() {
-                        info!(key, "Ignoring out-of-dialog OPTIONS request");
+                        info!(key = %tx.key, "ignoring out-of-dialog OPTIONS request");
                         continue;
                     }
                 }
@@ -421,20 +436,21 @@ impl SipServer {
             tokio::spawn(async move {
                 runnings_tx.fetch_add(1, Ordering::Relaxed);
                 let start_time = Instant::now();
+                let cookie = TransactionCookie::from(&tx.key);
                 select! {
-                    r = Self::process_transaction(token.clone(), modules, &key,  &mut tx) => {
+                    r = Self::process_transaction(token.clone(), modules, cookie.clone(),  &mut tx) => {
                         let final_status = tx.last_response.as_ref().map(|r| r.status_code());
                         match r {
                             Ok(_) => {
-                                info!(key, ?final_status, "Transaction processed in {} s ", start_time.elapsed().as_secs_f32());
+                                info!(key = %tx.key, ?final_status, "transaction processed in {:?}", start_time.elapsed());
                             },
                             Err(e) => {
-                                warn!(key, ?final_status, "Failed to process transaction: {} in {} s", e, start_time.elapsed().as_secs_f32());
+                                warn!(key = %tx.key, ?final_status, "failed to process transaction: {} in {:?}", e, start_time.elapsed());
                             }
                         }
                     }
                     _ = token.cancelled() => {
-                        info!(key, "Transaction cancelled");
+                        info!(key = %tx.key, "transaction cancelled");
                     }
                 };
                 runnings_tx.fetch_sub(1, Ordering::Relaxed);
@@ -442,8 +458,8 @@ impl SipServer {
                     tx.original.method,
                     rsip::Method::Bye | rsip::method::Method::Cancel | rsip::Method::Ack
                 ) {
-                    if tx.last_response.is_none() {
-                        tx.reply(rsip::StatusCode::RequestTerminated).await.ok();
+                    if tx.last_response.is_none() && !cookie.is_spam() {
+                        tx.reply(rsip::StatusCode::NotImplemented).await.ok();
                     }
                 }
                 return Ok::<(), anyhow::Error>(());
@@ -455,10 +471,9 @@ impl SipServer {
     async fn process_transaction(
         token: CancellationToken,
         modules: Arc<Vec<Box<dyn ProxyModule>>>,
-        key: &String,
+        cookie: TransactionCookie,
         tx: &mut Transaction,
     ) -> Result<()> {
-        let cookie = TransactionCookie::from(&tx.key);
         for module in modules.iter() {
             match module
                 .on_transaction_begin(token.clone(), tx, cookie.clone())
@@ -470,7 +485,7 @@ impl SipServer {
                 },
                 Err(e) => {
                     error!(
-                        key,
+                        key = %tx.key,
                         module = module.name(),
                         "failed to handle transaction: {}",
                         e
@@ -487,7 +502,7 @@ impl SipServer {
             match module.on_transaction_end(tx).await {
                 Ok(_) => {}
                 Err(e) => {
-                    error!(key, "failed to handle transaction: {}", e);
+                    error!(key = %tx.key, "failed to handle transaction: {}", e);
                 }
             }
         }
@@ -516,6 +531,14 @@ impl SipServerInner {
                             return true;
                         }
                     }
+                }
+                if self
+                    .endpoint
+                    .get_addrs()
+                    .iter()
+                    .any(|addr| addr.addr.host.to_string() == callee_realm)
+                {
+                    return true;
                 }
                 self.user_backend.is_same_realm(callee_realm).await
             }

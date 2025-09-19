@@ -311,7 +311,10 @@ impl ActiveCall {
         match command {
             Command::Invite { option } => self.do_invite(option).await,
             Command::Accept { option } => self.do_accept(option).await,
-            Command::Reject { reason, code } => self.do_reject(reason, code).await,
+            Command::Reject { reason, code } => {
+                self.do_reject(code.map(|c| (c as u16).into()), Some(reason))
+                    .await
+            }
             Command::Ringing {
                 ringtone,
                 recorder,
@@ -493,23 +496,34 @@ impl ActiveCall {
         return Ok(());
     }
 
-    async fn do_reject(&self, _reason: String, _code: Option<u32>) -> Result<()> {
-        Ok(())
+    async fn do_reject(
+        &self,
+        code: Option<rsip::StatusCode>,
+        reason: Option<String>,
+    ) -> Result<()> {
+        match self.invitation.has_pending_call(&self.session_id).await {
+            Some(id) => {
+                info!(
+                    session_id = self.session_id,
+                    ?reason,
+                    ?code,
+                    "rejecting call"
+                );
+                self.invitation.hangup(id, code, reason).await
+            }
+            None => Ok(()),
+        }
     }
 
     async fn do_ringing(
         &self,
         ringtone: Option<String>,
-        recorder: Option<bool>,
+        recorder: Option<RecorderOption>,
         early_media: Option<bool>,
     ) -> Result<()> {
         if self.ready_to_answer.lock().await.is_none() {
             let option = CallOption {
-                recorder: if recorder.unwrap_or_default() {
-                    Some(RecorderOption::default())
-                } else {
-                    None
-                },
+                recorder,
                 ..Default::default()
             };
             let _ = self.invite_or_accept(option, "ringing".to_string()).await?;
@@ -528,7 +542,7 @@ impl ActiveCall {
             dialog.ringing(headers, body).ok();
             info!(
                 session_id = self.session_id,
-                recorder, ringtone, early_media, "playing ringtone"
+                ringtone, early_media, "playing ringtone"
             );
             if let Some(ringtone) = ringtone {
                 self.do_play(ringtone, None, None).await.ok();
@@ -770,15 +784,21 @@ impl ActiveCall {
             })
             .ok();
 
-        if refer_option
+        let auto_hangup = refer_option
             .as_ref()
             .and_then(|o| o.auto_hangup)
-            .unwrap_or(true)
-        {
+            .unwrap_or(true);
+
+        if auto_hangup {
             *self.auto_hangup.lock().await = Some((ssrc, CallRecordHangupReason::ByRefer));
         } else {
             *self.auto_hangup.lock().await = None;
         }
+
+        info!(
+            session_id = self.session_id,
+            ssrc, auto_hangup, callee, "do_refer"
+        );
 
         match self
             .create_outgoing_sip_track(
@@ -789,13 +809,34 @@ impl ActiveCall {
             )
             .await
         {
-            Ok(_) => {}
+            Ok(answer) => {
+                self.event_sender
+                    .send(SessionEvent::Answer {
+                        timestamp: crate::get_timestamp(),
+                        track_id,
+                        sdp: answer,
+                    })
+                    .ok();
+            }
             Err(e) => {
                 warn!(
                     session_id = session_id,
                     "failed to create refer sip track: {}", e
                 );
-                return Err(e);
+                match &e {
+                    rsipstack::Error::DialogError(reason, _, code) => {
+                        self.event_sender
+                            .send(SessionEvent::Reject {
+                                track_id,
+                                timestamp: crate::get_timestamp(),
+                                reason: reason.clone(),
+                                code: Some(code.code() as u32),
+                            })
+                            .ok();
+                    }
+                    _ => {}
+                }
+                return Err(e.into());
             }
         }
         Ok(())
@@ -936,17 +977,15 @@ impl ActiveCall {
             .with_ssrc(ssrc)
             .with_cancel_token(cancel_token);
 
-        if let Some(ref sip) = app_state.config.ua {
-            if let Some(rtp_start_port) = sip.rtp_start_port {
-                rtp_track = rtp_track.with_rtp_start_port(rtp_start_port);
-            }
-            if let Some(rtp_end_port) = sip.rtp_end_port {
-                rtp_track = rtp_track.with_rtp_end_port(rtp_end_port);
-            }
+        if let Some(rtp_start_port) = app_state.config.rtp_start_port {
+            rtp_track = rtp_track.with_rtp_start_port(rtp_start_port);
+        }
+        if let Some(rtp_end_port) = app_state.config.rtp_end_port {
+            rtp_track = rtp_track.with_rtp_end_port(rtp_end_port);
+        }
 
-            if let Some(ref external_ip) = sip.external_ip {
-                rtp_track = rtp_track.with_external_addr(external_ip.parse()?);
-            }
+        if let Some(ref external_ip) = app_state.config.external_ip {
+            rtp_track = rtp_track.with_external_addr(external_ip.parse()?);
         }
         rtp_track.build().await
     }
@@ -1017,7 +1056,20 @@ impl ActiveCall {
                             session_id = self.session_id,
                             "failed to create sip track: {}", e
                         );
-                        return Err(e);
+                        match &e {
+                            rsipstack::Error::DialogError(reason, _, code) => {
+                                self.event_sender
+                                    .send(SessionEvent::Reject {
+                                        track_id: self.session_id.clone(),
+                                        timestamp: crate::get_timestamp(),
+                                        reason: reason.clone(),
+                                        code: Some(code.code() as u32),
+                                    })
+                                    .ok();
+                            }
+                            _ => {}
+                        }
+                        return Err(e.into());
                     }
                 }
             }
@@ -1301,10 +1353,10 @@ impl ActiveCall {
         call_state_ref: ActiveCallStateRef,
         track_id: &String,
         mut invite_option: InviteOption,
-    ) -> Result<String> {
+    ) -> Result<String, rsipstack::Error> {
         let ssrc = call_state_ref
             .read()
-            .map_err(|e| anyhow::anyhow!("{}", e))?
+            .map_err(|e| rsipstack::Error::Error(e.to_string()))?
             .ssrc;
         let rtp_track = Self::create_rtp_track(
             cancel_token.child_token(),
@@ -1313,7 +1365,8 @@ impl ActiveCall {
             self.track_config.clone(),
             ssrc,
         )
-        .await?;
+        .await
+        .map_err(|e| rsipstack::Error::Error(e.to_string()))?;
 
         let offer = rtp_track.local_description().ok();
         let call_option = call_state_ref
@@ -1341,7 +1394,8 @@ impl ActiveCall {
             &call_option,
             Box::new(rtp_track),
         )
-        .await?;
+        .await
+        .map_err(|e| rsipstack::Error::Error(e.to_string()))?;
 
         info!(
             session_id = self.session_id,
@@ -1378,19 +1432,25 @@ impl ActiveCall {
         let (dialog_id, answer) = self
             .invitation
             .invite(invite_option, dlg_state_sender)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .await?;
 
         let answer = match answer {
             Some(answer) => String::from_utf8_lossy(&answer).to_string(),
             None => {
                 warn!(session_id = self.session_id, "no answer received");
-                return Err(anyhow::anyhow!(
-                    "no answer received for dialog: {}",
-                    dialog_id
+                return Err(rsipstack::Error::DialogError(
+                    "No answer received".to_string(),
+                    dialog_id,
+                    rsip::StatusCode::NotAcceptableHere,
                 ));
             }
         };
+
+        call_state_ref.write().as_mut().ok().map(|cs| {
+            if cs.answer.is_none() {
+                cs.answer.replace(answer.clone());
+            }
+        });
 
         self.media_stream
             .update_remote_description(&track_id, &answer)

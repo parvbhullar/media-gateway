@@ -6,6 +6,7 @@ use crate::{
         sip::{Invitation, client_dialog_event_loop},
     },
     config::RouteResult,
+    event::SessionEvent,
     media::{recorder::RecorderOption, track::TrackConfig},
     useragent::invitation::PendingDialog,
 };
@@ -157,10 +158,7 @@ impl B2bua {
                 {
                     Ok(_) => {}
                     Err(_) => {
-                        dialog_ref.reject(
-                            Some(rsip::StatusCode::BusyHere), 
-                            Some("Call Rejected".to_string())
-                        ).ok();
+                        dialog_ref.reject(None, None).ok();
                     }
                 }
             },
@@ -176,10 +174,7 @@ impl B2bua {
                 session_id = self.session_id,
                 "pending dialog still exists, cleaning up"
             );
-            pending.dialog.reject(
-                Some(rsip::StatusCode::BusyHere), 
-                Some("Call Rejected".to_string())
-            ).ok();
+            pending.dialog.reject(None, None).ok();
         }
         app_state.active_calls.lock().await.remove(&self.session_id);
         Ok(())
@@ -367,7 +362,7 @@ impl B2bua {
                     _ = cancel_token.cancelled() => {
                         if let Some(dialog_id) = dialog_id {
                             info!(session_id = session_id, dialog_id = %dialog_id, "cancelling callee dialog");
-                            active_call_ref.invitation.hangup(dialog_id).await.ok();
+                            active_call_ref.invitation.hangup(dialog_id, None, None).await.ok();
                         }
                     }
                     _ = async {
@@ -381,9 +376,15 @@ impl B2bua {
                                 }
                                 DialogState::Early(_, resp) => {
                                     let body = String::from_utf8_lossy(&resp.body);
+                                    let recorder_option = if recorder {
+                                        let recorder_file = active_call_ref.app_state.get_recorder_file(&session_id);
+                                        Some(RecorderOption::new(recorder_file))
+                                    } else {
+                                        None
+                                    };
                                     let rinning_command = Command::Ringing {
                                         ringtone: None,
-                                        recorder: Some(recorder),
+                                        recorder: recorder_option,
                                         early_media: Some(!body.is_empty()),
                                     };
                                     active_call_ref.enqueue_command(rinning_command).await.ok();
@@ -424,6 +425,20 @@ impl B2bua {
             Ok((id, ans)) => (id, ans),
             Err(e) => {
                 warn!(session_id = self.session_id, %caller, %callee, "callee invite failed: {}", e);
+                match &e {
+                    rsipstack::Error::DialogError(reason, _, code) => {
+                        active_call
+                            .event_sender
+                            .send(SessionEvent::Reject {
+                                track_id,
+                                timestamp: crate::get_timestamp(),
+                                reason: reason.clone(),
+                                code: Some(code.code() as u32),
+                            })
+                            .ok();
+                    }
+                    _ => {}
+                }
                 return Err(anyhow::anyhow!("{}", e));
             }
         };
