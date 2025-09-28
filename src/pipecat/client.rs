@@ -151,11 +151,22 @@ impl PipecatClient {
             }
         }
         
-        debug!("Sending {} bytes of audio data to Pipecat server", audio_data.len());
-        
         let mut frame_counter = self.audio_frame_counter.lock().await;
         *frame_counter += 1;
         let frame_id = format!("{}_{}", self.room_id, *frame_counter);
+        
+        info!("📡 PipecatClient sending audio to server:");
+        info!("   Frame ID: {}", frame_id);
+        info!("   Audio size: {} bytes", audio_data.len());
+        info!("   Sample rate: {} Hz", self.config.audio.sample_rate);
+        info!("   Channels: {}", self.config.audio.channels);
+        
+        // Log first few bytes for debugging
+        if self.config.debug_logging && !audio_data.is_empty() {
+            let preview_len = std::cmp::min(16, audio_data.len());
+            let preview: Vec<u8> = audio_data[0..preview_len].to_vec();
+            debug!("   First {} bytes: {:?}", preview_len, preview);
+        }
         
         let audio_frame = PipecatAudioFrame {
             audio_data,
@@ -165,11 +176,17 @@ impl PipecatClient {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as u64,
-            frame_id,
+            frame_id: frame_id.clone(),
         };
         
         let message = PipecatMessage::Audio(audio_frame);
-        self.send_message(message).await
+        let result = self.send_message(message).await;
+        
+        if result.is_ok() {
+            info!("✅ Audio frame {} sent successfully", frame_id);
+        }
+        
+        result
     }
     
     /// Update system prompt

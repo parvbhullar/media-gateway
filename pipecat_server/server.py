@@ -306,8 +306,22 @@ def create_app(settings: Settings) -> FastAPI:
                 if message_type == "configure":
                     # Handle configuration from RustPBX call setup
                     response = await server.handle_rustpbx_configure(message)
-                elif message_type == "audio_frame" or "samples" in message or "data" in message:
+                elif message_type == "audio_frame" or message_type == "audio" or "audio_data" in message or "samples" in message or "data" in message:
                     # Handle audio data for AI processing
+                    logger.info(f"📨 Received audio packet from RustPBX WebSocket")
+                    logger.info(f"   Message type: {message_type}")
+                    logger.info(f"   Message keys: {list(message.keys())}")
+                    
+                    # Log audio data details
+                    if "audio_data" in message:
+                        audio_data = message["audio_data"]
+                        if isinstance(audio_data, list):
+                            logger.info(f"   Audio data: list of {len(audio_data)} bytes")
+                        elif isinstance(audio_data, str):
+                            logger.info(f"   Audio data: base64 string of length {len(audio_data)}")
+                        else:
+                            logger.info(f"   Audio data: {type(audio_data)}")
+                    
                     server.audio_streaming_active = True
                     if server.active_sessions == 0:
                         server.active_sessions = 1

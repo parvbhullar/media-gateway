@@ -15,15 +15,16 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     AudioFrame, TrackId,
+    config::IceServer,
     event::{EventSender, SessionEvent},
     media::{
         processor::ProcessorChain,
-        track::{Track, TrackConfig, TrackPacketSender},
+        track::{Track, TrackConfig, TrackPacketSender, webrtc::WebrtcTrack},
     },
     pipecat::{PipecatClient, PipecatEvent, PipecatEventReceiver},
 };
 
-/// Pipecat media track
+/// Pipecat media track that combines WebRTC functionality with Pipecat AI processing
 pub struct PipecatTrack {
     id: TrackId,
     ssrc: u32,
@@ -33,6 +34,9 @@ pub struct PipecatTrack {
     packet_sender: Arc<Mutex<Option<TrackPacketSender>>>,
     processor_chain: ProcessorChain,
     cancel_token: CancellationToken,
+    // Internal WebRTC track for handling WebRTC peer connection
+    webrtc_track: Arc<Mutex<Option<WebrtcTrack>>>,
+    ice_servers: Option<Vec<IceServer>>,
 }
 
 impl PipecatTrack {
@@ -44,6 +48,7 @@ impl PipecatTrack {
         pipecat_client: Arc<PipecatClient>,
         event_receiver: PipecatEventReceiver,
         cancel_token: CancellationToken,
+        ice_servers: Option<Vec<IceServer>>,
     ) -> Result<Self> {
         let track = Self {
             id,
@@ -54,6 +59,8 @@ impl PipecatTrack {
             packet_sender: Arc::new(Mutex::new(None)),
             processor_chain: ProcessorChain::new(config.samplerate),
             cancel_token,
+            webrtc_track: Arc::new(Mutex::new(None)),
+            ice_servers,
         };
         
         Ok(track)
@@ -135,7 +142,7 @@ impl PipecatTrack {
                 let _ = event_sender.send(session_event);
             }
             
-            PipecatEvent::LlmResponse { text, is_complete, timestamp } => {
+            PipecatEvent::LlmResponse { text, is_complete, timestamp: _ } => {
                 debug!("LLM response for track {}: {} (complete: {})", track_id, text, is_complete);
             }
             
@@ -160,11 +167,11 @@ impl PipecatTrack {
                 }
             }
             
-            PipecatEvent::TtsStarted { text, timestamp } => {
+            PipecatEvent::TtsStarted { text, timestamp: _ } => {
                 debug!("TTS started for track {}: {}", track_id, text);
             }
             
-            PipecatEvent::TtsCompleted { text, timestamp } => {
+            PipecatEvent::TtsCompleted { text, timestamp: _ } => {
                 debug!("TTS completed for track {}: {}", track_id, text);
             }
             
@@ -259,29 +266,23 @@ impl Track for PipecatTrack {
     }
     
     async fn handshake(&mut self, offer: String, timeout: Option<Duration>) -> Result<String> {
-        // PipecatTrack needs a real WebRTC connection to receive audio from the browser
-        // We'll create a minimal WebRTC peer connection for audio capture
-        debug!("PipecatTrack performing WebRTC handshake to receive audio from browser");
+        info!("PipecatTrack performing WebRTC handshake using internal WebrtcTrack");
         
-        // For now, we need to implement a basic WebRTC handshake
-        // This is a simplified version - in reality we'd need full WebRTC setup
-        // TODO: Implement proper WebRTC peer connection for audio capture
+        // Create internal WebRTC track for handling the peer connection
+        let mut webrtc_track = WebrtcTrack::new(
+            self.cancel_token.child_token(),
+            self.id.clone(),
+            self.config.clone(),
+            self.ice_servers.clone(),
+        ).with_ssrc(self.ssrc);
         
-        // Return a basic SDP answer that accepts audio
-        let answer = format!(
-            "v=0\r\n\
-             o=rustpbx 0 0 IN IP4 127.0.0.1\r\n\
-             s=Pipecat Audio Session\r\n\
-             c=IN IP4 127.0.0.1\r\n\
-             t=0 0\r\n\
-             m=audio 9 RTP/AVP 0 8 96\r\n\
-             a=rtpmap:0 PCMU/8000\r\n\
-             a=rtpmap:8 PCMA/8000\r\n\
-             a=rtpmap:96 opus/48000/2\r\n\
-             a=sendrecv\r\n"
-        );
+        // Perform WebRTC handshake
+        let answer = webrtc_track.handshake(offer, timeout).await?;
         
-        info!("PipecatTrack WebRTC handshake completed - ready to receive audio");
+        // Store the WebRTC track for later use
+        *self.webrtc_track.lock().await = Some(webrtc_track);
+        
+        info!("PipecatTrack WebRTC handshake completed - ready to receive and forward audio to Pipecat");
         Ok(answer)
     }
     
@@ -289,7 +290,7 @@ impl Track for PipecatTrack {
         info!("Starting Pipecat track: {} - setting up audio pipeline", self.id);
         
         // Store packet sender for sending processed audio back
-        *self.packet_sender.lock().await = Some(packet_sender);
+        *self.packet_sender.lock().await = Some(packet_sender.clone());
         
         // Connect to Pipecat server
         if !self.pipecat_client.is_connected().await {
@@ -297,13 +298,57 @@ impl Track for PipecatTrack {
         }
         
         // Start event processing
-        self.start_event_processing(event_sender).await;
+        self.start_event_processing(event_sender.clone()).await;
+        
+        // Start internal WebRTC track if available
+        if let Some(webrtc_track) = self.webrtc_track.lock().await.as_ref() {
+            info!("Starting internal WebRTC track for audio reception");
+            
+            // Create a custom packet sender that forwards audio to Pipecat
+            let pipecat_client = self.pipecat_client.clone();
+            let track_id = self.id.clone();
+            let (forward_sender, mut forward_receiver) = tokio::sync::mpsc::unbounded_channel::<AudioFrame>();
+            
+            // Spawn task to forward WebRTC audio to Pipecat
+            let cancel_token = self.cancel_token.clone();
+            tokio::spawn(async move {
+                while let Some(audio_frame) = forward_receiver.recv().await {
+                    if cancel_token.is_cancelled() {
+                        break;
+                    }
+                    
+                    // Forward audio frame to Pipecat
+                    let samples = match &audio_frame.samples {
+                        crate::Samples::PCM { samples } => samples,
+                        _ => {
+                            debug!("Received non-PCM audio, skipping Pipecat forward");
+                            continue;
+                        }
+                    };
+                    
+                    let audio_bytes = PipecatTrack::samples_to_bytes(samples);
+                    if let Err(e) = pipecat_client.send_audio(audio_bytes).await {
+                        warn!("Failed to forward audio to Pipecat: {}", e);
+                    }
+                }
+            });
+            
+            webrtc_track.start(event_sender, forward_sender).await?;
+            info!("Internal WebRTC track started successfully");
+        } else {
+            warn!("No WebRTC track available - handshake must be called first");
+        }
         
         Ok(())
     }
     
     async fn stop(&self) -> Result<()> {
         info!("Stopping Pipecat track: {}", self.id);
+        
+        // Stop internal WebRTC track first
+        if let Some(webrtc_track) = self.webrtc_track.lock().await.as_ref() {
+            webrtc_track.stop().await?;
+        }
         
         // Disconnect from Pipecat server
         self.pipecat_client.disconnect().await?;
@@ -315,25 +360,15 @@ impl Track for PipecatTrack {
     }
     
     async fn send_packet(&self, packet: &AudioFrame) -> Result<()> {
-        debug!("PipecatTrack received audio packet: {} samples", 
-            match &packet.samples {
-                crate::Samples::PCM { samples } => samples.len(),
-                _ => 0
-            }
-        );
-        
-        // Send audio to Pipecat for processing
-        if let Err(e) = self.send_audio_to_pipecat(packet).await {
-            warn!("Failed to send audio to Pipecat: {}. Using fallback.", e);
-            
-            // Fallback: send packet directly to output if Pipecat fails
-            let sender_guard = self.packet_sender.lock().await;
-            if let Some(sender) = sender_guard.as_ref() {
-                let _ = sender.send(packet.clone());
-            }
+        // This method is used for outbound audio (from system to WebRTC peer)
+        // Forward to internal WebRTC track for transmission to the browser
+        if let Some(webrtc_track) = self.webrtc_track.lock().await.as_ref() {
+            debug!("Forwarding outbound audio packet to WebRTC peer via internal track");
+            webrtc_track.send_packet(packet).await
+        } else {
+            debug!("No WebRTC track available, dropping outbound audio packet");
+            Ok(())
         }
-        
-        Ok(())
     }
 }
 
@@ -349,6 +384,7 @@ pub struct PipecatTrackBuilder {
     ssrc: Option<u32>,
     config: Option<TrackConfig>,
     pipecat_config: Option<crate::pipecat::config::PipecatConfig>,
+    ice_servers: Option<Vec<IceServer>>,
 }
 
 impl PipecatTrackBuilder {
@@ -358,6 +394,7 @@ impl PipecatTrackBuilder {
             ssrc: None,
             config: None,
             pipecat_config: None,
+            ice_servers: None,
         }
     }
     
@@ -381,6 +418,11 @@ impl PipecatTrackBuilder {
         self
     }
     
+    pub fn with_ice_servers(mut self, ice_servers: Vec<IceServer>) -> Self {
+        self.ice_servers = Some(ice_servers);
+        self
+    }
+    
     pub async fn build(self, cancel_token: CancellationToken) -> Result<PipecatTrack> {
         let id = self.id.ok_or_else(|| anyhow::anyhow!("Track ID is required"))?;
         let ssrc = self.ssrc.ok_or_else(|| anyhow::anyhow!("SSRC is required"))?;
@@ -391,7 +433,7 @@ impl PipecatTrackBuilder {
         let (pipecat_client, event_receiver) = PipecatClient::with_event_receiver(pipecat_config).await?;
         let pipecat_client = Arc::new(pipecat_client);
         
-        PipecatTrack::new(id, ssrc, config, pipecat_client, event_receiver, cancel_token).await
+        PipecatTrack::new(id, ssrc, config, pipecat_client, event_receiver, cancel_token, self.ice_servers).await
     }
 }
 

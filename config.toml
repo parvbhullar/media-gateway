@@ -36,8 +36,10 @@ method = "POST"
 
 
 # MediaProxy configuration
-[proxy.media_proxy]
-mode = "auto"
+# [proxy.media_proxy]
+# mode = "auto"
+# media_proxy can be: "all", "auto", "webrtc", or "none"
+media_proxy = "auto"
 rtp_start_port = 20000
 rtp_end_port = 30000
 

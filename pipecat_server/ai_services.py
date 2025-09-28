@@ -318,10 +318,26 @@ class AIProcessor:
                 logger.warning("⚠️ No audio data found in message")
                 return None
                 
-            # Log audio reception
+            # Log audio reception with detailed information
             audio_length = len(audio_data)
             sample_rate = message.get("sample_rate", 16000)
-            logger.info(f"🎵 Received audio: {audio_length} bytes, {sample_rate}Hz from session {session_id}")
+            channels = message.get("channels", 1)
+            frame_id = message.get("frame_id", "unknown")
+            
+            # Print detailed audio packet information
+            logger.info(f"🎵 Received audio packet from RustPBX:")
+            logger.info(f"   Session ID: {session_id}")
+            logger.info(f"   Frame ID: {frame_id}")
+            logger.info(f"   Audio length: {audio_length} bytes")
+            logger.info(f"   Sample rate: {sample_rate} Hz")
+            logger.info(f"   Channels: {channels}")
+            logger.info(f"   Format: {format}")
+            
+            # Print first few bytes for debugging (optional)
+            if self.settings.debug_logging and audio_length > 0:
+                preview_bytes = min(32, audio_length)
+                audio_preview = list(audio_data[:preview_bytes])
+                logger.debug(f"   First {preview_bytes} bytes: {audio_preview}")
                 
             format = message.get("format", "linear16")
             

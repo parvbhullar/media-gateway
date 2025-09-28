@@ -17,7 +17,7 @@ use crate::{
             Track, TrackConfig,
             file::FileTrack,
             media_pass::MediaPassTrack,
-            pipecat::{PipecatTrack, PipecatTrackBuilder},
+            pipecat::PipecatTrackBuilder,
             rtp::{RtpTrack, RtpTrackBuilder},
             tts::SynthesisHandle,
             webrtc::WebrtcTrack,
@@ -1283,6 +1283,7 @@ impl ActiveCall {
                     .with_ssrc(ssrc)
                     .with_config(self.track_config.clone())
                     .with_pipecat_config(pipecat_config.clone())
+                    .with_ice_servers(self.app_state.config.ice_servers.clone().unwrap_or_default())
                     .build(self.cancel_token.child_token())
                     .await?;
                 
