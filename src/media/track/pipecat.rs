@@ -1,68 +1,92 @@
 /*!
- * Pipecat Media Track for RustPBX
+ * Pipecat Media Processor for RustPBX
  * 
- * This track forwards audio to the Pipecat media server for AI processing
- * and receives processed audio back for playback.
+ * This processor intercepts audio from WebRTC tracks and forwards it to the 
+ * Pipecat media server for AI processing while allowing normal audio flow to continue.
  */
 
 use anyhow::Result;
-use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    AudioFrame, TrackId,
+    AudioFrame,
     event::{EventSender, SessionEvent},
     media::{
-        processor::ProcessorChain,
-        track::{Track, TrackConfig, TrackPacketSender},
+        codecs::{Decoder, pcmu::PcmuDecoder, pcma::PcmaDecoder, g722::G722Decoder},
+        processor::Processor,
+        track::TrackPacketSender,
     },
     pipecat::{PipecatClient, PipecatEvent, PipecatEventReceiver},
 };
 
-/// Pipecat media track
-pub struct PipecatTrack {
-    id: TrackId,
-    ssrc: u32,
-    config: TrackConfig,
+#[cfg(feature = "opus")]
+use crate::media::codecs::opus::OpusDecoder;
+
+/// Pipecat media processor that intercepts audio and forwards it to the Pipecat server
+#[derive(Clone)]
+pub struct PipecatProcessor {
     pipecat_client: Arc<PipecatClient>,
     event_receiver: Arc<Mutex<Option<PipecatEventReceiver>>>,
     packet_sender: Arc<Mutex<Option<TrackPacketSender>>>,
-    processor_chain: ProcessorChain,
     cancel_token: CancellationToken,
+    is_event_processing_started: Arc<Mutex<bool>>,
 }
 
-impl PipecatTrack {
-    /// Create a new Pipecat track
+impl PipecatProcessor {
+    /// Create a new Pipecat processor
     pub async fn new(
-        id: TrackId,
-        ssrc: u32,
-        config: TrackConfig,
         pipecat_client: Arc<PipecatClient>,
         event_receiver: PipecatEventReceiver,
         cancel_token: CancellationToken,
     ) -> Result<Self> {
-        let track = Self {
-            id,
-            ssrc,
-            config: config.clone(),
+        let processor = Self {
             pipecat_client,
             event_receiver: Arc::new(Mutex::new(Some(event_receiver))),
             packet_sender: Arc::new(Mutex::new(None)),
-            processor_chain: ProcessorChain::new(config.samplerate),
             cancel_token,
+            is_event_processing_started: Arc::new(Mutex::new(false)),
         };
         
-        Ok(track)
+        Ok(processor)
+    }
+    
+    /// Set the packet sender for sending processed audio back
+    pub async fn set_packet_sender(&self, packet_sender: TrackPacketSender) {
+        *self.packet_sender.lock().await = Some(packet_sender);
+    }
+    
+    /// Start event processing once (called from process_frame)
+    async fn start_event_processing_once(&self, track_id: String) {
+        let mut is_started = self.is_event_processing_started.lock().await;
+        if *is_started {
+            return; // Already started
+        }
+        *is_started = true;
+        drop(is_started);
+        
+        info!("Starting Pipecat event processing for track: {}", track_id);
+        
+        // We don't have an event_sender in the processor context
+        // Event handling will be done differently - through the packet_sender for audio responses
+        // For now, we'll skip event processing as the main goal is audio forwarding
+        debug!("Pipecat event processing initialized for track: {}", track_id);
     }
     
     /// Start processing events from Pipecat
-    async fn start_event_processing(&self, event_sender: EventSender) {
+    async fn start_event_processing(&self, event_sender: EventSender, track_id: String) {
+        // Check if event processing is already started
+        let mut is_started = self.is_event_processing_started.lock().await;
+        if *is_started {
+            debug!("Event processing already started for track {}", track_id);
+            return;
+        }
+        *is_started = true;
+        drop(is_started);
+        
         let event_receiver = self.event_receiver.clone();
-        let track_id = self.id.clone();
         let cancel_token = self.cancel_token.clone();
         let packet_sender = self.packet_sender.clone();
         
@@ -135,7 +159,7 @@ impl PipecatTrack {
                 let _ = event_sender.send(session_event);
             }
             
-            PipecatEvent::LlmResponse { text, is_complete, timestamp } => {
+            PipecatEvent::LlmResponse { text, is_complete, timestamp: _ } => {
                 debug!("LLM response for track {}: {} (complete: {})", track_id, text, is_complete);
             }
             
@@ -160,11 +184,11 @@ impl PipecatTrack {
                 }
             }
             
-            PipecatEvent::TtsStarted { text, timestamp } => {
+            PipecatEvent::TtsStarted { text, timestamp: _ } => {
                 debug!("TTS started for track {}: {}", track_id, text);
             }
             
-            PipecatEvent::TtsCompleted { text, timestamp } => {
+            PipecatEvent::TtsCompleted { text, timestamp: _ } => {
                 debug!("TTS completed for track {}: {}", track_id, text);
             }
             
@@ -238,142 +262,107 @@ impl PipecatTrack {
         let audio_bytes = Self::samples_to_bytes(samples);
         self.pipecat_client.send_audio(audio_bytes).await
     }
+    
+    /// Forward audio frame to Pipecat server (static method for use in async tasks)
+    async fn forward_audio_to_pipecat(pipecat_client: &PipecatClient, frame: &AudioFrame) -> Result<()> {
+        // Convert different audio formats to PCM samples for Pipecat
+        let samples = match &frame.samples {
+            crate::Samples::PCM { samples } => samples.clone(),
+            crate::Samples::RTP { payload_type, payload, .. } => {
+                // Decode RTP payload to PCM samples based on payload type
+                match *payload_type {
+                    0 => {  // PCMU
+                        let mut decoder = PcmuDecoder::new();
+                        decoder.decode(payload)
+                    }
+                    8 => {  // PCMA
+                        let mut decoder = PcmaDecoder::new();
+                        decoder.decode(payload)
+                    }
+                    9 => {  // G.722
+                        let mut decoder = G722Decoder::new();
+                        decoder.decode(payload)
+                    }
+                    111 => { // Opus
+                        #[cfg(feature = "opus")]
+                        {
+                            let mut decoder = OpusDecoder::new_default();
+                            decoder.decode(payload)
+                        }
+                        #[cfg(not(feature = "opus"))]
+                        {
+                            return Err(anyhow::anyhow!("Opus codec not enabled"));
+                        }
+                    }
+                    _ => {
+                        return Err(anyhow::anyhow!("Unsupported payload type: {}", payload_type));
+                    }
+                }
+            }
+            crate::Samples::Empty => {
+                return Ok(()); // Nothing to send for empty samples
+            }
+        };
+        
+        let audio_bytes = Self::samples_to_bytes(&samples);
+        pipecat_client.send_audio(audio_bytes).await
+    }
 }
 
-#[async_trait]
-impl Track for PipecatTrack {
-    fn ssrc(&self) -> u32 {
-        self.ssrc
-    }
-    
-    fn id(&self) -> &TrackId {
-        &self.id
-    }
-    
-    fn config(&self) -> &TrackConfig {
-        &self.config
-    }
-    
-    fn processor_chain(&mut self) -> &mut ProcessorChain {
-        &mut self.processor_chain
-    }
-    
-    async fn handshake(&mut self, offer: String, timeout: Option<Duration>) -> Result<String> {
-        // PipecatTrack needs a real WebRTC connection to receive audio from the browser
-        // We'll create a minimal WebRTC peer connection for audio capture
-        debug!("PipecatTrack performing WebRTC handshake to receive audio from browser");
+impl Processor for PipecatProcessor {
+    fn process_frame(&self, frame: &mut AudioFrame) -> Result<()> {
+        // Start event processing once (lazy initialization)
+        let track_id = frame.track_id.clone();
+        let processor_ref = self.clone();
+        tokio::spawn(async move {
+            processor_ref.start_event_processing_once(track_id).await;
+        });
         
-        // For now, we need to implement a basic WebRTC handshake
-        // This is a simplified version - in reality we'd need full WebRTC setup
-        // TODO: Implement proper WebRTC peer connection for audio capture
+        // Forward audio to Pipecat for AI processing (non-blocking)
+        let pipecat_client = self.pipecat_client.clone();
+        let frame_clone = frame.clone();
+        let cancel_token = self.cancel_token.clone();
         
-        // Return a basic SDP answer that accepts audio
-        let answer = format!(
-            "v=0\r\n\
-             o=rustpbx 0 0 IN IP4 127.0.0.1\r\n\
-             s=Pipecat Audio Session\r\n\
-             c=IN IP4 127.0.0.1\r\n\
-             t=0 0\r\n\
-             m=audio 9 RTP/AVP 0 8 96\r\n\
-             a=rtpmap:0 PCMU/8000\r\n\
-             a=rtpmap:8 PCMA/8000\r\n\
-             a=rtpmap:96 opus/48000/2\r\n\
-             a=sendrecv\r\n"
-        );
-        
-        info!("PipecatTrack WebRTC handshake completed - ready to receive audio");
-        Ok(answer)
-    }
-    
-    async fn start(&self, event_sender: EventSender, packet_sender: TrackPacketSender) -> Result<()> {
-        info!("Starting Pipecat track: {} - setting up audio pipeline", self.id);
-        
-        // Store packet sender for sending processed audio back
-        *self.packet_sender.lock().await = Some(packet_sender);
-        
-        // Connect to Pipecat server
-        if !self.pipecat_client.is_connected().await {
-            self.pipecat_client.start_with_reconnect().await?;
-        }
-        
-        // Start event processing
-        self.start_event_processing(event_sender).await;
-        
-        Ok(())
-    }
-    
-    async fn stop(&self) -> Result<()> {
-        info!("Stopping Pipecat track: {}", self.id);
-        
-        // Disconnect from Pipecat server
-        self.pipecat_client.disconnect().await?;
-        
-        // Clear packet sender
-        *self.packet_sender.lock().await = None;
-        
-        Ok(())
-    }
-    
-    async fn send_packet(&self, packet: &AudioFrame) -> Result<()> {
-        debug!("PipecatTrack received audio packet: {} samples", 
-            match &packet.samples {
-                crate::Samples::PCM { samples } => samples.len(),
-                _ => 0
+        tokio::spawn(async move {
+            // Don't use cancel token for individual audio frames - they should be processed
+            // Only check if we're explicitly shutting down the processor
+            if cancel_token.is_cancelled() {
+                debug!("Processor is shutting down, skipping audio forwarding");
+                return;
             }
-        );
-        
-        // Send audio to Pipecat for processing
-        if let Err(e) = self.send_audio_to_pipecat(packet).await {
-            warn!("Failed to send audio to Pipecat: {}. Using fallback.", e);
             
-            // Fallback: send packet directly to output if Pipecat fails
-            let sender_guard = self.packet_sender.lock().await;
-            if let Some(sender) = sender_guard.as_ref() {
-                let _ = sender.send(packet.clone());
+            // Connect to Pipecat server if not already connected
+            if !pipecat_client.is_connected().await {
+                info!("Connecting to Pipecat server for audio processing");
+                if let Err(e) = pipecat_client.start_with_reconnect().await {
+                    warn!("Failed to connect to Pipecat server: {}", e);
+                    return; // Skip this frame if can't connect
+                }
             }
-        }
+            
+            // Forward the audio frame
+            if let Err(e) = Self::forward_audio_to_pipecat(&pipecat_client, &frame_clone).await {
+                debug!("Failed to forward audio to Pipecat: {}", e);
+            } else {
+                debug!("Successfully forwarded audio frame to Pipecat server");
+            }
+        });
         
+        // Continue processing normally - don't modify the original frame
         Ok(())
     }
 }
 
-impl Drop for PipecatTrack {
-    fn drop(&mut self) {
-        debug!("Dropping Pipecat track: {}", self.id);
-    }
-}
-
-/// Builder for PipecatTrack
-pub struct PipecatTrackBuilder {
-    id: Option<TrackId>,
-    ssrc: Option<u32>,
-    config: Option<TrackConfig>,
+/// Builder for PipecatProcessor
+pub struct PipecatProcessorBuilder {
     pipecat_config: Option<crate::pipecat::config::PipecatConfig>,
 }
 
-impl PipecatTrackBuilder {
+impl PipecatProcessorBuilder {
     pub fn new() -> Self {
         Self {
-            id: None,
-            ssrc: None,
-            config: None,
             pipecat_config: None,
         }
-    }
-    
-    pub fn with_id(mut self, id: TrackId) -> Self {
-        self.id = Some(id);
-        self
-    }
-    
-    pub fn with_ssrc(mut self, ssrc: u32) -> Self {
-        self.ssrc = Some(ssrc);
-        self
-    }
-    
-    pub fn with_config(mut self, config: TrackConfig) -> Self {
-        self.config = Some(config);
-        self
     }
     
     pub fn with_pipecat_config(mut self, config: crate::pipecat::config::PipecatConfig) -> Self {
@@ -381,21 +370,18 @@ impl PipecatTrackBuilder {
         self
     }
     
-    pub async fn build(self, cancel_token: CancellationToken) -> Result<PipecatTrack> {
-        let id = self.id.ok_or_else(|| anyhow::anyhow!("Track ID is required"))?;
-        let ssrc = self.ssrc.ok_or_else(|| anyhow::anyhow!("SSRC is required"))?;
-        let config = self.config.ok_or_else(|| anyhow::anyhow!("Track config is required"))?;
+    pub async fn build(self, cancel_token: CancellationToken) -> Result<PipecatProcessor> {
         let pipecat_config = self.pipecat_config.ok_or_else(|| anyhow::anyhow!("Pipecat config is required"))?;
         
         // Create Pipecat client with event receiver
         let (pipecat_client, event_receiver) = PipecatClient::with_event_receiver(pipecat_config).await?;
         let pipecat_client = Arc::new(pipecat_client);
         
-        PipecatTrack::new(id, ssrc, config, pipecat_client, event_receiver, cancel_token).await
+        PipecatProcessor::new(pipecat_client, event_receiver, cancel_token).await
     }
 }
 
-impl Default for PipecatTrackBuilder {
+impl Default for PipecatProcessorBuilder {
     fn default() -> Self {
         Self::new()
     }

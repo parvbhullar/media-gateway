@@ -51,7 +51,7 @@ pub enum PipecatResponse {
         text: String,
         is_final: bool,
         timestamp: u64,
-        language: String,
+        language: Option<String>,
     },
     #[serde(rename = "llm_response")]
     LlmResponse {
@@ -274,6 +274,40 @@ mod tests {
                 assert_eq!(frame.frame_id, "test_frame");
             }
             _ => panic!("Unexpected message type"),
+        }
+    }
+
+    #[test]
+    fn test_transcription_parsing_without_language() {
+        // Test parsing transcription without language field (like the current server sends)
+        let json = r#"{"type": "transcription", "is_final": false, "text": "Processing audio...", "timestamp": 1758871533590}"#;
+        
+        let response: PipecatResponse = serde_json::from_str(json).unwrap();
+        match response {
+            PipecatResponse::Transcription { text, is_final, timestamp, language } => {
+                assert_eq!(text, "Processing audio...");
+                assert!(!is_final);
+                assert_eq!(timestamp, 1758871533590);
+                assert_eq!(language, None);
+            }
+            _ => panic!("Expected transcription response"),
+        }
+    }
+
+    #[test]
+    fn test_transcription_parsing_with_language() {
+        // Test parsing transcription with language field
+        let json = r#"{"type": "transcription", "is_final": true, "text": "Hello world", "timestamp": 1758871533590, "language": "en"}"#;
+        
+        let response: PipecatResponse = serde_json::from_str(json).unwrap();
+        match response {
+            PipecatResponse::Transcription { text, is_final, timestamp, language } => {
+                assert_eq!(text, "Hello world");
+                assert!(is_final);
+                assert_eq!(timestamp, 1758871533590);
+                assert_eq!(language, Some("en".to_string()));
+            }
+            _ => panic!("Expected transcription response"),
         }
     }
 }

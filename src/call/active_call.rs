@@ -17,7 +17,7 @@ use crate::{
             Track, TrackConfig,
             file::FileTrack,
             media_pass::MediaPassTrack,
-            pipecat::{PipecatTrack, PipecatTrackBuilder},
+            pipecat::{PipecatProcessorBuilder},
             rtp::{RtpTrack, RtpTrackBuilder},
             tts::SynthesisHandle,
             webrtc::WebrtcTrack,
@@ -1199,53 +1199,9 @@ impl ActiveCall {
             )
         };
 
-        // Check if Pipecat integration is enabled and should be used for AI processing
-        let use_pipecat = crate::pipecat::should_use_pipecat(&self.app_state.config);
-        debug!(
-            session_id = self.session_id,
-            use_pipecat = use_pipecat,
-            "Checking if Pipecat should be used for AI processing"
-        );
-        
-        if use_pipecat {
-            info!(
-                session_id = self.session_id,
-                "Creating Pipecat track for AI processing"
-            );
-            
-            // Get Pipecat configuration
-            debug!(
-                session_id = self.session_id,
-                has_pipecat_config = self.app_state.config.pipecat.is_some(),
-                "Checking Pipecat configuration availability"
-            );
-            
-            if let Some(pipecat_config) = self.app_state.config.pipecat.as_ref() {
-                info!(
-                    session_id = self.session_id,
-                    server_url = pipecat_config.server_url,
-                    "Found Pipecat configuration, creating PipecatTrack"
-                );
-                let pipecat_track = PipecatTrackBuilder::new()
-                    .with_id(self.session_id.clone())
-                    .with_ssrc(ssrc)
-                    .with_config(self.track_config.clone())
-                    .with_pipecat_config(pipecat_config.clone())
-                    .build(self.cancel_token.child_token())
-                    .await?;
-                
-                return Ok(Box::new(pipecat_track));
-            } else {
-                warn!(
-                    session_id = self.session_id,
-                    "Pipecat enabled but no configuration found, falling back to WebRTC track"
-                );
-            }
-        }
-
         info!(
             session_id = self.session_id,
-            "Creating WebRTC track (Pipecat not used)"
+            "Creating WebRTC track"
         );
         
         let mut webrtc_track = WebrtcTrack::new(
@@ -1292,6 +1248,48 @@ impl ActiveCall {
                 Ok(())
             })
             .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        // Add Pipecat processor to the track if enabled for AI processing
+        let use_pipecat = crate::pipecat::should_use_pipecat(&self.app_state.config);
+        if use_pipecat {
+            debug!(
+                session_id = self.session_id,
+                "Adding Pipecat processor to WebRTC track for AI processing"
+            );
+            
+            if let Some(pipecat_config) = self.app_state.config.pipecat.as_ref() {
+                match PipecatProcessorBuilder::new()
+                    .with_pipecat_config(pipecat_config.clone())
+                    .build(self.cancel_token.child_token())
+                    .await
+                {
+                    Ok(pipecat_processor) => {
+                        info!(
+                            session_id = self.session_id,
+                            "Successfully added Pipecat processor to WebRTC track"
+                        );
+                        webrtc_track.append_processor(Box::new(pipecat_processor));
+                    }
+                    Err(e) => {
+                        warn!(
+                            session_id = self.session_id,
+                            "Failed to create Pipecat processor: {}, continuing without AI processing", e
+                        );
+                    }
+                }
+            } else {
+                warn!(
+                    session_id = self.session_id,
+                    "Pipecat enabled but no configuration found, skipping Pipecat processor"
+                );
+            }
+        } else {
+            debug!(
+                session_id = self.session_id,
+                "Pipecat not enabled, using WebRTC track without AI processing"
+            );
+        }
+        
         Ok(Box::new(webrtc_track))
     }
 
