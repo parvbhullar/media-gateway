@@ -318,8 +318,12 @@ function mainApp() {
                     type: 'answer',
                     sdp: event.sdp
                 })).then(() => {
-                    // Start ASR inactivity monitor after call is established
-                    this.startAsrInactivityMonitor();
+                    // Only start ASR inactivity monitor if Pipecat is not handling AI processing
+                    if (!this.config.pipecat.enabled || !this.config.pipecat.useForAI) {
+                        this.startAsrInactivityMonitor();
+                    } else {
+                        this.addLogEntry('info', 'ASR inactivity monitor disabled - Pipecat handling AI processing');
+                    }
 
                     // Play greeting message when call is established
                     if (this.config.tts.greeting && this.config.tts.greeting.trim() !== '') {
@@ -330,7 +334,13 @@ function mainApp() {
             } else {
                 // For SIP calls, we don't need to set remote SDP
                 this.rtcStatus = 'connected';
-                this.startAsrInactivityMonitor();
+
+                // Only start ASR inactivity monitor if Pipecat is not handling AI processing
+                if (!this.config.pipecat.enabled || !this.config.pipecat.useForAI) {
+                    this.startAsrInactivityMonitor();
+                } else {
+                    this.addLogEntry('info', 'ASR inactivity monitor disabled - Pipecat handling AI processing');
+                }
 
                 // Play greeting message when call is established
                 if (this.config.tts.greeting && this.config.tts.greeting.trim() !== '') {

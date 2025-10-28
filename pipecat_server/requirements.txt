@@ -20,6 +20,8 @@ deepgram-sdk>=3.0.0
 
 # Audio processing
 audioop-lts>=0.2.1
+pyaudio>=0.2.13
+numpy>=1.24.0
 
 # Logging
 loguru>=0.7.0

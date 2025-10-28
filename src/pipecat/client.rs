@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use super::{
     config::PipecatConfig,
-    ConnectionStatus, PipecatAudioFrame, PipecatEvent, PipecatEventSender, 
+    ConnectionStatus, PipecatEvent, PipecatEventSender,
     PipecatMessage, PipecatResponse,
 };
 
@@ -140,7 +140,7 @@ impl PipecatClient {
         Ok(())
     }
     
-    /// Send audio frame to Pipecat server
+    /// Send audio frame to Pipecat server with retry logic
     pub async fn send_audio(&self, audio_data: Vec<u8>) -> Result<()> {
         if !self.is_connected().await {
             if self.config.fallback_to_internal {
@@ -150,26 +150,42 @@ impl PipecatClient {
                 return Err(anyhow!("Not connected to Pipecat server"));
             }
         }
-        
-        debug!("Sending {} bytes of audio data to Pipecat server", audio_data.len());
-        
+
+        // Check if audio data is valid
+        if audio_data.is_empty() {
+            debug!("Skipping empty audio data");
+            return Ok(());
+        }
+
+        let audio_len = audio_data.len();
+        debug!("Sending {} bytes of audio data to Pipecat server", audio_len);
+
         let mut frame_counter = self.audio_frame_counter.lock().await;
         *frame_counter += 1;
-        let frame_id = format!("{}_{}", self.room_id, *frame_counter);
-        
-        let audio_frame = PipecatAudioFrame {
-            audio_data,
-            sample_rate: self.config.audio.sample_rate,
-            channels: self.config.audio.channels,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64,
-            frame_id,
-        };
-        
-        let message = PipecatMessage::Audio(audio_frame);
-        self.send_message(message).await
+        let frame_number = *frame_counter;
+
+        // Send as raw binary data for efficiency instead of JSON
+        // The server expects raw audio bytes
+        let mut ws_guard = self.websocket.lock().await;
+
+        if let Some(ws) = ws_guard.as_mut() {
+            // Send raw audio bytes directly via WebSocket binary message
+            match ws.send(Message::Binary(audio_data.into())).await {
+                Ok(_) => {
+                    if frame_number % 100 == 0 {
+                        debug!("Successfully sent audio frame #{} to Pipecat ({} bytes)", frame_number, audio_len);
+                    }
+                    Ok(())
+                }
+                Err(e) => {
+                    error!("Failed to send audio to Pipecat: {}", e);
+                    *self.connection_status.write().await = ConnectionStatus::Error(e.to_string());
+                    Err(anyhow!("Failed to send audio: {}", e))
+                }
+            }
+        } else {
+            Err(anyhow!("WebSocket not connected"))
+        }
     }
     
     /// Update system prompt
@@ -197,39 +213,48 @@ impl PipecatClient {
     
     /// Start with automatic reconnection
     pub async fn start_with_reconnect(&self) -> Result<()> {
+        // Check if already connected
+        if self.is_connected().await {
+            debug!("Already connected to Pipecat server");
+            return Ok(());
+        }
+
         if !self.config.is_reconnect_enabled() {
+            info!("Attempting to connect to Pipecat server (reconnect disabled)");
             return self.connect().await;
         }
-        
+
+        info!("Starting connection to Pipecat server with reconnection enabled");
+
         loop {
             match self.connect().await {
                 Ok(()) => {
-                    info!("Successfully connected to Pipecat server");
+                    info!("✓ Successfully connected to Pipecat server at {}", self.config.get_server_url());
                     break;
                 }
                 Err(e) => {
                     let mut attempts = self.reconnect_attempts.lock().await;
                     *attempts += 1;
-                    
+
                     if *attempts > self.config.reconnect.max_attempts {
-                        error!("Max reconnection attempts reached, giving up");
+                        error!("✗ Max reconnection attempts ({}) reached, giving up", self.config.reconnect.max_attempts);
                         *self.connection_status.write().await = ConnectionStatus::Error(
                             format!("Max reconnection attempts reached: {}", e)
                         );
-                        return Err(anyhow!("Failed to connect after {} attempts", *attempts));
+                        return Err(anyhow!("Failed to connect after {} attempts: {}", *attempts, e));
                     }
-                    
+
                     let delay = self.config.calculate_reconnect_delay(*attempts);
                     warn!(
-                        "Connection failed (attempt {}/{}): {}. Retrying in {:?}",
+                        "⚠ Connection failed (attempt {}/{}): {}. Retrying in {:?}",
                         *attempts, self.config.reconnect.max_attempts, e, delay
                     );
-                    
+
                     sleep(delay).await;
                 }
             }
         }
-        
+
         Ok(())
     }
     
