@@ -91,7 +91,7 @@ impl Invitation {
     pub async fn hangup(&self, dialog_id: DialogId) -> Result<()> {
         let dialog_id_str = dialog_id.to_string();
         if let Some(call) = self.pending_dialogs.lock().await.remove(&dialog_id_str) {
-             call.dialog.reject().ok();
+            call.dialog.reject(None, None).ok();
             // call.dialog.reject(
             //     Some(rsip::StatusCode::BusyHere), 
             //     Some("Call Rejected".to_string())
@@ -126,9 +126,11 @@ impl Invitation {
                     Some(offer)
                 }
                 _ => {
+                    let status_code = resp.status_code.clone();
                     return Err(rsipstack::Error::DialogError(
-                        resp.status_code.to_string(),
+                        status_code.to_string(),
                         dialog.id(),
+                        status_code,
                     ));
                 }
             },
@@ -136,6 +138,7 @@ impl Invitation {
                 return Err(rsipstack::Error::DialogError(
                     "No response received".to_string(),
                     dialog.id(),
+                    rsip::StatusCode::RequestTimeout,
                 ));
             }
         };
@@ -155,22 +158,20 @@ fn on_dialog_terminated(
             return;
         }
     };
-    call_state_ref.last_status_code = match &reason {
+    call_state_ref.last_status_code = match reason.clone() {
+        TerminatedReason::Timeout => rsip::StatusCode::RequestTimeout.code(),
+        TerminatedReason::ProxyError(code) => code.code(),
+        TerminatedReason::ProxyAuthRequired => {
+            rsip::StatusCode::ProxyAuthenticationRequired.code()
+        }
         TerminatedReason::UacCancel => 487,
         TerminatedReason::UacBye => 200,
         TerminatedReason::UacBusy => 486,
         TerminatedReason::UasBye => 200,
         TerminatedReason::UasBusy => 486,
         TerminatedReason::UasDecline => 603,
-        TerminatedReason::UacOther(code) => code
-            .clone()
-            .unwrap_or(rsip::StatusCode::ServerInternalError)
-            .code(),
-        TerminatedReason::UasOther(code) => code
-            .clone()
-            .unwrap_or(rsip::StatusCode::ServerInternalError)
-            .code(),
-        _ => 500, // Default to internal server error
+        TerminatedReason::UacOther(code) => code.code(),
+        TerminatedReason::UasOther(code) => code.code(),
     };
 
     if call_state_ref.hangup_reason.is_none() {

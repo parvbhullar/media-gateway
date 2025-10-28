@@ -157,7 +157,7 @@ impl B2bua {
                 {
                     Ok(_) => {}
                     Err(_) => {
-                         dialog_ref.reject().ok();
+                        dialog_ref.reject(None, None).ok();
                         // dialog_ref.reject(
                         //     Some(rsip::StatusCode::BusyHere), 
                         //     Some("Call Rejected".to_string())
@@ -177,7 +177,7 @@ impl B2bua {
                 session_id = self.session_id,
                 "pending dialog still exists, cleaning up"
             );
-             pending.dialog.reject().ok();
+            pending.dialog.reject(None, None).ok();
             // pending.dialog.reject(
             //     Some(rsip::StatusCode::BusyHere), 
             //     Some("Call Rejected".to_string())
