@@ -68,20 +68,27 @@ impl PipecatProcessor {
         let cancel_token = self.cancel_token.clone();
 
         tokio::spawn(async move {
-            if pipecat_client.is_connected().await {
-                debug!("Pipecat already connected");
-                return;
-            }
+            tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    debug!("Pipecat connection attempt cancelled");
+                }
+                _ = async {
+                    if pipecat_client.is_connected().await {
+                        debug!("Pipecat already connected");
+                        return;
+                    }
 
-            info!("Starting connection to Pipecat server...");
-            match pipecat_client.start_with_reconnect().await {
-                Ok(_) => {
-                    info!("Successfully connected to Pipecat server");
-                }
-                Err(e) => {
-                    error!("Failed to connect to Pipecat server: {}", e);
-                    // Connection will be retried on next frame if needed
-                }
+                    info!("Starting connection to Pipecat server...");
+                    match pipecat_client.start_with_reconnect().await {
+                        Ok(_) => {
+                            info!("Successfully connected to Pipecat server");
+                        }
+                        Err(e) => {
+                            error!("Failed to connect to Pipecat server: {}", e);
+                            // Connection will be retried on next frame if needed
+                        }
+                    }
+                } => {}
             }
         });
     }
