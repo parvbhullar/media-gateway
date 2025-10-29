@@ -1266,9 +1266,62 @@ impl ActiveCall {
                     Ok(pipecat_processor) => {
                         info!(
                             session_id = self.session_id,
-                            "Successfully added Pipecat processor to WebRTC track"
+                            "Successfully created Pipecat processor, setting up packet sender"
                         );
+
+                        // Create a channel for the Pipecat processor to send audio responses back
+                        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::AudioFrame>();
+
+                        // Set the packet sender on the Pipecat processor
+                        pipecat_processor.set_packet_sender(tx).await;
+
+                        info!(
+                            session_id = self.session_id,
+                            "Successfully added Pipecat processor to WebRTC track with packet sender"
+                        );
+
+                        // Add the processor to the track
                         webrtc_track.append_processor(Box::new(pipecat_processor));
+
+                        // Spawn a task to forward audio responses from Pipecat back to the WebRTC track
+                        let track_id_clone = self.session_id.clone();
+                        let webrtc_track_sender = webrtc_track.packet_sender.clone();
+                        let cancel_token_clone = self.cancel_token.child_token();
+
+                        tokio::spawn(async move {
+                            debug!("Starting Pipecat audio response forwarding loop for track {}", track_id_clone);
+
+                            loop {
+                                tokio::select! {
+                                    _ = cancel_token_clone.cancelled() => {
+                                        debug!("Pipecat audio forwarding cancelled for track {}", track_id_clone);
+                                        break;
+                                    }
+                                    Some(audio_frame) = rx.recv() => {
+                                        debug!(
+                                            "Forwarding Pipecat audio response to WebRTC track {}: {} samples",
+                                            track_id_clone,
+                                            match &audio_frame.samples {
+                                                crate::Samples::PCM { samples } => samples.len(),
+                                                _ => 0,
+                                            }
+                                        );
+
+                                        // Forward the audio frame to the WebRTC track's packet sender
+                                        let sender_guard = webrtc_track_sender.lock().await;
+                                        if let Some(sender) = sender_guard.as_ref() {
+                                            if let Err(e) = sender.send(audio_frame) {
+                                                warn!("Failed to forward Pipecat audio to WebRTC track {}: {}", track_id_clone, e);
+                                            }
+                                        } else {
+                                            warn!("WebRTC track {} packet sender not available", track_id_clone);
+                                        }
+                                    }
+                                }
+                            }
+
+                            info!("Pipecat audio forwarding loop ended for track {}", track_id_clone);
+                        });
                     }
                     Err(e) => {
                         warn!(

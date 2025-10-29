@@ -91,11 +91,7 @@ impl Invitation {
     pub async fn hangup(&self, dialog_id: DialogId) -> Result<()> {
         let dialog_id_str = dialog_id.to_string();
         if let Some(call) = self.pending_dialogs.lock().await.remove(&dialog_id_str) {
-            call.dialog.reject(None, None).ok();
-            // call.dialog.reject(
-            //     Some(rsip::StatusCode::BusyHere), 
-            //     Some("Call Rejected".to_string())
-            // ).ok();
+            call.dialog.reject().ok();
 
             call.token.cancel();
         }
@@ -130,7 +126,6 @@ impl Invitation {
                     return Err(rsipstack::Error::DialogError(
                         status_code.to_string(),
                         dialog.id(),
-                        status_code,
                     ));
                 }
             },
@@ -138,7 +133,6 @@ impl Invitation {
                 return Err(rsipstack::Error::DialogError(
                     "No response received".to_string(),
                     dialog.id(),
-                    rsip::StatusCode::RequestTimeout,
                 ));
             }
         };
@@ -170,8 +164,8 @@ fn on_dialog_terminated(
         TerminatedReason::UasBye => 200,
         TerminatedReason::UasBusy => 486,
         TerminatedReason::UasDecline => 603,
-        TerminatedReason::UacOther(code) => code.code(),
-        TerminatedReason::UasOther(code) => code.code(),
+        TerminatedReason::UacOther(code) => code.map(|c| c.code()).unwrap_or(500),
+        TerminatedReason::UasOther(code) => code.map(|c| c.code()).unwrap_or(500),
     };
 
     if call_state_ref.hangup_reason.is_none() {

@@ -1,0 +1,4 @@
+python-dotenv
+loguru
+websockets>=12.0
+pipecat-ai[cartesia,openai,silero]>=0.0.82

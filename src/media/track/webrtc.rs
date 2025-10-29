@@ -53,7 +53,7 @@ pub struct WebrtcTrack {
     track_id: TrackId,
     track_config: TrackConfig,
     processor_chain: ProcessorChain,
-    packet_sender: Arc<Mutex<Option<TrackPacketSender>>>,
+    pub packet_sender: Arc<Mutex<Option<TrackPacketSender>>>,
     cancel_token: CancellationToken,
     local_track: Option<Arc<TrackLocalStaticSample>>,
     encoder: TrackCodec,

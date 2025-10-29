@@ -153,12 +153,10 @@ impl PipecatClient {
 
         // Check if audio data is valid
         if audio_data.is_empty() {
-            debug!("Skipping empty audio data");
             return Ok(());
         }
 
         let audio_len = audio_data.len();
-        debug!("Sending {} bytes of audio data to Pipecat server", audio_len);
 
         let mut frame_counter = self.audio_frame_counter.lock().await;
         *frame_counter += 1;

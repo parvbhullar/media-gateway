@@ -106,13 +106,108 @@ impl PipecatProcessor {
         }
         *is_started = true;
         drop(is_started);
-        
-        info!("Starting Pipecat event processing for track: {}", track_id);
-        
-        // We don't have an event_sender in the processor context
-        // Event handling will be done differently - through the packet_sender for audio responses
-        // For now, we'll skip event processing as the main goal is audio forwarding
-        debug!("Pipecat event processing initialized for track: {}", track_id);
+
+        info!("Starting Pipecat event processing loop for track: {}", track_id);
+
+        let event_receiver = self.event_receiver.clone();
+        let cancel_token = self.cancel_token.clone();
+        let packet_sender = self.packet_sender.clone();
+        let track_id_clone = track_id.clone();
+
+        tokio::spawn(async move {
+            let receiver = {
+                let mut guard = event_receiver.lock().await;
+                guard.take()
+            };
+
+            if let Some(mut rx) = receiver {
+                info!("Pipecat event receiver loop started for track {}", track_id_clone);
+                let mut event_count = 0u64;
+
+                loop {
+                    tokio::select! {
+                        _ = cancel_token.cancelled() => {
+                            info!("Pipecat event processing cancelled for track {} (processed {} events)", track_id_clone, event_count);
+                            break;
+                        }
+                        event = rx.recv() => {
+                            match event {
+                                Some(pipecat_event) => {
+                                    event_count += 1;
+
+                                    // Handle AudioResponse events (the main event we care about)
+                                    match pipecat_event {
+                                        PipecatEvent::AudioResponse { audio_data, sample_rate, channels } => {
+                                            // Convert raw audio bytes to samples and create audio frame for playback
+                                            match Self::bytes_to_samples(&audio_data, sample_rate, channels) {
+                                                Ok(samples) => {
+                                                    info!(
+                                                        "Received audio response from Pipecat: {} bytes, {} samples, {}Hz, {} channels",
+                                                        audio_data.len(), samples.len(), sample_rate, channels
+                                                    );
+
+                                                    let audio_frame = AudioFrame {
+                                                        samples: crate::Samples::PCM { samples },
+                                                        timestamp: std::time::SystemTime::now()
+                                                            .duration_since(std::time::UNIX_EPOCH)
+                                                            .unwrap()
+                                                            .as_millis() as u64,
+                                                        track_id: track_id_clone.clone(),
+                                                        sample_rate,
+                                                    };
+
+                                                    // Send to packet sender for playback on WebRTC track
+                                                    let sender_guard = packet_sender.lock().await;
+                                                    if let Some(sender) = sender_guard.as_ref() {
+                                                        match sender.send(audio_frame) {
+                                                            Ok(_) => {
+                                                                info!("Successfully sent audio response to WebRTC track (event #{})", event_count);
+                                                            }
+                                                            Err(e) => {
+                                                                error!("Failed to send audio response to track: {}", e);
+                                                            }
+                                                        }
+                                                    } else {
+                                                        warn!("No packet sender available for audio playback");
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    error!("Failed to convert audio response bytes to samples: {}", e);
+                                                }
+                                            }
+                                        }
+                                        PipecatEvent::TranscriptionDelta { text, timestamp } => {
+                                            debug!("STT delta for track {}: {} (ts: {})", track_id_clone, text, timestamp);
+                                        }
+                                        PipecatEvent::TranscriptionFinal { text, timestamp } => {
+                                            info!("STT final for track {}: {} (ts: {})", track_id_clone, text, timestamp);
+                                        }
+                                        PipecatEvent::LlmResponse { text, is_complete, .. } => {
+                                            debug!("LLM response for track {}: {} (complete: {})", track_id_clone, text, is_complete);
+                                        }
+                                        PipecatEvent::TtsStarted { text, .. } => {
+                                            info!("TTS started for track {}: {}", track_id_clone, text);
+                                        }
+                                        PipecatEvent::TtsCompleted { text, .. } => {
+                                            info!("TTS completed for track {}: {}", track_id_clone, text);
+                                        }
+                                        _ => {
+                                            debug!("Received Pipecat event #{}: {:?}", event_count, pipecat_event);
+                                        }
+                                    }
+                                }
+                                None => {
+                                    warn!("Pipecat event channel closed for track {} after {} events", track_id_clone, event_count);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                warn!("No event receiver available for track {}", track_id_clone);
+            }
+        });
     }
     
     /// Start processing events from Pipecat
@@ -433,23 +528,29 @@ impl Processor for PipecatProcessor {
             }
 
             // Forward the audio frame with error handling
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static FRAME_COUNT: AtomicU64 = AtomicU64::new(0);
+            let frame_num = FRAME_COUNT.fetch_add(1, Ordering::Relaxed);
+
             match Self::forward_audio_to_pipecat(&pipecat_client, &frame_clone).await {
                 Ok(_) => {
-                    // Only log periodically to reduce spam
-                    use std::sync::atomic::{AtomicU64, Ordering};
-                    static FRAME_COUNT: AtomicU64 = AtomicU64::new(0);
-                    let count = FRAME_COUNT.fetch_add(1, Ordering::Relaxed);
-                    if count % 200 == 0 {
-                        debug!("Successfully forwarded {} audio frames to Pipecat server", count);
+                    // Log every frame for first 10, then every 50th frame
+                    if frame_num < 10 || frame_num % 50 == 0 {
+                        let sample_info = match &frame_clone.samples {
+                            crate::Samples::PCM { samples } => format!("PCM {} samples", samples.len()),
+                            crate::Samples::RTP { payload_type, payload, .. } => format!("RTP pt:{} {} bytes", payload_type, payload.len()),
+                            _ => "Unknown".to_string(),
+                        };
+                        info!("🎤 Forwarded audio frame #{} to Pipecat: {} @ {}Hz, track: {}",
+                            frame_num, sample_info, frame_clone.sample_rate, frame_clone.track_id);
                     }
                 }
                 Err(e) => {
                     // Log error but don't fail the entire processing pipeline
-                    use std::sync::atomic::{AtomicU64, Ordering};
                     static ERROR_COUNT: AtomicU64 = AtomicU64::new(0);
                     let count = ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
                     if count % 50 == 0 {
-                        warn!("Failed to forward audio to Pipecat (error #{}, non-fatal): {}", count, e);
+                        warn!("❌ Failed to forward audio frame #{} to Pipecat (error #{}, non-fatal): {}", frame_num, count, e);
                     }
 
                     // Check if we should attempt reconnection
