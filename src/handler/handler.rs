@@ -6,6 +6,7 @@ use crate::{
         active_call::{ CallParams}, ActiveCall, ActiveCallType, Command
     },
     event::SessionEvent, media::track::TrackConfig,
+    pipecat,
 };
 use axum::{extract::{ ws::Message, Query, State, WebSocketUpgrade}, response::{IntoResponse, Response}, routing::get, Json, Router
 };
@@ -16,6 +17,7 @@ use tokio::{join, select};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+use webrtc::media::audio::buffer::info;
 
 pub fn router(app_state: AppState) -> Router<AppState> {
     Router::new()
@@ -100,13 +102,41 @@ pub async fn call_handler(
             while let Some(Ok(message)) = ws_receiver.next().await {
                 match message {
                     Message::Text(text) => {
-                        let command = match serde_json::from_str::<Command>(&text) {
+                        let mut command = match serde_json::from_str::<Command>(&text) {
                             Ok(cmd) => cmd,
                             Err(e) => {
                                 warn!(session_id, %client_ip, %text, "Failed to parse command {}",e);
                                 continue;
                             }
                         };
+                        match &mut command {
+                            Command::Invite { option } | Command::Accept { option } => {
+                                info!(
+                                    session_id, %client_ip,
+                                    "🔍 Processing invite/accept - BEFORE Pipecat check: {}",
+                                    option.pipecat.is_some()
+                                );
+    
+                                // Add Pipecat config if enabled and not already present
+                                if option.pipecat.is_none() && crate::pipecat::should_use_pipecat(&app_state.config) {
+                                    option.pipecat = app_state.config.pipecat.clone();
+                                    info!(
+                                        session_id, %client_ip,
+                                        "✅ Added Pipecat config to CallOption from app_state.config"
+                                    );
+                                }
+    
+                                info!(
+                                    session_id, %client_ip,
+                                    "🔍 AFTER Pipecat check - pipecat present: {}, enabled: {}",
+                                    option.pipecat.is_some(),
+                                    option.pipecat.as_ref().map(|p| p.enabled).unwrap_or(false)
+                                );
+                            }
+                            _ => {
+                                // Other commands don't need modification
+                            }
+                        }
                         if let Err(_) = active_call.enqueue_command(command).await {
                             break
                         }
@@ -209,6 +239,7 @@ pub async fn call_handler(
                 _ => {
                     match serde_json::to_string(&event) {
                         Ok(message) => {
+                            info!(session_id, %client_ip, "Draining event: {}", message);
                             if let Err(_) = ws_sender.send(Message::Text(message.into())).await {
                                 break;
                             }

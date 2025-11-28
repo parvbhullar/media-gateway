@@ -108,6 +108,26 @@ impl MediaStream {
         Ok(())
     }
 
+    pub async fn inject_audio_frame(&self, frame: AudioFrame) -> Result<()> {
+        info!(
+            session_id = self.id,
+            track_id = %frame.track_id,
+            samples = match &frame.samples {
+                Samples::PCM { samples } => samples.len(),
+                _ => 0,
+            },
+            "Injecting audio frame into media stream"
+        );
+        
+        // Send the frame directly to the packet sender
+        // This will forward it to all tracks listening on this stream
+        self.packet_sender
+            .send(frame)
+            .map_err(|e| anyhow::anyhow!("Failed to send audio frame: {}", e))?;
+        
+        Ok(())
+    }
+
     pub fn stop(&self, _reason: Option<String>, _initiator: Option<String>) {
         self.cancel_token.cancel()
     }
@@ -284,35 +304,83 @@ impl MediaStream {
     async fn handle_forward_track(&self, mut packet_receiver: TrackPacketReceiver) {
         let event_sender = self.event_sender.clone();
         while let Some(packet) = packet_receiver.recv().await {
-            // Process the packet with each track
-            for (track, dtmf_detector) in self.tracks.lock().await.values() {
-                if &packet.track_id == track.id() {
-                    match &packet.samples {
-                        Samples::RTP {
-                            payload_type,
-                            payload,
-                            ..
-                        } => {
-                            if let Some(digit) = dtmf_detector.detect_rtp(*payload_type, payload) {
-                                debug!(track_id = track.id(), digit, "DTMF detected");
-                                event_sender
-                                    .send(SessionEvent::Dtmf {
-                                        track_id: packet.track_id.to_string(),
-                                        timestamp: packet.timestamp,
-                                        digit,
-                                    })
-                                    .ok();
+            // info!(
+            //     "📨 Received packet for track: {}, routing to all other tracks",
+            //     packet.track_id
+            // );
+
+            let tracks = self.tracks.lock().await;
+
+            // ✅ If this is from server-side-track (Pipecat audio), send to ALL other tracks
+            if packet.track_id == "server-side-track" {
+                info!(
+                    "🔊 Pipecat audio from server-side-track - forwarding to all caller tracks"
+                );
+                
+                for (other_track_id, (track, _)) in tracks.iter() {
+                    if other_track_id != "server-side-track" {
+                        info!(
+                            "🎵 Forwarding Pipecat audio to caller track: {} (packet size: {} samples)",
+                            other_track_id,
+                            if let Samples::PCM { samples } = &packet.samples {
+                                samples.len()
+                            } else {
+                                0
+                            }
+                        );
+                        match track.send_packet(&packet).await {
+                            Ok(_) => {
+                                info!(
+                                    "✅ Forwarded Pipecat audio to track: {}",
+                                    other_track_id
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Failed to send Pipecat audio to track {}: {}",
+                                    other_track_id, e
+                                );
                             }
                         }
-                        _ => {}
+                    }
+                }
+                continue;
+            }
+
+            // For caller tracks, process normally
+            for (track_id, (track, dtmf_detector)) in tracks.iter() {
+                if &packet.track_id == track_id {
+                    // DTMF detection for caller audio
+                    if let crate::Samples::RTP {
+                        payload_type,
+                        payload,
+                        ..
+                    } = &packet.samples
+                    {
+                        if let Some(digit) = dtmf_detector.detect_rtp(*payload_type, payload) {
+                            debug!(track_id = track_id, digit, "DTMF detected");
+                            event_sender
+                                .send(SessionEvent::Dtmf {
+                                    track_id: packet.track_id.to_string(),
+                                    timestamp: packet.timestamp,
+                                    digit,
+                                })
+                                .ok();
+                        }
                     }
                     continue;
                 }
-                if let Err(e) = track.send_packet(&packet).await {
-                    warn!(
-                        id = track.id(),
-                        "media_stream: Failed to send packet to track: {}", e
-                    );
+
+                // Forward caller audio to server-side-track (for recording, etc.)
+                if track_id != "server-side-track" {
+                    match track.send_packet(&packet).await {
+                        Ok(_) => {
+                            // Silently forward
+                        }
+                        Err(_e) => {
+                            // Silently skip
+                        }
+                    }
                 }
             }
         }

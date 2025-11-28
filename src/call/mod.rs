@@ -1,8 +1,5 @@
 use crate::{
-    config::RouteResult,
-    media::{recorder::RecorderOption, track::media_pass::MediaPassOption, vad::VADOption},
-    synthesis::SynthesisOption,
-    transcription::TranscriptionOption,
+    config::RouteResult, media::{recorder::RecorderOption, track::media_pass::MediaPassOption, vad::VADOption}, pipecat::PipecatConfig, synthesis::SynthesisOption, transcription::TranscriptionOption
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -56,6 +53,8 @@ pub struct CallOption {
     pub extra: Option<HashMap<String, String>>,
     pub codec: Option<String>, // pcmu, pcma, g722, pcm, only for websocket call
     pub eou: Option<EouOption>,
+    #[serde(default)]
+    pub pipecat: Option<PipecatConfig>,
 }
 
 impl Default for CallOption {
@@ -76,6 +75,7 @@ impl Default for CallOption {
             extra: None,
             codec: None,
             eou: None,
+            pipecat: None,
         }
     }
 }
@@ -123,6 +123,9 @@ impl CallOption {
             if let Some(asr) = &mut self.asr {
                 asr.check_default();
             }
+        }
+        if self.pipecat.is_none() && crate::pipecat::should_use_pipecat(config) {
+            self.pipecat = config.pipecat.clone();
         }
         self
     }

@@ -14,7 +14,7 @@ impl LinearResampler {
         let rate = output_sample_rate as f64 / input_sample_rate as f64;
         let input_chunk_size = match input_sample_rate {
             8000 => 160,
-            16000 => 320,
+            16000 => 160,
             44100 => 882,
             48000 => 960,
             _ => (input_sample_rate as f64 / 50.0).ceil() as usize,

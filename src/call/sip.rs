@@ -91,7 +91,7 @@ impl Invitation {
     pub async fn hangup(&self, dialog_id: DialogId) -> Result<()> {
         let dialog_id_str = dialog_id.to_string();
         if let Some(call) = self.pending_dialogs.lock().await.remove(&dialog_id_str) {
-            call.dialog.reject().ok();
+            call.dialog.reject(Some(rsip::StatusCode::BusyHere), Some("Busy".to_string())).ok();
 
             call.token.cancel();
         }
@@ -126,6 +126,7 @@ impl Invitation {
                     return Err(rsipstack::Error::DialogError(
                         status_code.to_string(),
                         dialog.id(),
+                        status_code,
                     ));
                 }
             },
@@ -133,6 +134,7 @@ impl Invitation {
                 return Err(rsipstack::Error::DialogError(
                     "No response received".to_string(),
                     dialog.id(),
+                    rsip::StatusCode::RequestTimeout,
                 ));
             }
         };
@@ -164,8 +166,8 @@ fn on_dialog_terminated(
         TerminatedReason::UasBye => 200,
         TerminatedReason::UasBusy => 486,
         TerminatedReason::UasDecline => 603,
-        TerminatedReason::UacOther(code) => code.map(|c| c.code()).unwrap_or(500),
-        TerminatedReason::UasOther(code) => code.map(|c| c.code()).unwrap_or(500),
+        TerminatedReason::UacOther(code) => code.code(),
+        TerminatedReason::UasOther(code) => code.code(),
     };
 
     if call_state_ref.hangup_reason.is_none() {
@@ -249,7 +251,7 @@ pub async fn client_dialog_event_loop(
             DialogState::Calling(dialog_id) => {
                 info!(session_id, track_id, %dialog_id, "client dialog calling");
             }
-            DialogState::Confirmed(dialog_id) => {
+            DialogState::Confirmed(dialog_id, _response) => {
                 info!(session_id, track_id, %dialog_id, "client dialog confirmed");
                 call_state
                     .write()
@@ -319,7 +321,7 @@ pub async fn server_dialog_event_loop(
             DialogState::Calling(dialog_id) => {
                 info!(session_id, track_id, %dialog_id, "server dialog calling");
             }
-            DialogState::Confirmed(dialog_id) => {
+            DialogState::Confirmed(dialog_id, _response) => {
                 info!(session_id, track_id, %dialog_id, "server dialog confirmed");
                 call_state
                     .write()

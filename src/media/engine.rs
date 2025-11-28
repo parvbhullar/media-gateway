@@ -4,6 +4,7 @@ use super::{
     processor::Processor,
     track::{
         Track,
+        pipecat::PipecatProcessor,
         tts::{SynthesisHandle, TtsTrack},
     },
     vad::{VADOption, VadProcessor, VadType},
@@ -12,19 +13,21 @@ use crate::{
     TrackId,
     call::{CallOption, EouOption},
     event::EventSender,
+    pipecat::PipecatConfig,
     synthesis::{
-        AliyunTtsClient, SynthesisClient, SynthesisOption, SynthesisType, TencentCloudTtsClient,
-        VoiceApiTtsClient,DeepgramTtsClient,
+        AliyunTtsClient, DeepgramTtsClient, SynthesisClient, SynthesisOption, SynthesisType,
+        TencentCloudTtsClient, VoiceApiTtsClient,
     },
     transcription::{
-        AliyunAsrClientBuilder, TencentCloudAsrClientBuilder, TranscriptionClient,
-        TranscriptionOption, TranscriptionType, VoiceApiAsrClientBuilder, DeepgramAsrClientBuilder,
+        AliyunAsrClientBuilder, DeepgramAsrClientBuilder, TencentCloudAsrClientBuilder,
+        TranscriptionClient, TranscriptionOption, TranscriptionType, VoiceApiAsrClientBuilder,
     },
 };
 use anyhow::Result;
-use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
+use std::{collections::HashMap, error, future::Future, pin::Pin, sync::Arc};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
 
 pub type FnCreateVadProcessor = fn(
     token: CancellationToken,
@@ -50,6 +53,17 @@ pub type FnCreateAsrClient = Box<
 >;
 pub type FnCreateTtsClient = fn(option: &SynthesisOption) -> Result<Box<dyn SynthesisClient>>;
 
+pub type FnCreatePipecatProcessor = Box<
+    dyn Fn(
+            TrackId,
+            CancellationToken,
+            PipecatConfig,
+            EventSender,
+        ) -> Pin<Box<dyn Future<Output = Result<Box<dyn Processor>>> + Send>>
+        + Send
+        + Sync,
+>;
+
 // Define hook types
 pub type CreateProcessorsHook = Box<
     dyn Fn(
@@ -68,12 +82,18 @@ pub struct StreamEngine {
     eou_creators: HashMap<String, FnCreateEouProcessor>,
     asr_creators: HashMap<TranscriptionType, FnCreateAsrClient>,
     tts_creators: HashMap<SynthesisType, FnCreateTtsClient>,
+
+    // ADD: Pipecat processor creator
+    pipecat_creator: Option<FnCreatePipecatProcessor>,
+
     create_processors_hook: Arc<CreateProcessorsHook>,
 }
 
 impl Default for StreamEngine {
     fn default() -> Self {
         let mut engine = Self::new();
+
+        // Existing registrations...
         #[cfg(feature = "vad_silero")]
         engine.register_vad(VadType::Silero, VadProcessor::create_silero);
         #[cfg(feature = "vad_webrtc")]
@@ -101,6 +121,10 @@ impl Default for StreamEngine {
         engine.register_tts(SynthesisType::TencentCloud, TencentCloudTtsClient::create);
         engine.register_tts(SynthesisType::VoiceApi, VoiceApiTtsClient::create);
         engine.register_tts(SynthesisType::Deepgram, DeepgramTtsClient::create);
+
+        // ADD: Register Pipecat processor
+        engine.register_pipecat(Box::new(PipecatProcessor::create));
+
         engine
     }
 }
@@ -112,6 +136,10 @@ impl StreamEngine {
             asr_creators: HashMap::new(),
             tts_creators: HashMap::new(),
             eou_creators: HashMap::new(),
+
+            // ADD: Initialize pipecat creator
+            pipecat_creator: None,
+
             create_processors_hook: Arc::new(Box::new(Self::default_create_procesors_hook)),
         }
     }
@@ -141,6 +169,12 @@ impl StreamEngine {
         creator: FnCreateTtsClient,
     ) -> &mut Self {
         self.tts_creators.insert(tts_type, creator);
+        self
+    }
+
+    // ADD: Register Pipecat processor
+    pub fn register_pipecat(&mut self, creator: FnCreatePipecatProcessor) -> &mut Self {
+        self.pipecat_creator = Some(creator);
         self
     }
 
@@ -214,6 +248,28 @@ impl StreamEngine {
         }
     }
 
+    // ADD: Create Pipecat processor
+    pub async fn create_pipecat_processor(
+        &self,
+        track_id: TrackId,
+        cancel_token: CancellationToken,
+        pipecat_config: PipecatConfig,
+        event_sender: EventSender,
+    ) -> Result<Box<dyn Processor>> {
+        info!(
+            "🔧 StreamEngine::create_pipecat_processor called for track: {}",
+            track_id
+        );
+
+        if let Some(creator) = &self.pipecat_creator {
+            info!("✅ Pipecat creator found, calling it...");
+            creator(track_id, cancel_token, pipecat_config, event_sender).await
+        } else {
+            error!("❌ Pipecat creator not registered in StreamEngine!");
+            Err(anyhow::anyhow!("Pipecat processor creator not registered"))
+        }
+    }
+
     pub async fn create_processors(
         engine: Arc<StreamEngine>,
         track: &dyn Track,
@@ -264,7 +320,22 @@ impl StreamEngine {
         let track_id = track.id().clone();
         let samplerate = track.config().samplerate as usize;
         Box::pin(async move {
+            info!("🔍 DEBUG: Creating processors for track {}", track_id);
+            info!("🔍 DEBUG: CallOption.pipecat {:?}", option.pipecat);
             let mut processors = vec![];
+
+            // ✅ Check if Pipecat is handling AI processing FIRST
+            let pipecat_handles_ai = option
+                .pipecat
+                .as_ref()
+                .map(|p| p.enabled && p.use_for_ai)
+                .unwrap_or(false);
+
+            if pipecat_handles_ai {
+                info!("🎯 Pipecat will handle AI processing (ASR/TTS) - skipping internal processors");
+            }
+
+            // Add denoise processor (can work with Pipecat)
             match option.denoise {
                 Some(true) => {
                     let noise_reducer = NoiseReducer::new(samplerate)?;
@@ -272,41 +343,106 @@ impl StreamEngine {
                 }
                 _ => {}
             }
-            match option.vad {
-                Some(ref option) => {
-                    let vad_processor: Box<dyn Processor + 'static> = engine.create_vad_processor(
-                        cancel_token.child_token(),
-                        event_sender.clone(),
-                        option.to_owned(),
-                    )?;
-                    processors.push(vad_processor);
-                }
-                None => {}
-            }
-            match option.asr {
-                Some(ref option) => {
-                    let asr_processor = engine
-                        .create_asr_processor(
-                            track_id,
+
+            // Add Pipecat processor if enabled
+            match option.pipecat {
+                Some(ref pipecat_config) if pipecat_config.enabled => {
+                    info!("🔧 Creating Pipecat processor for track: {}", track_id);
+                    info!(
+                        "🔧 Pipecat config: enabled={}, server_url={:?}, use_for_ai={}",
+                        pipecat_config.enabled, pipecat_config.server_url, pipecat_config.use_for_ai
+                    );
+
+                    match engine
+                        .create_pipecat_processor(
+                            track_id.clone(),
                             cancel_token.child_token(),
-                            option.to_owned(),
+                            pipecat_config.clone(),
                             event_sender.clone(),
                         )
-                        .await?;
-                    processors.push(asr_processor);
+                        .await
+                    {
+                        Ok(pipecat_processor) => {
+                            processors.push(pipecat_processor);
+                            info!(
+                                "✅ Pipecat processor successfully added to pipeline for track: {}",
+                                track_id
+                            );
+                            if pipecat_config.use_for_ai {
+                                info!("✅ Returning early - Pipecat handles all AI processing");
+                                return Ok(processors);  // ✅ EARLY RETURN - skip all ASR/VAD/EOU
+                            }
+                        }
+                        Err(e) => {
+                            error!("❌ Failed to create Pipecat processor: {}", e);
+                            if pipecat_config.use_for_ai {
+                                if pipecat_config.fallback_to_internal {
+                                    warn!("⚠️ Pipecat failed but fallback enabled - will create internal ASR/TTS");
+                                    // Continue to create ASR/TTS below
+                                } else {
+                                    error!("❌ Pipecat failed and fallback disabled - no AI processing available");
+                                    return Err(anyhow::anyhow!("Pipecat failed and fallback disabled"));
+                                }
+                            }
+                        }
+                    }
                 }
-                None => {}
+                Some(ref pipecat_config) => {
+                    warn!("⚠️ Pipecat config present but enabled=false: {:?}", pipecat_config);
+                }
+                None => {
+                    debug!("No Pipecat config provided for track: {}", track_id);
+                }
             }
-            match option.eou {
-                Some(ref option) => {
-                    let eou_processor = engine.create_eou_processor(
-                        cancel_token.child_token(),
-                        event_sender.clone(),
-                        option.to_owned(),
-                    )?;
-                    processors.push(eou_processor);
+
+            // ✅ Only add internal processors if Pipecat is NOT handling AI
+            if !pipecat_handles_ai {
+                // Add VAD processor
+                match option.vad {
+                    Some(ref vad_option) => {
+                        info!("🔧 Creating VAD processor");
+                        let vad_processor = engine.create_vad_processor(
+                            cancel_token.child_token(),
+                            event_sender.clone(),
+                            vad_option.to_owned(),
+                        )?;
+                        processors.push(vad_processor);
+                    }
+                    None => {}
                 }
-                None => {}
+
+                // Add ASR processor
+                match option.asr {
+                    Some(ref asr_option) => {
+                        info!("🔧 Creating ASR processor");
+                        let asr_processor = engine
+                            .create_asr_processor(
+                                track_id.clone(),
+                                cancel_token.child_token(),
+                                asr_option.to_owned(),
+                                event_sender.clone(),
+                            )
+                            .await?;
+                        processors.push(asr_processor);
+                    }
+                    None => {}
+                }
+
+                // Add EOU processor
+                match option.eou {
+                    Some(ref eou_option) => {
+                        info!("🔧 Creating EOU processor");
+                        let eou_processor = engine.create_eou_processor(
+                            cancel_token.child_token(),
+                            event_sender.clone(),
+                            eou_option.to_owned(),
+                        )?;
+                        processors.push(eou_processor);
+                    }
+                    None => {}
+                }
+            } else {
+                info!("⏭️ Skipping all internal processors (VAD/ASR/EOU) - Pipecat handles everything");
             }
 
             Ok(processors)

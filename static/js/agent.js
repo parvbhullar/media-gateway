@@ -59,11 +59,11 @@ function mainApp() {
                 prompt: 'You are a helpful assistant.'
             },
             pipecat: {
-                enabled: false,
-                serverUrl: 'ws://localhost:8765/ws/rustpbx',
-                useForAI: false,
+                enabled: true,
+                serverUrl: 'ws://0.0.0.0:8081',
+                use_for_ai: true,
                 fallbackToInternal: true,
-                systemPrompt: 'You are a helpful AI assistant in a voice conversation. Respond naturally and conversationally. Keep responses brief but informative.'
+                default_system_prompt: 'You are a helpful AI assistant in a voice conversation. Respond naturally and conversationally. Keep responses brief but informative.'
             },
             // Add UI state for tabbed interface
             uiState: {
@@ -231,6 +231,7 @@ function mainApp() {
         connectWebSocket() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             const wsUrl = `${protocol}//${window.location.host}/call/${this.config.callType}`;
+            //const wsUrl = `ws://0.0.0.0:8081`;
 
             this.addLogEntry('info', `Connecting to WebSocket at ${wsUrl}`);
 
@@ -319,11 +320,12 @@ function mainApp() {
                     sdp: event.sdp
                 })).then(() => {
                     // Only start ASR inactivity monitor if Pipecat is not handling AI processing
-                    if (!this.config.pipecat.enabled || !this.config.pipecat.useForAI) {
-                        this.startAsrInactivityMonitor();
-                    } else {
-                        this.addLogEntry('info', 'ASR inactivity monitor disabled - Pipecat handling AI processing');
-                    }
+                    // if (!this.config.pipecat.enabled || !this.config.pipecat.useForAI) {
+                    //     this.startAsrInactivityMonitor();
+                    // } else {
+                    //     this.addLogEntry('info', 'ASR inactivity monitor disabled - Pipecat handling AI processing');
+                    // }
+                    this.startAsrInactivityMonitor();
 
                     // Play greeting message when call is established
                     if (this.config.tts.greeting && this.config.tts.greeting.trim() !== '') {
@@ -358,17 +360,30 @@ function mainApp() {
             this.endCall();
         },
         handleTrackStart(event) {
-            //this.addLogEntry('info', `track start`)
+            this.addLogEntry('info', `track start`)
         },
+        // Handle ASR result
+        // Around line 220-230
+
         // Handle ASR result
         handleTranscriptionFinal(data) {
             this.lastAsrResult = data.text;
-            // If we have a valid ASR result, process it with LLM
+
+            // ✅ FIX: Only process with internal LLM if Pipecat is NOT handling AI
             if (data.text && data.text.trim() !== '') {
                 this.addLogEntry('ASR', `ASR Final: ${data.text}`);
+
+                // Check if Pipecat is handling AI processing
+                if (this.config.pipecat.enabled && this.config.pipecat.useForAI) {
+                    // Pipecat handles the conversation - just log the transcription
+                    this.addLogEntry('info', '✅ Pipecat handling conversation - skipping internal LLM');
+                    return; // Don't call processWithLlm
+                }
+
+                // Only use internal LLM if Pipecat is not handling AI
                 this.processWithLlm(data.text).then().catch((reason) => {
                     this.addLogEntry('error', `processWithLlm failed: ${reason}`);
-                })
+                });
             }
         },
 
@@ -727,38 +742,24 @@ function mainApp() {
             if (this.peerConnection) {
                 this.peerConnection.close();
             }
-            let iceServers = {
-                urls: ['stun:stun.l.google.com:19302']
-            }
-
+            let iceServers = { urls: ['stun:stun.l.google.com:19302'] };
             try {
-                iceServers = await fetch('/iceservers').then(res => res.json())
+                iceServers = await fetch('/iceservers').then(res => res.json());
             } catch { }
-
-            const configuration = {
-                iceServers
-            };
-
-            let mediaStream = await navigator.mediaDevices.getUserMedia({
-                audio: {
-                    advanced: [{
-                        echoCancellation: true,
-                    }]
-                }, video: false
-            });
-
+            const configuration = { iceServers };
+            // :exclamation: only one RTCPeerConnection
             this.peerConnection = new RTCPeerConnection(configuration);
+            // Get microphone
+            const mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            // :fire: Add audio track to THE SAME peer connection
             mediaStream.getTracks().forEach(track => {
                 this.addLogEntry('info', 'Added local audio stream');
                 const sender = this.peerConnection.addTrack(track, mediaStream);
-
-                // Set up DTMF sender for audio track
                 if (track.kind === 'audio' && sender.dtmf) {
                     this.dtmfSender = sender.dtmf;
                     this.addLogEntry('info', 'DTMF sender initialized');
                 }
             });
-
             // Handle connection state changes
             this.peerConnection.onconnectionstatechange = () => {
                 switch (this.peerConnection.connectionState) {
@@ -774,34 +775,25 @@ function mainApp() {
                         break;
                 }
             };
-
-
-            // Handle incoming audio
+            // Handle remote audio
             this.peerConnection.ontrack = (event) => {
                 const remoteAudio = new Audio();
                 remoteAudio.srcObject = event.streams[0];
-                remoteAudio.play()
-                    .catch(error => {
-                        this.addLogEntry('error', `Error playing remote audio: ${error.message}`);
-                    });
+                remoteAudio.autoplay = true;
+                remoteAudio.play().catch(error => {
+                    this.addLogEntry('error', `Error playing remote audio: ${error.message}`);
+                });
                 this.addLogEntry('info', 'Received remote audio stream');
-
-                // Set up DTMF sender for the audio track
-                const senders = this.peerConnection.getSenders();
-                const audioSender = senders.find(sender => sender.track && sender.track.kind === 'audio');
-                if (audioSender && audioSender.dtmf) {
-                    this.dtmfSender = audioSender.dtmf;
-                    this.addLogEntry('info', 'DTMF sender initialized');
-                }
             };
-            // Handle ICE candidate events
+            // ICE handling
             this.peerConnection.onicecandidate = (event) => {
                 if (!event.candidate) {
-                    this.sendInvite()
-                    return
+                    this.sendInvite();
+                    return;
                 }
             };
         },
+
 
         // Create and send WebRTC offer
         async createOffer() {
@@ -851,7 +843,7 @@ function mainApp() {
                         if (this.config.asr.endpoint) asrConfig.endpoint = this.config.asr.endpoint;
                         if (this.config.asr.model) asrConfig.modelType = this.config.asr.model;
                         if (this.config.asr.language) asrConfig.language = this.config.asr.language;
-                    }else if (this.config.asr.provider === 'deepgram') {
+                    } else if (this.config.asr.provider === 'deepgram') {
                         if (this.config.asr.apiKey) asrConfig.secretKey = this.config.asr.apiKey;
                         if (this.config.asr.model) asrConfig.modelType = this.config.asr.model;
                         if (this.config.asr.language) asrConfig.language = this.config.asr.language;
@@ -891,13 +883,29 @@ function mainApp() {
                 if (this.config.pipecat.enabled) {
                     pipecatConfig = {
                         enabled: this.config.pipecat.enabled,
-                        serverUrl: this.config.pipecat.serverUrl,
-                        useForAI: this.config.pipecat.useForAI,
-                        fallbackToInternal: this.config.pipecat.fallbackToInternal,
-                        systemPrompt: this.config.pipecat.systemPrompt
+                        server_url: this.config.pipecat.serverUrl,  // ✅ Changed to snake_case
+                        use_for_ai: this.config.pipecat.use_for_ai,  // ✅ Changed to snake_case
+                        fallback_to_internal: this.config.pipecat.fallbackToInternal,  // ✅ Changed to snake_case
+                        default_system_prompt: this.config.pipecat.default_system_prompt,  // ✅ Changed field name
+                        connection_timeout: 30,  // ✅ Added missing field (30 seconds)
+                        reconnect: {
+                            enabled: true,
+                            max_attempts: 5,
+                            initial_delay: 1,      // seconds (was initial_delay_ms)
+                            max_delay: 30,         // seconds (was max_delay_ms)
+                            backoff_multiplier: 2.0
+                        },
+                        audio: {
+                            sample_rate: 16000,
+                            channels: 1,
+                            frame_size: 160,       // 10ms at 16kHz
+                            buffer_size: 320,      // 20ms at 16kHz
+                            enable_compression: false,
+                            encoding: "linear16"
+                        }
                     };
                     this.addLogEntry('info', `Pipecat enabled - Server: ${this.config.pipecat.serverUrl}`);
-                    
+
                     if (this.config.pipecat.useForAI) {
                         this.addLogEntry('info', 'Internal ASR/TTS disabled - AI processing handled by Pipecat');
                     }
@@ -964,22 +972,22 @@ function mainApp() {
             if (savedConfig) {
                 try {
                     const parsedConfig = JSON.parse(savedConfig);
-                    
+
                     // Check configuration version and migrate if needed
                     if (!parsedConfig.version || parsedConfig.version !== this.config.version) {
                         this.addLogEntry('info', `Configuration version mismatch (saved: ${parsedConfig.version || 'old'}, current: ${this.config.version}). Resetting to new defaults.`);
-                        
+
                         // Force new defaults for ASR and TTS to fix language issues
                         this.config.asr.provider = 'deepgram';
                         this.config.asr.language = 'en';
                         this.config.tts.provider = 'deepgram';
                         this.config.tts.speaker = 'aura-asteria-en';
-                        
+
                         // Preserve user credentials if they exist
                         if (parsedConfig.asr && parsedConfig.asr.apiKey) {
                             this.config.asr.apiKey = parsedConfig.asr.apiKey;
                         }
-                        
+
                         this.saveConfigToLocalStorage();
                         this.addLogEntry('info', 'Configuration migrated to new defaults (Deepgram + English)');
                     } else {

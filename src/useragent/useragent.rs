@@ -220,7 +220,7 @@ impl UserAgent {
                         }
                         if let Some(call) = pending_dialogs.lock().await.remove(&dialog_id_str) {
                             info!(?dialog_id, timeout = ?accept_timeout, "accept timeout, rejecting dialog");
-                            call.dialog.reject().ok();
+                            call.dialog.reject(Some(rsip::StatusCode::BusyHere), Some("Busy".to_string())).ok();
 
                             token_ref.cancel();
                         }
@@ -246,24 +246,24 @@ impl UserAgent {
                             info!(
                                 id = ?dialog.id(),
                                 "error handling invite: {:?}", e);
-                            dialog.reject().ok();
+                            dialog.reject(Some(rsip::StatusCode::BusyHere), Some("Busy".to_string())).ok();
                         }
                     }
                 }
-                rsip::Method::Options => {
-                    if tx.endpoint_inner.option.ignore_out_of_dialog_option {
-                        let to_tag = tx
-                            .original
-                            .to_header()
-                            .and_then(|to| to.tag())
-                            .ok()
-                            .flatten();
-                        if to_tag.is_none() {
-                            info!(?key, "ignoring out-of-dialog OPTIONS request");
-                            continue;
-                        }
-                    }
-                }
+                // // rsip::Method::Options => {
+                //     if tx.endpoint_inner.option.ignore_out_of_dialog_option {
+                //         let to_tag = tx
+                //             .original
+                //             .to_header()
+                //             .and_then(|to| to.tag())
+                //             .ok()
+                //             .flatten();
+                //         if to_tag.is_none() {
+                //             info!(?key, "ignoring out-of-dialog OPTIONS request");
+                //             continue;
+                //         }
+                //     }
+                // }
                 _ => {
                     info!(?key, "received request: {:?}", tx.original.method);
                     match tx.reply(rsip::StatusCode::OK).await {

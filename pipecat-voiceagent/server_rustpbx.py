@@ -77,6 +77,12 @@ class RustPBXConnection:
         """Handle incoming audio data from RustPBX"""
         try:
             self.audio_frame_count += 1
+            logger.info(
+                f"📥 AUDIO FRAME #{self.audio_frame_count} "
+                f"({len(audio_data)} bytes) received & queued"
+            )
+
+            await self.audio_queue.put(audio_data)
 
             # Log first few frames and then periodically
             if self.audio_frame_count <= 5:
@@ -222,6 +228,7 @@ async def handle_client(websocket: WebSocketServerProtocol):
         await connection.start()
 
         # Message loop
+        logger.info(f"🔔 Incoming message type: {type(message)}")
         async for message in websocket:
             if isinstance(message, bytes):
                 # Binary message = audio data

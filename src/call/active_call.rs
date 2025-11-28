@@ -1,6 +1,6 @@
 use super::{CallOption, Command, ReferOption};
 use crate::{
-    TrackId,
+    AudioFrame, TrackId,
     app::AppState,
     call::{
         CommandReceiver, CommandSender,
@@ -17,12 +17,16 @@ use crate::{
             Track, TrackConfig,
             file::FileTrack,
             media_pass::MediaPassTrack,
-            pipecat::{PipecatProcessorBuilder},
+            pipecat::PipecatProcessorBuilder,
             rtp::{RtpTrack, RtpTrackBuilder},
             tts::SynthesisHandle,
             webrtc::WebrtcTrack,
             websocket::{WebsocketBytesReceiver, WebsocketTrack},
         },
+    },
+    pipecat::{
+        PipecatConfig,
+        config::{PipecatAudioConfig, PipecatReconnectConfig},
     },
     synthesis::{SynthesisCommand, SynthesisOption},
     useragent::invitation::PendingDialog,
@@ -33,13 +37,14 @@ use rsipstack::dialog::{invitation::InviteOption, server_dialog::ServerInviteDia
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    error,
     path::Path,
     sync::{Arc, RwLock},
     time::Duration,
 };
 use tokio::{fs::File, select, sync::Mutex, time::sleep};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[derive(Deserialize)]
 pub struct CallParams {
@@ -246,6 +251,11 @@ impl ActiveCall {
         let server_side_track_id = &self.server_side_track_id;
         let event_hook_loop = async move {
             while let Ok(event) = event_receiver.recv().await {
+                info!(
+                    session_id = self.session_id,
+                    ?event,
+                    "received session event"
+                );
                 match event {
                     SessionEvent::Speaking { .. }
                     | SessionEvent::Dtmf { .. }
@@ -285,6 +295,59 @@ impl ActiveCall {
                             *input_timeout_expire_ref.lock().await = expire;
                         }
                     }
+                    // Replace the SessionEvent::Tts handler (around line 299-350)
+                    SessionEvent::PipecatAudio {
+                        track_id,
+                        audio_samples,
+                        sample_rate,
+                        timestamp,
+                    } => {
+                        info!(
+                            "🔊 Received PipecatAudio event: {} samples @ {}Hz",
+                            audio_samples.len(),
+                            sample_rate
+                        );
+
+                        // Convert bytes to i16 samples
+                        // let mut samples = Vec::with_capacity(audio_data.len() / 2);
+                        // for chunk in audio_data.chunks_exact(2) {
+                        //     let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
+                        //     samples.push(sample);
+                        // }
+
+                        // info!(
+                        //     "✅ Converted to {} samples at {}Hz",
+                        //     samples.len(),
+                        //     sample_rate
+                        // );
+
+                        // ✅ Send directly to media stream as PCM audio
+
+                        if let Err(e) = self.ensure_server_side_track_exists().await {
+                            error!("Failed to ensure server-side track exists: {}", e);
+                            continue;
+                        }
+
+                        let frame = AudioFrame {
+                            track_id: server_side_track_id.clone(),
+                            samples: crate::Samples::PCM {
+                                samples: audio_samples,
+                            },
+                            timestamp: crate::get_timestamp(),
+                            sample_rate,
+                        };
+
+                        // ✅ CRITICAL: Send this frame to the media stream for immediate playback
+                        match self.media_stream.inject_audio_frame(frame).await {
+                            Ok(_) => {
+                                info!("✅ Pipecat audio injected successfully");
+                            }
+                            Err(e) => {
+                                error!("Failed to inject Pipecat audio: {}", e);
+                            }
+                        }
+                    }
+
                     _ => {}
                 }
             }
@@ -327,6 +390,29 @@ impl ActiveCall {
                 option,
                 wait_input_timeout,
             } => {
+                let should_use_pipecat = {
+                    let call_state = self.call_state.read().unwrap();
+                    call_state
+                        .option
+                        .as_ref()
+                        .and_then(|opt| opt.pipecat.as_ref())
+                        .map(|pc| pc.enabled && pc.use_for_ai)
+                        .unwrap_or(false)
+                };
+
+                if should_use_pipecat {
+                    // Pipecat will handle TTS - just log and skip internal TTS
+                    info!(
+                        session_id = self.session_id,
+                        "Skipping internal TTS (Pipecat handles it): {}", text
+                    );
+
+                    // Send the text to Pipecat via event (if you have a mechanism for this)
+                    // Or just return Ok - Pipecat will generate audio when it receives user speech
+                    return Ok(());
+                }
+
+                // Only use internal TTS if Pipecat is NOT handling it
                 self.do_tts(
                     text,
                     speaker,
@@ -406,7 +492,22 @@ impl ActiveCall {
     }
 
     async fn invite_or_accept(&self, mut option: CallOption, sender: String) -> Result<CallOption> {
+        info!(
+            session_id = self.session_id,
+            "🔍 BEFORE check_default_with_config - option.pipecat: {:?}", option.pipecat
+        );
         option.check_default_with_config(&self.app_state.config);
+        info!(
+            session_id = self.session_id,
+            "🔍 AFTER check_default_with_config - option.pipecat: {:?}", option.pipecat
+        );
+        if option.pipecat.is_none() && crate::pipecat::should_use_pipecat(&self.app_state.config) {
+            option.pipecat = self.app_state.config.pipecat.clone();
+            info!(
+                session_id = self.session_id,
+                "Adding Pipecat config to call option"
+            );
+        }
         if let Some(opt) = self.build_record_option(&option) {
             self.media_stream.update_recorder_option(opt).await;
         }
@@ -452,6 +553,11 @@ impl ActiveCall {
     }
 
     async fn do_invite(&self, option: CallOption) -> Result<()> {
+        info!(session_id = self.session_id, "🔔 do_invite called");
+        info!(
+            session_id = self.session_id,
+            "🔍 do_invite with option.pipecat: {:?}", option.pipecat
+        );
         self.invite_or_accept(option, "invite".to_string())
             .await
             .map(|_| ())
@@ -461,7 +567,20 @@ impl ActiveCall {
         if self.ready_to_answer.lock().await.is_none() {
             option = self.invite_or_accept(option, "accept".to_string()).await?;
         } else {
+            info!(
+                session_id = self.session_id,
+                "🔍 do_accept with ready_to_answer - checking Pipecat config"
+            );
             option.check_default_with_config(&self.app_state.config);
+            if option.pipecat.is_none()
+                && crate::pipecat::should_use_pipecat(&self.app_state.config)
+            {
+                option.pipecat = self.app_state.config.pipecat.clone();
+                info!(
+                    session_id = self.session_id,
+                    "✅ Added Pipecat config to CallOption in do_accept"
+                );
+            }
             self.call_state
                 .write()
                 .as_mut()
@@ -510,6 +629,11 @@ impl ActiveCall {
                 } else {
                     None
                 },
+                pipecat: if crate::pipecat::should_use_pipecat(&self.app_state.config) {
+                    self.app_state.config.pipecat.clone()
+                } else {
+                    None
+                },
                 ..Default::default()
             };
             let _ = self.invite_or_accept(option, "ringing".to_string()).await?;
@@ -551,16 +675,34 @@ impl ActiveCall {
         wait_input_timeout: Option<u32>,
     ) -> Result<()> {
         let tts_option = match self.call_state.read() {
-            Ok(ref call_state) => match call_state.option.clone().unwrap_or_default().tts {
-                Some(opt) => opt.merge_with(option),
-                None => {
-                    if let Some(opt) = option {
-                        opt
-                    } else {
-                        return Err(anyhow::anyhow!("no tts option available"));
+            Ok(ref call_state) => {
+                match call_state.option.clone().unwrap_or_default().tts {
+                    Some(opt) => opt.merge_with(option),
+                    None => {
+                        // Check if Pipecat is enabled
+                        let pipecat_enabled = call_state
+                            .option
+                            .as_ref()
+                            .and_then(|o| o.pipecat.as_ref())
+                            .map(|pc| pc.enabled && pc.use_for_ai)
+                            .unwrap_or(false);
+
+                        if pipecat_enabled {
+                            return Err(anyhow::anyhow!(
+                                "Internal TTS not available - Pipecat is handling TTS. This error should not occur."
+                            ));
+                        }
+
+                        if let Some(opt) = option {
+                            opt
+                        } else {
+                            return Err(anyhow::anyhow!(
+                                "no tts option available and no option provided"
+                            ));
+                        }
                     }
                 }
-            },
+            }
             Err(_) => return Err(anyhow::anyhow!("failed to read call state")),
         };
         let speaker = match speaker {
@@ -688,31 +830,81 @@ impl ActiveCall {
             session_id = self.session_id,
             ?reason,
             ?initiator,
-            "do_hangup"
+            "do_hangup started"
         );
 
         // Set hangup reason based on initiator and reason
         let hangup_reason = match initiator.as_deref() {
-            Some("caller") => CallRecordHangupReason::ByCaller,
-            Some("callee") => CallRecordHangupReason::ByCallee,
-            Some("system") => CallRecordHangupReason::Autohangup,
-            _ => reason.unwrap_or(CallRecordHangupReason::BySystem),
+            Some("caller") => {
+                info!(
+                    session_id = self.session_id,
+                    "Hangup reason set to ByCaller"
+                );
+                CallRecordHangupReason::ByCaller
+            }
+            Some("callee") => {
+                info!(
+                    session_id = self.session_id,
+                    "Hangup reason set to ByCallee"
+                );
+                CallRecordHangupReason::ByCallee
+            }
+            Some("system") => {
+                info!(
+                    session_id = self.session_id,
+                    "Hangup reason set to Autohangup"
+                );
+                CallRecordHangupReason::Autohangup
+            }
+            _ => {
+                let default_reason = reason.unwrap_or(CallRecordHangupReason::BySystem);
+                info!(
+                    session_id = self.session_id,
+                    "Hangup reason set to default: {:?}", default_reason
+                );
+                default_reason
+            }
         };
 
+        info!(session_id = self.session_id, "Releasing TTS handle");
         self.tts_handle.lock().await.take();
+
+        info!(session_id = self.session_id, "Stopping media stream");
         self.media_stream
             .stop(Some(hangup_reason.to_string()), initiator);
 
+        info!(session_id = self.session_id, "Updating call state");
         match self.call_state.write().as_mut() {
             Ok(call_state) => {
                 if call_state.hangup_reason.is_none() {
+                    info!(
+                        session_id = self.session_id,
+                        "Setting hangup reason in call state"
+                    );
                     call_state.hangup_reason.replace(hangup_reason);
                 }
+                info!(
+                    session_id = self.session_id,
+                    "Removing dialog from call state"
+                );
                 call_state.dialog.take()
             }
-            Err(_) => None,
+            Err(_) => {
+                warn!(
+                    session_id = self.session_id,
+                    "Failed to acquire write lock on call state"
+                );
+                None
+            }
         };
+
+        info!(
+            session_id = self.session_id,
+            "Cancelling cancellation token"
+        );
         self.cancel_token.cancel();
+
+        info!(session_id = self.session_id, "do_hangup completed");
         Ok(())
     }
 
@@ -748,6 +940,11 @@ impl ActiveCall {
                 })
                 .ok()
                 .flatten(),
+            pipecat: if crate::pipecat::should_use_pipecat(&self.app_state.config) {
+                self.app_state.config.pipecat.clone()
+            } else {
+                None
+            },
             ..Default::default()
         };
 
@@ -951,7 +1148,55 @@ impl ActiveCall {
         rtp_track.build().await
     }
 
+    pub async fn ensure_server_side_track_exists(&self) -> Result<()> {
+        info!("Ensuring server-side track exists: {}", self.server_side_track_id);
+    
+        info!("Creating server-side track for TTS/Pipecat playback: {}", self.server_side_track_id);
+
+        // if self.media_stream.has_track(&self.server_side_track_id).await {
+        //     info!("✅ Server-side track already exists");
+        //     return Ok(());
+        // }
+    
+        // let media_pass_option = {
+        //     let call_state = self.call_state.read()
+        //         .map_err(|e| anyhow::anyhow!("Failed to read call state: {}", e))?;
+            
+        //     // If media_pass exists, use it; otherwise create a default
+        //     call_state
+        //         .option
+        //         .as_ref()
+        //         .and_then(|o| o.media_pass.clone())
+        //         .unwrap_or_else(|| {
+        //             info!("No MediaPassOption in call state - using default");
+        //             crate::media::track::media_pass::MediaPassOption::default()
+        //         })
+        // };
+
+        //let media_pass_option = crate::media::track::media_pass::MediaPassOption::default();
+    
+        // Create a simple audio track for playback
+        // This track will receive frames from Pipecat/TTS and send them to WebRTC
+        let track = Box::new(
+            crate::pipecat::passthrough::PassthroughTrack::new(
+                self.server_side_track_id.clone(),
+                rand::random::<u32>(),
+                self.cancel_token.child_token(),
+            ),
+        );
+    
+        self.media_stream.update_track(track, None).await;
+        
+        info!("✅ Server-side track created successfully");
+        Ok(())
+    }
+
     async fn setup_caller_track(&self, option: CallOption) -> Result<()> {
+        info!(
+            session_id = self.session_id,
+            "🔍 setup_caller_track called with Pipecat config: {}",
+            option.pipecat.is_some()
+        );
         self.call_state
             .write()
             .as_mut()
@@ -1063,6 +1308,19 @@ impl ActiveCall {
         option: &CallOption,
         track: Option<Box<dyn Track>>,
     ) -> Result<()> {
+        if option.pipecat.as_ref().map(|p| p.enabled).unwrap_or(false) {
+            info!("Pipecat enabled - creating server-side track");
+            if let Err(e) = self.ensure_server_side_track_exists().await {
+                warn!("Failed to create server-side track: {}", e);
+                // Don't fail the call - continue without server-side track
+            }
+        }
+        info!(
+            session_id = self.session_id,
+            "🔍 finish_caller_stack ENTRY - track present: {}, pipecat config: {}",
+            track.is_some(),
+            option.pipecat.is_some()
+        );
         if let Some(track) = track {
             Self::setup_track_with_stream(
                 self.app_state.clone(),
@@ -1110,14 +1368,38 @@ impl ActiveCall {
         // If Pipecat is handling AI processing, remove ASR/TTS from CallOption
         // to prevent internal AI services from running in parallel
         let mut processed_option = option.clone();
+        info!(
+            session_id,
+            "🔍 Setting up track with Pipecat config present: {}",
+            processed_option.pipecat.is_some()
+        );
         if crate::pipecat::should_use_pipecat(&app_state.config) {
             debug!(
                 session_id,
                 "Pipecat enabled for AI processing - disabling internal ASR/TTS processors"
             );
-            processed_option.asr = None;
-            processed_option.tts = None;
+            //processed_option.asr = None;
+            //processed_option.tts = None;
+            if processed_option.pipecat.is_none() {
+                processed_option.pipecat = app_state.config.pipecat.clone();
+                info!(
+                    session_id,
+                    "Adding Pipecat config to processed option for StreamEngine"
+                );
+            }
         }
+
+        // let pipecat_config = app_state
+        //     .config
+        //     .pipecat
+        //     .as_ref()
+        //     .ok_or_else(|| anyhow::anyhow!("Pipecat config not found"))?
+        //     .clone();
+        // let call_option = CallOption {
+        //     pipecat: Some(pipecat_config),
+        //     // ... other options
+        //     ..processed_option.clone()
+        // };
 
         let processors = match StreamEngine::create_processors(
             app_state.stream_engine.clone(),
@@ -1199,11 +1481,8 @@ impl ActiveCall {
             )
         };
 
-        info!(
-            session_id = self.session_id,
-            "Creating WebRTC track"
-        );
-        
+        info!(session_id = self.session_id, "Creating WebRTC track");
+
         let mut webrtc_track = WebrtcTrack::new(
             self.cancel_token.child_token(),
             self.session_id.clone(),
@@ -1249,100 +1528,113 @@ impl ActiveCall {
             })
             .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-        // Add Pipecat processor to the track if enabled for AI processing
-        let use_pipecat = crate::pipecat::should_use_pipecat(&self.app_state.config);
-        if use_pipecat {
-            debug!(
-                session_id = self.session_id,
-                "Adding Pipecat processor to WebRTC track for AI processing"
-            );
-            
-            if let Some(pipecat_config) = self.app_state.config.pipecat.as_ref() {
-                match PipecatProcessorBuilder::new()
-                    .with_pipecat_config(pipecat_config.clone())
-                    .build(self.cancel_token.child_token())
-                    .await
-                {
-                    Ok(pipecat_processor) => {
-                        info!(
-                            session_id = self.session_id,
-                            "Successfully created Pipecat processor, setting up packet sender"
-                        );
+        //Add Pipecat processor to the track if enabled for AI processing
+        // let use_pipecat = crate::pipecat::should_use_pipecat(&self.app_state.config);
+        // if use_pipecat {
+        //     debug!(
+        //         session_id = self.session_id,
+        //         "Adding Pipecat processor to WebRTC track for AI processing"
+        //     );
 
-                        // Create a channel for the Pipecat processor to send audio responses back
-                        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::AudioFrame>();
+        //     if let Some(pipecat_config) = self.app_state.config.pipecat.as_ref() {
+        //         match PipecatProcessorBuilder::new()
+        //             .with_pipecat_config(pipecat_config.clone())
+        //             .build(self.cancel_token.child_token())
+        //             .await
+        //         {
+        //             Ok(pipecat_processor) => {
+        //                 info!(
+        //                     session_id = self.session_id,
+        //                     "Successfully created Pipecat processor, setting up packet sender"
+        //                 );
 
-                        // Set the packet sender on the Pipecat processor
-                        pipecat_processor.set_packet_sender(tx).await;
+        //                 // Create a channel for the Pipecat processor to send audio responses back
+        //                 let (tx, mut rx) =
+        //                     tokio::sync::mpsc::unbounded_channel::<crate::AudioFrame>();
 
-                        info!(
-                            session_id = self.session_id,
-                            "Successfully added Pipecat processor to WebRTC track with packet sender"
-                        );
+        //                 // Set the packet sender on the Pipecat processor
+        //                 pipecat_processor.set_packet_sender(tx).await;
 
-                        // Add the processor to the track
-                        webrtc_track.append_processor(Box::new(pipecat_processor));
+        //                 info!(
+        //                     session_id = self.session_id,
+        //                     "Successfully added Pipecat processor to WebRTC track with packet sender"
+        //                 );
 
-                        // Spawn a task to forward audio responses from Pipecat back to the WebRTC track
-                        let track_id_clone = self.session_id.clone();
-                        let webrtc_track_sender = webrtc_track.packet_sender.clone();
-                        let cancel_token_clone = self.cancel_token.child_token();
+        //                 // Add the processor to the track
+        //                 webrtc_track.append_processor(Box::new(pipecat_processor));
 
-                        tokio::spawn(async move {
-                            debug!("Starting Pipecat audio response forwarding loop for track {}", track_id_clone);
+        //                 // Spawn a task to forward audio responses from Pipecat back to the WebRTC track
+        //                 let track_id_clone = self.session_id.clone();
+        //                 let webrtc_track_sender = webrtc_track.packet_sender.clone();
+        //                 let cancel_token_clone = self.cancel_token.child_token();
 
-                            loop {
-                                tokio::select! {
-                                    _ = cancel_token_clone.cancelled() => {
-                                        debug!("Pipecat audio forwarding cancelled for track {}", track_id_clone);
-                                        break;
-                                    }
-                                    Some(audio_frame) = rx.recv() => {
-                                        debug!(
-                                            "Forwarding Pipecat audio response to WebRTC track {}: {} samples",
-                                            track_id_clone,
-                                            match &audio_frame.samples {
-                                                crate::Samples::PCM { samples } => samples.len(),
-                                                _ => 0,
-                                            }
-                                        );
+        //                 tokio::spawn(async move {
+        //                     debug!(
+        //                         "Starting Pipecat audio response forwarding loop for track {}",
+        //                         track_id_clone
+        //                     );
 
-                                        // Forward the audio frame to the WebRTC track's packet sender
-                                        let sender_guard = webrtc_track_sender.lock().await;
-                                        if let Some(sender) = sender_guard.as_ref() {
-                                            if let Err(e) = sender.send(audio_frame) {
-                                                warn!("Failed to forward Pipecat audio to WebRTC track {}: {}", track_id_clone, e);
-                                            }
-                                        } else {
-                                            warn!("WebRTC track {} packet sender not available", track_id_clone);
-                                        }
-                                    }
-                                }
-                            }
+        //                     loop {
+        //                         tokio::select! {
+        //                             _ = cancel_token_clone.cancelled() => {
+        //                                 debug!("Pipecat audio forwarding cancelled for track {}", track_id_clone);
+        //                                 break;
+        //                             }
+        //                             Some(audio_frame) = rx.recv() => {
+        //                                 debug!(
+        //                                     "Forwarding Pipecat audio response to WebRTC track {}: {} samples",
+        //                                     track_id_clone,
+        //                                     match &audio_frame.samples {
+        //                                         crate::Samples::PCM { samples } => samples.len(),
+        //                                         _ => 0,
+        //                                     }
+        //                                 );
 
-                            info!("Pipecat audio forwarding loop ended for track {}", track_id_clone);
-                        });
-                    }
-                    Err(e) => {
-                        warn!(
-                            session_id = self.session_id,
-                            "Failed to create Pipecat processor: {}, continuing without AI processing", e
-                        );
-                    }
-                }
-            } else {
-                warn!(
-                    session_id = self.session_id,
-                    "Pipecat enabled but no configuration found, skipping Pipecat processor"
-                );
-            }
-        } else {
-            debug!(
-                session_id = self.session_id,
-                "Pipecat not enabled, using WebRTC track without AI processing"
-            );
-        }
-        
+        //                                 // Forward the audio frame to the WebRTC track's packet sender
+        //                                 let sender_guard = webrtc_track_sender.lock().await;
+        //                                 if let Some(sender) = sender_guard.as_ref() {
+        //                                     if let Err(e) = sender.send(audio_frame) {
+        //                                         warn!("Failed to forward Pipecat audio to WebRTC track {}: {}", track_id_clone, e);
+        //                                     }
+        //                                 } else {
+        //                                     warn!("WebRTC track {} packet sender not available", track_id_clone);
+        //                                 }
+        //                             }
+        //                         }
+        //                     }
+
+        //                     info!(
+        //                         "Pipecat audio forwarding loop ended for track {}",
+        //                         track_id_clone
+        //                     );
+        //                 });
+        //             }
+        //             Err(e) => {
+        //                 warn!(
+        //                     session_id = self.session_id,
+        //                     "Failed to create Pipecat processor: {}, continuing without AI processing",
+        //                     e
+        //                 );
+        //             }
+        //         }
+        //     } else {
+        //         warn!(
+        //             session_id = self.session_id,
+        //             "Pipecat enabled but no configuration found, skipping Pipecat processor"
+        //         );
+        //     }
+        // } else {
+        //     debug!(
+        //         session_id = self.session_id,
+        //         "Pipecat not enabled, using WebRTC track without AI processing"
+        //     );
+        // }
+
+        info!(
+            session_id = self.session_id,
+            "WebRTC track created - processors will be added by StreamEngine"
+        );
+
         Ok(Box::new(webrtc_track))
     }
 

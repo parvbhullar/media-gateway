@@ -170,6 +170,12 @@ pub enum SessionEvent {
         timestamp: u64,
         payload: Option<String>,
     },
+    PipecatAudio {
+        track_id: String,
+        audio_samples: Vec<i16>,
+        sample_rate: u32,
+        timestamp: u64,
+    },
 }
 
 pub type EventSender = tokio::sync::broadcast::Sender<SessionEvent>;

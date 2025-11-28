@@ -1,0 +1,195 @@
+warning: unused imports: `PipecatAudioConfig`, `PipecatConfig`, `PipecatReconnectConfig`, and `pipecat::PipecatProcessorBuilder`
+  --> src/call/active_call.rs:20:13
+   |
+20 |             pipecat::PipecatProcessorBuilder,
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+28 |         PipecatConfig,
+   |         ^^^^^^^^^^^^^
+29 |         config::{PipecatAudioConfig, PipecatReconnectConfig},
+   |                  ^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `webrtc::media::audio::buffer::info`
+  --> src/handler/handler.rs:19:5
+   |
+19 | use webrtc::media::audio::buffer::info;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `error`
+  --> src/media/engine.rs:28:33
+   |
+28 | use std::{collections::HashMap, error, future::Future, pin::Pin, sync::Arc};
+   |                                 ^^^^^
+
+warning: unused import: `sleep`
+ --> src/pipecat/client.rs:7:28
+  |
+7 | use tokio::time::{Instant, sleep, timeout};
+  |                            ^^^^^
+
+warning: unused import: `rsip::prelude::HeadersExt`
+  --> src/proxy/server.rs:17:5
+   |
+17 | use rsip::prelude::HeadersExt;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `event_sender`
+  --> src/media/track/pipecat.rs:47:9
+   |
+47 |         event_sender: EventSender,
+   |         ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_event_sender`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `event_tx`
+  --> src/media/track/pipecat.rs:74:18
+   |
+74 |             let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+   |                  ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_event_tx`
+
+warning: unnecessary `unsafe` block
+   --> src/media/track/pipecat.rs:628:13
+    |
+628 |             unsafe {
+    |             ^^^^^^ unnecessary `unsafe` block
+    |
+    = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated items `start_event_processing`, `handle_pipecat_event`, and `send_audio_to_pipecat` are never used
+   --> src/media/track/pipecat.rs:268:14
+    |
+ 42 | impl PipecatProcessor {
+    | --------------------- associated items in this implementation
+...
+268 |     async fn start_event_processing(&self, event_sender: EventSender, track_id: ...
+    |              ^^^^^^^^^^^^^^^^^^^^^^
+...
+329 |     async fn handle_pipecat_event(
+    |              ^^^^^^^^^^^^^^^^^^^^
+...
+497 |     async fn send_audio_to_pipecat(&self, frame: &AudioFrame) -> Result<()> {
+    |              ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `TtsRequest` is never constructed
+  --> src/synthesis/voiceapi.rs:29:8
+   |
+29 | struct TtsRequest {
+   |        ^^^^^^^^^^
+
+warning: field `metadata` is never read
+  --> src/transcription/deepgram.rs:39:9
+   |
+33 |     Results {
+   |     ------- field in this variant
+...
+39 |         metadata: Option<DgMetadata>,
+   |         ^^^^^^^^
+   |
+   = note: `DgEvent` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: multiple fields are never read
+  --> src/transcription/deepgram.rs:43:9
+   |
+42 |     Metadata { 
+   |     -------- fields in this variant
+43 |         request_id: Option<String>,
+   |         ^^^^^^^^^^
+44 |         transaction_key: Option<String>,
+   |         ^^^^^^^^^^^^^^^
+45 |         sha256: Option<String>,
+   |         ^^^^^^
+46 |         created: Option<String>,
+   |         ^^^^^^^
+47 |         duration: Option<f64>,
+   |         ^^^^^^^^
+48 |         channels: Option<u32>,
+   |         ^^^^^^^^
+49 |         models: Option<Vec<String>>,
+   |         ^^^^^^
+   |
+   = note: `DgEvent` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: field `request_id` is never read
+  --> src/transcription/deepgram.rs:61:9
+   |
+60 |     CloseStream { 
+   |     ----------- field in this variant
+61 |         request_id: Option<String>,
+   |         ^^^^^^^^^^
+   |
+   = note: `DgEvent` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: fields `word`, `start`, `end`, `confidence`, and `punctuated_word` are never read
+  --> src/transcription/deepgram.rs:87:5
+   |
+86 | struct DgWord {
+   |        ------ fields in this struct
+87 |     word: String,
+   |     ^^^^
+88 |     start: f64,
+   |     ^^^^^
+89 |     end: f64,
+   |     ^^^
+90 |     confidence: Option<f64>,
+   |     ^^^^^^^^^^
+91 |     punctuated_word: Option<String>,
+   |     ^^^^^^^^^^^^^^^
+   |
+   = note: `DgWord` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: fields `request_id`, `transaction_key`, `sha256`, `created`, `duration`, and `channels` are never read
+   --> src/transcription/deepgram.rs:96:5
+    |
+ 95 | struct DgMetadata {
+    |        ---------- fields in this struct
+ 96 |     request_id: Option<String>,
+    |     ^^^^^^^^^^
+ 97 |     transaction_key: Option<String>,
+    |     ^^^^^^^^^^^^^^^
+ 98 |     sha256: Option<String>,
+    |     ^^^^^^
+ 99 |     created: Option<String>,
+    |     ^^^^^^^
+100 |     duration: Option<f64>,
+    |     ^^^^^^^^
+101 |     channels: Option<u32>,
+    |     ^^^^^^^^
+    |
+    = note: `DgMetadata` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: `rustpbx` (lib) generated 15 warnings (run `cargo fix --lib -p rustpbx` to apply 5 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.44s
+warning: the following packages contain code that will be rejected by a future version of Rust: nom v6.1.2
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running `target/debug/rustpbx --conf config.toml`
+🔧 DEBUG: Loaded configuration from config.toml
+🔧 DEBUG: Pipecat config found - enabled: true, use_for_ai: true, server_url: Some("ws://localhost:8081")
+rustpbx 0.3.13
+Build Time: 2025-11-27 20:56:22 +05:30
+Git Commit: f82d109
+Git Branch: voiceAgentBinding
+Git Status: dirty
+[2m2025-11-27T20:57:36.455432+05:30[0m [32m INFO[0m [2mrsipstack::transport::udp[0m[2m:[0m [2m/Users/mriduly/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rsipstack-0.2.91/src/transport/udp.rs[0m[2m:[0m[2m61:[0m created UDP connection: 0.0.0.0:13050 external: None
+[2m2025-11-27T20:57:36.455965+05:30[0m [32m INFO[0m [2mrustpbx::useragent::useragent[0m[2m:[0m [2msrc/useragent/useragent.rs[0m[2m:[0m[2m86:[0m start useragent, addr: 0.0.0.0:13050
+[2m2025-11-27T20:57:36.456638+05:30[0m [32m INFO[0m [2mrustpbx::app[0m[2m:[0m [2msrc/app.rs[0m[2m:[0m[2m200:[0m ✅ Pipecat integration enabled - Server: ws://localhost:8081, UseForAI: true, Fallback: true
+[2m2025-11-27T20:57:36.456764+05:30[0m [32m INFO[0m [2mrustpbx::callrecord[0m[2m:[0m [2msrc/callrecord/mod.rs[0m[2m:[0m[2m556:[0m CallRecordManager serving
+[2m2025-11-27T20:57:36.456899+05:30[0m [32m INFO[0m [2mrustpbx::proxy::user[0m[2m:[0m [2msrc/proxy/user.rs[0m[2m:[0m[2m53:[0m Creating MemoryUserBackend, users: 2
+[2m2025-11-27T20:57:36.457046+05:30[0m [32m INFO[0m [2mrsipstack::transport::udp[0m[2m:[0m [2m/Users/mriduly/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/rsipstack-0.2.91/src/transport/udp.rs[0m[2m:[0m[2m61:[0m created UDP connection: 0.0.0.0:15060 external: None
+[2m2025-11-27T20:57:36.457059+05:30[0m [32m INFO[0m [2mrustpbx::proxy::server[0m[2m:[0m [2msrc/proxy/server.rs[0m[2m:[0m[2m209:[0m start proxy, udp port: 0.0.0.0:15060
+[2m2025-11-27T20:57:36.457317+05:30[0m [34mDEBUG[0m [2mrustpbx::proxy::acl[0m[2m:[0m [2msrc/proxy/acl.rs[0m[2m:[0m[2m213:[0m ACL module started with 4 rules
+[2m2025-11-27T20:57:36.457367+05:30[0m [34mDEBUG[0m [2mrustpbx::proxy::server[0m[2m:[0m [2msrc/proxy/server.rs[0m[2m:[0m[2m293:[0m module acl loaded in 267.708µs
+[2m2025-11-27T20:57:36.457377+05:30[0m [34mDEBUG[0m [2mrustpbx::proxy::auth[0m[2m:[0m [2msrc/proxy/auth.rs[0m[2m:[0m[2m164:[0m Auth module started
+[2m2025-11-27T20:57:36.457398+05:30[0m [34mDEBUG[0m [2mrustpbx::proxy::server[0m[2m:[0m [2msrc/proxy/server.rs[0m[2m:[0m[2m293:[0m module auth loaded in 21.75µs
+[2m2025-11-27T20:57:36.457427+05:30[0m [34mDEBUG[0m [2mrustpbx::proxy::registrar[0m[2m:[0m [2msrc/proxy/registrar.rs[0m[2m:[0m[2m38:[0m Registrar module started
+[2m2025-11-27T20:57:36.457449+05:30[0m [34mDEBUG[0m [2mrustpbx::proxy::server[0m[2m:[0m [2msrc/proxy/server.rs[0m[2m:[0m[2m293:[0m module registrar loaded in 43.292µs
+[2m2025-11-27T20:57:36.457478+05:30[0m [34mDEBUG[0m [2mrustpbx::proxy::call[0m[2m:[0m [2msrc/proxy/call.rs[0m[2m:[0m[2m299:[0m Call module with Dialog-based B2BUA started
+[2m2025-11-27T20:57:36.457487+05:30[0m [34mDEBUG[0m [2mrustpbx::proxy::server[0m[2m:[0m [2msrc/proxy/server.rs[0m[2m:[0m[2m293:[0m module call loaded in 30.792µs
+[2m2025-11-27T20:57:36.457531+05:30[0m [32m INFO[0m [2mrustpbx::proxy::server[0m[2m:[0m [2msrc/proxy/server.rs[0m[2m:[0m[2m316:[0m modules loaded in 407.375µs modules: ["acl", "auth", "registrar", "call"] allows: INVITE,REGISTER,BYE,OPTIONS,INFO,ACK,CANCEL
+[2m2025-11-27T20:57:36.457578+05:30[0m [32m INFO[0m [2mrustpbx[0m[2m:[0m [2msrc/bin/rustpbx.rs[0m[2m:[0m[2m99:[0m starting rustpbx on 0.0.0.0:8080
+[2m2025-11-27T20:57:36.459226+05:30[0m [32m INFO[0m [2mrustpbx::app[0m[2m:[0m [2msrc/app.rs[0m[2m:[0m[2m262:[0m Registering WebSocket handler to sip server: /ws
+[2m2025-11-27T20:57:36.460114+05:30[0m [32m INFO[0m [2mrustpbx::useragent::useragent[0m[2m:[0m [2msrc/useragent/useragent.rs[0m[2m:[0m[2m289:[0m registration started, count: 0
+[2m2025-11-27T20:57:36.460214+05:30[0m [32m INFO[0m [2mrustpbx::app[0m[2m:[0m [2msrc/app.rs[0m[2m:[0m[2m281:[0m Proxy server started

@@ -3,16 +3,13 @@ use clap::Parser;
 use dotenv::dotenv;
 use futures::{SinkExt, StreamExt};
 use rustpbx::{
-    call::{CallOption, Command},
-    event::SessionEvent,
-    media::{
+    call::{CallOption, Command}, event::SessionEvent, media::{
         codecs::{CodecType, Encoder, g722::G722Encoder, resample::resample_mono},
         negotiate::strip_ipv6_candidates,
         recorder::RecorderOption,
         track::{file::read_wav_file, webrtc::WebrtcTrack},
         vad::VADOption,
-    },
-    version,
+    }, pipecat::PipecatConfig, version
 };
 use std::{
     sync::{
@@ -58,7 +55,7 @@ struct Cli {
     #[clap(
         long,
         help = "Endpoint of the server",
-        default_value = "ws://localhost:8080/call/webrtc"
+        default_value = "ws://localhost:8081"
     )]
     endpoint: String,
 
@@ -88,6 +85,8 @@ struct Cli {
 
     #[clap(long, help = "Denoising", default_value = "true")]
     recorder: Option<bool>,
+
+    pipecat: Option<bool>,
 }
 
 async fn serve_client(codec: CodecType, cli: Cli, id: u32, state: Arc<AppState>) -> Result<()> {
@@ -205,6 +204,11 @@ async fn serve_client(codec: CodecType, cli: Cli, id: u32, state: Arc<AppState>)
         },
         recorder: if cli.recorder.unwrap_or(false) {
             Some(RecorderOption::default())
+        } else {
+            None
+        },
+        pipecat: if cli.pipecat.unwrap_or(false) {
+            Some(PipecatConfig::default())
         } else {
             None
         },

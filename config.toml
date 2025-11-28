@@ -100,21 +100,13 @@ sample_rate = 16000
 
 # Pipecat Media Server Configuration
 [pipecat]
-# Enable Pipecat integration (set to true to use external AI processing)
 enabled = true
-# Pipecat server WebSocket URL
-server_url = "ws://localhost:8765/ws/rustpbx"
-# Use Pipecat for AI processing instead of internal services
+server_url = "ws://localhost:8081"
 use_for_ai = true
-# Fallback to internal AI processing if Pipecat is unavailable
-fallback_to_internal = true
-# Connection timeout in seconds
+fallback_to_internal = false
 connection_timeout = 30
-# Default system prompt for AI conversations
 default_system_prompt = "You are a helpful AI assistant in a voice conversation. Respond naturally and conversationally. Keep responses brief but informative."
-# Enable metrics collection
 enable_metrics = true
-# Enable debug logging for Pipecat communication
 debug_logging = false
 
 # Pipecat reconnection settings
@@ -133,3 +125,9 @@ frame_size = 160  # 10ms at 16kHz
 buffer_size = 10
 enable_compression = false
 encoding = "linear16"
+
+[pipecat.vad]
+silence_threshold = 0.02          # Energy threshold (0.0 to 1.0)
+silence_duration_ms = 800         # Wait 800ms after speech ends
+min_speech_duration_ms = 500      # Minimum speech length
+max_buffer_frames = 1000          # Maximum frames to buffer

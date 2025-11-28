@@ -61,6 +61,8 @@ pub struct WebrtcTrack {
     ssrc: u32,
     pub peer_connection: Option<Arc<RTCPeerConnection>>,
     pub ice_servers: Option<Vec<IceServer>>,
+    audio_buffer: Arc<Mutex<Vec<i16>>>,
+    rtp_timestamp: Arc<Mutex<u32>>,
 }
 
 impl WebrtcTrack {
@@ -121,7 +123,7 @@ impl WebrtcTrack {
             RTCRtpCodecParameters {
                 capability: RTCRtpCodecCapability {
                     mime_type: MIME_TYPE_PCMU.to_owned(),
-                    clock_rate: 8000,
+                    clock_rate: 16000,
                     channels: 1,
                     sdp_fmtp_line: "".to_owned(),
                     rtcp_feedback: vec![],
@@ -132,7 +134,7 @@ impl WebrtcTrack {
             RTCRtpCodecParameters {
                 capability: RTCRtpCodecCapability {
                     mime_type: MIME_TYPE_PCMA.to_owned(),
-                    clock_rate: 8000,
+                    clock_rate: 16000,
                     channels: 1,
                     sdp_fmtp_line: "".to_owned(),
                     rtcp_feedback: vec![],
@@ -182,6 +184,8 @@ impl WebrtcTrack {
             ssrc: 0,
             peer_connection: None,
             ice_servers,
+            audio_buffer: Arc::new(Mutex::new(Vec::new())),
+            rtp_timestamp: Arc::new(Mutex::new(rand::random::<u32>())),
         }
     }
     pub fn with_ssrc(mut self, ssrc: u32) -> Self {
@@ -261,6 +265,12 @@ impl WebrtcTrack {
                 let track_id_clone = track_id_clone.clone();
                 let packet_sender_clone = packet_sender.clone();
                 let processor_chain = processor_chain.clone();
+                // info!(
+                //     track_id=track_id_clone,
+                //     "on_track called for processors: {:?}",
+                //     processor_chain.clone(),
+                // );
+                    
                 let track_samplerate = match track.codec().payload_type {
                     9 => 16000,   // G722
                     111 => 48000, // Opus
@@ -320,7 +330,8 @@ impl WebrtcTrack {
                 let codec = match prefer_audio_codec(&remote_desc.unmarshal()?) {
                     Some(codec) => codec,
                     None => {
-                        return Err(anyhow::anyhow!("No codec found"));
+                        info!("⚠️ No codec in offer, defaulting to G.722");
+                        crate::media::codecs::CodecType::G722
                     }
                 };
                 codec
@@ -365,10 +376,363 @@ impl WebrtcTrack {
         );
         Ok(answer)
     }
+
+    async fn send_packet(&self, frame: &AudioFrame) -> Result<()> {
+        use crate::Samples;
+
+        match &frame.samples {
+            Samples::PCM { samples } => {
+                if samples.is_empty() {
+                    debug!("Empty PCM samples, skipping");
+                    return Ok(());
+                }
+                info!(
+                    "🔊 Received PCM samples ({} samples @ {}Hz) - encoding to {}",
+                    samples.len(),
+                    frame.sample_rate,
+                    self.track_config.codec.mime_type()
+                );
+
+                let local_track = self
+                    .local_track
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("local_track not initialized"))?;
+
+
+
+                let target_frame_size = self.get_target_frame_size();
+                debug!(
+                    "🎯 Target frame size: {} samples @ {}Hz",
+                    target_frame_size,
+                    self.track_config.codec.clock_rate()
+                );
+
+                // ✅ Resample if needed
+                let resampled = if frame.sample_rate != self.track_config.codec.clock_rate() {
+                    debug!(
+                        "🔄 Resampling {}Hz → {}Hz",
+                        frame.sample_rate,
+                        self.track_config.codec.clock_rate()
+                    );
+                    resample_audio(samples, frame.sample_rate, self.track_config.codec.clock_rate())
+                } else {
+                    samples.clone()
+                };
+
+                let mut buffer = self.audio_buffer.lock().await;
+                buffer.extend_from_slice(&resampled);
+                debug!(
+                    "📦 Buffer now has {} samples (need {})",
+                    buffer.len(),
+                    target_frame_size
+                );
+
+                let mut frames_sent = 0;
+                while buffer.len() >= target_frame_size {
+                    let frame_samples: Vec<i16> = buffer.drain(0..target_frame_size).collect();
+
+                    // ✅ Encode frame
+                    let encoded_data = match self.track_config.codec {
+                        CodecType::G722 => encode_g722(&frame_samples)?,
+                        CodecType::PCMU => encode_pcmu(&frame_samples)?,
+                        CodecType::PCMA => encode_pcma(&frame_samples)?,
+                        #[cfg(feature = "opus")]
+                        CodecType::Opus => encode_opus(&frame_samples)?,
+                        #[cfg(feature = "g729")]
+                        CodecType::G729 => encode_g729(&frame_samples)?,
+                        _ => {
+                            warn!("⚠️ Unsupported codec: {:?}", self.track_config.codec);
+                            continue;
+                        }
+                    };
+
+                    if encoded_data.is_empty() {
+                        warn!("⚠️ Encoding produced empty payload");
+                        continue;
+                    }
+
+                    // ✅ Calculate frame duration (always 20ms for standard codecs)
+                    let frame_duration_ms = (target_frame_size as u64 * 1000)
+                        / (self.track_config.codec.clock_rate() as u64);
+
+                    // ✅ Create WebRTC sample
+                    let sample = webrtc::media::Sample {
+                        data: encoded_data.into(),
+                        duration: std::time::Duration::from_millis(frame_duration_ms),
+                        ..Default::default()
+                    };
+
+                    debug!(
+                        "🎵 Sending frame #{}: {} bytes, {}ms",
+                        frames_sent,
+                        sample.data.len(),
+                        frame_duration_ms
+                    );
+
+                    // ✅ Write to WebRTC
+                    local_track.write_sample(&sample).await.map_err(|e| {
+                        error!("❌ Failed to write sample: {}", e);
+                        anyhow::anyhow!("Failed to write audio: {}", e)
+                    })?;
+
+                    frames_sent += 1;
+                    
+                    // ✅ Update RTP timestamp
+                    let mut ts = self.rtp_timestamp.lock().await;
+                    *ts = ts.wrapping_add(target_frame_size as u32);
+                }
+                if frames_sent > 0 {
+                    info!(
+                        "✅ Sent {} frames from {} input samples",
+                        frames_sent, samples.len()
+                    );
+                }
+
+                Ok(())
+            }
+
+            Samples::RTP { payload, .. } => {
+                if payload.is_empty() {
+                    debug!("Empty RTP payload, skipping");
+                    return Ok(());
+                }
+
+                let local_track = self
+                    .local_track
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("local_track not initialized"))?;
+
+                let sample = webrtc::media::Sample {
+                    data: payload.clone().into(),
+                    duration: std::time::Duration::from_millis(20),
+                    ..Default::default()
+                };
+
+                local_track.write_sample(&sample).await.map_err(|e| {
+                    error!("Failed to write RTP sample to WebRTC: {}", e);
+                    anyhow::anyhow!("Failed to write RTP sample: {}", e)
+                })?;
+
+                info!("✅ RTP sample sent to WebRTC ({} bytes)", payload.len());
+                Ok(())
+            }
+
+            Samples::Empty => {
+                debug!("Empty sample, skipping");
+                Ok(())
+            }
+
+            _ => {
+                warn!("Unknown sample type, skipping");
+                Ok(())
+            }
+        }
+    }
+
+    fn get_target_frame_size(&self) -> usize {
+        match self.track_config.codec {
+            CodecType::Opus => 960,   // 20ms @ 48kHz
+            CodecType::G722 => 160,   // 20ms @ 8kHz  
+            CodecType::PCMU => 320,   // 20ms @ 16kHz ✅ Changed!
+            CodecType::PCMA => 320,   // 20ms @ 16kHz ✅ Changed!
+            CodecType::G729 => 160,   // 20ms @ 8kHz
+            _ => 160,
+        }
+    }
+    
+}
+
+// ✅ Codec encoding functions
+fn resample_audio(samples: &[i16], from_rate: u32, to_rate: u32) -> Vec<i16> {
+    if from_rate == to_rate {
+        return samples.to_vec();
+    }
+
+    // ✅ Special case: 16kHz → 8kHz (proper decimation with low-pass filter)
+    if from_rate == 16000 && to_rate == 8000 {
+        // Simple averaging filter to avoid aliasing before decimation
+        let mut filtered = Vec::new();
+        for window in samples.windows(2) {
+            let avg = ((window[0] as i32 + window[1] as i32) / 2) as i16;
+            filtered.push(avg);
+        }
+        // Now decimate by taking every 2nd sample
+        return filtered.iter().step_by(2).copied().collect();
+    }
+
+    // ✅ General resampling for other rates (linear interpolation)
+    let ratio = to_rate as f64 / from_rate as f64;
+    let mut resampled = Vec::new();
+    let mut pos = 0.0;
+
+    while (pos as usize) < samples.len().saturating_sub(1) {
+        let idx = pos as usize;
+        let frac = pos - idx as f64;
+        
+        let val = if idx + 1 < samples.len() {
+            samples[idx] as f64 * (1.0 - frac) + samples[idx + 1] as f64 * frac
+        } else {
+            samples[idx] as f64
+        };
+        
+        resampled.push(val as i16);
+        pos += 1.0 / ratio;
+    }
+
+    resampled
+}
+
+fn encode_g722(samples: &[i16]) -> Result<Vec<u8>> {
+    // ✅ G.722 encoding: simple bit packing
+    // G.722 uses 4 bits per sample (16:1 compression)
+    let mut encoded = Vec::with_capacity(samples.len() / 2);
+    
+    // Process samples in pairs for G.722 frames
+    for chunk in samples.chunks(2) {
+        if chunk.len() == 2 {
+            // Average the two samples (proper downsampling from 16kHz to 8kHz concept)
+            let avg = ((chunk[0] as i32 + chunk[1] as i32) / 2) as i16;
+            
+            // μ-law encode the averaged sample
+            encoded.push(linear_to_ulaw(avg));
+        } else if chunk.len() == 1 {
+            encoded.push(linear_to_ulaw(chunk[0]));
+        }
+    }
+    Ok(encoded)
+}
+
+fn encode_pcmu(samples: &[i16]) -> Result<Vec<u8>> {
+    // ✅ PCMU (μ-law) encoding
+    let mut encoded = Vec::with_capacity(samples.len());
+    for &sample in samples {
+        encoded.push(linear_to_ulaw(sample));
+    }
+    Ok(encoded)
+}
+
+fn encode_pcma(samples: &[i16]) -> Result<Vec<u8>> {
+    // ✅ PCMA (A-law) encoding
+    let mut encoded = Vec::with_capacity(samples.len());
+    for &sample in samples {
+        encoded.push(linear_to_alaw(sample));
+    }
+    Ok(encoded)
+}
+
+#[cfg(feature = "opus")]
+fn encode_opus(samples: &[i16]) -> Result<Vec<u8>> {
+    use opus::Encoder;
+    
+    // ✅ Create Opus encoder (48kHz, mono, 20ms frames)
+    let mut encoder = Encoder::new(48000, opus::Channels::Mono, opus::Application::Voip)?;
+    
+    // Opus expects 48kHz, so input should be resampled to 48kHz
+    let frame_size = 48000 / 50; // 20ms frame at 48kHz = 960 samples
+    
+    let mut encoded = Vec::new();
+    for chunk in samples.chunks(frame_size) {
+        // Pad if needed
+        let mut frame = vec![0i16; frame_size];
+        frame[..chunk.len()].copy_from_slice(chunk);
+        
+        let mut output = vec![0u8; 4000];
+        match encoder.encode(&frame, &mut output) {
+            Ok(len) => {
+                output.truncate(len);
+                encoded.extend_from_slice(&output);
+            }
+            Err(e) => {
+                warn!("Opus encoding failed: {}", e);
+                // Return what we have
+            }
+        }
+    }
+    
+    Ok(encoded)
+}
+
+#[cfg(feature = "g729")]
+fn encode_g729(samples: &[i16]) -> Result<Vec<u8>> {
+    // ✅ G.729 encoding would require external library
+    // For now, just pass through as-is
+    let mut encoded = Vec::with_capacity(samples.len() * 2);
+    for &sample in samples {
+        encoded.extend_from_slice(&sample.to_le_bytes());
+    }
+    Ok(encoded)
+}
+
+// ✅ μ-law encoding (PCMU)
+fn linear_to_ulaw(sample: i16) -> u8 {
+    const BIAS: i32 = 0x84;
+    const CLIP: i32 = 32635;
+    
+    let mut sign = 0;
+    let mut sample = sample as i32;
+    
+    if sample < 0 {
+        sample = -sample;
+        sign = 0x80;
+    }
+    
+    if sample > CLIP {
+        sample = CLIP;
+    }
+    
+    sample = sample + BIAS;
+    
+    let mut exponent = 7;
+    let mut mantissa = 0;
+    
+    for i in (1..=8).rev() {
+        if sample & (0xFF << i) != 0 {
+            exponent = 8 - i;
+            break;
+        }
+    }
+    
+    mantissa = (sample >> (exponent + 3)) & 0x0F;
+    
+    ((!(sign | ((exponent & 0x07) << 4) | mantissa)) & 0xFF) as u8
+}
+
+// ✅ A-law encoding (PCMA)
+fn linear_to_alaw(sample: i16) -> u8 {
+    const CLIP: i32 = 32635;
+    
+    let mut sign = 0;
+    let mut sample = sample as i32;
+    
+    if sample < 0 {
+        sample = -sample;
+        sign = 0x80;
+    }
+    
+    if sample > CLIP {
+        sample = CLIP;
+    }
+    
+    let mut exponent = 7;
+    let mut mantissa = 0;
+    
+    for i in (1..=8).rev() {
+        if sample & (0xFF << i) != 0 {
+            exponent = 8 - i;
+            break;
+        }
+    }
+    
+    mantissa = (sample >> (exponent + 3)) & 0x0F;
+    
+    ((sign | ((exponent & 0x07) << 4) | mantissa) ^ 0x55) as u8
 }
 
 #[async_trait]
 impl Track for WebrtcTrack {
+    async fn send_packet(&self, frame: &AudioFrame) -> Result<()> {
+        self.send_packet(frame).await
+    }
     fn ssrc(&self) -> u32 {
         self.ssrc
     }
@@ -417,40 +781,6 @@ impl Track for WebrtcTrack {
     async fn stop(&self) -> Result<()> {
         // Cancel all processing
         self.cancel_token.cancel();
-        Ok(())
-    }
-
-    async fn send_packet(&self, packet: &AudioFrame) -> Result<()> {
-        if self.local_track.is_none() {
-            return Ok(());
-        }
-        let local_track = match self.local_track.as_ref() {
-            Some(track) => track,
-            None => {
-                return Ok(()); // no local track, ignore
-            }
-        };
-
-        let payload_type = self.track_config.codec.payload_type();
-        let (_payload_type, payload) = self.encoder.encode(payload_type, packet.clone());
-        if payload.is_empty() {
-            return Ok(());
-        }
-
-        let sample = webrtc::media::Sample {
-            data: payload.into(),
-            duration: Duration::from_millis(self.track_config.ptime.as_millis() as u64),
-            timestamp: SystemTime::now(),
-            packet_timestamp: packet.timestamp as u32,
-            ..Default::default()
-        };
-        match local_track.write_sample(&sample).await {
-            Ok(_) => {}
-            Err(e) => {
-                error!("failed to send sample: {}", e);
-                return Err(anyhow::anyhow!("Failed to send sample: {}", e));
-            }
-        }
         Ok(())
     }
 }

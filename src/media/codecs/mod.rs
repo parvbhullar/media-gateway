@@ -71,6 +71,18 @@ pub fn create_encoder(codec: CodecType) -> Box<dyn Encoder> {
 }
 
 impl CodecType {
+    pub fn payload_type(&self) -> u8 {
+        match self {
+            CodecType::PCMU => 0,
+            CodecType::PCMA => 8,
+            CodecType::G722 => 9,
+            #[cfg(feature = "g729")]
+            CodecType::G729 => 18,
+            #[cfg(feature = "opus")]
+            CodecType::Opus => 111,
+            _ => 9, // Default to G.722
+        }
+    }
     pub fn mime_type(&self) -> &str {
         match self {
             CodecType::PCMU => "audio/PCMU",
@@ -106,18 +118,6 @@ impl CodecType {
             #[cfg(feature = "opus")]
             CodecType::Opus => 48000,
             CodecType::TelephoneEvent => 8000,
-        }
-    }
-    pub fn payload_type(&self) -> u8 {
-        match self {
-            CodecType::PCMU => 0,
-            CodecType::PCMA => 8,
-            CodecType::G722 => 9,
-            #[cfg(feature = "g729")]
-            CodecType::G729 => 18, // Static payload type
-            #[cfg(feature = "opus")]
-            CodecType::Opus => 111, // Static payload type
-            CodecType::TelephoneEvent => 101,
         }
     }
     pub fn samplerate(&self) -> u32 {

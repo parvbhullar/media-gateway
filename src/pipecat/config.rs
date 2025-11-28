@@ -12,92 +12,50 @@ pub struct PipecatConfig {
     pub enabled: bool,
     
     /// Pipecat server WebSocket URL
+    #[serde(alias = "serverUrl", alias = "server_url")]
     pub server_url: Option<String>,
     
     /// Use Pipecat for AI processing instead of internal services
+    #[serde(alias = "useForAI", alias = "use_for_ai")]
     pub use_for_ai: bool,
     
     /// Fallback to internal AI processing if Pipecat is unavailable
+    #[serde(alias = "fallbackToInternal", alias = "fallback_to_internal")]
     pub fallback_to_internal: bool,
     
     /// Connection timeout in seconds
     pub connection_timeout: u64,
     
     /// Reconnection settings
+    #[serde(default)]
     pub reconnect: PipecatReconnectConfig,
     
     /// Audio processing settings
+    #[serde(default)]
     pub audio: PipecatAudioConfig,
     
     /// Default system prompt for AI conversations
+    #[serde(default)]
     pub default_system_prompt: Option<String>,
     
     /// Enable metrics collection
+    #[serde(default)]
     pub enable_metrics: bool,
     
     /// Enable debug logging for Pipecat communication
+    #[serde(default)]
     pub debug_logging: bool,
 }
 
 /// Reconnection configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PipecatReconnectConfig {
-    /// Enable automatic reconnection
     pub enabled: bool,
-    
-    /// Maximum number of reconnection attempts
     pub max_attempts: u32,
-    
-    /// Initial delay between reconnection attempts in seconds
     pub initial_delay: u64,
-    
-    /// Maximum delay between reconnection attempts in seconds
     pub max_delay: u64,
-    
-    /// Backoff multiplier for reconnection delay
     pub backoff_multiplier: f64,
-}
-
-/// Audio processing configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PipecatAudioConfig {
-    /// Sample rate for audio processing
-    pub sample_rate: u32,
-    
-    /// Number of audio channels
-    pub channels: u32,
-    
-    /// Audio frame size in samples
-    pub frame_size: u32,
-    
-    /// Buffer size for audio frames
-    pub buffer_size: u32,
-    
-    /// Enable audio compression for WebSocket transmission
-    pub enable_compression: bool,
-    
-    /// Audio encoding format (linear16, mulaw, alaw)
-    pub encoding: String,
-}
-
-impl Default for PipecatConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            server_url: Some("ws://localhost:8765/ws/rustpbx".to_string()),
-            use_for_ai: false,
-            fallback_to_internal: true,
-            connection_timeout: 30,
-            reconnect: PipecatReconnectConfig::default(),
-            audio: PipecatAudioConfig::default(),
-            default_system_prompt: Some(
-                "You are a helpful AI assistant in a voice conversation. \
-                Respond naturally and conversationally. Keep responses brief but informative.".to_string()
-            ),
-            enable_metrics: true,
-            debug_logging: false,
-        }
-    }
 }
 
 impl Default for PipecatReconnectConfig {
@@ -112,18 +70,56 @@ impl Default for PipecatReconnectConfig {
     }
 }
 
+/// Audio processing configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PipecatAudioConfig {
+    pub sample_rate: u32,
+    pub channels: u16,
+    #[serde(default)]
+    pub frame_size: Option<usize>,
+    #[serde(default)]
+    pub buffer_size: Option<usize>,
+    #[serde(default)]
+    pub enable_compression: bool,
+    #[serde(default)]
+    pub encoding: Option<String>,
+}
+
 impl Default for PipecatAudioConfig {
     fn default() -> Self {
         Self {
             sample_rate: 16000,
             channels: 1,
-            frame_size: 160, // 10ms at 16kHz
-            buffer_size: 10,
+            frame_size: Some(160),
+            buffer_size: Some(320),
             enable_compression: false,
-            encoding: "linear16".to_string(),
+            encoding: Some("linear16".to_string()),
         }
     }
 }
+
+
+impl Default for PipecatConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            server_url: Some("ws://0.0.0.0:8081".to_string()),
+            use_for_ai: true,
+            fallback_to_internal: true,
+            connection_timeout: 30,
+            reconnect: PipecatReconnectConfig::default(),
+            audio: PipecatAudioConfig::default(),
+            default_system_prompt: Some(
+                "You are a helpful AI assistant in a voice conversation. \
+                Respond naturally and conversationally. Keep responses brief but informative.".to_string()
+            ),
+            enable_metrics: true,
+            debug_logging: false,
+        }
+    }
+}
+
 
 impl PipecatConfig {
     /// Get connection timeout as Duration
@@ -149,7 +145,7 @@ impl PipecatConfig {
     /// Get server URL or default
     pub fn get_server_url(&self) -> String {
         self.server_url.clone()
-            .unwrap_or_else(|| "ws://localhost:8765/ws/rustpbx".to_string())
+            .unwrap_or_else(|| "ws://0.0.0.0:8081".to_string())
     }
     
     /// Validate configuration
@@ -207,7 +203,7 @@ mod tests {
         assert_eq!(config.connection_timeout, 30);
         assert_eq!(config.audio.sample_rate, 16000);
         assert_eq!(config.audio.channels, 1);
-        assert_eq!(config.audio.encoding, "linear16");
+        assert_eq!(config.audio.encoding, Some("linear16".to_string()));
     }
 
     #[test]
@@ -223,7 +219,7 @@ mod tests {
         assert!(config.validate().is_err());
         
         // Valid enabled config
-        config.server_url = Some("ws://localhost:8765".to_string());
+        config.server_url = Some("ws://0.0.0.0:8081".to_string());
         assert!(config.validate().is_ok());
         
         // Invalid timeout
@@ -267,7 +263,7 @@ mod tests {
         let mut config = PipecatConfig::default();
         
         // Has default URL
-        assert_eq!(config.get_server_url(), "ws://localhost:8765/ws/rustpbx");
+        assert_eq!(config.get_server_url(), "ws://0.0.0.0:8081");
         
         // Custom URL
         config.server_url = Some("ws://custom:9000/pipecat".to_string());

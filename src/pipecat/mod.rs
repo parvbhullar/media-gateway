@@ -12,6 +12,8 @@ use tokio::sync::mpsc;
 
 pub mod client;
 pub mod config;
+pub mod passthrough;
+pub use passthrough::PassthroughTrack;
 
 pub use client::PipecatClient;
 pub use config::PipecatConfig;
@@ -238,7 +240,7 @@ mod tests {
         // Add pipecat config
         config.pipecat = Some(crate::pipecat::config::PipecatConfig {
             enabled: true,
-            server_url: Some("ws://localhost:8765/ws/rustpbx".to_string()),
+            server_url: Some("ws://0.0.0.0:8081".to_string()),
             use_for_ai: true,
             ..Default::default()
         });
@@ -247,7 +249,7 @@ mod tests {
         assert!(should_use_pipecat(&config));
         assert_eq!(
             get_server_url(&config),
-            Some("ws://localhost:8765/ws/rustpbx".to_string())
+            Some("ws://0.0.0.0:8081".to_string())
         );
     }
 

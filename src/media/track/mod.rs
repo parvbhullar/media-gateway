@@ -81,5 +81,7 @@ pub trait Track: Send + Sync {
         packet_sender: TrackPacketSender,
     ) -> Result<()>;
     async fn stop(&self) -> Result<()>;
-    async fn send_packet(&self, packet: &AudioFrame) -> Result<()>;
+    // Find the send_packet method (around line 440)
+
+    async fn send_packet(&self, frame: &AudioFrame) -> Result<()>;
 }

@@ -21,6 +21,11 @@ import pyaudio
 from scipy import signal
 
 from loguru import logger
+from dotenv import load_dotenv
+import wave
+
+
+load_dotenv()
 
 # Pipecat AI imports are optional - they will be loaded on-demand if available
 PIPECAT_AI_AVAILABLE = False
@@ -248,6 +253,40 @@ class RustPBXPipecatServer:
         self.active_sessions: Dict[str, Dict] = {}
         self.enable_speaker_playback = True  # Enable/disable speaker playback
         
+    async def test_wav_file_ingestion(self, wav_file_path: str):
+        """Test function to ingest a WAV file into the server"""
+        logger.info(f"Testing WAV file ingestion: {wav_file_path}")
+        
+        # Create a fake session
+        session_id = "test_wav_session"
+        services = await self.create_ai_services()
+        speaker = AudioSpeakerPlayer(session_id)
+        await speaker.start()
+        
+        self.active_sessions[session_id] = {
+            'websocket': None,
+            'services': services,
+            'speaker': speaker,
+            'started_at': time.time(),
+            'total_audio_bytes': 0,
+            'total_audio_chunks': 0,
+        }
+        
+        # Read WAV file in chunks
+        with wave.open(wav_file_path, 'rb') as wf:
+            logger.info(f"WAV: {wf.getnchannels()} ch, {wf.getframerate()} Hz, {wf.getnframes()} frames")
+            
+            while True:
+                frames = wf.readframes(CHUNK_SIZE)
+                if not frames:
+                    break
+                
+                await self.process_audio_chunk(frames, session_id)
+                await asyncio.sleep(0.02)  # 20ms
+        
+        await speaker.stop()
+        logger.info("WAV file ingestion test complete")
+
     async def create_ai_services(self):
         """Create AI services for processing (optional - for audio streaming, not required)"""
 
@@ -317,6 +356,16 @@ class RustPBXPipecatServer:
         """Process a single audio chunk - play on speaker and forward to AI pipeline"""
 
         try:
+            logger.debug(f"Processing audio chunk for session {session_id} ({len(audio_data)} bytes)")
+            pcm = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32)
+            if pcm.size > 0:
+                rms = float(np.sqrt(np.mean(pcm ** 2)))
+            else:
+                rms = 0.0
+
+            logger.debug(
+                f"Audio stats - Min: {pcm.min()}, Max: {pcm.max()}, RMS: {rms:.2f}"
+            )
             session = self.active_sessions.get(session_id)
             if not session:
                 logger.warning(f"Session {session_id} not found")
@@ -373,6 +422,8 @@ class RustPBXPipecatServer:
                     "timestamp": int(time.time() * 1000)
                 })
 
+                logger.debug(f"Sent audio_received metrics to RustPBX (chunk #{chunk_num})")
+
         except Exception as e:
             logger.error(f"Error processing audio chunk for session {session_id}: {e}")
             import traceback
@@ -382,6 +433,7 @@ class RustPBXPipecatServer:
 
     async def send_event_to_rustpbx(self, session_id: str, event: Dict[str, Any]):
         """Send an event back to RustPBX via WebSocket"""
+        logger.debug(f"Sending event to RustPBX for session {session_id}: {event['type']}")
         
         try:
             websocket = self.active_sessions[session_id]['websocket']
@@ -394,6 +446,8 @@ class RustPBXPipecatServer:
 
     async def run_session(self, websocket, path: str):
         """Run a session for raw audio processing from RustPBX"""
+
+        recorded_chunks: list[bytes] = []
 
         session_id = f"rustpbx_{id(websocket)}"
         logger.info(f"🎤 Starting RustPBX audio session: {session_id} for path: {path}")
@@ -448,8 +502,11 @@ class RustPBXPipecatServer:
                     if isinstance(message, bytes):
                         # Raw audio data from RustPBX
                         logger.debug(f"Received {len(message)} bytes of audio data from RustPBX")
+                        logger.debug(f"First 32 bytes of audio data: {message[:32]}")
 
                         # Process the audio chunk (includes speaker playback)
+                        audio_bytes = message
+                        recorded_chunks.append(audio_bytes)
                         await self.process_audio_chunk(message, session_id)
 
                     elif isinstance(message, str):
@@ -491,11 +548,27 @@ class RustPBXPipecatServer:
             logger.error(f"Error in session {session_id}: {e}")
             raise
         finally:
-            # Stop speaker
+            if 'recorded_chunks' in locals() and recorded_chunks:
+                raw_data = b"".join(recorded_chunks)
+
+                wav_path = f"rustpbx_capture_{session_id}.wav"
+                with wave.open(wav_path, "wb") as wf:
+                    wf.setnchannels(1)          # mono
+                    wf.setsampwidth(2)          # 16-bit PCM
+                    wf.setframerate(INPUT_SAMPLE_RATE)  # 16000 Hz
+                    wf.writeframes(raw_data)
+
+                logger.info(
+                    "💾 Saved RustPBX audio capture to %s (%.2f seconds)",
+                    wav_path,
+                    len(raw_data) / 2 / INPUT_SAMPLE_RATE,
+                )
+            else:
+                logger.info("ℹ️ No audio chunks recorded for this session")
+
             if speaker:
                 await speaker.stop()
 
-            # Clean up session
             if session_id in self.active_sessions:
                 session = self.active_sessions[session_id]
                 logger.info(
@@ -504,9 +577,9 @@ class RustPBXPipecatServer:
                     f"Duration: {time.time() - session['started_at']:.2f}s"
                 )
                 del self.active_sessions[session_id]
-
-            logger.info(f"📴 Session {session_id} ended")
             
+            logger.info(f"📴 Session {session_id} ended")
+
     async def handle_websocket_connection(self, websocket):
         """Handle incoming WebSocket connections"""
 
@@ -562,7 +635,9 @@ async def main():
 
     # Check environment variables (optional for basic audio streaming)
     deepgram_key = os.getenv("DEEPGRAM_API_KEY")
+    print(f"DEEPGRAM_API_KEY: {deepgram_key}")
     openai_key = os.getenv("OPENAI_API_KEY")
+    print(f"OPENAI: {openai_key}")
 
     if not deepgram_key or not openai_key:
         logger.warning("⚠️  API keys not set - running in AUDIO STREAMING ONLY mode")
@@ -576,6 +651,10 @@ async def main():
     # Create and start server
     server = RustPBXPipecatServer(host="localhost", port=8765)
 
+    if len(sys.argv) > 1 and sys.argv[1].endswith('.wav'):
+        await server.test_wav_file_ingestion(sys.argv[1])
+        return
+        
     try:
         await server.start_server()
     except KeyboardInterrupt:

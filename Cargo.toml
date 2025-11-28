@@ -100,6 +100,8 @@ object_store = { version = "0.12.1", features = ["aws", "azure", "gcp"] }
 humantime = "2"
 ndarray = "0.16.1"
 serde_with = "3.14.0"
+lazy_static = "1.5.0"
+serde_with_macros = "3.16.0"
 
 
 [dev-dependencies]

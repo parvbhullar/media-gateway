@@ -25,9 +25,20 @@ type WsSink = SplitSink<WsConn, Message>;
 #[serde(rename_all = "camelCase")]
 pub struct MediaPassOption {
     url: String,              // websocket url, e.g. ws://localhost:8080/
-    input_sample_rate: u32, // sample rate of audio receiving from websocket, and also the sample rate of the track
-    output_sample_rate: u32, // sample rate of audio sending to websocket server
+    input_sample_rate: u32,   // sample rate of audio receiving from websocket, and also the sample rate of the track
+    output_sample_rate: u32,  // sample rate of audio sending to websocket server
     packet_size: Option<u32>, // packet size send to websocket server, default is 2560
+}
+
+impl Default for MediaPassOption {
+    fn default() -> Self {
+        Self {
+            url: String::from("ws://localhost:8080/"),
+            input_sample_rate: 16000,
+            output_sample_rate: 16000,
+            packet_size: Some(160),
+        }
+    }
 }
 
 impl MediaPassOption {
