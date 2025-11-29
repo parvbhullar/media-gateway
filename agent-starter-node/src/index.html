@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>TTS WebSocket Test (Correct Speed)</title>
+    <style>
+      body {
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+        padding: 1rem;
+      }
+      button {
+        padding: 0.5rem 1rem;
+        font-size: 1rem;
+        cursor: pointer;
+      }
+      #log {
+        margin-top: 1rem;
+        padding: 0.5rem;
+        border: 1px solid #ccc;
+        height: 200px;
+        overflow: auto;
+        font-size: 0.8rem;
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>TTS WebSocket Test</h1>
+    <p>
+      Click the button, the page will connect to <code>ws://localhost:8090</code>,
+      get the LLM’s reply, and play the TTS audio at normal speed.
+    </p>
+    <button id="startBtn">Start TTS Stream</button>
+    <pre id="log"></pre>
+
+    <script>
+      const logEl = document.getElementById('log');
+      const startBtn = document.getElementById('startBtn');
+
+      function log(msg) {
+        console.log(msg);
+        logEl.textContent += msg + '\n';
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+
+      let audioCtx;
+      let ws;
+      let playhead = 0;
+
+      // This will be set from the server's JSON config
+      let sourceSampleRate = 16000; // default, overridden by config
+      let sourceChannels = 1;
+
+      startBtn.addEventListener('click', async () => {
+        if (!audioCtx || audioCtx.state === 'closed') {
+          // Let the browser pick its preferred sampleRate (often 44100 or 48000)
+          audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
+
+        if (audioCtx.state === 'suspended') {
+          await audioCtx.resume();
+        }
+
+        log('AudioContext state: ' + audioCtx.state);
+        log('AudioContext sampleRate: ' + audioCtx.sampleRate);
+
+        connectWs();
+      });
+
+      function connectWs() {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          log('WebSocket already open');
+          return;
+        }
+
+        ws = new WebSocket('ws://localhost:8090');
+        ws.binaryType = 'arraybuffer';
+
+        ws.onopen = () => {
+          log('WebSocket connected');
+          // Start scheduling from "now"
+          playhead = audioCtx.currentTime;
+        };
+
+        ws.onmessage = (event) => {
+          if (typeof event.data === 'string') {
+            // Could be config JSON or a plain log/error string
+            try {
+              const msg = JSON.parse(event.data);
+              if (msg.type === 'config') {
+                sourceSampleRate = msg.sampleRate;
+                sourceChannels = msg.channels;
+                log(
+                  'Received config from server: ' +
+                    JSON.stringify(msg, null, 2),
+                );
+                return;
+              }
+              // Some other JSON message
+              log('JSON from server: ' + JSON.stringify(msg));
+            } catch {
+              // Plain string
+              log('Text from server: ' + event.data);
+            }
+            return;
+          }
+
+          // Binary => PCM audio chunk
+          playPcmChunk(event.data);
+        };
+
+        ws.onerror = (err) => {
+          log('WS error: ' + err.toString());
+        };
+
+        ws.onclose = () => {
+          log('WS closed');
+        };
+      }
+
+      /**
+       * Resample a Float32Array from one sample rate to another
+       * using simple linear interpolation. Good enough for TTS streaming.
+       */
+      function resampleFloat32(input, fromRate, toRate) {
+        if (fromRate === toRate) return input;
+
+        const ratio = fromRate / toRate;
+        const outputLength = Math.round(input.length / ratio);
+        const output = new Float32Array(outputLength);
+
+        for (let i = 0; i < outputLength; i++) {
+          const srcIndex = i * ratio;
+          const idx = Math.floor(srcIndex);
+          const frac = srcIndex - idx;
+          const s0 = input[idx] ?? 0;
+          const s1 = input[idx + 1] ?? s0;
+          output[i] = s0 + frac * (s1 - s0);
+        }
+
+        return output;
+      }
+
+      function playPcmChunk(arrayBuffer) {
+        if (!audioCtx) return;
+
+        // 1) Interpret incoming bytes as 16-bit PCM
+        const int16 = new Int16Array(arrayBuffer);
+        const float32Src = new Float32Array(int16.length);
+        for (let i = 0; i < int16.length; i++) {
+          float32Src[i] = int16[i] / 32768;
+        }
+
+        // 2) Resample from sourceSampleRate (e.g. 16000) to audioCtx.sampleRate (e.g. 48000)
+        const float32 = resampleFloat32(
+          float32Src,
+          sourceSampleRate,
+          audioCtx.sampleRate,
+        );
+
+        // 3) Put into an AudioBuffer at the browser's sampleRate
+        const buffer = audioCtx.createBuffer(
+          1,
+          float32.length,
+          audioCtx.sampleRate,
+        );
+        buffer.copyToChannel(float32, 0);
+
+        const source = audioCtx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(audioCtx.destination);
+
+        // 4) Schedule back-to-back so there's no gap
+        const now = audioCtx.currentTime;
+        if (playhead < now) {
+          playhead = now;
+        }
+        source.start(playhead);
+
+        const chunkDuration = buffer.duration;
+        playhead += chunkDuration;
+
+        log(
+          `Scheduled chunk, srcLen=${float32Src.length}, resampledLen=${float32.length}, duration=${chunkDuration.toFixed(
+            3,
+          )}s`,
+        );
+      }
+    </script>
+  </body>
+</html>
