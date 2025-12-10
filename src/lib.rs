@@ -38,6 +38,9 @@ pub struct AudioFrame {
     pub samples: Samples,
     pub timestamp: u64,
     pub sample_rate: u32,
+    /// VAD state: None = not processed, Some(true) = speech detected, Some(false) = silence detected
+    #[serde(default)]
+    pub vad_speaking: Option<bool>,
 }
 
 impl Samples {

@@ -23,7 +23,7 @@ import { TrackPublishOptions } from '@livekit/rtc-node'; // Adjusted to the base
 dotenv.config({ path: '.env.local' });
 
 // ========== WebSocket server for Rust audio ==========
-const WS_PORT = Number(process.env.WS_PORT ?? 8081);
+const WS_PORT = Number(process.env.WS_PORT ?? 8765);
 
 const wss = new WebSocketServer({ port: WS_PORT });
 

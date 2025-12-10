@@ -199,7 +199,7 @@ impl AppStateBuilder {
             if pipecat_config.enabled {
                 info!(
                     "✅ Pipecat integration enabled - Server: {}, UseForAI: {}, Fallback: {}",
-                    pipecat_config.server_url.as_deref().unwrap_or("ws://0.0.0.0:8081"),
+                    pipecat_config.server_url.as_deref().unwrap_or("ws://0.0.0.0:8765"),
                     pipecat_config.use_for_ai,
                     pipecat_config.fallback_to_internal
                 );

@@ -101,7 +101,7 @@ sample_rate = 16000
 # Pipecat Media Server Configuration
 [pipecat]
 enabled = true
-server_url = "ws://localhost:8081"
+server_url = "ws://localhost:8765"
 use_for_ai = true
 fallback_to_internal = false
 connection_timeout = 30

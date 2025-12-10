@@ -143,6 +143,9 @@ impl VadProcessorInner {
             }
             self.process_vad_logic(is_speaking, timestamp, &frame.track_id)?;
 
+            // Mark the frame with VAD state (triggered = in active speech segment)
+            frame.vad_speaking = Some(self.triggered);
+
             // Clean up old buffers periodically
             if self.window_bufs.len() > 1000 || !self.triggered {
                 let cutoff = if self.triggered {

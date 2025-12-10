@@ -370,6 +370,7 @@ async fn process_audio_reader(
                 timestamp: crate::get_timestamp(),
                 samples: Samples::PCM { samples: chunk },
                 sample_rate: chunk_sample_rate,
+                vad_speaking: None,
             };
 
             match processor_chain.process_frame(&mut packet) {

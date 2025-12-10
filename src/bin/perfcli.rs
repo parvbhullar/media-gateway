@@ -55,7 +55,7 @@ struct Cli {
     #[clap(
         long,
         help = "Endpoint of the server",
-        default_value = "ws://localhost:8081"
+        default_value = "ws://localhost:8765"
     )]
     endpoint: String,
 

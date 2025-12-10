@@ -20,7 +20,7 @@ initializeLogger({ pretty: true, level: "info" });
 
 const RUSTPBX_API_URL = 'http://localhost:8080'; // Example URL, adjust as needed
 const SAMPLE_RATE = 16_000;
-const PORT = Number(process.env.PORT ?? 8081);
+const PORT = Number(process.env.PORT ?? 8765);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);

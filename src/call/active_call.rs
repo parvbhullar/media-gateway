@@ -191,7 +191,6 @@ impl ActiveCall {
         self.app_state
             .total_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
         tokio::join!(
             self.dump_loop(self.dump_events, dump_cmd_receiver, dump_event_receiver),
             async {
@@ -251,11 +250,11 @@ impl ActiveCall {
         let server_side_track_id = &self.server_side_track_id;
         let event_hook_loop = async move {
             while let Ok(event) = event_receiver.recv().await {
-                info!(
-                    session_id = self.session_id,
-                    ?event,
-                    "received session event"
-                );
+                // info!(
+                //     session_id = self.session_id,
+                //     ?event,
+                //     "received session event"
+                // );
                 match event {
                     SessionEvent::Speaking { .. }
                     | SessionEvent::Dtmf { .. }
@@ -335,6 +334,7 @@ impl ActiveCall {
                             },
                             timestamp: crate::get_timestamp(),
                             sample_rate,
+                            vad_speaking: None,
                         };
 
                         // ✅ CRITICAL: Send this frame to the media stream for immediate playback
@@ -1187,7 +1187,7 @@ impl ActiveCall {
     
         self.media_stream.update_track(track, None).await;
         
-        info!("✅ Server-side track created successfully");
+        //info!("✅ Server-side track created successfully");
         Ok(())
     }
 

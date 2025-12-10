@@ -204,6 +204,7 @@ impl Track for MediaPassTrack {
                             samples: Samples::PCM { samples },
                             timestamp: crate::get_timestamp(),
                             sample_rate,
+                            vad_speaking: None,
                         };
                         ticker.tick().await;
                         packet_sender.send(frame)?;

@@ -104,7 +104,7 @@ impl Default for PipecatConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            server_url: Some("ws://0.0.0.0:8081".to_string()),
+            server_url: Some("ws://0.0.0.0:8765".to_string()),
             use_for_ai: true,
             fallback_to_internal: true,
             connection_timeout: 30,
@@ -145,7 +145,7 @@ impl PipecatConfig {
     /// Get server URL or default
     pub fn get_server_url(&self) -> String {
         self.server_url.clone()
-            .unwrap_or_else(|| "ws://0.0.0.0:8081".to_string())
+            .unwrap_or_else(|| "ws://0.0.0.0:8765".to_string())
     }
     
     /// Validate configuration
@@ -219,7 +219,7 @@ mod tests {
         assert!(config.validate().is_err());
         
         // Valid enabled config
-        config.server_url = Some("ws://0.0.0.0:8081".to_string());
+        config.server_url = Some("ws://0.0.0.0:8765".to_string());
         assert!(config.validate().is_ok());
         
         // Invalid timeout
@@ -263,7 +263,7 @@ mod tests {
         let mut config = PipecatConfig::default();
         
         // Has default URL
-        assert_eq!(config.get_server_url(), "ws://0.0.0.0:8081");
+        assert_eq!(config.get_server_url(), "ws://0.0.0.0:8765");
         
         // Custom URL
         config.server_url = Some("ws://custom:9000/pipecat".to_string());

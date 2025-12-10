@@ -41,6 +41,100 @@ use webrtc::{
     track::track_local::track_local_static_sample::TrackLocalStaticSample,
 };
 
+// use std::fs::File;
+// use std::io::{Write, Seek, SeekFrom};
+// use std::path::PathBuf;
+
+// struct WavWriter {
+//     file: File,
+//     sample_rate: u32,
+//     num_channels: u16,
+//     bits_per_sample: u16,
+//     data_size: u32,
+//     samples_written: u32,
+//     path: Option<PathBuf>,
+// }
+
+// impl WavWriter {
+//     fn new(path: &str, sample_rate: u32, num_channels: u16, bits_per_sample: u16) -> Result<Self> {
+//         let path_buf = std::path::Path::new(path).to_path_buf();
+//         let mut file = File::create(path)?;
+        
+//         // ✅ Write placeholder header (44 bytes) - reserve space
+//         let placeholder_header = vec![0u8; 44];
+//         file.write_all(&placeholder_header)?;
+//         file.flush()?;
+        
+//         Ok(WavWriter {
+//             file,
+//             sample_rate,
+//             num_channels,
+//             bits_per_sample,
+//             data_size: 0,
+//             samples_written: 0,
+//             path: Some(path_buf),
+//         })
+//     }
+
+//     fn write_header(&mut self, data_size: u32) -> Result<()> {
+//         let byte_rate = self.sample_rate * self.num_channels as u32 * (self.bits_per_sample as u32 / 8);
+//         let block_align = self.num_channels * (self.bits_per_sample / 8);
+
+//         // ✅ Seek to start
+//         self.file.seek(SeekFrom::Start(0))?;
+
+//         // RIFF header
+//         self.file.write_all(b"RIFF")?;
+//         self.file.write_all(&(36 + data_size).to_le_bytes())?;
+//         self.file.write_all(b"WAVE")?;
+
+//         // fmt subchunk
+//         self.file.write_all(b"fmt ")?;
+//         self.file.write_all(&16u32.to_le_bytes())?; // Subchunk1Size
+//         self.file.write_all(&1u16.to_le_bytes())?;  // AudioFormat (PCM)
+//         self.file.write_all(&self.num_channels.to_le_bytes())?;
+//         self.file.write_all(&self.sample_rate.to_le_bytes())?;
+//         self.file.write_all(&byte_rate.to_le_bytes())?;
+//         self.file.write_all(&block_align.to_le_bytes())?;
+//         self.file.write_all(&self.bits_per_sample.to_le_bytes())?;
+
+//         // data subchunk
+//         self.file.write_all(b"data")?;
+//         self.file.write_all(&data_size.to_le_bytes())?;
+
+//         Ok(())
+//     }
+
+//     fn write_samples(&mut self, samples: &[i16]) -> Result<()> {
+//         for &sample in samples {
+//             self.file.write_all(&sample.to_le_bytes())?;
+//             self.data_size += 2; // 16-bit samples = 2 bytes
+//             self.samples_written += 1;
+//         }
+//         Ok(())
+//     }
+
+//     fn finalize(&mut self) -> Result<()> {
+//         // ✅ Update header with final data_size
+//         self.write_header(self.data_size)?;
+        
+//         // ✅ Seek to end and flush
+//         self.file.seek(SeekFrom::End(0))?;
+//         self.file.flush()?;
+        
+//         let duration_ms = (self.samples_written as u64 * 1000) / self.sample_rate as u64;
+//         info!(
+//             "✅ WAV file finalized: {} samples ({} ms) at {}Hz, {} bytes total",
+//             self.samples_written,
+//             duration_ms,
+//             self.sample_rate,
+//             self.data_size + 44 // +44 for WAV header
+//         );
+        
+//         Ok(())
+//     }
+// }
+
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 // Configuration for integrating a webrtc crate track with our WebrtcTrack
 #[derive(Clone)]
@@ -63,9 +157,40 @@ pub struct WebrtcTrack {
     pub ice_servers: Option<Vec<IceServer>>,
     audio_buffer: Arc<Mutex<Vec<i16>>>,
     rtp_timestamp: Arc<Mutex<u32>>,
+    //wav_writer: Arc<Mutex<Option<WavWriter>>>,
+    //all_samples: Arc<Mutex<Vec<i16>>>,
 }
 
 impl WebrtcTrack {
+
+    // async fn ensure_wav_writer(&self, input_sample_rate: u32) -> Result<()> {
+    //     let mut guard = self.wav_writer.lock().await;
+    //     if guard.is_none() {
+    //         let timestamp =
+    //             chrono::Local::now().format("%Y%m%d_%H%M%S%.3f").to_string();
+    //         let output_dir = PathBuf::from("webrtc_audio_debug");
+
+    //         std::fs::create_dir_all(&output_dir)?;
+    //         let wav_path = output_dir.join(format!(
+    //             "webrtc_raw_{}_{}.wav",
+    //             self.track_id, timestamp
+    //         ));
+
+    //         info!(
+    //             "🎙 Creating raw debug WAV at {:?} ({} Hz)",
+    //             wav_path, input_sample_rate
+    //         );
+
+    //         *guard = Some(WavWriter::new(
+    //             wav_path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid WAV path"))?,
+    //             input_sample_rate,
+    //             1,
+    //             16,
+    //         )?);
+    //     }
+    //     Ok(())
+    // }
+
     pub fn create_audio_track(
         codec: CodecType,
         stream_id: Option<String>,
@@ -112,7 +237,7 @@ impl WebrtcTrack {
             RTCRtpCodecParameters {
                 capability: RTCRtpCodecCapability {
                     mime_type: MIME_TYPE_G722.to_owned(),
-                    clock_rate: 8000,
+                    clock_rate: 16000,
                     channels: 1,
                     sdp_fmtp_line: "".to_owned(),
                     rtcp_feedback: vec![],
@@ -186,6 +311,8 @@ impl WebrtcTrack {
             ice_servers,
             audio_buffer: Arc::new(Mutex::new(Vec::new())),
             rtp_timestamp: Arc::new(Mutex::new(rand::random::<u32>())),
+            //wav_writer: Arc::new(Mutex::new(None)),
+            //all_samples: Arc::new(Mutex::new(Vec::new())),  // ✅ NEW
         }
     }
     pub fn with_ssrc(mut self, ssrc: u32) -> Self {
@@ -386,6 +513,17 @@ impl WebrtcTrack {
                     debug!("Empty PCM samples, skipping");
                     return Ok(());
                 }
+
+                // self.ensure_wav_writer(frame.sample_rate).await?;
+                // {
+                //     let mut guard = self.wav_writer.lock().await;
+                //     if let Some(writer) = guard.as_mut() {
+                //         if let Err(e) = writer.write_samples(samples) {
+                //             warn!("⚠️ Failed to write to raw WAV: {}", e);
+                //         }
+                //     }
+                // }
+
                 info!(
                     "🔊 Received PCM samples ({} samples @ {}Hz) - encoding to {}",
                     samples.len(),
@@ -431,6 +569,15 @@ impl WebrtcTrack {
                 while buffer.len() >= target_frame_size {
                     let frame_samples: Vec<i16> = buffer.drain(0..target_frame_size).collect();
 
+                    // {
+                    //     let mut wav_guard = self.wav_writer.lock().await;
+                    //     if let Some(writer) = wav_guard.as_mut() {
+                    //         if let Err(e) = writer.write_samples(&frame_samples) {
+                    //             warn!("⚠️ Failed to write samples to WAV: {}", e);
+                    //         }
+                    //     }
+                    // }
+
                     // ✅ Encode frame
                     let encoded_data = match self.track_config.codec {
                         CodecType::G722 => encode_g722(&frame_samples)?,
@@ -462,12 +609,12 @@ impl WebrtcTrack {
                         ..Default::default()
                     };
 
-                    debug!(
-                        "🎵 Sending frame #{}: {} bytes, {}ms",
-                        frames_sent,
-                        sample.data.len(),
-                        frame_duration_ms
-                    );
+                    // debug!(
+                    //     "🎵 Sending frame #{}: {} bytes, {}ms",
+                    //     frames_sent,
+                    //     sample.data.len(),
+                    //     frame_duration_ms
+                    // );
 
                     // ✅ Write to WebRTC
                     local_track.write_sample(&sample).await.map_err(|e| {
@@ -779,7 +926,24 @@ impl Track for WebrtcTrack {
     }
 
     async fn stop(&self) -> Result<()> {
-        // Cancel all processing
+        // info!("🛑 Stopping WebrtcTrack - finalizing debug WAV (if any)");
+
+        // {
+        //     let mut guard = self.wav_writer.lock().await;
+        //     if let Some(writer) = guard.as_mut() {
+        //         if let Err(e) = writer.finalize() {
+        //             error!("❌ Failed to finalize WAV: {}", e);
+        //         } else {
+        //             info!("✅ Debug WAV finalized successfully");
+        //         }
+        //     } else {
+        //         info!("ℹ️ No WAV writer active, nothing to finalize");
+        //     }
+
+        //     // Drop the writer
+        //     *guard = None;
+        // }
+
         self.cancel_token.cancel();
         Ok(())
     }

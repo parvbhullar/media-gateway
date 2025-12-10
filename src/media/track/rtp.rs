@@ -900,6 +900,7 @@ impl RtpTrack {
                         },
                         timestamp: crate::get_timestamp(),
                         sample_rate,
+                        vad_speaking: None,
                     };
 
                     jitter.push(frame);

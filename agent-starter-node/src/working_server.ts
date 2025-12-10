@@ -17,7 +17,7 @@ dotenv.config({ path: '.env.local' });
 
 initializeLogger({ pretty: true, level: 'info' });
 
-const PORT = Number(process.env.PORT ?? 8081);
+const PORT = Number(process.env.PORT ?? 8765);
 const RUSTPBX_API_URL = 'http://localhost:8080'; // RustPBX API endpoint
 const SAMPLE_RATE = 16_000;
 const INPUT_SAMPLE_RATE = 16_000;   // change if your incoming audio is 44100/48000 etc.

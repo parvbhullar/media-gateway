@@ -17,7 +17,7 @@ dotenv.config({ path: '.env.local' });
 
 initializeLogger({ pretty: true, level: 'info' });
 
-const PORT = Number(process.env.PORT ?? 8081);
+const PORT = Number(process.env.PORT ?? 8765);
 const SAMPLE_RATE = 16_000;
 
 const __filename = fileURLToPath(import.meta.url);

@@ -118,6 +118,7 @@ impl Track for WebsocketTrack {
                         samples,
                         timestamp: crate::get_timestamp(),
                         sample_rate,
+                        vad_speaking: None,
                     };
                     match packet_sender.send(packet) {
                         Ok(_) => (),

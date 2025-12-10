@@ -22,7 +22,7 @@ class WebSocketManager {
         this.updateConnectionStatus('connecting');
         
         // Try to connect to Pipecat server WebSocket
-        const wsUrl = `ws://0.0.0.0:8081`;
+        const wsUrl = `ws://0.0.0.0:8765`;
         console.log('🔌 Connecting to WebSocket:', wsUrl);
         console.log('ℹ️ Make sure the Pipecat server is running and accessible.');
         

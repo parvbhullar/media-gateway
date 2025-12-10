@@ -465,6 +465,7 @@ impl Track for TtsTrack {
                                         samples: Samples::PCM { samples: packet_samples },
                                         timestamp: crate::get_timestamp(),
                                         sample_rate,
+                                        vad_speaking: None,
                                     }
                                 } else {
                                     if is_recv_finished {
@@ -475,6 +476,7 @@ impl Track for TtsTrack {
                                         samples: Samples::PCM { samples: Vec::new() },
                                         timestamp: crate::get_timestamp(),
                                         sample_rate,
+                                        vad_speaking: None,
                                     }
                                 };
                                 *remaining_size_ref.lock().await = buffer.len();

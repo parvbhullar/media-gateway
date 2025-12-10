@@ -15,6 +15,7 @@ impl Default for AudioFrame {
             samples: Samples::Empty,
             timestamp: 0,
             sample_rate: 16000,
+            vad_speaking: None,
         }
     }
 }

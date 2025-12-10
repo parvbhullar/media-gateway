@@ -60,7 +60,7 @@ function mainApp() {
             },
             pipecat: {
                 enabled: true,
-                serverUrl: 'ws://0.0.0.0:8081',
+                serverUrl: 'ws://0.0.0.0:8765',
                 use_for_ai: true,
                 fallbackToInternal: true,
                 default_system_prompt: 'You are a helpful AI assistant in a voice conversation. Respond naturally and conversationally. Keep responses brief but informative.'
@@ -231,7 +231,7 @@ function mainApp() {
         connectWebSocket() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             const wsUrl = `${protocol}//${window.location.host}/call/${this.config.callType}`;
-            //const wsUrl = `ws://0.0.0.0:8081`;
+            //const wsUrl = `ws://0.0.0.0:8765`;
 
             this.addLogEntry('info', `Connecting to WebSocket at ${wsUrl}`);
 

@@ -240,7 +240,7 @@ mod tests {
         // Add pipecat config
         config.pipecat = Some(crate::pipecat::config::PipecatConfig {
             enabled: true,
-            server_url: Some("ws://0.0.0.0:8081".to_string()),
+            server_url: Some("ws://0.0.0.0:8765".to_string()),
             use_for_ai: true,
             ..Default::default()
         });
@@ -249,7 +249,7 @@ mod tests {
         assert!(should_use_pipecat(&config));
         assert_eq!(
             get_server_url(&config),
-            Some("ws://0.0.0.0:8081".to_string())
+            Some("ws://0.0.0.0:8765".to_string())
         );
     }
 
