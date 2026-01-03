@@ -1,0 +1,107 @@
+version: '3.8'
+
+services:
+  kamailio:
+    image: kamailio/kamailio:5.7.3-bullseye
+    container_name: kamailio-sbc
+    restart: unless-stopped
+    network_mode: host  # Required for SIP - needs direct port access
+    volumes:
+      - ./kamailio.cfg:/etc/kamailio/kamailio.cfg:ro
+      - ./kamailio-local.cfg:/etc/kamailio/kamailio-local.cfg:ro
+      - /var/log/kamailio:/var/log/kamailio
+      - /run/kamailio:/run/kamailio
+    environment:
+      - SHM_MEMORY=256
+      - PKG_MEMORY=64
+    depends_on:
+      - mysql
+      - rtpengine
+    command: >
+      kamailio -DD -E -f /etc/kamailio/kamailio.cfg
+      -m ${SHM_MEMORY:-256} -M ${PKG_MEMORY:-64}
+    healthcheck:
+      test: ["CMD", "kamctl", "monitor"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  rtpengine:
+    image: drachtio/rtpengine:latest
+    container_name: rtpengine
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./rtpengine.conf:/etc/rtpengine/rtpengine.conf:ro
+    command: >
+      rtpengine --config-file=/etc/rtpengine/rtpengine.conf
+      --interface=internal/10.0.0.100
+      --interface=external/203.0.113.50
+      --listen-ng=127.0.0.1:2223
+      --port-min=10000
+      --port-max=20000
+      --log-level=6
+      --foreground
+    cap_add:
+      - NET_ADMIN
+      - SYS_NICE
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "2223"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  mysql:
+    image: mysql:8.0
+    container_name: kamailio-db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-kamailioroot}
+      MYSQL_DATABASE: kamailio
+      MYSQL_USER: kamailio
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-kamailiorw}
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./kamailio_schema.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    ports:
+      - "127.0.0.1:3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Homer for SIP tracing (optional but recommended)
+  homer-webapp:
+    image: sipcapture/homer-webapp:latest
+    container_name: homer-webapp
+    restart: unless-stopped
+    environment:
+      - DB_HOST=mysql
+      - DB_USER=kamailio
+      - DB_PASS=${MYSQL_PASSWORD:-kamailiorw}
+    ports:
+      - "9080:80"
+    depends_on:
+      - mysql
+
+  # Prometheus metrics exporter (optional)
+  kamailio-exporter:
+    image: pascomnet/kamailio_exporter:latest
+    container_name: kamailio-exporter
+    restart: unless-stopped
+    command: ["--kamailio.scrape-uri", "http://127.0.0.1:5060"]
+    ports:
+      - "9494:9494"
+    depends_on:
+      - kamailio
+
+volumes:
+  mysql_data:
+
+networks:
+  default:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
