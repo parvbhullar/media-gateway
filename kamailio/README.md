@@ -1,265 +1,495 @@
 # Kamailio SBC for Voice AI Infrastructure
 
-Multi-tenant SBC/Proxy for bridging private telecom carriers to public Voice AI gateways (LiveKit).
+Multi-tenant SBC/Proxy for bridging private telecom carriers to public Voice AI gateways (VAPI/LiveKit).
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Prerequisites](#prerequisites)
+- [File Structure](#file-structure)
+- [Setup Instructions](#setup-instructions)
+- [Current Deployment](#current-deployment)
+- [Gateway Management](#gateway-management)
+- [Service Management](#service-management)
+- [Troubleshooting](#troubleshooting)
+
+## Overview
+
+This Kamailio SBC provides bidirectional SIP proxy functionality:
+
+| Direction | Flow | Use Case |
+|-----------|------|----------|
+| **Inbound** | Telecom → Voice AI | Customer calls routed to AI agents |
+| **Outbound** | Voice AI → Telecom | AI-initiated calls to customers |
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              PRIVATE NETWORK                                 │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐                   │
-│  │   Carrier 1  │    │   Carrier 2  │    │   Carrier N  │                   │
-│  │  10.0.1.10   │    │  10.0.1.20   │    │  10.0.1.x    │                   │
-│  └──────┬───────┘    └──────┬───────┘    └──────┬───────┘                   │
-│         │                   │                   │                            │
-│         └───────────────────┼───────────────────┘                            │
-│                             │                                                │
-│                    ┌────────▼────────┐                                       │
-│                    │    KAMAILIO     │                                       │
-│                    │   10.0.0.100    │◄──── Private Interface (:5060)       │
-│                    │  (SBC/Proxy)    │                                       │
-│                    │                 │                                       │
-│                    │  ┌───────────┐  │                                       │
-│                    │  │ RTPEngine │  │                                       │
-│                    │  │  (Media)  │  │                                       │
-│                    │  └───────────┘  │                                       │
-│                    └────────┬────────┘                                       │
-│                             │                                                │
-└─────────────────────────────┼────────────────────────────────────────────────┘
-                              │
-                    ┌─────────▼─────────┐
-                    │  203.0.113.50     │◄──── Public Interface (:5080)
-                    │  (Public IP)      │
-                    └─────────┬─────────┘
-                              │
-┌─────────────────────────────┼────────────────────────────────────────────────┐
-│                             │              PUBLIC NETWORK / CLOUD            │
-│         ┌───────────────────┼───────────────────┐                            │
-│         │                   │                   │                            │
-│  ┌──────▼───────┐    ┌──────▼───────┐    ┌──────▼───────┐                   │
-│  │  LiveKit GW  │    │  LiveKit GW  │    │  LiveKit GW  │                   │
-│  │  (Group 1)   │    │  (Group 2)   │    │  (Backup)    │                   │
-│  │   Default    │    │   Premium    │    │   Group 3    │                   │
-│  └──────┬───────┘    └──────┬───────┘    └──────┬───────┘                   │
-│         │                   │                   │                            │
-│         └───────────────────┼───────────────────┘                            │
-│                             │                                                │
-│                    ┌────────▼────────┐                                       │
-│                    │    LIVEKIT      │                                       │
-│                    │   Voice AI      │                                       │
-│                    │   Processing    │                                       │
-│                    └─────────────────┘                                       │
-└─────────────────────────────────────────────────────────────────────────────┘
+┌────────────────────┐                                        ┌────────────────────┐
+│   PRIVATE SIDE     │                                        │    PUBLIC SIDE     │
+│                    │                                        │                    │
+│  ┌──────────────┐  │       ┌──────────────────────┐         │  ┌──────────────┐  │
+│  │   Vodafone   │  │       │    KAMAILIO SBC      │         │  │     VAPI     │  │
+│  │              │  │       │                      │         │  │  (Group 1)   │  │
+│  │ 10.230.73.220│◄─┼──────►│ Private Interface    │         │  └──────────────┘  │
+│  │    :5060     │  │  SIP  │ 10.230.73.225:5060   │         │                    │
+│  └──────────────┘  │       │                      │         │  ┌──────────────┐  │
+│                    │       │  ┌────────────────┐  │         │  │   LiveKit    │  │
+│                    │       │  │   RTPEngine    │  │   SIP   │  │  (Group 2)   │  │
+│                    │       │  │  127.0.0.1:2223│  │◄───────►│  │  - Primary   │  │
+│                    │       │  │  (Media Bridge)│  │         │  │  - DigiPanda │  │
+│                    │       │  └────────────────┘  │         │  │  - Voxket    │  │
+│                    │       │                      │         │  │  - Fabriq    │  │
+│                    │       │ Public Interface     │         │  └──────────────┘  │
+│                    │       │ 103.146.242.234:5060 │         │                    │
+│                    │       └──────────────────────┘         │  ┌──────────────┐  │
+│                    │                                        │  │ Unpod Cloud  │  │
+│                    │                                        │  │  (Group 3)   │  │
+│                    │                                        │  │   Backup     │  │
+│                    │                                        │  └──────────────┘  │
+└────────────────────┘                                        └────────────────────┘
 ```
 
-## Call Flow
+### Call Flow
 
-### Inbound (Telecom → LiveKit)
 ```
-1. Carrier sends INVITE to Kamailio (10.0.0.100:5060)
-2. Kamailio identifies tenant (by source IP, header, or prefix)
-3. Kamailio selects gateway from dispatcher (load-balanced)
-4. RTPEngine bridges media (internal ↔ external)
-5. INVITE forwarded to LiveKit gateway (203.0.113.x:5060)
-6. LiveKit processes call with Voice AI
+═══════════════════════════════════════════════════════════════════════════════════
+                           INBOUND (Telecom → Voice AI)
+═══════════════════════════════════════════════════════════════════════════════════
+
+  Vodafone                 Kamailio SBC                      Voice AI Gateway
+  10.230.73.220           10.230.73.225                     (VAPI/LiveKit)
+       │                        │                                  │
+       │──── INVITE ───────────►│ (Private :5060)                  │
+       │                        │                                  │
+       │                        │──────── INVITE ─────────────────►│ (Public :5060)
+       │                        │         (via Dispatcher)         │
+       │                        │                                  │
+       │◄─── 200 OK ────────────│◄──────── 200 OK ─────────────────│
+       │                        │                                  │
+       │════ RTP Media ════════►│◄════════ RTP Media ══════════════│
+       │                   (RTPEngine bridges media)               │
+
+
+═══════════════════════════════════════════════════════════════════════════════════
+                           OUTBOUND (Voice AI → Telecom)
+═══════════════════════════════════════════════════════════════════════════════════
+
+  Vodafone                 Kamailio SBC                      Voice AI Gateway
+  10.230.73.220           10.230.73.225                     (VAPI/LiveKit)
+       │                        │                                  │
+       │                        │◄─────── INVITE ──────────────────│ (Public :5060)
+       │                        │                                  │
+       │◄─── INVITE ────────────│ (Private :5060)                  │
+       │                        │                                  │
+       │──── 200 OK ───────────►│──────── 200 OK ─────────────────►│
+       │                        │                                  │
+       │◄═══ RTP Media ═════════│═════════ RTP Media ══════════════│
+       │                   (RTPEngine bridges media)               │
+
 ```
 
-### Outbound (LiveKit → Telecom)
+## Prerequisites
+
+- Docker and Docker Compose
+- Two network interfaces (private and public)
+- Open ports: 5060/udp, 5060/tcp, 10000-20000/udp (RTP)
+
+## File Structure
+
 ```
-1. LiveKit sends INVITE to Kamailio (203.0.113.50:5080)
-2. Kamailio identifies destination carrier
-3. RTPEngine bridges media (external ↔ internal)
-4. INVITE forwarded to carrier (10.0.1.x:5060)
-5. Telecom delivers call
+kamailio/
+├── docker-compose.yml      # Docker stack definition
+├── Dockerfile              # Custom Kamailio image
+├── kamailio.cfg            # Main Kamailio configuration
+├── kamailio-local.cfg      # Local IP overrides
+├── kamailio_schema.sql     # Database schema
+├── rtpengine.conf          # RTPEngine configuration
+└── README.md               # This file
 ```
 
-## Quick Start
+## Setup Instructions
 
-### 1. Configure IPs
-
-Edit `kamailio.cfg` and update:
-```
-#!substdef "!PRIVATE_IP!10.0.0.100!g"      # Your private interface
-#!substdef "!PUBLIC_IP!203.0.113.50!g"      # Your public interface
-#!substdef "!TELECOM_CARRIER_1!10.0.1.10!g" # Primary carrier
-#!substdef "!TELECOM_CARRIER_2!10.0.1.20!g" # Secondary carrier
-```
-
-Update `rtpengine.conf`:
-```
-interface = internal/10.0.0.100
-interface = external/203.0.113.50
-```
-
-### 2. Deploy with Docker
+### Step 1: Install Docker
 
 ```bash
-# Set environment variables
-export MYSQL_PASSWORD=your_secure_password
+curl -fsSL https://get.docker.com | sh
+```
 
-# Start stack
-docker-compose up -d
+### Step 2: Configure Network IPs
+
+Edit `kamailio-local.cfg` with your network IPs:
+
+```bash
+# kamailio-local.cfg
+#!substdef "!PRIVATE_IP!10.230.73.225!g"      # Your private interface
+#!substdef "!PUBLIC_IP!103.146.242.234!g"      # Your public interface
+#!substdef "!TELECOM_CARRIER_1!10.230.73.220!g" # Telecom carrier IP
+```
+
+Update `kamailio.cfg` with the same IPs:
+
+```kamailio
+# Network Configuration (around line 25)
+#!substdef "!PRIVATE_IP!10.230.73.225!g"
+#!substdef "!PUBLIC_IP!103.146.242.234!g"
+#!substdef "!PRIVATE_PORT!5060!g"
+#!substdef "!PUBLIC_PORT!5060!g"
+
+# Carrier Configuration
+#!substdef "!TELECOM_CARRIER_1!10.230.73.220!g"
+```
+
+Add aliases for OPTIONS keepalive responses (around line 38):
+
+```kamailio
+# Aliases so "myself" matches our listening IPs
+alias=10.230.73.225
+alias=103.146.242.234
+```
+
+### Step 3: Configure RTPEngine
+
+Edit `rtpengine.conf`:
+
+```ini
+[rtpengine]
+interface = internal/10.230.73.225
+interface = external/103.146.242.234
+listen-ng = 127.0.0.1:2223
+port-min = 10000
+port-max = 20000
+log-level = 6
+foreground = true
+```
+
+### Step 4: Update Docker Compose
+
+Ensure `docker-compose.yml` has correct interface IPs for RTPEngine:
+
+```yaml
+rtpengine:
+  command: >
+    rtpengine --config-file=/etc/rtpengine/rtpengine.conf
+    --interface=internal/10.230.73.225
+    --interface=external/103.146.242.234
+    --listen-ng=127.0.0.1:2223
+    --port-min=10000
+    --port-max=20000
+```
+
+### Step 5: Create Log Directories
+
+```bash
+sudo mkdir -p /var/log/kamailio /run/kamailio
+sudo chmod 777 /var/log/kamailio /run/kamailio
+```
+
+### Step 6: Start the Stack
+
+```bash
+cd /var/apps/media-gateway/kamailio
+
+# Start all services
+docker compose up -d
 
 # Wait for MySQL to initialize
 sleep 30
 
 # Verify services
-docker-compose ps
+docker compose ps
 ```
 
-### 3. Add Gateways
+### Step 7: Verify Setup
 
 ```bash
-# Using CLI
-./kamctl-sbc.sh add-gateway 1 "sip:livekit-gw1.example.com:5060" "LiveKit Primary" 10 50
+# Check Kamailio is listening
+ss -lnup | grep ":5060"
 
-# Using API
-curl -X POST http://localhost:8080/api/v1/gateways \
-  -H "Content-Type: application/json" \
-  -d '{
-    "destination": "sip:livekit-gw1.example.com:5060",
-    "group": 1,
-    "priority": 10,
-    "weight": 50,
-    "description": "LiveKit Primary"
-  }'
+# Test OPTIONS response on both interfaces
+sipsak -s sip:10.230.73.225:5060   # Private
+sipsak -s sip:103.146.242.234:5060  # Public
+
+# Check logs
+docker logs kamailio-sbc 2>&1 | head -50
 ```
 
-### 4. Add Tenants
+## Current Deployment
+
+### Services
+
+| Service | Container | Endpoint |
+|---------|-----------|----------|
+| Kamailio SBC | kamailio-sbc | 10.230.73.225:5060 (private), 103.146.242.234:5060 (public) |
+| RTPEngine | rtpengine | 127.0.0.1:2223 |
+| MySQL | kamailio-db | 127.0.0.1:3306 |
+
+### Gateway Groups
+
+| Group | Gateway | Endpoint | Description |
+|-------|---------|----------|-------------|
+| 1 | VAPI | 66e592d6-d690-45bb-8996-18215af542d0.sip.vapi.ai | Primary AI Gateway |
+| 2 | LiveKit | 3i5bvr312d9.sip.livekit.cloud | LiveKit Primary |
+| 2 | DigiPanda | 61xh9s3ubwq.sip.livekit.cloud | DigiPanda LiveKit |
+| 2 | Voxket | 4gv2kcqpg2d.sip.livekit.cloud | Voxket LiveKit |
+| 2 | Fabriq | 15j2dl095m2.sip.livekit.cloud | Fabriq LiveKit |
+| 3 | Unpod Cloud | sip-up-tt.unpod.tv | Backup Gateway |
+| 3 | Unpod Cloud | sip.unpod.tel | Backup Gateway |
+
+### Network Configuration
+
+- **Private Interface**: `10.230.73.225:5060` - Receives calls from Vodafone
+- **Public Interface**: `103.146.242.234:5060` - Connects to Voice AI gateways
+- **Telecom Carrier**: Vodafone INT Phony at `10.230.73.220:5060`
+
+## Gateway Management
+
+### List Gateways
 
 ```bash
-# CLI
-./kamctl-sbc.sh add-tenant "askiitians" "10.0.1.50" 1 20 200
-
-# API
-curl -X POST http://localhost:8080/api/v1/tenants \
-  -H "Content-Type: application/json" \
-  -d '{
-    "tenant_id": "askiitians",
-    "source_ip": "10.0.1.50",
-    "gateway_group": 1,
-    "max_cps": 20,
-    "max_concurrent": 200
-  }'
+docker exec kamailio-db mysql -u kamailio -pkamailiorw kamailio \
+  -e "SELECT setid AS 'Group', destination AS 'Gateway', description FROM dispatcher;"
 ```
 
-### 5. Add Carriers
+### Add Gateway
 
 ```bash
-# Allow carrier IP
-./kamctl-sbc.sh add-carrier "10.0.1.10" 32 "Primary-Carrier" 1
+docker exec kamailio-db mysql -u kamailio -pkamailiorw kamailio -e "
+INSERT INTO dispatcher (setid, destination, flags, priority, attrs, description) VALUES
+(2, 'sip:new-gateway.example.com:5060;transport=tcp', 0, 10, 'weight=50;socket=udp:103.146.242.234:5080', 'New Gateway');
+"
+
+# Reload dispatcher
+docker exec kamailio-sbc kamcmd dispatcher.reload
 ```
 
-## Dispatcher Groups
+### Remove Gateway
 
-| Group | Purpose | Use Case |
-|-------|---------|----------|
-| 1 | Default | Standard tenants |
-| 2 | Premium | Low-latency, priority routing |
-| 3 | Backup | Failover when groups 1/2 fail |
-
-## Tenant Identification
-
-Tenants can be identified by:
-
-1. **Source IP** - Map carrier IP to tenant in `tenant_config`
-2. **X-Tenant-ID Header** - Carrier sends header with INVITE
-3. **Username Prefix** - Format: `tenantid_phonenumber` (e.g., `mahindra_919876543210`)
-
-## API Endpoints
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/api/v1/gateways` | List all gateways |
-| POST | `/api/v1/gateways` | Add gateway |
-| DELETE | `/api/v1/gateways/{id}` | Remove gateway |
-| GET | `/api/v1/tenants` | List tenants |
-| POST | `/api/v1/tenants` | Add/update tenant |
-| DELETE | `/api/v1/tenants/{id}` | Remove tenant |
-| POST | `/api/v1/route` | Dynamic routing (for Kamailio) |
-| GET | `/api/v1/status` | System status |
-| GET | `/api/v1/stats/calls` | Call statistics |
-
-## Performance Tuning
-
-### Kamailio
 ```bash
-# Increase shared memory (256MB default)
-kamailio -m 512 -M 128
+docker exec kamailio-db mysql -u kamailio -pkamailiorw kamailio \
+  -e "DELETE FROM dispatcher WHERE id = <gateway_id>;"
 
-# Increase children processes
-children=16
-
-# Enable async processing
-loadmodule "async.so"
+# Reload dispatcher
+docker exec kamailio-sbc kamcmd dispatcher.reload
 ```
 
-### RTPEngine
-```bash
-# Kernel forwarding (requires module)
-modprobe xt_RTPENGINE
-rtpengine --table=0
+### Reload Dispatcher (after changes)
 
-# Increase port range
-port-min = 10000
-port-max = 60000
+```bash
+docker exec kamailio-sbc kamcmd dispatcher.reload
 ```
 
-### System
-```bash
-# File descriptors
-ulimit -n 65536
+## Database Tables
 
-# Network buffers
-sysctl -w net.core.rmem_max=16777216
-sysctl -w net.core.wmem_max=16777216
+### dispatcher (Gateway routing)
+
+| Column | Description |
+|--------|-------------|
+| setid | Gateway group (1=VAPI, 2=LiveKit, 3=Backup) |
+| destination | SIP URI of gateway |
+| priority | Higher = preferred |
+| attrs | weight, socket binding |
+
+### address (IP ACL)
+
+| Column | Description |
+|--------|-------------|
+| grp | 1=Telecom carriers, 2=Public gateways |
+| ip_addr | IP address to allow |
+| mask | CIDR mask |
+| tag | Description |
+
+### did_routing (DID to Gateway mapping)
+
+| Column | Description |
+|--------|-------------|
+| did | Phone number (DID) |
+| gateway_group | Target dispatcher group |
+| gateway_uri | Direct gateway URI (optional) |
+
+## Service Management
+
+### Start Services
+
+```bash
+cd /var/apps/media-gateway/kamailio
+
+# Start all services in background
+docker compose up -d
+
+# Start with logs visible
+docker compose up
+
+# Start and rebuild containers
+docker compose up -d --build
 ```
 
-## Monitoring
+### Stop Services
 
-### Homer (SIP Tracing)
-Access at `http://your-server:9080`
-
-### Prometheus Metrics
-Kamailio exporter at `:9494/metrics`
-
-### Logs
 ```bash
-# Kamailio logs
-tail -f /var/log/kamailio/kamailio.log
+# Stop all services
+docker compose down
 
-# RTPEngine
-journalctl -u rtpengine -f
+# Stop without removing containers
+docker compose stop
+```
+
+### Restart Services
+
+```bash
+# Restart all services
+docker compose restart
+
+# Restart specific service
+docker compose restart kamailio
+docker compose restart rtpengine
+docker compose restart mysql
+```
+
+### View Logs
+
+```bash
+# All services
+docker compose logs -f
+
+# Specific service
+docker logs kamailio-sbc -f
+docker logs rtpengine -f
+docker logs kamailio-db -f
+
+# Last 50 lines
+docker logs kamailio-sbc 2>&1 | tail -50
+
+# Recent logs (last 5 minutes)
+docker logs kamailio-sbc --since 5m
+```
+
+### Service Status
+
+```bash
+# Check running containers
+docker compose ps
+
+# Check listening ports
+ss -lnup | grep -E "5060|5080"
+
+# Test SIP connectivity
+sipsak -s sip:10.230.73.225:5060   # Private interface
+sipsak -s sip:103.146.242.234:5060  # Public interface
+sipsak -s sip:10.230.73.220:5060    # Vodafone
+```
+
+### Kamailio Commands
+
+```bash
+# Reload dispatcher (after gateway changes)
+docker exec kamailio-sbc kamcmd dispatcher.reload
+
+# List dispatcher gateways
+docker exec kamailio-sbc kamcmd dispatcher.list
+
+# View active dialogs/calls
+docker exec kamailio-sbc kamcmd dlg.list
+
+# Check RTPEngine connection
+docker exec kamailio-sbc kamcmd rtpengine.show all
 ```
 
 ## Troubleshooting
 
-### Gateway Not Reachable
-```bash
-# Check dispatcher status
-kamcmd dispatcher.list
+### Check Service Status
 
-# Ping gateway
-kamcmd dispatcher.ping 1
+```bash
+docker compose ps
+docker logs kamailio-sbc 2>&1 | tail -50
 ```
 
-### Calls Failing
-```bash
-# Check recent failures
-./kamctl-sbc.sh stats
+### Test SIP Connectivity
 
-# SIP trace
-sngrep -d any port 5060 or port 5080
+```bash
+# Test OPTIONS response
+sipsak -s sip:10.230.73.225:5060
+
+# Trace SIP traffic
+sngrep -d any port 5060
 ```
 
-### Media Issues
-```bash
-# RTPEngine stats
-echo '{ "command": "statistics" }' | nc -u 127.0.0.1 2223
+### Common Issues
 
-# Check interfaces
-rtpengine-ctl list numsessions
+#### OPTIONS Keepalive Not Responding
+
+Ensure aliases are configured in `kamailio.cfg`:
+```kamailio
+alias=10.230.73.225
+alias=103.146.242.234
 ```
+
+And OPTIONS handler is FIRST in REQINIT route:
+```kamailio
+route[REQINIT] {
+    # OPTIONS keepalive reply - handle FIRST
+    if (is_method("OPTIONS") && uri == myself) {
+        sl_send_reply("200", "OK");
+        exit;
+    }
+    # ... rest of checks
+}
+```
+
+#### Database Connection Errors
+
+Check MySQL is accessible:
+```bash
+docker exec kamailio-db mysql -u kamailio -pkamailiorw -e "SELECT 1;"
+```
+
+Verify db_url in kamailio.cfg uses port:
+```kamailio
+modparam("dispatcher", "db_url", "mysql://kamailio:kamailiorw@127.0.0.1:3306/kamailio")
+```
+
+#### RTPEngine Not Working
+
+Check RTPEngine is running:
+```bash
+echo '{ "command": "ping" }' | nc -u 127.0.0.1 2223
+```
+
+### View Active Calls
+
+```bash
+docker exec kamailio-sbc kamcmd dlg.list
+```
+
+### Restart Services
+
+```bash
+# Restart all
+docker compose restart
+
+# Restart just Kamailio
+docker compose restart kamailio
+
+# Full rebuild
+docker compose down
+docker compose up -d --build
+```
+
+## Configuration Reference
+
+### Key kamailio.cfg Sections
+
+| Line Range | Section | Purpose |
+|------------|---------|---------|
+| 25-40 | Network Config | IP addresses, ports, aliases |
+| 70-100 | Module Loading | Required Kamailio modules |
+| 130-170 | Module Params | Database URLs, dispatcher settings |
+| 230-262 | REQINIT | Request validation, OPTIONS handling |
+| 300-330 | FROM_TELECOM | Identify calls from carriers |
+| 315-328 | FROM_PUBLIC_GATEWAY | Identify calls from AI gateways |
+| 331-390 | TO_PUBLIC_GATEWAY | Route to AI gateways (dispatcher) |
+| 393-405 | TO_TELECOM | Route to Vodafone carrier |
 
 ## License
 

@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   kamailio:
-    image: kamailio/kamailio:5.7.3-bullseye
+    build: .
     container_name: kamailio-sbc
     restart: unless-stopped
     network_mode: host  # Required for SIP - needs direct port access
@@ -35,8 +35,8 @@ services:
       - ./rtpengine.conf:/etc/rtpengine/rtpengine.conf:ro
     command: >
       rtpengine --config-file=/etc/rtpengine/rtpengine.conf
-      --interface=internal/10.0.0.100
-      --interface=external/203.0.113.50
+      --interface=internal/10.230.73.225
+      --interface=external/103.146.242.234
       --listen-ng=127.0.0.1:2223
       --port-min=10000
       --port-max=20000
@@ -71,30 +71,30 @@ services:
       timeout: 5s
       retries: 5
 
-  # Homer for SIP tracing (optional but recommended)
-  homer-webapp:
-    image: sipcapture/homer-webapp:latest
-    container_name: homer-webapp
-    restart: unless-stopped
-    environment:
-      - DB_HOST=mysql
-      - DB_USER=kamailio
-      - DB_PASS=${MYSQL_PASSWORD:-kamailiorw}
-    ports:
-      - "9080:80"
-    depends_on:
-      - mysql
+  # Homer for SIP tracing (optional - disabled for now)
+  # homer-webapp:
+  #   image: sipcapture/homer-webapp:latest
+  #   container_name: homer-webapp
+  #   restart: unless-stopped
+  #   environment:
+  #     - DB_HOST=mysql
+  #     - DB_USER=kamailio
+  #     - DB_PASS=${MYSQL_PASSWORD:-kamailiorw}
+  #   ports:
+  #     - "9080:80"
+  #   depends_on:
+  #     - mysql
 
-  # Prometheus metrics exporter (optional)
-  kamailio-exporter:
-    image: pascomnet/kamailio_exporter:latest
-    container_name: kamailio-exporter
-    restart: unless-stopped
-    command: ["--kamailio.scrape-uri", "http://127.0.0.1:5060"]
-    ports:
-      - "9494:9494"
-    depends_on:
-      - kamailio
+  # Prometheus metrics exporter (optional - disabled for now)
+  # kamailio-exporter:
+  #   image: pascomnet/kamailio_exporter:latest
+  #   container_name: kamailio-exporter
+  #   restart: unless-stopped
+  #   command: ["--kamailio.scrape-uri", "http://127.0.0.1:5060"]
+  #   ports:
+  #     - "9494:9494"
+  #   depends_on:
+  #     - kamailio
 
 volumes:
   mysql_data:

@@ -3,6 +3,24 @@
 -- Dispatcher & Permissions Tables
 -- ============================================
 
+-- Version table (required by Kamailio for schema version checking)
+CREATE TABLE IF NOT EXISTS version (
+    id INT(10) UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    table_name VARCHAR(32) NOT NULL,
+    table_version INT UNSIGNED NOT NULL DEFAULT 0,
+    UNIQUE KEY table_name_idx (table_name)
+) ENGINE=InnoDB;
+
+-- Insert version info for all tables
+INSERT INTO version (table_name, table_version) VALUES
+('dispatcher', 4),
+('address', 6),
+('trusted', 6),
+('dialog', 7),
+('dialog_vars', 1),
+('acc', 5),
+('missed_calls', 4);
+
 -- Dispatcher table for public gateways (LiveKit endpoints)
 -- Group 1: Default gateways
 -- Group 2: Premium/Priority gateways  
@@ -18,22 +36,21 @@ CREATE TABLE IF NOT EXISTS dispatcher (
     description VARCHAR(64) NOT NULL DEFAULT ''
 ) ENGINE=InnoDB;
 
--- Default Gateway Group (setid=1)
--- These are your primary LiveKit SIP endpoints
+-- Default Gateway Group (setid=1) - VAPI as primary (UDP)
 INSERT INTO dispatcher (setid, destination, flags, priority, attrs, description) VALUES
-(1, 'sip:livekit-gw1.unpod.ai:5060', 0, 10, 'weight=50;socket=udp:203.0.113.50:5080', 'LiveKit Gateway 1 - Primary'),
-(1, 'sip:livekit-gw2.unpod.ai:5060', 0, 10, 'weight=50;socket=udp:203.0.113.50:5080', 'LiveKit Gateway 2 - Primary');
+(1, 'sip:66e592d6-d690-45bb-8996-18215af542d0.sip.vapi.ai:5060', 0, 10, 'weight=100;socket=udp:103.146.242.234:5080', 'VAPI Gateway - Primary');
 
--- Premium Gateway Group (setid=2)
--- Lower latency / dedicated instances for premium tenants
+-- LiveKit Gateway Group (setid=2) - UDP
 INSERT INTO dispatcher (setid, destination, flags, priority, attrs, description) VALUES
-(2, 'sip:livekit-premium1.unpod.ai:5060', 0, 10, 'weight=100;socket=udp:203.0.113.50:5080', 'LiveKit Premium Gateway 1'),
-(2, 'sip:livekit-premium2.unpod.ai:5060', 0, 5, 'weight=50;socket=udp:203.0.113.50:5080', 'LiveKit Premium Gateway 2');
+(2, 'sip:3i5bvr312d9.sip.livekit.cloud:5060', 0, 10, 'weight=50;socket=udp:103.146.242.234:5080', 'LiveKit Gateway - Primary'),
+(2, 'sip:61xh9s3ubwq.sip.livekit.cloud:5060', 0, 10, 'weight=50;socket=udp:103.146.242.234:5080', 'DigiPanda LiveKit Gateway'),
+(2, 'sip:4gv2kcqpg2d.sip.livekit.cloud:5060', 0, 10, 'weight=50;socket=udp:103.146.242.234:5080', 'Voxket LiveKit Gateway'),
+(2, 'sip:15j2dl095m2.sip.livekit.cloud:5060', 0, 10, 'weight=50;socket=udp:103.146.242.234:5080', 'Fabriq LiveKit Gateway');
 
--- Backup Gateway Group (setid=3)
--- Failover destinations
+-- Backup Gateway Group (setid=3) - Unpod Cloud (UDP)
 INSERT INTO dispatcher (setid, destination, flags, priority, attrs, description) VALUES
-(3, 'sip:livekit-backup.unpod.ai:5060', 0, 1, 'weight=100;socket=udp:203.0.113.50:5080', 'LiveKit Backup Gateway');
+(3, 'sip:sip-up-tt.unpod.tv:5060', 0, 10, 'weight=50;socket=udp:103.146.242.234:5080', 'Unpod Cloud Gateway 1'),
+(3, 'sip:sip.unpod.tel:5060', 0, 5, 'weight=50;socket=udp:103.146.242.234:5080', 'Unpod Cloud Gateway 2');
 
 -- ============================================
 -- Address/Permissions Table
@@ -51,17 +68,28 @@ CREATE TABLE IF NOT EXISTS address (
 
 -- Group 1: Telecom Carriers (Private Network)
 INSERT INTO address (grp, ip_addr, mask, port, tag) VALUES
-(1, '10.0.1.10', 32, 5060, 'Carrier-Primary'),
-(1, '10.0.1.20', 32, 5060, 'Carrier-Secondary'),
-(1, '10.0.1.0', 24, 0, 'Carrier-Subnet'),
-(1, '192.168.1.0', 24, 0, 'Internal-Network');
+(1, '10.230.73.220', 32, 5060, 'Vodafone-INT-Phony'),
+(1, '10.230.73.0', 24, 0, 'Private-Subnet');
 
--- Group 2: Public Gateways (Trusted LiveKit endpoints)
+-- Group 2: Public Gateways (Trusted Voice AI endpoints)
+-- Note: These are DNS names, Kamailio will resolve them
+-- For IP-based ACL, you may need to add resolved IPs or use domain matching
 INSERT INTO address (grp, ip_addr, mask, port, tag) VALUES
-(2, '203.0.113.100', 32, 0, 'LiveKit-GW1'),
-(2, '203.0.113.101', 32, 0, 'LiveKit-GW2'),
-(2, '203.0.113.102', 32, 0, 'LiveKit-Premium'),
-(2, '203.0.113.103', 32, 0, 'LiveKit-Backup');
+(2, '0.0.0.0', 0, 0, 'Allow-All-Public-Gateways');
+
+-- ============================================
+-- Trusted Table (for permissions module)
+-- ============================================
+
+CREATE TABLE IF NOT EXISTS trusted (
+    id INT(10) UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    src_ip VARCHAR(50) NOT NULL,
+    proto VARCHAR(4) NOT NULL,
+    from_pattern VARCHAR(64) DEFAULT NULL,
+    ruri_pattern VARCHAR(64) DEFAULT NULL,
+    tag VARCHAR(64) DEFAULT NULL,
+    priority INT(10) NOT NULL DEFAULT 0
+) ENGINE=InnoDB;
 
 -- ============================================
 -- Tenant Mapping Table (Custom)
@@ -84,12 +112,13 @@ CREATE TABLE IF NOT EXISTS tenant_config (
 ) ENGINE=InnoDB;
 
 -- Sample tenant configurations
+-- Group 1: VAPI Gateway (default)
+-- Group 2: LiveKit Gateways
+-- Group 3: Unpod Cloud (backup)
 INSERT INTO tenant_config (tenant_id, source_ip, gateway_group, max_cps, max_concurrent, priority) VALUES
-('tenant_askiitians', '10.0.1.50', 1, 20, 200, 5),
-('tenant_mahindra', '10.0.1.51', 2, 50, 500, 10),
-('tenant_onecard', '10.0.1.52', 2, 30, 300, 8),
-('tenant_lg', '10.0.1.53', 1, 25, 250, 6),
-('tenant_default', NULL, 1, 10, 100, 1);
+('vapi', '10.230.73.220', 1, 50, 500, 10),
+('livekit', NULL, 2, 50, 500, 10),
+('default', NULL, 1, 10, 100, 1);
 
 -- ============================================
 -- CDR Table (Call Detail Records)
