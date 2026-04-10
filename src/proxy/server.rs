@@ -803,6 +803,9 @@ impl SipServer {
                 let via = tx.original.via_header()?.value();
                 if to_tag.is_none() {
                     info!(key = %tx.key, via, "ignoring out-of-dialog {} request", tx.original.method);
+                    if matches!(tx.original.method, rsipstack::sip::Method::Options) {
+                        tx.reply(rsipstack::sip::StatusCode::OK).await.ok();
+                    }
                     continue;
                 }
             }
