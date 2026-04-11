@@ -1385,6 +1385,21 @@ enum CallRecordStoragePayload {
         #[serde(default)]
         root: Option<String>,
     },
+    S3 {
+        vendor: crate::storage::S3Vendor,
+        bucket: String,
+        region: String,
+        access_key: String,
+        secret_key: String,
+        #[serde(default)]
+        endpoint: Option<String>,
+        #[serde(default)]
+        root: Option<String>,
+        #[serde(default)]
+        with_media: Option<bool>,
+        #[serde(default)]
+        keep_media_copy: Option<bool>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -1469,9 +1484,19 @@ pub(crate) async fn get_effective_config(
             .collect(),
     );
 
-    // Include the effective running config (what server booted with)
+    // Include the effective running config (what server booted with).
+    // Expose enough of each section that the UI can render "current running
+    // values" next to each tab without needing to call multiple endpoints.
     let effective = if let Some(app_state) = state.app_state() {
         let config = app_state.config();
+        let proxy_json = serde_json::to_value(&config.proxy).unwrap_or(JsonValue::Null);
+        let rwi_json = serde_json::to_value(&config.rwi).unwrap_or(JsonValue::Null);
+        let recording_json =
+            serde_json::to_value(&config.recording).unwrap_or(JsonValue::Null);
+        let callrecord_json =
+            serde_json::to_value(&config.callrecord).unwrap_or(JsonValue::Null);
+        let sipflow_json =
+            serde_json::to_value(&config.sipflow).unwrap_or(JsonValue::Null);
         json!({
             "http_addr": config.http_addr,
             "external_ip": config.external_ip,
@@ -1482,7 +1507,12 @@ pub(crate) async fn get_effective_config(
             "rtp_end_port": config.rtp_end_port,
             "recording": {
                 "path": config.recorder_path(),
+                "policy": recording_json,
             },
+            "callrecord": callrecord_json,
+            "proxy": proxy_json,
+            "rwi": rwi_json,
+            "sipflow": sipflow_json,
         })
     } else {
         json!(null)
@@ -1822,15 +1852,23 @@ pub(crate) async fn update_storage_settings(
         Err(resp) => return resp,
     };
 
+    // DB ops collected while mutating `doc` (which is used for Config validation).
+    // Some(v) = upsert, None = delete the row so base config.toml value takes effect.
+    let mut ops: Vec<(String, Option<serde_json::Value>)> = Vec::new();
     let mut modified = false;
 
     if let Some(path_opt) = payload.recorder_path {
         {
             let table = ensure_table_mut(&mut doc, "recording");
-            if let Some(path) = normalize_opt_string(path_opt) {
-                table["path"] = value(path);
-            } else {
-                table.remove("path");
+            match normalize_opt_string(path_opt) {
+                Some(path) => {
+                    table["path"] = value(path.clone());
+                    ops.push(("recording.path".into(), Some(json!(path))));
+                }
+                None => {
+                    table.remove("path");
+                    ops.push(("recording.path".into(), None));
+                }
             }
         }
         doc.remove("recorder_path");
@@ -1838,18 +1876,32 @@ pub(crate) async fn update_storage_settings(
     }
 
     if let Some(cache_opt) = payload.media_cache_path {
-        if let Some(path) = normalize_opt_string(cache_opt) {
-            doc["media_cache_path"] = value(path);
-        } else {
-            doc.remove("media_cache_path");
+        match normalize_opt_string(cache_opt) {
+            Some(path) => {
+                doc["media_cache_path"] = value(path.clone());
+                ops.push(("media_cache_path".into(), Some(json!(path))));
+            }
+            None => {
+                doc.remove("media_cache_path");
+                ops.push(("media_cache_path".into(), None));
+            }
         }
         modified = true;
     }
 
+    // Signal that the entire `callrecord.*` key space should be wiped before
+    // upserting the new values. Used so stale fields from the previous mode
+    // (e.g. local→s3) or seeded base-config values don't leak back in via
+    // config_merge::seed_missing_from_doc.
+    let mut clear_callrecord = false;
+
     if let Some(callrecord_opt) = payload.callrecord {
+        clear_callrecord = true;
         match callrecord_opt {
             Some(CallRecordStoragePayload::Disabled) | None => {
                 doc.remove("callrecord");
+                // ops entries are a no-op for disabled: the blanket wipe below
+                // is the whole effect.
             }
             Some(CallRecordStoragePayload::Local { root }) => {
                 let Some(root_path) = normalize_opt_string(root) else {
@@ -1860,61 +1912,141 @@ pub(crate) async fn update_storage_settings(
                 };
                 let mut table = Table::new();
                 table["type"] = value("local");
-                table["root"] = value(root_path);
+                table["root"] = value(root_path.clone());
                 doc["callrecord"] = Item::Table(table);
+                ops.push(("callrecord.type".into(), Some(json!("local"))));
+                ops.push(("callrecord.root".into(), Some(json!(root_path))));
+            }
+            Some(CallRecordStoragePayload::S3 {
+                vendor,
+                bucket,
+                region,
+                access_key,
+                secret_key,
+                endpoint,
+                root,
+                with_media,
+                keep_media_copy,
+            }) => {
+                let endpoint = endpoint.unwrap_or_default();
+                let root = root.unwrap_or_default();
+                let vendor_str = serde_json::to_value(&vendor)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_else(|| "aws".to_string());
+                let mut table = Table::new();
+                table["type"] = value("s3");
+                table["vendor"] = value(vendor_str.clone());
+                table["bucket"] = value(bucket.clone());
+                table["region"] = value(region.clone());
+                table["access_key"] = value(access_key.clone());
+                table["secret_key"] = value(secret_key.clone());
+                table["endpoint"] = value(endpoint.clone());
+                table["root"] = value(root.clone());
+                if let Some(b) = with_media {
+                    table["with_media"] = value(b);
+                }
+                if let Some(b) = keep_media_copy {
+                    table["keep_media_copy"] = value(b);
+                }
+                doc["callrecord"] = Item::Table(table);
+
+                ops.push(("callrecord.type".into(), Some(json!("s3"))));
+                ops.push(("callrecord.vendor".into(), Some(json!(vendor_str))));
+                ops.push(("callrecord.bucket".into(), Some(json!(bucket))));
+                ops.push(("callrecord.region".into(), Some(json!(region))));
+                ops.push(("callrecord.access_key".into(), Some(json!(access_key))));
+                ops.push(("callrecord.secret_key".into(), Some(json!(secret_key))));
+                ops.push(("callrecord.endpoint".into(), Some(json!(endpoint))));
+                ops.push(("callrecord.root".into(), Some(json!(root))));
+                if let Some(b) = with_media {
+                    ops.push(("callrecord.with_media".into(), Some(json!(b))));
+                }
+                if let Some(b) = keep_media_copy {
+                    ops.push(("callrecord.keep_media_copy".into(), Some(json!(b))));
+                }
             }
         }
         modified = true;
     }
 
+    // All individual recording.* keys managed by recording_policy.
+    const RECORDING_KEYS: &[&str] = &[
+        "recording.enabled",
+        "recording.auto_start",
+        "recording.directions",
+        "recording.caller_allow",
+        "recording.caller_deny",
+        "recording.callee_allow",
+        "recording.callee_deny",
+        "recording.filename_pattern",
+        "recording.samplerate",
+        "recording.ptime",
+        "recording.path",
+        "recording.format",
+    ];
+
     if let Some(policy_opt) = payload.recording_policy {
         match policy_opt {
             Some(policy_payload) => {
                 let mut table = Table::new();
-                table["enabled"] = value(policy_payload.enabled.unwrap_or(false));
+                let enabled = policy_payload.enabled.unwrap_or(false);
+                table["enabled"] = value(enabled);
+                ops.push(("recording.enabled".into(), Some(json!(enabled))));
 
                 if let Some(directions) = policy_payload.directions {
                     if directions.is_empty() {
                         table.remove("directions");
+                        ops.push(("recording.directions".into(), None));
                     } else {
-                        set_string_array(&mut table, "directions", directions);
+                        set_string_array(&mut table, "directions", directions.clone());
+                        ops.push(("recording.directions".into(), Some(json!(directions))));
                     }
                 }
 
                 if let Some(allow) = policy_payload.caller_allow {
                     if allow.is_empty() {
                         table.remove("caller_allow");
+                        ops.push(("recording.caller_allow".into(), None));
                     } else {
-                        set_string_array(&mut table, "caller_allow", allow);
+                        set_string_array(&mut table, "caller_allow", allow.clone());
+                        ops.push(("recording.caller_allow".into(), Some(json!(allow))));
                     }
                 }
 
                 if let Some(deny) = policy_payload.caller_deny {
                     if deny.is_empty() {
                         table.remove("caller_deny");
+                        ops.push(("recording.caller_deny".into(), None));
                     } else {
-                        set_string_array(&mut table, "caller_deny", deny);
+                        set_string_array(&mut table, "caller_deny", deny.clone());
+                        ops.push(("recording.caller_deny".into(), Some(json!(deny))));
                     }
                 }
 
                 if let Some(allow) = policy_payload.callee_allow {
                     if allow.is_empty() {
                         table.remove("callee_allow");
+                        ops.push(("recording.callee_allow".into(), None));
                     } else {
-                        set_string_array(&mut table, "callee_allow", allow);
+                        set_string_array(&mut table, "callee_allow", allow.clone());
+                        ops.push(("recording.callee_allow".into(), Some(json!(allow))));
                     }
                 }
 
                 if let Some(deny) = policy_payload.callee_deny {
                     if deny.is_empty() {
                         table.remove("callee_deny");
+                        ops.push(("recording.callee_deny".into(), None));
                     } else {
-                        set_string_array(&mut table, "callee_deny", deny);
+                        set_string_array(&mut table, "callee_deny", deny.clone());
+                        ops.push(("recording.callee_deny".into(), Some(json!(deny))));
                     }
                 }
 
                 if let Some(auto_start) = policy_payload.auto_start {
                     table["auto_start"] = value(auto_start);
+                    ops.push(("recording.auto_start".into(), Some(json!(auto_start))));
                 }
 
                 match policy_payload.filename_pattern {
@@ -1922,12 +2054,18 @@ pub(crate) async fn update_storage_settings(
                         let trimmed = pattern.trim();
                         if trimmed.is_empty() {
                             table.remove("filename_pattern");
+                            ops.push(("recording.filename_pattern".into(), None));
                         } else {
                             table["filename_pattern"] = value(trimmed);
+                            ops.push((
+                                "recording.filename_pattern".into(),
+                                Some(json!(trimmed)),
+                            ));
                         }
                     }
                     Some(None) => {
                         table.remove("filename_pattern");
+                        ops.push(("recording.filename_pattern".into(), None));
                     }
                     None => {}
                 }
@@ -1935,9 +2073,11 @@ pub(crate) async fn update_storage_settings(
                 match policy_payload.samplerate {
                     Some(Some(rate)) => {
                         table["samplerate"] = value(i64::from(rate));
+                        ops.push(("recording.samplerate".into(), Some(json!(rate))));
                     }
                     Some(None) => {
                         table.remove("samplerate");
+                        ops.push(("recording.samplerate".into(), None));
                     }
                     None => {}
                 }
@@ -1945,18 +2085,25 @@ pub(crate) async fn update_storage_settings(
                 match policy_payload.ptime {
                     Some(Some(ptime)) => {
                         table["ptime"] = value(i64::from(ptime));
+                        ops.push(("recording.ptime".into(), Some(json!(ptime))));
                     }
                     Some(None) => {
                         table.remove("ptime");
+                        ops.push(("recording.ptime".into(), None));
                     }
                     None => {}
                 }
 
                 if let Some(path_opt) = policy_payload.path {
-                    if let Some(path) = normalize_opt_string(path_opt) {
-                        table["path"] = value(path);
-                    } else {
-                        table.remove("path");
+                    match normalize_opt_string(path_opt) {
+                        Some(path) => {
+                            table["path"] = value(path.clone());
+                            ops.push(("recording.path".into(), Some(json!(path))));
+                        }
+                        None => {
+                            table.remove("path");
+                            ops.push(("recording.path".into(), None));
+                        }
                     }
                 }
 
@@ -1966,8 +2113,13 @@ pub(crate) async fn update_storage_settings(
                             let normalized = format_value.trim().to_ascii_lowercase();
                             if normalized.is_empty() {
                                 table.remove("format");
+                                ops.push(("recording.format".into(), None));
                             } else if normalized == "wav" || normalized == "ogg" {
-                                table["format"] = value(normalized);
+                                table["format"] = value(normalized.clone());
+                                ops.push((
+                                    "recording.format".into(),
+                                    Some(json!(normalized)),
+                                ));
                             } else {
                                 return json_error(
                                     StatusCode::UNPROCESSABLE_ENTITY,
@@ -1977,6 +2129,7 @@ pub(crate) async fn update_storage_settings(
                         }
                         None => {
                             table.remove("format");
+                            ops.push(("recording.format".into(), None));
                         }
                     }
                 }
@@ -1985,6 +2138,9 @@ pub(crate) async fn update_storage_settings(
             }
             None => {
                 doc.remove("recording");
+                for key in RECORDING_KEYS {
+                    ops.push((key.to_string(), None));
+                }
             }
         }
         modified = true;
@@ -1998,8 +2154,10 @@ pub(crate) async fn update_storage_settings(
                     let normalized = format_value.trim().to_ascii_lowercase();
                     if normalized.is_empty() {
                         table.remove("format");
+                        ops.push(("recording.format".into(), None));
                     } else if normalized == "wav" {
-                        table["format"] = value(normalized);
+                        table["format"] = value(normalized.clone());
+                        ops.push(("recording.format".into(), Some(json!(normalized))));
                     } else {
                         return json_error(
                             StatusCode::UNPROCESSABLE_ENTITY,
@@ -2009,6 +2167,7 @@ pub(crate) async fn update_storage_settings(
                 }
                 None => {
                     table.remove("format");
+                    ops.push(("recording.format".into(), None));
                 }
             }
         }
@@ -2016,6 +2175,7 @@ pub(crate) async fn update_storage_settings(
         modified = true;
     }
 
+    // Validate the mutated doc parses as a Config before touching the DB.
     let doc_text = doc.to_string();
     let config = match parse_config_from_str(&doc_text) {
         Ok(cfg) => cfg,
@@ -2027,29 +2187,51 @@ pub(crate) async fn update_storage_settings(
             Ok(db) => db,
             Err(r) => return r,
         };
-        // Save recorder path
-        let recorder_path = config.recorder_path();
-        if !recorder_path.is_empty() {
-            if let Err(e) = system_config::Model::upsert(
-                &db,
-                "recording.path",
-                &serde_json::json!(recorder_path).to_string(),
-                false,
-            ).await {
+        use sea_orm::EntityTrait;
+        // Wipe the entire `callrecord.*` key space before writing the new
+        // set. Without this, fields from the previous mode (e.g. local→s3)
+        // or seeded base-config values would leak back in on the next
+        // startup via seed_missing_from_doc and clobber the current mode.
+        if clear_callrecord {
+            use sea_orm::{ColumnTrait, QueryFilter};
+            if let Err(e) = system_config::Entity::delete_many()
+                .filter(system_config::Column::Key.starts_with("callrecord."))
+                .exec(&db)
+                .await
+            {
                 return json_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to save setting 'recording.path': {e}"),
+                    format!("Failed to clear stale callrecord.* rows: {e}"),
                 );
             }
+            // Also remove any legacy top-level `callrecord` row left over
+            // from the previous (object-blob) storage format.
+            let _ = system_config::Entity::delete_by_id("callrecord".to_string())
+                .exec(&db)
+                .await;
         }
-        // Save media_cache_path from TOML doc (field doesn't exist on Config struct)
-        if let Some(toml_edit::Item::Value(v)) = doc.get("media_cache_path") {
-            let val_str = serde_json::json!(v.to_string().trim_matches('"')).to_string();
-            if let Err(e) = system_config::Model::upsert(&db, "media_cache_path", &val_str, false).await {
-                return json_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Failed to save setting 'media_cache_path': {e}"),
-                );
+        for (key, val_opt) in ops {
+            match val_opt {
+                Some(v) => {
+                    if let Err(e) =
+                        system_config::Model::upsert(&db, &key, &v.to_string(), false).await
+                    {
+                        return json_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Failed to save setting '{key}': {e}"),
+                        );
+                    }
+                }
+                None => {
+                    if let Err(e) =
+                        system_config::Entity::delete_by_id(key.clone()).exec(&db).await
+                    {
+                        return json_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Failed to delete setting '{key}': {e}"),
+                        );
+                    }
+                }
             }
         }
     }

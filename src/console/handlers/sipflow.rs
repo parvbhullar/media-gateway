@@ -1,5 +1,6 @@
 use crate::console::{ConsoleState, middleware::AuthRequired};
 use crate::models::call_record::{Column as CallRecordColumn, Entity as CallRecordEntity};
+use crate::models::system_config;
 use axum::{
     Json, Router,
     extract::{Path as AxumPath, Query, State},
@@ -11,8 +12,7 @@ use chrono::{DateTime, TimeZone};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::{fs, sync::Arc};
-use toml_edit::{DocumentMut, Item, Table, value};
+use std::sync::Arc;
 
 #[derive(Debug, Deserialize)]
 struct FlowQueryParams {
@@ -113,73 +113,87 @@ async fn update_settings(
     AuthRequired(_user): AuthRequired,
     Json(payload): Json<UpdateSettingsRequest>,
 ) -> Response {
-    // Get config file path
-    let config_path = match get_config_path(&state) {
-        Ok(path) => path,
-        Err(resp) => return resp,
+    // Get DB connection
+    let Some(app_state) = state.app_state() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "Application state is unavailable." })),
+        )
+            .into_response();
     };
+    let db = app_state.db().clone();
 
-    // Load TOML document
-    let mut doc = match load_document(&config_path) {
-        Ok(doc) => doc,
-        Err(resp) => return resp,
-    };
-
-    // Ensure [sipflow] section exists
-    let table = ensure_table_mut(&mut doc, "sipflow");
-
-    // Update backend type
+    // Build the flat (sipflow.<field>, JSON-value) rows to upsert, matching
+    // the config_merge seed convention. The SipFlowConfig enum uses
+    // `#[serde(tag = "type")]` so `sipflow.type` acts as the discriminator.
     let backend_type = payload.backend_type.as_str();
-    match backend_type {
-        "none" => {
-            table["type"] = value("none");
-            table.remove("root");
-            table.remove("subdirs");
-            table.remove("flush_count");
-            table.remove("flush_interval_secs");
-            table.remove("udp_addr");
-            table.remove("http_addr");
-            table.remove("timeout_secs");
-        }
+    let rows: Vec<(&'static str, serde_json::Value)> = match backend_type {
+        "none" => Vec::new(),
         "local" => {
-            table["type"] = value("local");
-            if let Some(root) = payload.config.get("root").and_then(|v| v.as_str()) {
-                table["root"] = value(root);
+            let Some(root) = payload
+                .config
+                .get("root")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .filter(|s| !s.is_empty())
+            else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "sipflow local backend requires 'root'" })),
+                )
+                    .into_response();
+            };
+            let mut out: Vec<(&'static str, serde_json::Value)> = Vec::new();
+            out.push(("sipflow.type", json!("local")));
+            out.push(("sipflow.root", json!(root)));
+            if let Some(s) = payload.config.get("subdirs").and_then(|v| v.as_str()) {
+                out.push(("sipflow.subdirs", json!(s)));
             }
-            if let Some(subdirs) = payload.config.get("subdirs").and_then(|v| v.as_str()) {
-                table["subdirs"] = value(subdirs);
+            if let Some(n) = payload.config.get("flush_count").and_then(|v| v.as_i64()) {
+                out.push(("sipflow.flush_count", json!(n)));
             }
-            if let Some(count) = payload.config.get("flush_count").and_then(|v| v.as_i64()) {
-                table["flush_count"] = value(count);
-            }
-            if let Some(secs) = payload
+            if let Some(n) = payload
                 .config
                 .get("flush_interval_secs")
                 .and_then(|v| v.as_i64())
             {
-                table["flush_interval_secs"] = value(secs);
+                out.push(("sipflow.flush_interval_secs", json!(n)));
             }
-            // Remove other backend fields
-            table.remove("udp_addr");
-            table.remove("http_addr");
-            table.remove("timeout_secs");
+            if let Some(n) = payload.config.get("id_cache_size").and_then(|v| v.as_i64()) {
+                out.push(("sipflow.id_cache_size", json!(n)));
+            }
+            out
         }
         "remote" => {
-            table["type"] = value("remote");
-            if let Some(addr) = payload.config.get("udp_addr").and_then(|v| v.as_str()) {
-                table["udp_addr"] = value(addr);
+            let udp = payload
+                .config
+                .get("udp_addr")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .filter(|s| !s.is_empty());
+            let http = payload
+                .config
+                .get("http_addr")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .filter(|s| !s.is_empty());
+            let (Some(udp), Some(http)) = (udp, http) else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "sipflow remote backend requires 'udp_addr' and 'http_addr'"
+                    })),
+                )
+                    .into_response();
+            };
+            let mut out: Vec<(&'static str, serde_json::Value)> = Vec::new();
+            out.push(("sipflow.type", json!("remote")));
+            out.push(("sipflow.udp_addr", json!(udp)));
+            out.push(("sipflow.http_addr", json!(http)));
+            if let Some(n) = payload.config.get("timeout_secs").and_then(|v| v.as_i64()) {
+                out.push(("sipflow.timeout_secs", json!(n)));
             }
-            if let Some(addr) = payload.config.get("http_addr").and_then(|v| v.as_str()) {
-                table["http_addr"] = value(addr);
-            }
-            if let Some(secs) = payload.config.get("timeout_secs").and_then(|v| v.as_i64()) {
-                table["timeout_secs"] = value(secs);
-            }
-            // Remove other backend fields
-            table.remove("root");
-            table.remove("subdirs");
-            table.remove("flush_count");
-            table.remove("flush_interval_secs");
+            out
         }
         _ => {
             return (
@@ -190,12 +204,37 @@ async fn update_settings(
             )
                 .into_response();
         }
+    };
+
+    // Wipe the entire `sipflow.*` key space (stale fields from previous
+    // mode or base-config seeding) plus any legacy top-level `sipflow`
+    // row, then upsert the new set.
+    {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        if let Err(e) = system_config::Entity::delete_many()
+            .filter(system_config::Column::Key.starts_with("sipflow."))
+            .exec(&db)
+            .await
+        {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Failed to clear stale sipflow.* rows: {e}") })),
+            )
+                .into_response();
+        }
+        let _ = system_config::Entity::delete_by_id("sipflow".to_string())
+            .exec(&db)
+            .await;
     }
 
-    // Write back to file
-    let doc_text = doc.to_string();
-    if let Err(resp) = persist_document(&config_path, doc_text) {
-        return resp;
+    for (key, val) in rows {
+        if let Err(e) = system_config::Model::upsert(&db, key, &val.to_string(), false).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Failed to save '{key}': {e}") })),
+            )
+                .into_response();
+        }
     }
 
     (
@@ -206,76 +245,6 @@ async fn update_settings(
         })),
     )
         .into_response()
-}
-
-// Helper functions from setting.rs
-fn get_config_path(state: &ConsoleState) -> Result<String, Response> {
-    let Some(app_state) = state.app_state() else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({
-                "error": "Application state is unavailable."
-            })),
-        )
-            .into_response());
-    };
-
-    let Some(path) = app_state.config_path.clone() else {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": "Configuration file path is unknown. Start the service with --conf to enable editing."
-            })),
-        )
-            .into_response());
-    };
-    Ok(path)
-}
-
-fn load_document(path: &str) -> Result<DocumentMut, Response> {
-    let contents = match fs::read_to_string(path) {
-        Ok(raw) => raw,
-        Err(err) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "error": format!("Failed to read configuration file: {}", err)
-                })),
-            )
-                .into_response());
-        }
-    };
-
-    contents.parse::<DocumentMut>().map_err(|err| {
-        (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({
-                "error": format!("Configuration file is not valid TOML: {}", err)
-            })),
-        )
-            .into_response()
-    })
-}
-
-fn persist_document(path: &str, contents: String) -> Result<(), Response> {
-    fs::write(path, contents).map_err(|err| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({
-                "error": format!("Failed to write configuration file: {}", err)
-            })),
-        )
-            .into_response()
-    })
-}
-
-fn ensure_table_mut<'doc>(doc: &'doc mut DocumentMut, key: &str) -> &'doc mut Table {
-    if doc.get(key).is_none() {
-        doc[key] = Item::Table(Table::new());
-    } else if !doc[key].is_table() {
-        doc[key] = Item::Table(Table::new());
-    }
-    doc[key].as_table_mut().expect("table")
 }
 
 async fn query_flow(
