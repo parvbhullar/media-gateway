@@ -25,3 +25,4 @@ pub mod utils;
 pub mod version;
 pub mod ip_detect;
 pub mod config_merge;
+pub mod upload_retry;

@@ -163,6 +163,26 @@ pub async fn persist_call_record(
     Ok(())
 }
 
+/// Set `recording_url` on the row matching `call_id`. Used by the
+/// upload-retry scheduler after a successful re-upload, so the playback
+/// handler can find the file in S3 instead of looking for the (possibly
+/// deleted) local copy.
+pub async fn update_recording_url_by_call_id(
+    db: &sea_orm::DatabaseConnection,
+    call_id: &str,
+    recording_url: &str,
+) -> Result<u64, sea_orm::DbErr> {
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    let res = Entity::update_many()
+        .col_expr(Column::RecordingUrl, Expr::value(recording_url.to_string()))
+        .col_expr(Column::UpdatedAt, Expr::value(chrono::Utc::now()))
+        .filter(Column::CallId.eq(call_id))
+        .exec(db)
+        .await?;
+    Ok(res.rows_affected)
+}
+
 pub fn extract_sip_username(input: &str) -> Option<String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {

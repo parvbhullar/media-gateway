@@ -286,6 +286,21 @@ async fn stream_call_recording(
         }
     }
 
+    // S3 fallback: when the recording_url has the `s3://bucket/key` form,
+    // use the configured callrecord storage to fetch the object and
+    // stream it back to the client. Works for any vendor supported by
+    // crate::storage (AWS, MinIO, GCP, Azure, …). No HTTP range support
+    // in this first cut: we read the whole object into memory, which is
+    // fine for typical .wav recordings; high-volume deployments should
+    // generate presigned URLs instead.
+    if let Some(raw_url) = record.recording_url.as_ref() {
+        if let Some(s3_key) = raw_url.strip_prefix("s3://") {
+            if let Some(resp) = stream_s3_recording(&state, s3_key).await {
+                return resp;
+            }
+        }
+    }
+
     // Fallback: Try to get recording from sipflow backend
     if let Some(server) = state.sip_server() {
         if let Some(sipflow) = &server.sip_flow {
@@ -413,6 +428,109 @@ async fn stream_file_with_range(
     }
 
     response
+}
+
+/// Fetch a recording from the configured S3 callrecord storage and stream
+/// it to the client. The `bucket_and_key` argument is the suffix after
+/// `s3://`, i.e. `<bucket>/<key>`. We don't trust the bucket part — the
+/// real bucket comes from the running callrecord config — but the key is
+/// what we read.
+///
+/// Returns `None` when the request can't be satisfied (callrecord isn't
+/// in S3 mode, the storage client can't be built, the read fails, etc.).
+/// `None` lets `stream_call_recording` fall through to its sipflow path
+/// instead of short-circuiting with a 5xx.
+async fn stream_s3_recording(
+    state: &Arc<ConsoleState>,
+    bucket_and_key: &str,
+) -> Option<Response> {
+    use crate::config::CallRecordConfig;
+    use crate::storage::{Storage, StorageConfig};
+
+    // Split into <bucket>/<key>. We use the bucket to sanity-check the
+    // current config matches; if it doesn't, the saved URL is from a
+    // different config and we can't recover it here.
+    let (claimed_bucket, key) = match bucket_and_key.split_once('/') {
+        Some((b, k)) if !b.is_empty() && !k.is_empty() => (b, k),
+        _ => {
+            warn!(value = bucket_and_key, "stream_s3_recording: malformed s3 url");
+            return None;
+        }
+    };
+
+    let app_state = state.app_state()?;
+    let callrecord = app_state.config().callrecord.clone()?;
+    let CallRecordConfig::S3 {
+        vendor,
+        bucket,
+        region,
+        access_key,
+        secret_key,
+        endpoint,
+        ..
+    } = callrecord
+    else {
+        warn!("stream_s3_recording: recording_url is s3:// but callrecord is not S3 mode");
+        return None;
+    };
+
+    if bucket != claimed_bucket {
+        warn!(
+            current = %bucket,
+            saved = %claimed_bucket,
+            "stream_s3_recording: stored bucket does not match current callrecord bucket; cannot fetch"
+        );
+        return None;
+    }
+
+    let storage_cfg = StorageConfig::S3 {
+        vendor: vendor.clone(),
+        bucket: bucket.clone(),
+        region: region.clone(),
+        access_key: access_key.clone(),
+        secret_key: secret_key.clone(),
+        endpoint: Some(endpoint.clone()),
+        prefix: None,
+    };
+    let storage = match Storage::new(&storage_cfg) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("stream_s3_recording: failed to build storage client: {}", e);
+            return None;
+        }
+    };
+
+    let bytes = match storage.read(key).await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(key, "stream_s3_recording: read failed: {}", e);
+            return None;
+        }
+    };
+
+    let file_name = Path::new(key)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("recording.wav");
+    let mime = guess_audio_mime(file_name);
+    let safe_file_name = file_name.replace('"', "'");
+    let mut response = Response::new(Body::from(bytes.clone()));
+    *response.status_mut() = StatusCode::OK;
+    let h = response.headers_mut();
+    if let Ok(v) = HeaderValue::from_str(mime) {
+        h.insert(http::header::CONTENT_TYPE, v);
+    }
+    h.insert(
+        http::header::CONTENT_LENGTH,
+        HeaderValue::from_str(&bytes.len().to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+    );
+    if let Ok(disposition) =
+        HeaderValue::from_str(&format!("inline; filename=\"{}\"", safe_file_name))
+    {
+        h.insert(http::header::CONTENT_DISPOSITION, disposition);
+    }
+    Some(response)
 }
 
 fn parse_range_header(range: &str, file_len: u64) -> Option<(u64, u64)> {

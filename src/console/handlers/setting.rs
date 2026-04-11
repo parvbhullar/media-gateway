@@ -176,6 +176,19 @@ pub fn urls() -> Router<Arc<ConsoleState>> {
         )
         .route("/settings/config/security", patch(update_security_settings))
         .route("/settings/config/rwi", patch(update_rwi_settings))
+        // Failed S3 upload retry queue (read + ops)
+        .route(
+            "/settings/uploads/pending",
+            get(list_pending_uploads),
+        )
+        .route(
+            "/settings/uploads/pending/retry",
+            post(retry_pending_uploads),
+        )
+        .route(
+            "/settings/uploads/pending/clear",
+            post(clear_pending_failures),
+        )
         .route(
             "/settings/departments",
             post(query_departments).put(create_department),
@@ -3058,6 +3071,170 @@ async fn assign_user_roles(
         }
     }
     Json(json!({ "status": "ok" })).into_response()
+}
+
+// ─── Pending S3 uploads (failed-upload retry queue) ─────────────────────────
+
+/// GET /settings/uploads/pending
+///
+/// Returns the recent pending_uploads rows plus counts grouped by status.
+/// Used by the "Pending S3 uploads" panel on the Recording tab.
+pub(crate) async fn list_pending_uploads(
+    State(state): State<Arc<ConsoleState>>,
+    AuthRequired(user): AuthRequired,
+) -> Response {
+    if !state.has_permission(&user, "system", "read").await {
+        return json_error(StatusCode::FORBIDDEN, "Permission denied");
+    }
+    let db = match get_db(&state) {
+        Ok(db) => db,
+        Err(r) => return r,
+    };
+
+    let counts =
+        match crate::models::pending_upload::Model::count_by_status(&db).await {
+            Ok(c) => c,
+            Err(e) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to count pending uploads: {e}"),
+                );
+            }
+        };
+
+    let rows = match crate::models::pending_upload::Model::list_recent(&db, 50).await {
+        Ok(r) => r,
+        Err(e) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to list pending uploads: {e}"),
+            );
+        }
+    };
+
+    let entries: Vec<JsonValue> = rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "call_id": r.call_id,
+                "kind": r.kind,
+                "local_path": r.local_path,
+                "target_key": r.target_key,
+                "attempts": r.attempts,
+                "status": r.status,
+                "last_error": r.last_error,
+                "last_attempt_at": r.last_attempt_at.map(|t| t.to_rfc3339()),
+                "created_at": r.created_at.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    Json(json!({
+        "status": "ok",
+        "counts": {
+            "pending": counts.0,
+            "failed_permanent": counts.1,
+            "failed_missing_source": counts.2,
+        },
+        "entries": entries,
+    }))
+    .into_response()
+}
+
+/// POST /settings/uploads/pending/retry
+///
+/// Resets every non-pending row back to `pending` (so failed_permanent
+/// rows get a fresh chance) and triggers an immediate sweep of the
+/// upload-retry scheduler. Returns the post-sweep counts.
+pub(crate) async fn retry_pending_uploads(
+    State(state): State<Arc<ConsoleState>>,
+    AuthRequired(user): AuthRequired,
+) -> Response {
+    if !state.has_permission(&user, "system", "write").await {
+        return json_error(StatusCode::FORBIDDEN, "Permission denied");
+    }
+    let db = match get_db(&state) {
+        Ok(db) => db,
+        Err(r) => return r,
+    };
+    let reset = match crate::models::pending_upload::Model::reset_failed(&db).await {
+        Ok(n) => n,
+        Err(e) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to reset failed rows: {e}"),
+            );
+        }
+    };
+
+    let app_state = match state.app_state() {
+        Some(a) => a,
+        None => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Application state unavailable",
+            );
+        }
+    };
+    if let Err(e) = crate::upload_retry::sweep(&app_state, 10).await {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Sweep failed: {e}"),
+        );
+    }
+
+    let counts = match crate::models::pending_upload::Model::count_by_status(&db).await {
+        Ok(c) => c,
+        Err(e) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to count after sweep: {e}"),
+            );
+        }
+    };
+    Json(json!({
+        "status": "ok",
+        "reset_to_pending": reset,
+        "counts": {
+            "pending": counts.0,
+            "failed_permanent": counts.1,
+            "failed_missing_source": counts.2,
+        },
+    }))
+    .into_response()
+}
+
+/// POST /settings/uploads/pending/clear
+///
+/// Deletes every row in `failed_permanent` or `failed_missing_source`.
+/// Used by the "Clear failures" button in the panel — these are rows
+/// the operator has acknowledged and decided not to retry.
+pub(crate) async fn clear_pending_failures(
+    State(state): State<Arc<ConsoleState>>,
+    AuthRequired(user): AuthRequired,
+) -> Response {
+    if !state.has_permission(&user, "system", "write").await {
+        return json_error(StatusCode::FORBIDDEN, "Permission denied");
+    }
+    let db = match get_db(&state) {
+        Ok(db) => db,
+        Err(r) => return r,
+    };
+    let cleared = match crate::models::pending_upload::Model::clear_failures(&db).await {
+        Ok(n) => n,
+        Err(e) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to clear failures: {e}"),
+            );
+        }
+    };
+    Json(json!({
+        "status": "ok",
+        "cleared": cleared,
+    }))
+    .into_response()
 }
 
 #[cfg(test)]

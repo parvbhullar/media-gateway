@@ -259,6 +259,7 @@ impl AppStateBuilder {
             let mut builder = CallRecordManagerBuilder::new()
                 .with_cancel_token(token.child_token())
                 .with_formatter(callrecord_formatter.clone())
+                .with_pending_db(db_conn.clone())
                 .with_hook(Box::new(DatabaseHook {
                     db: db_conn.clone(),
                 }));
@@ -408,6 +409,11 @@ impl AppStateBuilder {
                 manager.serve().await;
             });
         }
+
+        // Spawn the failed-S3-upload retry scheduler. The loop is a no-op
+        // unless callrecord is configured for S3, so it's safe to start
+        // unconditionally.
+        crate::upload_retry::spawn(app_state.clone());
 
         // Initialize addons
         if let Err(e) = addon_registry.initialize_all(app_state.clone()).await {

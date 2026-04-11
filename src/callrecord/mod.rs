@@ -460,6 +460,9 @@ pub struct CallRecordManagerBuilder {
     saver_fn: Option<FnSaveCallRecord>,
     formatter: Option<Arc<dyn CallRecordFormatter>>,
     hooks: Vec<Box<dyn CallRecordHook>>,
+    /// Optional database used to record per-file S3 upload failures into
+    /// `pending_uploads` so the upload-retry scheduler can retry them later.
+    pending_db: Option<sea_orm::DatabaseConnection>,
 }
 
 impl CallRecordManagerBuilder {
@@ -471,6 +474,7 @@ impl CallRecordManagerBuilder {
             saver_fn: None,
             formatter: None,
             hooks: Vec::new(),
+            pending_db: None,
         }
     }
 
@@ -502,14 +506,30 @@ impl CallRecordManagerBuilder {
         self.max_concurrent = Some(max_concurrent);
         self
     }
+    pub fn with_pending_db(mut self, db: sea_orm::DatabaseConnection) -> Self {
+        self.pending_db = Some(db);
+        self
+    }
 
     pub fn build(self) -> CallRecordManager {
         let cancel_token = self.cancel_token.unwrap_or_default();
         let config = Arc::new(self.config.unwrap_or_default());
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-        let saver_fn = self
-            .saver_fn
-            .unwrap_or_else(|| Arc::new(Box::new(CallRecordManager::default_saver)));
+        let pending_db_for_saver = self.pending_db.clone();
+        let saver_fn = self.saver_fn.unwrap_or_else(|| {
+            // Capture the optional DB so default_saver can record per-file
+            // S3 failures into the pending_uploads table.
+            Arc::new(Box::new(move |cancel_token, formatter, config, record| {
+                let pending_db = pending_db_for_saver.clone();
+                Box::pin(CallRecordManager::default_saver_with_pending(
+                    cancel_token,
+                    formatter,
+                    config,
+                    record,
+                    pending_db,
+                ))
+            }))
+        });
         let formatter = self
             .formatter
             .unwrap_or_else(|| Arc::new(DefaultCallRecordFormatter::default()));
@@ -546,11 +566,27 @@ impl CallRecordManagerBuilder {
 }
 
 impl CallRecordManager {
-    fn default_saver(
+    /// Original entry point — kept for backwards compatibility with anyone
+    /// who registered `default_saver` directly via `with_saver`. Forwards
+    /// to the pending-aware variant with no DB.
+    pub fn default_saver(
+        cancel_token: CancellationToken,
+        formatter: Arc<dyn CallRecordFormatter>,
+        config: Arc<CallRecordConfig>,
+        record: CallRecord,
+    ) -> Pin<Box<dyn Future<Output = CallRecordSaveResult> + Send>> {
+        Self::default_saver_with_pending(cancel_token, formatter, config, record, None)
+    }
+
+    /// Same as `default_saver` but accepts an optional DB connection. When
+    /// provided, S3 per-file upload failures get inserted into the
+    /// `pending_uploads` table so the retry scheduler can pick them up.
+    pub fn default_saver_with_pending(
         _cancel_token: CancellationToken,
         formatter: Arc<dyn CallRecordFormatter>,
         config: Arc<CallRecordConfig>,
         record: CallRecord,
+        pending_db: Option<sea_orm::DatabaseConnection>,
     ) -> Pin<Box<dyn Future<Output = CallRecordSaveResult> + Send>> {
         Box::pin(async move {
             let mut record = record;
@@ -580,7 +616,8 @@ impl CallRecordManager {
                         endpoint,
                         with_media,
                         keep_media_copy,
-                        &record,
+                        &mut record,
+                        pending_db.as_ref(),
                     )
                     .await
                 }
@@ -723,7 +760,8 @@ impl CallRecordManager {
         endpoint: &String,
         with_media: &Option<bool>,
         keep_media_copy: &Option<bool>,
-        record: &CallRecord,
+        record: &mut CallRecord,
+        pending_db: Option<&sea_orm::DatabaseConnection>,
     ) -> Result<String> {
         let start_time = Instant::now();
         let storage_config = crate::storage::StorageConfig::S3 {
@@ -737,25 +775,52 @@ impl CallRecordManager {
         };
         let storage = crate::storage::Storage::new(&storage_config)?;
 
-        // Serialize call record to JSON
+        // Serialize call record to JSON and upload.
         let call_log_json = formatter.format(record)?;
-        // Upload call log JSON
         let filename = formatter.format_file_name(record);
-        let local_files = vec![filename.clone()];
         let buf_size = call_log_json.len();
-        match storage.write(&filename, call_log_json.into()).await {
+        let cdr_upload_ok = match storage.write(&filename, call_log_json.into()).await {
             Ok(_) => {
                 info!(
                     elapsed = start_time.elapsed().as_secs_f64(),
                     filename, buf_size, "upload call record"
                 );
+                true
             }
             Err(e) => {
                 warn!(filename, "failed to upload call record: {}", e);
+                // Persist a CDR-kind pending row so the retry scheduler
+                // can re-attempt. We use the formatted filename as the
+                // local_path key — even though no local CDR file exists
+                // in S3 mode, the JSON can be regenerated from the
+                // record's serialized snapshot stored in the row.
+                if let Some(db) = pending_db {
+                    let _ = crate::models::pending_upload::Model::upsert_failure(
+                        db,
+                        &record.call_id,
+                        crate::models::pending_upload::KIND_CDR,
+                        &filename,
+                        &filename,
+                        &format!("{}", e),
+                    )
+                    .await;
+                }
+                false
             }
-        }
-        // Upload media files if with_media is true
+        };
+
+        // Upload media files if with_media is true. Track which local paths
+        // actually landed in S3 so we only delete those below — a failed
+        // upload must never cause local data loss.
+        let mut uploaded_media_paths: Vec<String> = Vec::new();
+        // Hold onto the s3 key of the first successful media upload so we
+        // can set `recording_url` to `s3://bucket/key` after the loop. The
+        // playback handler uses this to fetch the object back from S3.
+        let mut first_uploaded_s3_key: Option<String> = None;
         if with_media.unwrap_or(false) {
+            // Snapshot what we need from `record` so the inner mutations
+            // (recording_url) don't fight the borrow checker.
+            let call_id_owned = record.call_id.clone();
             let mut media_files = vec![];
             for media in &record.recorder {
                 if Path::new(&media.path).exists() {
@@ -763,41 +828,92 @@ impl CallRecordManager {
                     media_files.push((media.path.clone(), media_path));
                 }
             }
-            for (path, media_path) in &media_files {
+            for (local_path, s3_path) in &media_files {
                 let start_time = Instant::now();
-                let file_content = match tokio::fs::read(path).await {
+                let file_content = match tokio::fs::read(local_path).await {
                     Ok(file_content) => file_content,
                     Err(e) => {
-                        warn!("failed to read media file {}: {}", path, e);
+                        warn!("failed to read media file {}: {}", local_path, e);
+                        if let Some(db) = pending_db {
+                            let _ = crate::models::pending_upload::Model::upsert_failure(
+                                db,
+                                &call_id_owned,
+                                crate::models::pending_upload::KIND_MEDIA,
+                                local_path,
+                                s3_path,
+                                &format!("read media file: {}", e),
+                            )
+                            .await;
+                        }
                         continue;
                     }
                 };
                 let buf_size = file_content.len();
-                match storage.write(media_path, file_content.into()).await {
+                match storage.write(s3_path, file_content.into()).await {
                     Ok(_) => {
                         info!(
                             elapsed = start_time.elapsed().as_secs_f64(),
-                            media_path, buf_size, "upload media file"
+                            s3_path, buf_size, "upload media file"
                         );
+                        uploaded_media_paths.push(local_path.clone());
+                        if first_uploaded_s3_key.is_none() {
+                            first_uploaded_s3_key = Some(s3_path.clone());
+                        }
                     }
                     Err(e) => {
-                        warn!(media_path, "failed to upload media file: {}", e);
+                        warn!(s3_path, "failed to upload media file: {}", e);
+                        if let Some(db) = pending_db {
+                            let _ = crate::models::pending_upload::Model::upsert_failure(
+                                db,
+                                &call_id_owned,
+                                crate::models::pending_upload::KIND_MEDIA,
+                                local_path,
+                                s3_path,
+                                &format!("{}", e),
+                            )
+                            .await;
+                        }
                     }
                 }
             }
         }
-        // Optionally delete local media files if keep_media_copy is false
+
+        // If at least one media file landed in S3, point `recording_url`
+        // at the S3 object so the playback handler can fetch it later.
+        // Format: `s3://<bucket>/<key>` — the playback handler parses
+        // this scheme and reads from the configured callrecord storage.
+        if let Some(key) = first_uploaded_s3_key.as_ref() {
+            let s3_url = format!("s3://{}/{}", bucket, key.trim_start_matches('/'));
+            record.details.recording_url = Some(s3_url);
+        }
+
+        // Delete local files only when `keep_media_copy = false` AND the
+        // upload actually succeeded. This guarantees a failed S3 upload
+        // never leaves the service without a copy of the recording.
+        //
+        // Note: when with_media is false the audio was never intended to
+        // reach S3, so uploaded_media_paths is empty and we keep the local
+        // audio untouched — local disk is the primary store in that mode.
         if !keep_media_copy.unwrap_or(false) {
-            for media in &record.recorder {
-                let p = Path::new(&media.path);
+            for local_path in &uploaded_media_paths {
+                let p = Path::new(local_path);
                 if p.exists() {
-                    tokio::fs::remove_file(p).await.ok();
+                    if let Err(e) = tokio::fs::remove_file(p).await {
+                        warn!(
+                            path = %local_path,
+                            "failed to delete local media file after successful upload: {}",
+                            e
+                        );
+                    }
                 }
             }
-            for file_name in &local_files {
-                let p = Path::new(file_name);
+            // The CDR JSON lives on S3; only clean up a leftover local copy
+            // (e.g. from a previous local-mode run at the same path) when
+            // the S3 upload succeeded.
+            if cdr_upload_ok {
+                let p = Path::new(&filename);
                 if p.exists() {
-                    tokio::fs::remove_file(p).await.ok();
+                    let _ = tokio::fs::remove_file(p).await;
                 }
             }
         }

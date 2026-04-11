@@ -26,6 +26,7 @@ pub mod routing;
 pub mod sip_trunk;
 pub mod system_config;
 pub mod system_notification;
+pub mod pending_upload;
 pub mod user;
 pub mod wholesale_agent;
 
