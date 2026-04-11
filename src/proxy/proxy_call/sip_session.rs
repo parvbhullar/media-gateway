@@ -1575,7 +1575,7 @@ impl SipSession {
     ) {
         use crate::media::recorder::Leg;
 
-        let session_id = &self.context.session_id;
+        let session_id = self.context.session_id.clone();
 
         let caller_pc = Self::get_peer_pc(&self.caller_peer, Self::CALLER_TRACK_ID).await;
         let callee_pc = Self::get_peer_pc(&self.callee_peer, Self::CALLEE_TRACK_ID).await;
@@ -1612,6 +1612,27 @@ impl SipSession {
         let (callee_to_caller_tc, callee_to_caller_audio, callee_to_caller_dtmf) =
             Self::build_forwarding_config(&callee_profile, &caller_profile);
 
+        // Auto-start recording when enabled and recorder not yet initialized.
+        // For anchored media (SIP-to-SIP), start_recording is not triggered by
+        // any external command, so we initialize it here before wiring the tracks.
+        let recording = &self.context.dialplan.recording;
+        if recording.enabled && recording.auto_start && self.recording_state.is_none() {
+            if let Some(opt) = recording.option.as_ref() {
+                if !opt.recorder_file.is_empty() {
+                    if let Err(e) = self
+                        .start_recording(&opt.recorder_file.clone(), None, false)
+                        .await
+                    {
+                        warn!(
+                            session_id = %session_id,
+                            error = %e,
+                            "Failed to auto-start recording for anchored media"
+                        );
+                    }
+                }
+            }
+        }
+
         let shared_recorder = self.recorder.clone();
 
         if let Err(e) = Self::wire_with_forwarding_track(
@@ -1623,7 +1644,7 @@ impl SipSession {
             shared_recorder.clone(),
             Leg::A,
             caller_to_callee_dtmf,
-            session_id,
+            &session_id,
             "caller→callee",
         ) {
             warn!(session_id = %session_id, error = %e, "Failed to wire caller→callee");
@@ -1638,7 +1659,7 @@ impl SipSession {
             shared_recorder,
             Leg::B,
             callee_to_caller_dtmf,
-            session_id,
+            &session_id,
             "callee→caller",
         ) {
             warn!(session_id = %session_id, error = %e, "Failed to wire callee→caller");
