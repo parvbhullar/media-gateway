@@ -73,9 +73,9 @@ impl ProxyDataContext {
             db,
             trunk_registrar,
         };
-        let _ = ctx.reload_trunks(false, None).await?;
+        let _ = ctx.reload_trunks(true, None).await?;
         let _ = ctx.reload_queues(false, None).await?;
-        let _ = ctx.reload_routes(false, None).await?;
+        let _ = ctx.reload_routes(true, None).await?;
         let _ = ctx.reload_acl_rules(false, None)?;
         Ok(ctx)
     }
@@ -258,6 +258,19 @@ impl ProxyDataContext {
             let generated_pattern = vec![info.path.clone()];
             let (generated_trunks, _) = load_trunks_from_files(&generated_pattern)?;
             trunks.extend(generated_trunks);
+        } else {
+            // When not regenerating (no DB or generated_toml=false), load from any
+            // previously-generated file on disk so restarts pick up DB-managed trunks.
+            let generated_path = config
+                .generated_trunks_dir()
+                .join("trunks.generated.toml");
+            if generated_path.exists() {
+                let pattern = vec![generated_path.to_string_lossy().to_string()];
+                let (generated_trunks, generated_files) = load_trunks_from_files(&pattern)?;
+                file_count += generated_trunks.len();
+                files.extend(generated_files);
+                trunks.extend(generated_trunks);
+            }
         }
 
         let len = trunks.len();
@@ -419,6 +432,21 @@ impl ProxyDataContext {
             let (generated_routes, _) = load_routes_from_files(&generated_pattern)?;
             for route in generated_routes {
                 upsert_route(&mut routes, route);
+            }
+        } else {
+            // When not regenerating (no DB or generated_toml=false), load from any
+            // previously-generated file on disk so restarts pick up DB-managed routes.
+            let generated_path = config
+                .generated_routes_dir()
+                .join("routes.generated.toml");
+            if generated_path.exists() {
+                let pattern = vec![generated_path.to_string_lossy().to_string()];
+                let (generated_routes, generated_files) = load_routes_from_files(&pattern)?;
+                file_count += generated_routes.len();
+                files.extend(generated_files);
+                for route in generated_routes {
+                    upsert_route(&mut routes, route);
+                }
             }
         }
 
