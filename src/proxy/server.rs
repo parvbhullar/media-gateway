@@ -784,29 +784,33 @@ impl SipServer {
                     continue;
                 }
             }
-            // Spam protection for OPTIONS requests
-            // If the OPTIONS request is out-of-dialog and the tag is not present, ignore it
+            // Out-of-dialog OPTIONS keepalives (RFC 3261 §11) must be answered so
+            // upstream peers can probe liveness; reply 200 OK directly without
+            // routing into the module chain. INFO/REFER/UPDATE outside a dialog are
+            // still dropped when spam protection is enabled.
             if matches!(
                 tx.original.method,
                 rsipstack::sip::Method::Options
                     | rsipstack::sip::method::Method::Info
                     | rsipstack::sip::method::Method::Refer
                     | rsipstack::sip::method::Method::Update
-            ) && self.inner.ignore_out_of_dialog_request
-            {
+            ) {
                 let to_tag = tx
                     .original
                     .to_header()
                     .and_then(|to| to.tag())
                     .ok()
                     .flatten();
-                let via = tx.original.via_header()?.value();
                 if to_tag.is_none() {
-                    info!(key = %tx.key, via, "ignoring out-of-dialog {} request", tx.original.method);
                     if matches!(tx.original.method, rsipstack::sip::Method::Options) {
                         tx.reply(rsipstack::sip::StatusCode::OK).await.ok();
+                        continue;
                     }
-                    continue;
+                    if self.inner.ignore_out_of_dialog_request {
+                        let via = tx.original.via_header()?.value();
+                        info!(key = %tx.key, via, "ignoring out-of-dialog {} request", tx.original.method);
+                        continue;
+                    }
                 }
             }
             crate::utils::spawn(async move {
