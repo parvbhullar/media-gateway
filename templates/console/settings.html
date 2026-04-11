@@ -234,9 +234,10 @@
 
         <section x-show="activeTab === 'platform'" x-cloak x-transition.opacity class="space-y-6"
             id="settings-tab-platform" role="tabpanel" tabindex="0">
-            <div class="rounded-md bg-amber-50 px-4 py-2 text-xs text-amber-800 ring-1 ring-amber-200 flex items-center gap-2">
+            <div x-show="tabDirty('platform', platformDraft)" x-cloak
+                class="rounded-md bg-amber-50 px-4 py-2 text-xs text-amber-800 ring-1 ring-amber-200 flex items-center gap-2">
                 <svg class="h-4 w-4 flex-none" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01M5 19h14a2 2 0 001.84-2.75L13.74 4a2 2 0 00-3.48 0L3.16 16.25A2 2 0 005 19z"></path></svg>
-                <span>Changes to platform settings require a service restart to take effect.</span>
+                <span>You have unsaved platform changes — a service restart is required after saving.</span>
             </div>
             <div class="grid gap-6 lg:grid-cols-2">
                 <div class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
@@ -430,9 +431,10 @@
 
         <section x-show="activeTab === 'proxy'" x-cloak x-transition.opacity class="space-y-6" id="settings-tab-proxy"
             role="tabpanel" tabindex="0">
-            <div class="rounded-md bg-amber-50 px-4 py-2 text-xs text-amber-800 ring-1 ring-amber-200 flex items-center gap-2">
+            <div x-show="tabDirty('proxy', proxyDraft)" x-cloak
+                class="rounded-md bg-amber-50 px-4 py-2 text-xs text-amber-800 ring-1 ring-amber-200 flex items-center gap-2">
                 <svg class="h-4 w-4 flex-none" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01M5 19h14a2 2 0 001.84-2.75L13.74 4a2 2 0 00-3.48 0L3.16 16.25A2 2 0 005 19z"></path></svg>
-                <span>Changes to proxy settings require a service restart to take effect.</span>
+                <span>You have unsaved proxy changes — a service restart is required after saving.</span>
             </div>
             <div class="grid gap-6 lg:grid-cols-1">
                 <div class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
@@ -872,9 +874,10 @@
 
         <section x-show="activeTab === 'sipflow'" x-cloak x-transition.opacity class="space-y-6"
             id="settings-tab-sipflow" role="tabpanel" tabindex="0">
-            <div class="rounded-md bg-amber-50 px-4 py-2 text-xs text-amber-800 ring-1 ring-amber-200 flex items-center gap-2">
+            <div x-show="tabDirty('sipflow', sipflowDraft)" x-cloak
+                class="rounded-md bg-amber-50 px-4 py-2 text-xs text-amber-800 ring-1 ring-amber-200 flex items-center gap-2">
                 <svg class="h-4 w-4 flex-none" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01M5 19h14a2 2 0 001.84-2.75L13.74 4a2 2 0 00-3.48 0L3.16 16.25A2 2 0 005 19z"></path></svg>
-                <span>Changes to SipFlow settings require a service restart to take effect.</span>
+                <span>You have unsaved SipFlow changes — a service restart is required after saving.</span>
             </div>
             <div class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
                 <div class="flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
@@ -1022,9 +1025,10 @@
 
         <section x-show="activeTab === 'recording'" x-cloak x-transition.opacity class="space-y-6"
             id="settings-tab-recording" role="tabpanel" tabindex="0">
-            <div class="rounded-md bg-amber-50 px-4 py-2 text-xs text-amber-800 ring-1 ring-amber-200 flex items-center gap-2">
+            <div x-show="tabDirty('recording', storageDraft)" x-cloak
+                class="rounded-md bg-amber-50 px-4 py-2 text-xs text-amber-800 ring-1 ring-amber-200 flex items-center gap-2">
                 <svg class="h-4 w-4 flex-none" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01M5 19h14a2 2 0 001.84-2.75L13.74 4a2 2 0 00-3.48 0L3.16 16.25A2 2 0 005 19z"></path></svg>
-                <span>Changes to recording settings require a service restart to take effect.</span>
+                <span>You have unsaved recording changes — a service restart is required after saving.</span>
             </div>
             <div class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
                 <div class="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
@@ -1223,9 +1227,10 @@
 
         <section x-show="activeTab === 'security'" x-cloak x-transition.opacity class="space-y-6"
             id="settings-tab-security" role="tabpanel" tabindex="0">
-            <div class="rounded-md bg-emerald-50 px-4 py-2 text-xs text-emerald-800 ring-1 ring-emerald-200 flex items-center gap-2">
+            <div x-show="tabDirty('security', securityDraft)" x-cloak
+                class="rounded-md bg-emerald-50 px-4 py-2 text-xs text-emerald-800 ring-1 ring-emerald-200 flex items-center gap-2">
                 <svg class="h-4 w-4 flex-none" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>
-                <span>ACL changes are hot-reloaded — no service restart required.</span>
+                <span>You have unsaved ACL changes — they will hot-reload on save (no restart needed).</span>
             </div>
             <div class="grid gap-6 lg:grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)]">
                 <div class="space-y-6">
@@ -1421,9 +1426,10 @@
 
         <section x-show="activeTab === 'rwi'" x-cloak x-transition.opacity class="space-y-6" id="settings-tab-rwi"
             role="tabpanel" tabindex="0">
-            <div class="rounded-md bg-amber-50 px-4 py-2 text-xs text-amber-800 ring-1 ring-amber-200 flex items-center gap-2">
+            <div x-show="tabDirty('rwi', rwiDraft)" x-cloak
+                class="rounded-md bg-amber-50 px-4 py-2 text-xs text-amber-800 ring-1 ring-amber-200 flex items-center gap-2">
                 <svg class="h-4 w-4 flex-none" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01M5 19h14a2 2 0 001.84-2.75L13.74 4a2 2 0 00-3.48 0L3.16 16.25A2 2 0 005 19z"></path></svg>
-                <span>Changes to RWI settings require a service restart to take effect.</span>
+                <span>You have unsaved RWI changes — a service restart is required after saving.</span>
             </div>
             <div class="grid gap-6 lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
                 <div class="space-y-6">
@@ -1665,10 +1671,6 @@
 
         <section x-show="activeTab === 'db_config'" x-cloak x-transition.opacity class="space-y-6"
             id="settings-tab-db_config" role="tabpanel" tabindex="0" x-init="loadDbConfig()">
-            <div class="rounded-md bg-amber-50 px-4 py-2 text-xs text-amber-800 ring-1 ring-amber-200 flex items-center gap-2">
-                <svg class="h-4 w-4 flex-none" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01M5 19h14a2 2 0 001.84-2.75L13.74 4a2 2 0 00-3.48 0L3.16 16.25A2 2 0 005 19z"></path></svg>
-                <span>Overrides here are merged into the generated config at startup — restart the service to apply changes.</span>
-            </div>
             <div class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
                 <div class="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
                     <div>
@@ -2521,6 +2523,10 @@
                 ];
             })(),
             activeTab: 'platform',
+            // Snapshot of each tab's draft taken at load/reset time. Compared
+            // against the live draft to decide whether the "restart required"
+            // banner should appear.
+            draftBaselines: {},
             platform: {},
             proxyConfig: {},
             stats: {},
@@ -2790,6 +2796,7 @@
                     })),
                     contexts: this.rwi.contexts || [],
                 };
+                this.snapshotDraft('rwi', this.rwiDraft);
 
                 const storageMeta = this.server.storage || {};
                 this.selectedStorageProfile = storageMeta.active_profile
@@ -4335,6 +4342,26 @@
                 }
                 return `${Math.round(value)}ms`;
             },
+            // Store a deep-clone of the draft so later edits can be compared
+            // against the baseline for dirty detection.
+            snapshotDraft(name, draft) {
+                try {
+                    this.draftBaselines[name] = JSON.parse(JSON.stringify(draft ?? {}));
+                } catch (_) {
+                    this.draftBaselines[name] = {};
+                }
+            },
+            // Returns true when the tab's current draft differs from its
+            // baseline snapshot. Used to gate "restart required" banners.
+            tabDirty(name, draft) {
+                const base = this.draftBaselines[name];
+                if (base === undefined) return false;
+                try {
+                    return JSON.stringify(draft ?? {}) !== JSON.stringify(base);
+                } catch (_) {
+                    return true;
+                }
+            },
             initPlatformDraft() {
                 const rtp = this.proxyConfig?.rtp || {};
                 const toStringOrEmpty = (value) => (value === undefined || value === null || value === ''
@@ -4347,6 +4374,7 @@
                     rtp_start_port: toStringOrEmpty(rtp?.start_port),
                     rtp_end_port: toStringOrEmpty(rtp?.end_port),
                 };
+                this.snapshotDraft('platform', this.platformDraft);
             },
             initProxyDraft() {
                 const proxy = this.proxyConfig || {};
@@ -4364,6 +4392,7 @@
                     },
                     user_backends: JSON.parse(JSON.stringify(proxy.user_backends || [])),
                 };
+                this.snapshotDraft('proxy', this.proxyDraft);
             },
             resetProxyDraft() {
                 this.initProxyDraft();
@@ -4641,6 +4670,11 @@
                     recording_ptime: recording?.ptime ? String(recording.ptime) : '',
                     recording_filename_pattern: recording?.filename_pattern || '',
                 };
+                // Storage tab carries both "storage" (callrecord + paths) and
+                // "recording" (policy) sections — snapshot both so each banner
+                // lights up independently.
+                this.snapshotDraft('storage', this.storageDraft);
+                this.snapshotDraft('recording', this.storageDraft);
             },
             resetStorageDraft() {
                 this.initStorageDraft();
@@ -4823,6 +4857,7 @@
                     remote_http_addr: backendType === 'remote' ? (config.http_addr || '') : '',
                     remote_timeout_secs: backendType === 'remote' ? (config.timeout_secs || 10) : 10,
                 };
+                this.snapshotDraft('sipflow', this.sipflowDraft);
             },
             resetSipFlowDraft() {
                 this.initSipFlowDraft();
@@ -4892,6 +4927,8 @@
                         backend_type: backendType,
                         config,
                     };
+                    // Re-baseline so the "unsaved changes" banner disappears.
+                    this.snapshotDraft('sipflow', this.sipflowDraft);
 
                     this.$dispatch('toast', {
                         title: this.tt('settings_page.settings_saved'),
@@ -4986,6 +5023,7 @@
             },
             initSecurityDraft() {
                 this.securityDraft.acl_rules = this.formatAclRules(this.acl.active_rules || []);
+                this.snapshotDraft('security', this.securityDraft);
             },
             resetSecurityDraft() {
                 this.initSecurityDraft();
@@ -5014,6 +5052,7 @@
                     const acl_rules = Array.isArray(data?.security?.acl_rules) ? data.security.acl_rules : [];
                     this.acl.active_rules = acl_rules;
                     this.securityDraft.acl_rules = this.formatAclRules(this.acl.active_rules);
+                    this.snapshotDraft('security', this.securityDraft);
                     this.$dispatch('toast', {
                         title: 'Settings saved',
                         message: data?.message || 'Security settings saved. Restart required to apply.',
@@ -5090,6 +5129,7 @@
                     }
                     // Update the current RWI config
                     this.rwi = data.rwi || this.rwiDraft;
+                    this.snapshotDraft('rwi', this.rwiDraft);
                     this.$dispatch('toast', {
                         title: 'Settings saved',
                         message: data?.message || 'RWI settings saved.',
