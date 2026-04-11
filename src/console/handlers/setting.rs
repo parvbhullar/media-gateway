@@ -152,6 +152,7 @@ impl From<UserModel> for UserView {
 pub fn urls() -> Router<Arc<ConsoleState>> {
     Router::new()
         .route("/settings", get(page_settings))
+        .route("/settings/config", get(get_effective_config))
         .route("/settings/config/platform", patch(update_platform_settings))
         .route("/settings/config/proxy", patch(update_proxy_settings))
         .route("/settings/config/storage", patch(update_storage_settings))
@@ -1416,6 +1417,83 @@ pub(crate) struct RecordingPolicyPayload {
 pub(crate) struct SecuritySettingsPayload {
     #[serde(default)]
     acl_rules: Option<Option<String>>,
+}
+
+/// GET /settings/config
+///
+/// Returns all effective configuration: the in-memory merged config (what the
+/// server is actually running with) combined with the raw DB overrides so the
+/// caller can see both the effective values and which keys have been overridden.
+pub(crate) async fn get_effective_config(
+    State(state): State<Arc<ConsoleState>>,
+    AuthRequired(user): AuthRequired,
+) -> Response {
+    if !state.has_permission(&user, "system", "read").await {
+        return json_error(StatusCode::FORBIDDEN, "Permission denied");
+    }
+
+    let db = match get_db(&state) {
+        Ok(db) => db,
+        Err(r) => return r,
+    };
+
+    // Load all DB overrides
+    let db_overrides = match system_config::Model::get_all(&db).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load config overrides: {e}"),
+            );
+        }
+    };
+
+    // Build a map of key → {value, is_override, updated_at}
+    let overrides_map: serde_json::Value = serde_json::Value::Object(
+        db_overrides
+            .iter()
+            .map(|row| {
+                let val: serde_json::Value = serde_json::from_str(&row.value)
+                    .unwrap_or(serde_json::Value::String(row.value.clone()));
+                (
+                    row.key.clone(),
+                    json!({
+                        "value": val,
+                        "is_override": row.is_override,
+                        "updated_at": row.updated_at.to_rfc3339(),
+                    }),
+                )
+            })
+            .collect(),
+    );
+
+    // Include the effective running config (what server booted with)
+    let effective = if let Some(app_state) = state.app_state() {
+        let config = app_state.config();
+        json!({
+            "http_addr": config.http_addr,
+            "external_ip": config.external_ip,
+            "log_level": config.log_level,
+            "log_file": config.log_file,
+            "database_url": config.database_url,
+            "rtp_start_port": config.rtp_start_port,
+            "rtp_end_port": config.rtp_end_port,
+            "recording": {
+                "path": config.recorder_path(),
+            },
+        })
+    } else {
+        json!(null)
+    };
+
+    Json(json!({
+        "status": "ok",
+        "effective_config": effective,
+        "db_overrides": overrides_map,
+        "override_count": db_overrides.len(),
+        "note": "effective_config shows running values; db_overrides shows what is stored in DB. Restart applies all overrides."
+    }))
+    .into_response()
 }
 
 pub(crate) async fn update_platform_settings(

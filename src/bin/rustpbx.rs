@@ -308,7 +308,14 @@ async fn main() -> Result<()> {
     let _ = guard_holder; // keep the guard alive
 
     let mut cached_config = Some(config);
-    let mut next_config_path = config_path.clone();
+    // base_config_path is always config.toml — used as the merge source on every restart.
+    // effective_config_path (config.generated.toml) is stored in app_state so the
+    // console settings page reads the actual merged/effective values from disk.
+    // base_config_path is always config.toml — used as the merge source on every restart.
+    // effective_config_path (config.generated.toml) is stored in app_state so the
+    // console settings page reads the actual merged/effective values from disk.
+    let base_config_path = config_path.clone();
+    let mut current_effective_path = effective_config_path.clone();
     let mut retry_count = 0;
     let max_retries = 10;
     let retry_interval = Duration::from_secs(5);
@@ -316,12 +323,17 @@ async fn main() -> Result<()> {
     loop {
         let config = if let Some(cfg) = cached_config.take() {
             cfg
-        } else if let Some(ref path) = next_config_path {
-            // Re-run merge on restart to pick up any new DB overrides
+        } else if let Some(ref path) = base_config_path {
+            // Always re-merge from base config.toml (not the generated file) so DB
+            // overrides are applied fresh and never stacked on top of themselves.
             let effective = match rustpbx::config_merge::apply(path).await {
-                Ok(generated) => generated,
+                Ok(generated) => {
+                    current_effective_path = Some(generated.clone());
+                    generated
+                }
                 Err(e) => {
                     tracing::warn!("Config merge skipped on restart ({}), using base.", e);
+                    current_effective_path = Some(path.clone());
                     path.clone()
                 }
             };
@@ -355,7 +367,8 @@ async fn main() -> Result<()> {
 
         let state_builder = AppStateBuilder::new()
             .with_config(config.clone())
-            .with_config_metadata(next_config_path.clone(), Utc::now());
+            // Store effective (generated) path so the console settings page reads merged values.
+            .with_config_metadata(current_effective_path.clone(), Utc::now());
 
         let (app_reload_requested, app_config_path) = {
             let state = match state_builder.build().await {
@@ -461,7 +474,7 @@ async fn main() -> Result<()> {
 
         if app_reload_requested {
             info!("Reload requested; restarting with updated configuration");
-            next_config_path = app_config_path;
+            let _ = app_config_path; // noted but base_config_path is always used for merge
             cached_config = None;
             retry_count = 0;
 
