@@ -7,214 +7,198 @@
 
 ## Problem
 
-All configuration currently lives in `config.toml`. Changing any setting requires editing a file on disk and restarting the service. There is no way to manage configuration through the console UI in a persistent, file-free way. The TOML file mixes bootstrap values (database URL) with runtime values (external IP, SIP ports, recording paths) making deployments fragile.
+All configuration currently lives in `config.toml`. Changing any setting requires editing a file on disk and restarting the service. There is no way to manage configuration through the console UI in a persistent way. The TOML file is the only source of truth, so console-applied changes are lost on restart.
 
 ---
 
 ## Goal
 
-Move all runtime configuration into the database. The only value that must remain in `config.toml` is `database_url`. Everything else is read from DB at startup, auto-seeded on first run, and manageable through the console UI without touching any files.
+Allow runtime settings to be managed via the console UI and persisted in the database. On every startup the server merges the base `config.toml` with DB overrides and boots from a generated final config file. **No changes are required anywhere else in the system** — `Config::load()`, hot-reload, and the service file all stay exactly as they are today.
 
 ---
 
-## Design
+## Core Idea
 
-### config.toml — Minimal Bootstrap
-
-After this change, the only required content of `config.toml` is:
-
-```toml
-database_url = "sqlite://rustpbx.sqlite3"
+```
+config.toml  (base — operator-edited template)
+     +
+system_config table  (DB overrides — console UI writes here)
+     │
+     └──── merge step (runs at startup, before Config::load)
+                  │
+                  ▼
+         config.generated.toml  (final merged config)
+                  │
+                  ▼
+          Config::load("config.generated.toml")
+          ← everything else unchanged
 ```
 
-The server will refuse to start if `database_url` is missing. All other fields in `config.toml` are ignored once DB config is seeded (first run only).
-
-The `--conf` CLI flag continues to work as today — it points to the TOML file that contains `database_url`.
+`config.toml` remains the human-editable base. The DB holds only the delta — values changed via the console UI. `config.generated.toml` is the single file the server actually boots from. It is always present and inspectable.
 
 ---
 
-### Database Schema — `system_config` Table
-
-A flat key-value table. Keys use dot notation to mirror the existing config struct hierarchy.
-
-```sql
-CREATE TABLE system_config (
-    key         TEXT    PRIMARY KEY,
-    value       TEXT    NOT NULL,        -- JSON-encoded value
-    is_override BOOLEAN NOT NULL DEFAULT FALSE,  -- TRUE = skip auto-detection
-    updated_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-```
-
-**Example rows:**
-
-| key | value | is_override |
-|-----|-------|-------------|
-| `http_addr` | `"0.0.0.0:8080"` | false |
-| `external_ip` | `"13.202.41.67"` | false |
-| `proxy.udp_port` | `5060` | false |
-| `proxy.media_proxy` | `"auto"` | false |
-| `rtp.start_port` | `12000` | false |
-| `rtp.end_port` | `42000` | false |
-| `log_level` | `"info"` | false |
-| `recording.enabled` | `true` | false |
-| `recording.path` | `"./config/recorders"` | false |
-| `proxy.registrar_expires` | `60` | false |
-
-All values are JSON-encoded so booleans, integers, strings, arrays, and objects are all handled uniformly.
-
----
-
-### Startup Flow
+## Startup Flow
 
 ```
 rustpbx --conf config.toml
           │
-          ├─ Parse config.toml → extract database_url only
-          │   (error if missing)
+          ├─ Minimal parse of config.toml → extract database_url only
+          │   (fatal error if missing)
           │
           ├─ Connect to DB, run migrations
           │
           ├─ First run? (system_config table is empty)
           │   YES:
-          │     → Seed DB with compiled-in defaults (see Defaults section)
-          │     → Auto-detect external_ip → save with is_override=false
-          │     → Log: "First run: config seeded, external_ip=x.x.x.x"
+          │     → Auto-detect external_ip → insert into system_config
+          │     → Log: "First run: external_ip detected as x.x.x.x"
+          │   NO:
+          │     → Auto-detect external_ip (unless is_override=true)
+          │     → If changed from DB value → update system_config
+          │     → Log: "external_ip updated: old → new"  (only if changed)
           │
-          ├─ Load Config from DB (all keys)
+          ├─ Load full config.toml
+          ├─ Load overrides from system_config table
+          ├─ Merge: DB values overwrite matching config.toml values
+          ├─ Write merged result to config.generated.toml
           │
-          ├─ Auto-detect external_ip
-          │   is_override=false:
-          │     → Detect current public IP
-          │     → If changed from DB value → update DB, log "IP updated: old→new"
-          │     → Use detected IP
-          │   is_override=true:
-          │     → Skip detection, use DB value as-is
-          │
-          └─ Build full Config struct → start server
+          └─ Config::load("config.generated.toml")
+             → normal server startup, nothing else changes
 ```
+
+The `--conf config.toml` argument is preserved. The server uses it to locate both the base config and the generated output path (`config.generated.toml` lives alongside `config.toml`).
 
 ---
 
-### External IP Auto-Detection
+## Database Schema — `system_config` Table
 
-Detection is attempted on every startup when `is_override=false`. A chain of sources is tried in order with per-source timeouts. The entire detection has a 5-second total budget.
+A flat key-value store. Keys use dot notation mirroring the TOML structure.
 
+```sql
+CREATE TABLE system_config (
+    key         TEXT    PRIMARY KEY,
+    value       TEXT    NOT NULL,               -- JSON-encoded value
+    is_override BOOLEAN NOT NULL DEFAULT FALSE, -- TRUE = skip auto-detection
+    updated_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 ```
-1. AWS EC2 metadata:  http://169.254.169.254/latest/meta-data/public-ipv4   (1s)
-2. GCP metadata:      http://metadata.google.internal/computeMetadata/v1/
-                        instance/network-interfaces/0/access-configs/0/externalIp  (1s)
-3. Public API:        https://api.ipify.org                                 (3s)
-4. Fallback:          first non-loopback, non-link-local interface IP
-```
 
-The fallback (step 4) always succeeds — it guarantees the server starts even with no internet access.
+**Example rows after a user changes settings via console:**
 
-When the detected IP differs from the DB value, the DB is updated and an `INFO` log line is emitted. No restart is required for the detection itself since it runs before the server binds ports.
+| key | value | is_override |
+|-----|-------|-------------|
+| `external_ip` | `"13.202.41.67"` | false |
+| `proxy.udp_port` | `15060` | false |
+| `log_level` | `"debug"` | false |
+| `recording.enabled` | `true` | false |
+| `proxy.registrar_expires` | `120` | false |
+
+Only keys that differ from `config.toml` need to be in this table. The table is empty on first run — the base `config.toml` values are used as-is except for `external_ip` which is auto-detected.
 
 ---
 
-### Config Load Priority
+## Merge Rules
+
+1. Start with the full parsed `config.toml` as a TOML document (using `toml_edit` to preserve formatting/comments is not required here — we just need the values)
+2. For each row in `system_config`: set the corresponding key in the document to the DB value
+3. Write the resulting document to `config.generated.toml`
+4. `config.generated.toml` is a complete, valid TOML file — every key is present
+
+**Key mapping** (dot notation → TOML path):
+
+| DB key | TOML path |
+|--------|-----------|
+| `external_ip` | `external_ip` |
+| `log_level` | `log_level` |
+| `proxy.udp_port` | `[proxy] udp_port` |
+| `proxy.media_proxy` | `[proxy] media_proxy` |
+| `rtp.start_port` | `rtp_start_port` |
+| `rtp.end_port` | `rtp_end_port` |
+| `recording.enabled` | `[recording] enabled` |
+| `recording.path` | `[recording] path` |
+| `proxy.registrar_expires` | `[proxy] registrar_expires` |
+| `proxy.realms` | `[proxy] realms` |
+
+---
+
+## External IP Auto-Detection
+
+Runs on every startup when `is_override=false` (or key not in DB yet).
 
 ```
-compiled-in defaults  (lowest)
-       ↓
-  DB values
-       ↓
-  env vars  (highest)
+1. AWS EC2 metadata:  http://169.254.169.254/latest/meta-data/public-ipv4    (1s timeout)
+2. GCP metadata:      http://metadata.google.internal/...                     (1s timeout)
+3. Public API:        https://api.ipify.org                                   (3s timeout)
+4. Fallback:          first non-loopback, non-link-local network interface IP
 ```
 
-Env var naming: `RUSTPBX_` prefix + key uppercased with dots replaced by underscores.
-Examples: `RUSTPBX_EXTERNAL_IP=1.2.3.4`, `RUSTPBX_PROXY_UDP_PORT=5080`, `RUSTPBX_LOG_LEVEL=debug`.
+Total budget: 5 seconds. Step 4 always succeeds — server never blocks on network.
 
-Env vars allow CI/CD and container deployments to override specific values without a DB write.
+Result is written to `system_config` (key=`external_ip`, `is_override=false`) and included in `config.generated.toml`.
 
----
-
-### Compiled-In Defaults
-
-These are the values seeded into DB on first run. They match current `Config::default()` behaviour exactly so existing deployments see no change in behaviour.
-
-| Key | Default |
-|-----|---------|
-| `http_addr` | `"0.0.0.0:8080"` |
-| `log_level` | `"info"` |
-| `proxy.addr` | `"0.0.0.0"` |
-| `proxy.udp_port` | `5060` |
-| `proxy.media_proxy` | `"auto"` |
-| `proxy.registrar_expires` | `60` |
-| `proxy.modules` | `["acl","auth","registrar","call"]` |
-| `proxy.nat_fix` | `true` |
-| `proxy.ensure_user` | `true` |
-| `proxy.generated_dir` | `"./config"` |
-| `rtp.start_port` | `12000` |
-| `rtp.end_port` | `42000` |
-| `recording.enabled` | `false` |
-| `recording.auto_start` | `true` |
-| `recording.path` | `"./config/recorders"` |
-| `callrecord.type` | `"local"` |
-| `callrecord.root` | `"./config/cdr"` |
-| `external_ip` | *(auto-detected)* |
+When `is_override=true`: skip detection entirely, use the DB value as-is.
 
 ---
 
-### Console UI — Settings Page
+## Console UI — Settings Page
 
-The existing settings page handlers (`/settings/config/platform`, `/settings/config/proxy`, `/settings/config/storage`, etc.) are updated to read from and write to `system_config` instead of calling `toml_edit` on `config.toml`.
+The existing settings page handlers are updated to write to `system_config` instead of using `toml_edit` to patch `config.toml` on disk.
 
-**Read:** `GET /settings` — query all keys from `system_config`, build response JSON (same shape as today).
+**Read:** Query `system_config` for current overrides. For keys not in DB, read from the last `config.generated.toml` (or `config.toml` as fallback) to show current effective values.
 
-**Write:** `PATCH /settings/config/*` — validate input, upsert into `system_config`. Return `requires_restart` flag for settings that need it (same as today).
+**Write:** Validate input → upsert into `system_config`. Return `requires_restart: true` (unchanged from today — changes take effect on next restart when the generated file is rebuilt).
 
-**External IP override:** A toggle on the platform settings page sets `is_override=true/false` for the `external_ip` key. When override is off, the displayed value shows the auto-detected IP with a note "auto-detected, updates on restart".
+**External IP override toggle:** Sets `is_override=true/false` on the `external_ip` row. When off, the UI displays the auto-detected value with a note: *"auto-detected — updates on restart"*.
 
 ---
 
-### Migration Path for Existing Deployments
+## Migration Path for Existing Deployments
 
 Existing deployments have a fully configured `config.toml`. On the first restart after this change:
 
-1. Server reads `database_url` from `config.toml`
-2. `system_config` table is empty (first run for this feature)
-3. **Seed from existing `config.toml`** — parse the full file, extract known keys, insert into DB
-4. Auto-detect external IP, update DB if changed
-5. Log: "Config migrated from config.toml to database"
+1. `system_config` table is empty — first run
+2. Auto-detect external IP → insert into `system_config`
+3. Merge: `config.toml` + `system_config` (only external_ip) → write `config.generated.toml`
+4. Server boots from `config.generated.toml`
 
-This means existing deployments automatically carry over their current settings. No manual intervention required.
+All existing settings in `config.toml` are preserved unchanged in the generated file. The operator sees no difference in behaviour. On subsequent console UI changes, those values accumulate in `system_config` and are reflected in the generated file on next restart.
 
 ---
 
-### Error Handling
+## Error Handling
 
 | Scenario | Behaviour |
 |----------|-----------|
-| `config.toml` missing | Fatal error: "config.toml not found — at minimum, database_url must be set" |
-| `database_url` missing from TOML | Fatal error with message pointing to docs |
-| DB connection fails | Fatal error — server cannot start without DB |
-| `system_config` table empty, first run | Seed defaults + auto-detect IP, continue |
-| External IP detection fails entirely | Use `""` (empty), log warning "external_ip not detected — set manually in console" |
-| Unknown key in `system_config` | Ignored (forward compatibility for future keys) |
-| Env var override malformed | Log warning, use DB value |
+| `config.toml` missing | Fatal: "config.toml not found" (unchanged from today) |
+| `database_url` missing from `config.toml` | Fatal: "database_url required in config.toml" |
+| DB connection fails | Fatal: server cannot generate config without DB |
+| `system_config` empty (first run) | Auto-detect IP, write generated file from base config |
+| External IP detection fails (all sources) | Use `config.toml` value if present, else empty string; log warning |
+| DB key has malformed JSON value | Skip that key, log warning, use `config.toml` value |
+| `config.generated.toml` write fails (disk full, permissions) | Fatal: cannot start without writable config |
 
 ---
 
-### Files Affected
+## Files Affected
 
 | File | Change |
 |------|--------|
 | `src/models/mod.rs` | Add `system_config` module |
 | `src/models/migration/` | New migration: create `system_config` table |
 | `src/models/system_config.rs` | New: sea-orm entity + CRUD helpers |
-| `src/config.rs` | `Config::load()` reads `database_url` only from TOML; new `Config::load_from_db()` |
-| `src/bin/rustpbx.rs` | Startup flow updated: connect DB first, then load config from DB |
-| `src/console/handlers/setting.rs` | All `toml_edit` writes replaced with DB upserts |
+| `src/config_merge.rs` | New: merge logic (base TOML + DB overrides → generated file) |
 | `src/ip_detect.rs` | New: external IP auto-detection with fallback chain |
+| `src/bin/rustpbx.rs` | Add pre-boot merge step before `Config::load()` (~30 lines) |
+| `src/console/handlers/setting.rs` | Replace `toml_edit` writes with DB upserts |
+
+**Everything else stays unchanged:** `Config::load()`, `SipServerBuilder`, hot-reload, service file, all call/media/proxy code.
 
 ---
 
-### Out of Scope
+## Out of Scope
 
-- Live hot-reload of all settings without restart (future work — `requires_restart` flag unchanged)
-- Config history / audit log (can be added later to `system_config_history` table)
-- Multi-node config sync (single-node only for now)
-- Secrets management / encryption of sensitive values in DB
+- Live hot-reload without restart (future work)
+- Config history / audit log (add `system_config_history` table later)
+- Multi-node config sync
+- Secrets encryption in DB
+- Removing `config.toml` entirely (it remains the base template)

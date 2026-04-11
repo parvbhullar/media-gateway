@@ -1,4 +1,5 @@
 use crate::app::AppStateInner;
+use crate::models::system_config;
 use crate::config::{
     CallRecordConfig, Config, HttpRouterConfig, LocatorWebhookConfig, ProxyConfig,
     UserBackendConfig,
@@ -1425,21 +1426,29 @@ pub(crate) async fn update_platform_settings(
     if !state.has_permission(&user, "system", "write").await {
         return json_error(StatusCode::FORBIDDEN, "Permission denied");
     }
+
+    let db = match get_db(&state) {
+        Ok(db) => db,
+        Err(r) => return r,
+    };
+
+    // Load base config for validation only (not written back to disk)
     let config_path = match get_config_path(&state) {
-        Ok(path) => path,
-        Err(resp) => return resp,
+        Ok(p) => p,
+        Err(r) => return r,
     };
-
     let mut doc = match load_document(&config_path) {
-        Ok(doc) => doc,
-        Err(resp) => return resp,
+        Ok(d) => d,
+        Err(r) => return r,
     };
 
+    let mut overrides: Vec<(&'static str, serde_json::Value)> = Vec::new();
     let mut modified = false;
 
     if let Some(level_opt) = payload.log_level {
         if let Some(level) = normalize_opt_string(level_opt) {
-            doc["log_level"] = value(level);
+            doc["log_level"] = value(level.clone());
+            overrides.push(("log_level", serde_json::json!(level)));
         } else {
             doc.remove("log_level");
         }
@@ -1448,7 +1457,8 @@ pub(crate) async fn update_platform_settings(
 
     if let Some(file_opt) = payload.log_file {
         if let Some(path) = normalize_opt_string(file_opt) {
-            doc["log_file"] = value(path);
+            doc["log_file"] = value(path.clone());
+            overrides.push(("log_file", serde_json::json!(path)));
         } else {
             doc.remove("log_file");
         }
@@ -1457,7 +1467,8 @@ pub(crate) async fn update_platform_settings(
 
     if let Some(ext_opt) = payload.external_ip {
         if let Some(ip) = normalize_opt_string(ext_opt) {
-            doc["external_ip"] = value(ip);
+            doc["external_ip"] = value(ip.clone());
+            overrides.push(("external_ip", serde_json::json!(ip)));
         } else {
             doc.remove("external_ip");
         }
@@ -1473,6 +1484,7 @@ pub(crate) async fn update_platform_settings(
                 );
             }
             doc["rtp_start_port"] = value(i64::from(port));
+            overrides.push(("rtp_start_port", serde_json::json!(port)));
         } else {
             doc.remove("rtp_start_port");
         }
@@ -1488,12 +1500,14 @@ pub(crate) async fn update_platform_settings(
                 );
             }
             doc["rtp_end_port"] = value(i64::from(port));
+            overrides.push(("rtp_end_port", serde_json::json!(port)));
         } else {
             doc.remove("rtp_end_port");
         }
         modified = true;
     }
 
+    // Validate the merged document as a Config
     let doc_text = doc.to_string();
     let config = match parse_config_from_str(&doc_text) {
         Ok(cfg) => cfg,
@@ -1509,9 +1523,18 @@ pub(crate) async fn update_platform_settings(
         }
     }
 
+    // Persist to DB (not to disk)
     if modified {
-        if let Err(resp) = persist_document(&config_path, doc_text) {
-            return resp;
+        for (key, val) in overrides {
+            let is_override = key == "external_ip"; // manual IP = skip auto-detection
+            if let Err(e) =
+                system_config::Model::upsert(&db, key, &val.to_string(), is_override).await
+            {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to save setting '{key}': {e}"),
+                );
+            }
         }
     }
 
@@ -1540,21 +1563,28 @@ pub(crate) async fn update_proxy_settings(
     if !state.has_permission(&user, "system", "write").await {
         return json_error(StatusCode::FORBIDDEN, "Permission denied");
     }
+
+    let db = match get_db(&state) {
+        Ok(db) => db,
+        Err(r) => return r,
+    };
+
     let config_path = match get_config_path(&state) {
-        Ok(path) => path,
-        Err(resp) => return resp,
+        Ok(p) => p,
+        Err(r) => return r,
     };
-
     let mut doc = match load_document(&config_path) {
-        Ok(doc) => doc,
-        Err(resp) => return resp,
+        Ok(d) => d,
+        Err(r) => return r,
     };
 
+    let mut overrides: Vec<(&'static str, serde_json::Value)> = Vec::new();
     let mut modified = false;
     let table = ensure_table_mut(&mut doc, "proxy");
 
     if let Some(realms) = payload.realms {
-        set_string_array(table, "realms", realms);
+        set_string_array(table, "realms", realms.clone());
+        overrides.push(("proxy.realms", serde_json::json!(realms)));
         modified = true;
     }
 
@@ -1562,24 +1592,27 @@ pub(crate) async fn update_proxy_settings(
         let toml_s = toml::to_string(&webhook).unwrap_or_default();
         if let Ok(new_doc) = toml_s.parse::<DocumentMut>() {
             table["locator_webhook"] = new_doc.as_item().clone();
-            modified = true;
         }
+        overrides.push(("proxy.locator_webhook", serde_json::to_value(&webhook).unwrap_or_default()));
+        modified = true;
     }
 
     if let Some(backends) = payload.user_backends {
         let toml_s = toml::to_string(&json!({ "b": backends })).unwrap_or_default();
         if let Ok(new_doc) = toml_s.parse::<DocumentMut>() {
             table["user_backends"] = new_doc["b"].clone();
-            modified = true;
         }
+        overrides.push(("proxy.user_backends", serde_json::to_value(&backends).unwrap_or_default()));
+        modified = true;
     }
 
     if let Some(router) = payload.http_router {
         let toml_s = toml::to_string(&router).unwrap_or_default();
         if let Ok(new_doc) = toml_s.parse::<DocumentMut>() {
             table["http_router"] = new_doc.as_item().clone();
-            modified = true;
         }
+        overrides.push(("proxy.http_router", serde_json::to_value(&router).unwrap_or_default()));
+        modified = true;
     }
 
     if modified {
@@ -1587,8 +1620,15 @@ pub(crate) async fn update_proxy_settings(
         if let Err(resp) = parse_config_from_str(&doc_text) {
             return resp;
         }
-        if let Err(resp) = persist_document(&config_path, doc_text) {
-            return resp;
+        for (key, val) in overrides {
+            if let Err(e) =
+                system_config::Model::upsert(&db, key, &val.to_string(), false).await
+            {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to save setting '{key}': {e}"),
+                );
+            }
         }
     }
 
@@ -1818,8 +1858,34 @@ pub(crate) async fn update_storage_settings(
     };
 
     if modified {
-        if let Err(resp) = persist_document(&config_path, doc_text) {
-            return resp;
+        let db = match get_db(&state) {
+            Ok(db) => db,
+            Err(r) => return r,
+        };
+        // Save recorder path
+        let recorder_path = config.recorder_path();
+        if !recorder_path.is_empty() {
+            if let Err(e) = system_config::Model::upsert(
+                &db,
+                "recording.path",
+                &serde_json::json!(recorder_path).to_string(),
+                false,
+            ).await {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to save setting 'recording.path': {e}"),
+                );
+            }
+        }
+        // Save media_cache_path from TOML doc (field doesn't exist on Config struct)
+        if let Some(toml_edit::Item::Value(v)) = doc.get("media_cache_path") {
+            let val_str = serde_json::json!(v.to_string().trim_matches('"')).to_string();
+            if let Err(e) = system_config::Model::upsert(&db, "media_cache_path", &val_str, false).await {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to save setting 'media_cache_path': {e}"),
+                );
+            }
         }
     }
 
@@ -1880,8 +1946,23 @@ pub(crate) async fn update_security_settings(
     };
 
     if modified {
-        if let Err(resp) = persist_document(&config_path, doc_text) {
-            return resp;
+        let db = match get_db(&state) {
+            Ok(db) => db,
+            Err(r) => return r,
+        };
+        let rules = config.proxy.acl_rules.clone().unwrap_or_default();
+        if let Err(e) = system_config::Model::upsert(
+            &db,
+            "proxy.acl_rules",
+            &serde_json::to_string(&rules).unwrap_or_default(),
+            false,
+        )
+        .await
+        {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to save acl_rules: {e}"),
+            );
         }
     }
 
@@ -2049,8 +2130,22 @@ pub(crate) async fn update_rwi_settings(
     };
 
     if modified {
-        if let Err(resp) = persist_document(&config_path, doc_text) {
-            return resp;
+        let db = match get_db(&state) {
+            Ok(db) => db,
+            Err(r) => return r,
+        };
+        if let Err(e) = system_config::Model::upsert(
+            &db,
+            "rwi",
+            &serde_json::to_string(&config.rwi).unwrap_or_default(),
+            false,
+        )
+        .await
+        {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to save rwi settings: {e}"),
+            );
         }
     }
 
@@ -2062,6 +2157,14 @@ pub(crate) async fn update_rwi_settings(
         "rwi": rwi_config
     }))
     .into_response()
+}
+
+/// Get the DB connection from the console state, returning an error Response if unavailable.
+fn get_db(state: &ConsoleState) -> Result<sea_orm::DatabaseConnection, Response> {
+    state
+        .app_state()
+        .map(|s| s.db().clone())
+        .ok_or_else(|| json_error(StatusCode::SERVICE_UNAVAILABLE, "Application state unavailable"))
 }
 
 fn get_config_path(state: &ConsoleState) -> Result<String, Response> {
@@ -2100,6 +2203,7 @@ fn load_document(path: &str) -> Result<DocumentMut, Response> {
     })
 }
 
+#[allow(dead_code)]
 fn persist_document(path: &str, contents: String) -> Result<(), Response> {
     fs::write(path, contents).map_err(|err| {
         json_error(

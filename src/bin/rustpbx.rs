@@ -86,7 +86,25 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let config_path = cli.conf.clone();
-    let config = if let Some(ref path) = config_path {
+
+    // Merge base config with DB overrides → config.generated.toml.
+    // Falls back to the original path if the merge step fails (e.g. no DB yet).
+    let effective_config_path = if let Some(ref path) = config_path {
+        match rustpbx::config_merge::apply(path).await {
+            Ok(generated) => {
+                println!("Config merged: {}", generated);
+                Some(generated)
+            }
+            Err(e) => {
+                println!("Config merge skipped ({}), using base config.", e);
+                Some(path.clone())
+            }
+        }
+    } else {
+        None
+    };
+
+    let config = if let Some(ref path) = effective_config_path {
         println!("Loading config from: {}", path);
         Config::load(path).expect("Failed to load config")
     } else {
@@ -299,7 +317,15 @@ async fn main() -> Result<()> {
         let config = if let Some(cfg) = cached_config.take() {
             cfg
         } else if let Some(ref path) = next_config_path {
-            match Config::load(path) {
+            // Re-run merge on restart to pick up any new DB overrides
+            let effective = match rustpbx::config_merge::apply(path).await {
+                Ok(generated) => generated,
+                Err(e) => {
+                    tracing::warn!("Config merge skipped on restart ({}), using base.", e);
+                    path.clone()
+                }
+            };
+            match Config::load(&effective) {
                 Ok(cfg) => cfg,
                 Err(err) => {
                     retry_count += 1;

@@ -28,6 +28,7 @@ impl MigratorTrait for Migrator {
             Box::new(super::wholesale_agent::Migration),
             Box::new(super::add_sip_trunk_rewrite_hostport::Migration),
             Box::new(super::add_metadata_column::Migration),
+            Box::new(super::system_config::Migration),
         ]
     }
 }
