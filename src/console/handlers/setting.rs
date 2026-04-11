@@ -23,7 +23,7 @@ use argon2::password_hash::{PasswordHasher, SaltString};
 use axum::extract::{Path as AxumPath, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, post};
+use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Duration, Utc};
 use sea_orm::sea_query::Condition;
@@ -153,6 +153,8 @@ pub fn urls() -> Router<Arc<ConsoleState>> {
     Router::new()
         .route("/settings", get(page_settings))
         .route("/settings/config", get(get_effective_config))
+        .route("/settings/config/entry", patch(upsert_config_entry))
+        .route("/settings/config/entry/{key}", delete(delete_config_entry))
         .route("/settings/config/platform", patch(update_platform_settings))
         .route("/settings/config/proxy", patch(update_proxy_settings))
         .route("/settings/config/storage", patch(update_storage_settings))
@@ -1494,6 +1496,91 @@ pub(crate) async fn get_effective_config(
         "note": "effective_config shows running values; db_overrides shows what is stored in DB. Restart applies all overrides."
     }))
     .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ConfigEntryPayload {
+    key: String,
+    /// Raw JSON string as it will be stored (e.g. "\"debug\"", "5060", "true",
+    /// "[\"a\",\"b\"]"). The backend validates it by parsing as JSON.
+    value: String,
+    #[serde(default)]
+    is_override: bool,
+}
+
+/// PATCH /settings/config/entry — upsert a single system_config row.
+pub(crate) async fn upsert_config_entry(
+    State(state): State<Arc<ConsoleState>>,
+    AuthRequired(user): AuthRequired,
+    Json(payload): Json<ConfigEntryPayload>,
+) -> Response {
+    if !state.has_permission(&user, "system", "write").await {
+        return json_error(StatusCode::FORBIDDEN, "Permission denied");
+    }
+
+    let key = payload.key.trim();
+    if key.is_empty() {
+        return json_error(StatusCode::UNPROCESSABLE_ENTITY, "key must not be empty");
+    }
+
+    // Validate the value is valid JSON so the merge step won't silently skip it
+    if serde_json::from_str::<serde_json::Value>(&payload.value).is_err() {
+        return json_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "value must be valid JSON (e.g. \"debug\" for strings, 5060 for numbers)",
+        );
+    }
+
+    let db = match get_db(&state) {
+        Ok(db) => db,
+        Err(r) => return r,
+    };
+
+    if let Err(e) = system_config::Model::upsert(&db, key, &payload.value, payload.is_override).await {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to save entry: {e}"),
+        );
+    }
+
+    Json(json!({
+        "status": "ok",
+        "requires_restart": true,
+        "message": "Entry saved. Restart RustPBX to apply.",
+        "key": key,
+    }))
+    .into_response()
+}
+
+/// DELETE /settings/config/entry/{key} — remove a system_config row.
+pub(crate) async fn delete_config_entry(
+    State(state): State<Arc<ConsoleState>>,
+    AuthRequired(user): AuthRequired,
+    AxumPath(key): AxumPath<String>,
+) -> Response {
+    if !state.has_permission(&user, "system", "write").await {
+        return json_error(StatusCode::FORBIDDEN, "Permission denied");
+    }
+
+    let db = match get_db(&state) {
+        Ok(db) => db,
+        Err(r) => return r,
+    };
+
+    use sea_orm::EntityTrait;
+    match system_config::Entity::delete_by_id(key.clone()).exec(&db).await {
+        Ok(res) => Json(json!({
+            "status": "ok",
+            "deleted": res.rows_affected,
+            "key": key,
+            "requires_restart": true,
+        }))
+        .into_response(),
+        Err(e) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to delete entry: {e}"),
+        ),
+    }
 }
 
 pub(crate) async fn update_platform_settings(

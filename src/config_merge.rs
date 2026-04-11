@@ -43,18 +43,25 @@ pub async fn apply(base_path: &str) -> Result<String> {
         .await
         .context("cannot connect to database for config merge")?;
 
-    // --- External IP handling ---
+    // --- Parse base TOML (needed for seeding) ---
+    let mut doc: DocumentMut = base_text
+        .parse()
+        .context("config.toml is not valid TOML")?;
+
+    // --- Seed missing keys from config.toml into DB ---
+    // Every startup, insert config.toml keys that don't already exist in
+    // system_config. Existing DB values are never overwritten — this is the
+    // authoritative source for user-customised settings. On first run the
+    // entire base config is copied in; on later runs only newly-added keys.
+    seed_missing_from_doc(&db, &doc).await;
+
+    // --- External IP handling (may override the seeded value) ---
     handle_external_ip(&db).await;
 
     // --- Load overrides ---
     let overrides = system_config::Model::get_all(&db)
         .await
         .context("cannot load system_config from DB")?;
-
-    // --- Parse base TOML ---
-    let mut doc: DocumentMut = base_text
-        .parse()
-        .context("config.toml is not valid TOML")?;
 
     // --- Apply overrides ---
     let mut applied = 0usize;
@@ -187,4 +194,128 @@ fn generated_path_for(base_path: &str) -> PathBuf {
     let base = Path::new(base_path);
     let dir = base.parent().unwrap_or(Path::new("."));
     dir.join("config.generated.toml")
+}
+
+/// Insert every key from `config.toml` into `system_config` that is not
+/// already present. Never overwrites an existing DB row — user-customised
+/// values are preserved. `database_url` is skipped (bootstrap-only value).
+async fn seed_missing_from_doc(db: &DatabaseConnection, doc: &DocumentMut) {
+    // Collect existing keys first so we know what to skip.
+    let existing: std::collections::HashSet<String> = match system_config::Model::get_all(db).await
+    {
+        Ok(rows) => rows.into_iter().map(|r| r.key).collect(),
+        Err(e) => {
+            warn!(error = %e, "seed: failed to read existing system_config, skipping seed");
+            return;
+        }
+    };
+
+    let seeds = flatten_doc_for_seed(doc);
+    let mut inserted = 0usize;
+    for (key, json_val) in seeds {
+        if existing.contains(&key) {
+            continue;
+        }
+        let encoded = json_val.to_string();
+        match system_config::Model::upsert(db, &key, &encoded, false).await {
+            Ok(()) => inserted += 1,
+            Err(e) => warn!(key = %key, error = %e, "seed: failed to insert"),
+        }
+    }
+
+    if inserted > 0 {
+        info!(count = inserted, "seeded system_config from config.toml");
+    }
+}
+
+/// Walk the base TOML document and produce a list of `(dot.key, json_value)`
+/// pairs that match the convention used by the console settings handlers:
+///   - top-level scalars/arrays/inline tables → `key`
+///   - nested table entries → `section.field`
+///     (a nested table *inside* a section is stored as a JSON object)
+fn flatten_doc_for_seed(doc: &DocumentMut) -> Vec<(String, serde_json::Value)> {
+    let mut out = Vec::new();
+    for (key, item) in doc.as_table().iter() {
+        if key == "database_url" {
+            continue; // bootstrap only, never stored in DB
+        }
+        match item {
+            toml_edit::Item::Value(v) => {
+                if let Some(jv) = toml_value_to_json(v) {
+                    out.push((key.to_string(), jv));
+                }
+            }
+            toml_edit::Item::Table(t) => {
+                for (sub_key, sub_item) in t.iter() {
+                    let full_key = format!("{}.{}", key, sub_key);
+                    if let Some(jv) = toml_item_to_json(sub_item) {
+                        out.push((full_key, jv));
+                    }
+                }
+            }
+            toml_edit::Item::ArrayOfTables(arr) => {
+                let items: Vec<serde_json::Value> = arr
+                    .iter()
+                    .map(|t| {
+                        let map: serde_json::Map<String, serde_json::Value> = t
+                            .iter()
+                            .filter_map(|(k, v)| toml_item_to_json(v).map(|j| (k.to_string(), j)))
+                            .collect();
+                        serde_json::Value::Object(map)
+                    })
+                    .collect();
+                out.push((key.to_string(), serde_json::Value::Array(items)));
+            }
+            toml_edit::Item::None => {}
+        }
+    }
+    out
+}
+
+fn toml_value_to_json(v: &toml_edit::Value) -> Option<serde_json::Value> {
+    match v {
+        toml_edit::Value::String(s) => Some(serde_json::Value::String(s.value().clone())),
+        toml_edit::Value::Integer(i) => Some(serde_json::json!(*i.value())),
+        toml_edit::Value::Float(f) => Some(serde_json::json!(*f.value())),
+        toml_edit::Value::Boolean(b) => Some(serde_json::json!(*b.value())),
+        toml_edit::Value::Datetime(d) => Some(serde_json::Value::String(d.value().to_string())),
+        toml_edit::Value::Array(arr) => {
+            let items: Vec<serde_json::Value> = arr.iter().filter_map(toml_value_to_json).collect();
+            Some(serde_json::Value::Array(items))
+        }
+        toml_edit::Value::InlineTable(t) => {
+            let map: serde_json::Map<String, serde_json::Value> = t
+                .iter()
+                .filter_map(|(k, v)| toml_value_to_json(v).map(|jv| (k.to_string(), jv)))
+                .collect();
+            Some(serde_json::Value::Object(map))
+        }
+    }
+}
+
+fn toml_item_to_json(item: &toml_edit::Item) -> Option<serde_json::Value> {
+    match item {
+        toml_edit::Item::Value(v) => toml_value_to_json(v),
+        toml_edit::Item::Table(t) => {
+            let map: serde_json::Map<String, serde_json::Value> = t
+                .iter()
+                .filter_map(|(k, v)| toml_item_to_json(v).map(|jv| (k.to_string(), jv)))
+                .collect();
+            Some(serde_json::Value::Object(map))
+        }
+        toml_edit::Item::ArrayOfTables(arr) => {
+            let items: Vec<serde_json::Value> = arr
+                .iter()
+                .map(|t| {
+                    let map: serde_json::Map<String, serde_json::Value> = t
+                        .iter()
+                        .filter_map(|(k, v)| toml_item_to_json(v).map(|jv| (k.to_string(), jv)))
+                        .collect();
+                    serde_json::Value::Object(map)
+                })
+                .collect();
+            Some(serde_json::Value::Array(items))
+        }
+        toml_edit::Item::None => None,
+    }
 }
