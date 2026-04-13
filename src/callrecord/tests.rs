@@ -191,7 +191,7 @@ async fn test_save_with_s3_like_memory_store() {
     let with_media = Some(false);
     let keep_media_copy = Some(false);
 
-    let record = CallRecord {
+    let mut record = CallRecord {
         call_id: "test_s3_call_123".to_string(),
         start_time: Utc::now(),
         end_time: Utc::now(),
@@ -214,7 +214,8 @@ async fn test_save_with_s3_like_memory_store() {
         &endpoint,
         &with_media,
         &keep_media_copy,
-        &record,
+        &mut record,
+        None,
     )
     .await;
 
@@ -243,7 +244,7 @@ async fn test_save_with_s3_like_with_media() {
         extra: None,
     };
 
-    let record = CallRecord {
+    let mut record = CallRecord {
         call_id: "test_s3_media_456".to_string(),
         start_time: Utc::now(),
         end_time: Utc::now(),
@@ -284,7 +285,8 @@ async fn test_save_with_s3_like_with_media() {
             &endpoint,
             &with_media,
             &keep_media_copy,
-            &record,
+            &mut record,
+            None,
         )
         .await;
 
