@@ -30,6 +30,7 @@ impl MigratorTrait for Migrator {
             Box::new(super::add_metadata_column::Migration),
             Box::new(super::system_config::Migration),
             Box::new(super::pending_upload::Migration),
+            Box::new(super::did::Migration),
         ]
     }
 }

@@ -1,0 +1,523 @@
+{% extends "console/layout.html" %}
+{% block title %}Numbers · {{ site_name | default('RustPBX') }}{% endblock %}
+{% block content %}
+<div class="p-4 sm:p-6" x-data='didsPage({
+        basePath: {{ (base_path | default("/console")) | tojson }},
+        listUrl: {{ list_url | tojson }},
+        bulkUrl: {{ bulk_url | tojson }},
+        trunksUrl: {{ trunks_url | tojson }}
+    })' x-init="init()">
+    <div class="mx-auto max-w-7xl space-y-6">
+        <header class="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+            <div class="space-y-0.5">
+                <p class="text-[11px] font-semibold uppercase tracking-wide text-sky-600">Inbound routing</p>
+                <h1 class="text-2xl font-semibold text-slate-900">Numbers (DIDs)</h1>
+                <p class="text-sm text-slate-500 sm:max-w-xl">Manage direct inward dial numbers attached to SIP trunks and extensions.</p>
+            </div>
+        </header>
+
+        <template x-if="flash">
+            <div class="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700"
+                x-text="flash"></div>
+        </template>
+        <template x-if="error">
+            <div class="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700" x-text="error">
+            </div>
+        </template>
+
+        <!-- Add single DID -->
+        <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
+            <h2 class="text-sm font-semibold text-slate-900">Add a number</h2>
+            <p class="mt-1 text-sm text-slate-500">Create a single DID binding. The number will be normalized to E.164.</p>
+            <form class="mt-4 grid gap-4 md:grid-cols-2 lg:grid-cols-3" @submit.prevent="createOne()">
+                <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                    Number
+                    <input type="text" x-model="createForm.number" required placeholder="+14155551212"
+                        class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200" />
+                </label>
+                <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                    Trunk
+                    <select x-model="createForm.trunk_name"
+                        class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                        <option value="">— Unassigned —</option>
+                        <template x-for="t in trunks" :key="t.id">
+                            <option :value="t.name" x-text="t.name"></option>
+                        </template>
+                    </select>
+                </label>
+                <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                    Extension (optional)
+                    <input type="text" x-model="createForm.extension_number" placeholder="1001"
+                        class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200" />
+                </label>
+                <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                    Failover trunk (optional)
+                    <select x-model="createForm.failover_trunk"
+                        class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                        <option value="">None</option>
+                        <template x-for="t in trunks" :key="'f-'+t.id">
+                            <option :value="t.name" x-text="t.name"></option>
+                        </template>
+                    </select>
+                </label>
+                <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                    Label (optional)
+                    <input type="text" x-model="createForm.label" placeholder="Main line"
+                        class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200" />
+                </label>
+                <label class="flex items-center gap-2 text-sm font-medium text-slate-700 md:col-span-1 lg:self-end">
+                    <input type="checkbox" x-model="createForm.enabled" class="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500" />
+                    Enabled
+                </label>
+                <div class="md:col-span-2 lg:col-span-3 flex justify-end">
+                    <button type="submit" :disabled="creating"
+                        class="inline-flex items-center gap-2 rounded-lg bg-sky-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-400 focus:ring-offset-2 disabled:cursor-wait disabled:opacity-60">
+                        <span x-text="creating ? 'Adding…' : 'Add number'"></span>
+                    </button>
+                </div>
+            </form>
+            <template x-if="createError">
+                <p class="mt-3 text-sm text-rose-600" x-text="createError"></p>
+            </template>
+        </section>
+
+        <!-- Bulk add -->
+        <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
+            <h2 class="text-sm font-semibold text-slate-900">Bulk add numbers</h2>
+            <p class="mt-1 text-sm text-slate-500">Paste one number per line. All numbers will be assigned to the selected trunk.</p>
+            <form class="mt-4 grid gap-4 md:grid-cols-2" @submit.prevent="bulkCreate()">
+                <label class="flex flex-col gap-2 text-sm font-medium text-slate-700 md:col-span-2">
+                    Numbers
+                    <textarea rows="5" x-model="bulkForm.numbers_text" required
+                        placeholder="+14155551212&#10;+14155551213"
+                        class="font-mono rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"></textarea>
+                </label>
+                <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                    Trunk
+                    <select x-model="bulkForm.trunk_name"
+                        class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                        <option value="">— Unassigned —</option>
+                        <template x-for="t in trunks" :key="'b-'+t.id">
+                            <option :value="t.name" x-text="t.name"></option>
+                        </template>
+                    </select>
+                </label>
+                <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                    Label (optional)
+                    <input type="text" x-model="bulkForm.label"
+                        class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200" />
+                </label>
+                <div class="md:col-span-2 flex justify-end">
+                    <button type="submit" :disabled="bulking"
+                        class="inline-flex items-center gap-2 rounded-lg bg-sky-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-sky-500 focus:outline-none focus:ring-2 focus:ring-sky-400 focus:ring-offset-2 disabled:cursor-wait disabled:opacity-60">
+                        <span x-text="bulking ? 'Importing…' : 'Import numbers'"></span>
+                    </button>
+                </div>
+            </form>
+            <template x-if="bulkError">
+                <p class="mt-3 text-sm text-rose-600" x-text="bulkError"></p>
+            </template>
+            <template x-if="bulkResult">
+                <div class="mt-4 grid gap-4 md:grid-cols-2">
+                    <div>
+                        <h3 class="text-xs font-semibold uppercase tracking-wide text-emerald-700">Accepted (<span x-text="bulkResult.accepted.length"></span>)</h3>
+                        <ul class="mt-2 space-y-1 text-sm text-slate-700">
+                            <template x-for="row in bulkResult.accepted" :key="'ok-'+row.number">
+                                <li class="font-mono" x-text="row.number"></li>
+                            </template>
+                        </ul>
+                    </div>
+                    <div>
+                        <h3 class="text-xs font-semibold uppercase tracking-wide text-rose-700">Rejected (<span x-text="bulkResult.rejected.length"></span>)</h3>
+                        <ul class="mt-2 space-y-1 text-sm text-slate-700">
+                            <template x-for="(row, idx) in bulkResult.rejected" :key="'rej-'+idx">
+                                <li>
+                                    <span class="font-mono" x-text="row.input"></span>
+                                    <span class="text-rose-600"> — <span x-text="row.reason"></span></span>
+                                </li>
+                            </template>
+                        </ul>
+                    </div>
+                </div>
+            </template>
+        </section>
+
+        <!-- List -->
+        <section class="rounded-xl bg-white shadow-sm ring-1 ring-black/5">
+            <div class="flex flex-col gap-3 border-b border-slate-100 px-6 py-4 sm:flex-row sm:items-center sm:justify-between">
+                <div class="flex items-center gap-3">
+                    <h2 class="text-sm font-semibold text-slate-900">Numbers</h2>
+                    <span class="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-semibold text-slate-600"
+                        x-text="dids.length + ' total'"></span>
+                </div>
+                <div class="flex items-center gap-2">
+                    <input type="search" x-model.debounce.300ms="keyword" @input="fetchDids()" placeholder="Search number or label"
+                        class="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200 sm:w-72" />
+                    <select x-model="trunkFilter" @change="fetchDids()" :disabled="unassignedOnly"
+                        class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200 disabled:opacity-50">
+                        <option value="">All trunks</option>
+                        <template x-for="t in trunks" :key="'l-'+t.id">
+                            <option :value="t.name" x-text="t.name"></option>
+                        </template>
+                    </select>
+                    <label class="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600">
+                        <input type="checkbox" x-model="unassignedOnly" @change="fetchDids()"
+                            class="h-3.5 w-3.5 rounded border-slate-300 text-sky-600 focus:ring-sky-500" />
+                        Unassigned only
+                    </label>
+                </div>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="min-w-full divide-y divide-slate-100 text-sm">
+                    <thead class="bg-slate-50 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                        <tr>
+                            <th class="px-6 py-3 text-left">Number</th>
+                            <th class="px-6 py-3 text-left">Trunk</th>
+                            <th class="px-6 py-3 text-left">Extension</th>
+                            <th class="px-6 py-3 text-left">Label</th>
+                            <th class="px-6 py-3 text-left">Enabled</th>
+                            <th class="px-6 py-3 text-right">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-slate-100">
+                        <template x-if="loading">
+                            <tr><td colspan="6" class="px-6 py-6 text-center text-sm text-slate-500">Loading…</td></tr>
+                        </template>
+                        <template x-if="!loading && dids.length === 0">
+                            <tr><td colspan="6" class="px-6 py-6 text-center text-sm text-slate-500">No numbers configured yet.</td></tr>
+                        </template>
+                        <template x-for="d in dids" :key="d.number">
+                            <tr>
+                                <td class="px-6 py-3 font-mono text-slate-800" x-text="d.number"></td>
+                                <td class="px-6 py-3">
+                                    <template x-if="d.trunk_name">
+                                        <span x-text="d.trunk_name"></span>
+                                    </template>
+                                    <template x-if="!d.trunk_name">
+                                        <span class="text-slate-400 italic">Unassigned</span>
+                                    </template>
+                                </td>
+                                <td class="px-6 py-3" x-text="d.extension_number || '—'"></td>
+                                <td class="px-6 py-3" x-text="d.label || '—'"></td>
+                                <td class="px-6 py-3">
+                                    <span :class="d.enabled ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-500'"
+                                        class="inline-flex rounded-full px-2 py-0.5 text-xs font-semibold"
+                                        x-text="d.enabled ? 'Enabled' : 'Disabled'"></span>
+                                </td>
+                                <td class="px-6 py-3 text-right">
+                                    <button type="button" @click="toggleEnabled(d)"
+                                        class="mr-2 rounded-md border border-slate-200 px-2 py-1 text-xs font-semibold text-slate-600 hover:border-sky-300 hover:text-sky-700">
+                                        <span x-text="d.enabled ? 'Disable' : 'Enable'"></span>
+                                    </button>
+                                    <button type="button" @click="editDid(d)"
+                                        class="mr-2 rounded-md border border-slate-200 px-2 py-1 text-xs font-semibold text-slate-600 hover:border-sky-300 hover:text-sky-700">
+                                        Edit
+                                    </button>
+                                    <button type="button" @click="deleteDid(d)"
+                                        class="rounded-md border border-rose-200 px-2 py-1 text-xs font-semibold text-rose-600 hover:border-rose-300 hover:bg-rose-50">
+                                        Delete
+                                    </button>
+                                </td>
+                            </tr>
+                        </template>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- Edit dialog -->
+        <template x-if="editing">
+            <div class="fixed inset-0 z-40 flex items-center justify-center bg-slate-900/40 p-4">
+                <div class="w-full max-w-lg rounded-xl bg-white p-6 shadow-lg ring-1 ring-black/5">
+                    <h2 class="text-sm font-semibold text-slate-900">Edit <span class="font-mono" x-text="editing.number"></span></h2>
+                    <form class="mt-4 grid gap-4" @submit.prevent="saveEdit()">
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Trunk
+                            <select x-model="editing.trunk_name"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <option value="">— Unassigned —</option>
+                                <template x-for="t in trunks" :key="'e-'+t.id">
+                                    <option :value="t.name" x-text="t.name"></option>
+                                </template>
+                            </select>
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Extension
+                            <input type="text" x-model="editing.extension_number"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200" />
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Failover trunk
+                            <select x-model="editing.failover_trunk"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <option value="">None</option>
+                                <template x-for="t in trunks" :key="'ef-'+t.id">
+                                    <option :value="t.name" x-text="t.name"></option>
+                                </template>
+                            </select>
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Label
+                            <input type="text" x-model="editing.label"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200" />
+                        </label>
+                        <label class="flex items-center gap-2 text-sm font-medium text-slate-700">
+                            <input type="checkbox" x-model="editing.enabled" class="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500" />
+                            Enabled
+                        </label>
+                        <template x-if="editError">
+                            <p class="text-sm text-rose-600" x-text="editError"></p>
+                        </template>
+                        <div class="flex justify-end gap-2">
+                            <button type="button" @click="editing=null; editError=null"
+                                class="rounded-lg border border-slate-200 px-4 py-2 text-sm font-semibold text-slate-600 hover:border-slate-300">
+                                Cancel
+                            </button>
+                            <button type="submit" :disabled="saving"
+                                class="rounded-lg bg-sky-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-sky-500 disabled:cursor-wait disabled:opacity-60">
+                                <span x-text="saving ? 'Saving…' : 'Save changes'"></span>
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </template>
+    </div>
+</div>
+
+<script>
+    document.addEventListener('alpine:init', () => {
+        Alpine.data('didsPage', (options) => {
+            const emptyCreate = () => ({
+                number: '',
+                trunk_name: '',
+                extension_number: '',
+                failover_trunk: '',
+                label: '',
+                enabled: true,
+            });
+            const emptyBulk = () => ({
+                numbers_text: '',
+                trunk_name: '',
+                label: '',
+            });
+            return {
+                basePath: options.basePath || '/console',
+                listUrl: options.listUrl || `${options.basePath || '/console'}/dids`,
+                bulkUrl: options.bulkUrl || `${options.basePath || '/console'}/dids/bulk`,
+                trunksUrl: options.trunksUrl || `${options.basePath || '/console'}/sip-trunk`,
+                dids: [],
+                trunks: [],
+                loading: false,
+                error: null,
+                flash: null,
+                keyword: '',
+                trunkFilter: '',
+                unassignedOnly: false,
+                createForm: emptyCreate(),
+                creating: false,
+                createError: null,
+                bulkForm: emptyBulk(),
+                bulking: false,
+                bulkError: null,
+                bulkResult: null,
+                editing: null,
+                editError: null,
+                saving: false,
+                async init() {
+                    await this.loadTrunks();
+                    await this.fetchDids();
+                },
+                async loadTrunks() {
+                    try {
+                        const resp = await fetch(this.trunksUrl, {
+                            method: 'POST',
+                            headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ page: 1, per_page: 500, filters: {} }),
+                        });
+                        if (!resp.ok) throw new Error('Failed to load trunks');
+                        const data = await resp.json();
+                        const items = Array.isArray(data?.items) ? data.items : [];
+                        this.trunks = items.map((t) => ({
+                            id: t.id,
+                            name: t.name || t.trunk_name || String(t.id),
+                        }));
+                    } catch (err) {
+                        this.error = err.message || String(err);
+                    }
+                },
+                async fetchDids() {
+                    if (!this.trunks.length) {
+                        try { await this.loadTrunks(); } catch (_) { /* swallow, user still sees DID list */ }
+                    }
+                    this.loading = true;
+                    this.error = null;
+                    try {
+                        const params = new URLSearchParams();
+                        if (this.keyword.trim()) params.set('q', this.keyword.trim());
+                        if (this.unassignedOnly) {
+                            params.set('unassigned', 'true');
+                        } else if (this.trunkFilter) {
+                            params.set('trunk', this.trunkFilter);
+                        }
+                        const url = params.toString() ? `${this.listUrl}?${params}` : this.listUrl;
+                        const resp = await fetch(url, { headers: { 'Accept': 'application/json' } });
+                        const data = await resp.json();
+                        if (!resp.ok) throw new Error(data?.message || 'Failed to load numbers');
+                        this.dids = Array.isArray(data?.items) ? data.items : [];
+                    } catch (err) {
+                        this.error = err.message || String(err);
+                    } finally {
+                        this.loading = false;
+                    }
+                },
+                async createOne() {
+                    this.creating = true;
+                    this.createError = null;
+                    try {
+                        const payload = {
+                            number: this.createForm.number.trim(),
+                            trunk_name: this.createForm.trunk_name || null,
+                            extension_number: this.createForm.extension_number.trim() || null,
+                            failover_trunk: this.createForm.failover_trunk || null,
+                            label: this.createForm.label.trim() || null,
+                            enabled: !!this.createForm.enabled,
+                        };
+                        const resp = await fetch(this.listUrl, {
+                            method: 'PUT',
+                            headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+                            body: JSON.stringify(payload),
+                        });
+                        const data = await resp.json().catch(() => ({}));
+                        if (!resp.ok) throw new Error(data?.message || `Request failed (${resp.status})`);
+                        this.flash = `Added ${data.number || payload.number}`;
+                        setTimeout(() => { this.flash = null; }, 4000);
+                        this.createForm = emptyCreate();
+                        await this.fetchDids();
+                    } catch (err) {
+                        this.createError = err.message || String(err);
+                    } finally {
+                        this.creating = false;
+                    }
+                },
+                async bulkCreate() {
+                    this.bulking = true;
+                    this.bulkError = null;
+                    this.bulkResult = null;
+                    try {
+                        const numbers = this.bulkForm.numbers_text
+                            .split(/\r?\n/)
+                            .map((s) => s.trim())
+                            .filter((s) => s.length > 0);
+                        if (numbers.length === 0) throw new Error('Enter at least one number');
+                        const payload = {
+                            trunk_name: this.bulkForm.trunk_name || null,
+                            numbers,
+                            label: this.bulkForm.label.trim() || null,
+                            enabled: true,
+                        };
+                        const resp = await fetch(this.bulkUrl, {
+                            method: 'POST',
+                            headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+                            body: JSON.stringify(payload),
+                        });
+                        const data = await resp.json().catch(() => ({}));
+                        if (!resp.ok) throw new Error(data?.message || `Request failed (${resp.status})`);
+                        this.bulkResult = {
+                            accepted: Array.isArray(data.accepted) ? data.accepted : [],
+                            rejected: Array.isArray(data.rejected) ? data.rejected : [],
+                        };
+                        this.flash = `Accepted ${this.bulkResult.accepted.length}, rejected ${this.bulkResult.rejected.length}`;
+                        setTimeout(() => { this.flash = null; }, 4000);
+                        if (this.bulkResult.accepted.length > 0) {
+                            this.bulkForm = emptyBulk();
+                            await this.fetchDids();
+                        }
+                    } catch (err) {
+                        this.bulkError = err.message || String(err);
+                    } finally {
+                        this.bulking = false;
+                    }
+                },
+                editDid(d) {
+                    this.editError = null;
+                    this.editing = {
+                        number: d.number,
+                        trunk_name: d.trunk_name || '',
+                        extension_number: d.extension_number || '',
+                        failover_trunk: d.failover_trunk || '',
+                        label: d.label || '',
+                        enabled: !!d.enabled,
+                    };
+                },
+                async saveEdit() {
+                    if (!this.editing) return;
+                    this.saving = true;
+                    this.editError = null;
+                    try {
+                        const payload = {
+                            trunk_name: this.editing.trunk_name || null,
+                            extension_number: this.editing.extension_number.trim() || null,
+                            failover_trunk: this.editing.failover_trunk || null,
+                            label: this.editing.label.trim() || null,
+                            enabled: !!this.editing.enabled,
+                        };
+                        const url = `${this.listUrl}/${encodeURIComponent(this.editing.number)}`;
+                        const resp = await fetch(url, {
+                            method: 'PATCH',
+                            headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+                            body: JSON.stringify(payload),
+                        });
+                        const data = await resp.json().catch(() => ({}));
+                        if (!resp.ok) throw new Error(data?.message || `Request failed (${resp.status})`);
+                        this.flash = `Updated ${this.editing.number}`;
+                        setTimeout(() => { this.flash = null; }, 4000);
+                        this.editing = null;
+                        await this.fetchDids();
+                    } catch (err) {
+                        this.editError = err.message || String(err);
+                    } finally {
+                        this.saving = false;
+                    }
+                },
+                async toggleEnabled(d) {
+                    try {
+                        const url = `${this.listUrl}/${encodeURIComponent(d.number)}`;
+                        const resp = await fetch(url, {
+                            method: 'PATCH',
+                            headers: { 'Accept': 'application/json', 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ enabled: !d.enabled }),
+                        });
+                        const data = await resp.json().catch(() => ({}));
+                        if (!resp.ok) throw new Error(data?.message || `Request failed (${resp.status})`);
+                        this.flash = `${!d.enabled ? 'Enabled' : 'Disabled'} ${d.number}`;
+                        setTimeout(() => { this.flash = null; }, 4000);
+                        await this.fetchDids();
+                    } catch (err) {
+                        this.error = err.message || String(err);
+                    }
+                },
+                async deleteDid(d) {
+                    if (!confirm(`Delete ${d.number}?`)) return;
+                    try {
+                        const url = `${this.listUrl}/${encodeURIComponent(d.number)}`;
+                        const resp = await fetch(url, {
+                            method: 'DELETE',
+                            headers: { 'Accept': 'application/json' },
+                        });
+                        if (!resp.ok && resp.status !== 204) {
+                            const data = await resp.json().catch(() => ({}));
+                            throw new Error(data?.message || `Request failed (${resp.status})`);
+                        }
+                        this.flash = `Deleted ${d.number}`;
+                        setTimeout(() => { this.flash = null; }, 4000);
+                        await this.fetchDids();
+                    } catch (err) {
+                        this.error = err.message || String(err);
+                    }
+                },
+            };
+        });
+    });
+</script>
+{% endblock %}

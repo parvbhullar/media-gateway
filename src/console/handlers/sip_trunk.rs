@@ -161,6 +161,10 @@ async fn page_sip_trunk_detail(
                 let _ = tenant_link;
             }
 
+            let dids_count = crate::models::did::Model::count_by_trunk(db, &model.name)
+                .await
+                .unwrap_or(0);
+
             state.render_with_headers(
                 "console/sip_trunk_detail.html",
                 json!({
@@ -171,6 +175,7 @@ async fn page_sip_trunk_detail(
                     "mode": "edit",
                     "update_url": state.url_for(&format!("/sip-trunk/{id}")),
                     "current_user": current_user,
+                    "dids_count": dids_count,
                 }),
                 &headers,
             )
@@ -343,6 +348,47 @@ async fn delete_sip_trunk(
                 .into_response();
         }
     };
+
+    // Guard: refuse to delete a trunk that is still referenced by any DID,
+    // either as the owning trunk or as a failover target. The user must
+    // reassign or remove those DIDs first — silent orphaning would break
+    // runtime routing.
+    use crate::models::did;
+    let owned = match did::Model::count_by_trunk(db, &model.name).await {
+        Ok(n) => n,
+        Err(err) => {
+            warn!(
+                "failed to count DIDs owning trunk {}: {}; refusing delete",
+                model.name, err
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"message": "failed to check DID references"})),
+            )
+                .into_response();
+        }
+    };
+    let as_failover = match did::Model::count_by_failover_trunk(db, &model.name).await {
+        Ok(n) => n,
+        Err(err) => {
+            warn!(
+                "failed to count DIDs failing over to trunk {}: {}; refusing delete",
+                model.name, err
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"message": "failed to check DID failover references"})),
+            )
+                .into_response();
+        }
+    };
+    if owned + as_failover > 0 {
+        let msg = format!(
+            "trunk '{}' still has {} DID(s) and {} failover reference(s); remove them first",
+            model.name, owned, as_failover
+        );
+        return (StatusCode::CONFLICT, Json(json!({ "message": msg }))).into_response();
+    }
 
     let active: SipTrunkActiveModel = model.into();
     match active.delete(db).await {
@@ -925,5 +971,116 @@ mod tests {
         let resp =
             create_sip_trunk(State(state), AuthRequired(user), axum::extract::Form(form)).await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    async fn seed_trunk(state: &Arc<ConsoleState>, name: &str) -> i64 {
+        use axum::body::to_bytes;
+        let mut form = SipTrunkForm::default();
+        form.name = Some(name.into());
+        form.sip_server = Some("sip.example.com".into());
+        let resp = create_sip_trunk(
+            State(state.clone()),
+            AuthRequired(superuser()),
+            axum::extract::Form(form),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        v["id"].as_i64().expect("trunk id")
+    }
+
+    #[tokio::test]
+    async fn delete_trunk_with_dids_returns_409() {
+        use crate::models::did::{self, NewDid};
+
+        let state = setup_state().await;
+        let trunk_id = seed_trunk(&state, "guarded").await;
+
+        did::Model::upsert(
+            state.db(),
+            NewDid {
+                number: "+14158675309".into(),
+                trunk_name: Some("guarded".into()),
+                extension_number: None,
+                failover_trunk: None,
+                label: None,
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        let resp =
+            delete_sip_trunk(AxumPath(trunk_id), State(state.clone()), AuthRequired(superuser()))
+                .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        // Trunk row still exists.
+        assert!(
+            SipTrunkEntity::find_by_id(trunk_id)
+                .one(state.db())
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_trunk_with_failover_reference_returns_409() {
+        use crate::models::did::{self, NewDid};
+
+        let state = setup_state().await;
+        let owner_id = seed_trunk(&state, "owner").await;
+        let failover_id = seed_trunk(&state, "backup").await;
+
+        did::Model::upsert(
+            state.db(),
+            NewDid {
+                number: "+14158675310".into(),
+                trunk_name: Some("owner".into()),
+                extension_number: None,
+                failover_trunk: Some("backup".into()),
+                label: None,
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Deleting the failover target must be blocked.
+        let resp = delete_sip_trunk(
+            AxumPath(failover_id),
+            State(state.clone()),
+            AuthRequired(superuser()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        // Owner trunk is also blocked.
+        let resp = delete_sip_trunk(
+            AxumPath(owner_id),
+            State(state.clone()),
+            AuthRequired(superuser()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn delete_trunk_without_dids_succeeds() {
+        let state = setup_state().await;
+        let trunk_id = seed_trunk(&state, "free").await;
+        let resp =
+            delete_sip_trunk(AxumPath(trunk_id), State(state.clone()), AuthRequired(superuser()))
+                .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            SipTrunkEntity::find_by_id(trunk_id)
+                .one(state.db())
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

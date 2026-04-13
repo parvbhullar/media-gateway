@@ -1179,3 +1179,101 @@ pub(crate) fn apply_trunk_config(option: &mut InviteOption, trunk: &TrunkConfig)
 
     Ok(())
 }
+
+// ─── DID-first inbound resolution ───────────────────────────────────────────
+use crate::proxy::routing::did_index::DidIndex;
+
+/// Outcome of a DID-first lookup against a [`DidIndex`].
+#[derive(Debug)]
+pub enum DidLookup {
+    /// Route directly to this extension, skipping the rule engine.
+    ShortCircuitExtension(String),
+    /// Known DID, no extension — fall through to rules (caller may want to
+    /// tag context).
+    KnownNoExtension {
+        trunk_name: String,
+        number: String,
+    },
+    /// DID owned by another trunk; strict mode → reject with this reason.
+    Reject(String),
+    /// Not a DID we know (unparseable, unknown, or loose-mode mismatch);
+    /// continue with existing matching.
+    FallThrough,
+}
+
+/// DID-first inbound resolution. Pure function — no I/O.
+///
+/// * `index` — current DID snapshot.
+/// * `default_country` — ISO alpha-2 (e.g. `"US"`) for normalizing
+///   local-format numbers.
+/// * `callee_user` — the `To:` user part as received on the wire.
+/// * `source_trunk_name` — the trunk the INVITE arrived on.
+/// * `strict_mode` — when true, mismatched ownership is a reject; otherwise
+///   it's a warn + fall-through.
+pub fn did_lookup_result(
+    index: &DidIndex,
+    default_country: Option<&str>,
+    callee_user: &str,
+    source_trunk_name: &str,
+    strict_mode: bool,
+) -> DidLookup {
+    let region_upper = default_country.map(|c| c.to_ascii_uppercase());
+    let normalized = match crate::models::did::normalize_did(callee_user, region_upper.as_deref()) {
+        Ok(n) => n,
+        Err(_) => return DidLookup::FallThrough,
+    };
+
+    let Some(entry) = index.lookup(&normalized) else {
+        return DidLookup::FallThrough;
+    };
+
+    let Some(owner_trunk) = entry.trunk_name.as_deref() else {
+        tracing::debug!(
+            did = %normalized,
+            source = %source_trunk_name,
+            "inbound DID is unassigned (no owning trunk), falling through"
+        );
+        return DidLookup::FallThrough;
+    };
+
+    if owner_trunk != source_trunk_name {
+        if strict_mode {
+            return DidLookup::Reject(format!(
+                "DID {} belongs to trunk '{}', call arrived on '{}'",
+                normalized, owner_trunk, source_trunk_name
+            ));
+        }
+        tracing::warn!(
+            did = %normalized,
+            owner = %owner_trunk,
+            source = %source_trunk_name,
+            "inbound DID ownership mismatch (loose mode, falling through)"
+        );
+        return DidLookup::FallThrough;
+    }
+
+    if let Some(ext) = &entry.extension_number {
+        DidLookup::ShortCircuitExtension(ext.clone())
+    } else {
+        DidLookup::KnownNoExtension {
+            trunk_name: owner_trunk.to_string(),
+            number: normalized,
+        }
+    }
+}
+
+/// Build the [`RouteResult::Forward`] used when a DID short-circuits to an
+/// on-net extension. Mirrors the `ActionType::Forward` branch in
+/// [`match_invite_impl`] for the "no dest trunk" case (internal extension):
+/// the callee user is rewritten to the extension number and the result is
+/// wrapped in a bare `Forward(option, None)`. No `DialplanHints`, no trunk
+/// config, no rewrite of host/port — the local registrar resolves the
+/// contact from the extension user, just like a rule-driven internal-only
+/// forward.
+pub fn build_did_extension_route_result(
+    mut option: InviteOption,
+    extension: &str,
+) -> Result<RouteResult> {
+    option.callee = update_uri_user(&option.callee, extension)?;
+    Ok(RouteResult::Forward(option, None))
+}

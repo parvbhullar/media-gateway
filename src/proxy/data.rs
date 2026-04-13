@@ -22,6 +22,7 @@ use crate::{
     proxy::routing::{
         ConfigOrigin, DestConfig, MatchConditions, RewriteRules, RouteAction, RouteDirection,
         RouteQueueConfig, RouteRule, TrunkConfig,
+        did_index::DidIndex,
     },
     proxy::trunk_registrar::TrunkRegistrar,
 };
@@ -32,6 +33,9 @@ pub struct ProxyDataContext {
     queues: RwLock<HashMap<String, RouteQueueConfig>>,
     routes: RwLock<Vec<RouteRule>>,
     acl_rules: RwLock<Vec<String>>,
+    did_index: RwLock<Arc<DidIndex>>,
+    did_default_country: RwLock<Option<String>>,
+    did_strict_mode: RwLock<bool>,
     db: Option<DatabaseConnection>,
     trunk_registrar: Arc<TrunkRegistrar>,
 }
@@ -70,6 +74,9 @@ impl ProxyDataContext {
             queues: RwLock::new(HashMap::new()),
             routes: RwLock::new(Vec::new()),
             acl_rules: RwLock::new(Vec::new()),
+            did_index: RwLock::new(Arc::new(DidIndex::default())),
+            did_default_country: RwLock::new(None),
+            did_strict_mode: RwLock::new(false),
             db,
             trunk_registrar,
         };
@@ -77,7 +84,65 @@ impl ProxyDataContext {
         let _ = ctx.reload_queues(false, None).await?;
         let _ = ctx.reload_routes(true, None).await?;
         let _ = ctx.reload_acl_rules(false, None)?;
+        if let Some(db) = ctx.db.as_ref() {
+            if let Err(e) = crate::models::backfill_dids_from_sip_trunks::run(db).await {
+                warn!(error = %e, "DID backfill failed, continuing startup");
+            }
+        }
+        ctx.reload_did_index().await;
         Ok(ctx)
+    }
+
+    pub fn did_index(&self) -> Arc<DidIndex> {
+        self.did_index.read().unwrap().clone()
+    }
+
+    pub fn set_did_index(&self, idx: Arc<DidIndex>) {
+        *self.did_index.write().unwrap() = idx;
+    }
+
+    /// Cached `routing.default_country` snapshot (uppercase ISO alpha-2).
+    /// Refreshed alongside the DID index via [`reload_did_index`].
+    pub fn did_default_country(&self) -> Option<String> {
+        self.did_default_country.read().unwrap().clone()
+    }
+
+    /// Cached `routing.did_strict_mode` snapshot. Refreshed alongside the
+    /// DID index via [`reload_did_index`].
+    pub fn did_strict_mode(&self) -> bool {
+        *self.did_strict_mode.read().unwrap()
+    }
+
+    fn set_did_default_country(&self, value: Option<String>) {
+        *self.did_default_country.write().unwrap() = value;
+    }
+
+    fn set_did_strict_mode(&self, value: bool) {
+        *self.did_strict_mode.write().unwrap() = value;
+    }
+
+    /// Rebuild the DID index from the database and refresh cached DID
+    /// settings (`routing.default_country`, `routing.did_strict_mode`).
+    /// Logs and installs an empty index / default settings on error so
+    /// callers can always rely on `did_index()` returning a valid snapshot.
+    pub async fn reload_did_index(&self) {
+        let Some(db) = self.db.as_ref() else {
+            self.set_did_index(Arc::new(DidIndex::default()));
+            self.set_did_default_country(None);
+            self.set_did_strict_mode(false);
+            return;
+        };
+        match DidIndex::load(db).await {
+            Ok(idx) => self.set_did_index(idx),
+            Err(e) => {
+                warn!(error = %e, "failed to load DID index; keeping empty index");
+                self.set_did_index(Arc::new(DidIndex::default()));
+            }
+        }
+        let default_country = crate::config_merge::read_default_country(db).await;
+        let strict = crate::config_merge::read_did_strict_mode(db).await;
+        self.set_did_default_country(default_country);
+        self.set_did_strict_mode(strict);
     }
 
     pub fn trunk_registrar(&self) -> &Arc<TrunkRegistrar> {

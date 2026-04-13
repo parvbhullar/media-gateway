@@ -13,6 +13,15 @@ use tracing::{info, warn};
 
 use crate::models::system_config;
 
+/// DB key: default country code used when normalising DIDs that arrive without
+/// a `+` prefix. Stored as a JSON-encoded string, e.g. `"\"US\""`.
+pub const ROUTING_DEFAULT_COUNTRY_KEY: &str = "routing.default_country";
+
+/// DB key: when true, incoming calls whose called-number cannot be matched to
+/// a provisioned DID are rejected instead of falling through to the legacy
+/// regex-based route table. Stored as a JSON bool (`true`/`false`).
+pub const ROUTING_DID_STRICT_MODE_KEY: &str = "routing.did_strict_mode";
+
 /// Minimal bootstrap config: only `database_url` is required in `config.toml`.
 #[derive(Deserialize)]
 struct Bootstrap {
@@ -54,6 +63,9 @@ pub async fn apply(base_path: &str) -> Result<String> {
     // authoritative source for user-customised settings. On first run the
     // entire base config is copied in; on later runs only newly-added keys.
     seed_missing_from_doc(&db, &doc).await;
+
+    // --- Seed routing defaults (keys not present in config.toml) ---
+    seed_routing_defaults(&db).await;
 
     // --- External IP handling (may override the seeded value) ---
     handle_external_ip(&db).await;
@@ -318,4 +330,66 @@ fn toml_item_to_json(item: &toml_edit::Item) -> Option<serde_json::Value> {
         }
         toml_edit::Item::None => None,
     }
+}
+
+/// Insert default rows for the `routing.*` settings if they're not already
+/// present in `system_config`. Never overwrites an existing row — users can
+/// edit these via the Database Config tab in Settings.
+async fn seed_routing_defaults(db: &DatabaseConnection) {
+    let defaults: &[(&str, &str)] = &[
+        // Empty string = "no default country", forces callers to send E.164.
+        (ROUTING_DEFAULT_COUNTRY_KEY, "\"\""),
+        // false = legacy regex-route fallback still used when DID not found.
+        (ROUTING_DID_STRICT_MODE_KEY, "false"),
+    ];
+    for (key, value) in defaults {
+        match system_config::Model::get(db, key).await {
+            Ok(Some(_)) => {} // already present, leave alone
+            Ok(None) => {
+                if let Err(e) = system_config::Model::upsert(db, key, value, false).await {
+                    warn!(key = %key, error = %e, "seed_routing_defaults: failed to insert");
+                }
+            }
+            Err(e) => warn!(key = %key, error = %e, "seed_routing_defaults: read failed"),
+        }
+    }
+}
+
+/// Read `routing.default_country`.
+///
+/// Returns `None` when the key is unset or blank. The value is normalised to
+/// an upper-case ISO 3166-1 alpha-2 string (`"US"`, `"GB"`, …). Stored in the
+/// DB as a JSON-encoded string — accepts raw strings too, to keep the reader
+/// robust against hand-edited rows.
+pub async fn read_default_country(db: &DatabaseConnection) -> Option<String> {
+    let row = system_config::Model::get(db, ROUTING_DEFAULT_COUNTRY_KEY)
+        .await
+        .ok()
+        .flatten()?;
+    let decoded: Option<String> = if row.value.trim_start().starts_with('"') {
+        serde_json::from_str(&row.value).ok()
+    } else {
+        Some(row.value)
+    };
+    decoded.and_then(|s| {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_ascii_uppercase())
+        }
+    })
+}
+
+/// Read `routing.did_strict_mode`. Defaults to `false` when missing or
+/// unparseable.
+pub async fn read_did_strict_mode(db: &DatabaseConnection) -> bool {
+    let Some(row) = system_config::Model::get(db, ROUTING_DID_STRICT_MODE_KEY)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return false;
+    };
+    serde_json::from_str::<bool>(row.value.trim()).unwrap_or(false)
 }

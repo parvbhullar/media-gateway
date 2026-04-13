@@ -50,6 +50,7 @@ cross = ["aws-lc-rs/bindgen"]
 perfcli-bin = []
 text2wav-bin = []
 wav2text-bin = []
+integration-test = []
 
 [dependencies]
 instant-acme = { version = "0.8.5", optional = true }

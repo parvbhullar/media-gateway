@@ -290,12 +290,21 @@ default('RustPBX') }}{% endblock %}
                                 class="font-mono rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
                                 placeholder="{{ "sip_trunk_detail.field_allowed_ips_placeholder" | t }}"></textarea>
                         </label>
-                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
-                            {{ "sip_trunk_detail.field_did_numbers" | t }}
-                            <textarea rows="6" x-model="form.did_numbers"
-                                class="font-mono rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
-                                placeholder="{{ "sip_trunk_detail.field_did_numbers_placeholder" | t }}"></textarea>
-                        </label>
+                        <div class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            <span>{{ "sip_trunk_detail.field_did_numbers" | t }}</span>
+                            <div class="rounded-lg border border-dashed border-slate-200 bg-slate-50 px-3 py-3 text-sm text-slate-600">
+                                {% if dids_count and dids_count > 0 %}
+                                    <p class="font-semibold text-slate-800">{{ dids_count }} number(s) assigned</p>
+                                {% else %}
+                                    <p class="text-slate-500">No numbers assigned</p>
+                                {% endif %}
+                                <p class="mt-1 text-xs text-slate-500">
+                                    Managed on the
+                                    <a href="{{ (base_path | default('/console')) }}/dids/page"
+                                        class="font-semibold text-sky-600 hover:text-sky-500">Numbers page</a>.
+                                </p>
+                            </div>
+                        </div>
                     </div>
                 </section>
             </div>
@@ -696,7 +705,7 @@ default('RustPBX') }}{% endblock %}
                 });
 
                 params.set('allowed_ips', this.form.allowed_ips.trim());
-                params.set('did_numbers', this.form.did_numbers.trim());
+                // did_numbers are now managed on the Numbers page; do not submit from trunk form.
                 params.set('billing_snapshot', this.form.billing_snapshot.trim());
                 params.set('analytics', this.form.analytics.trim());
                 params.set('tags', this.form.tags.trim());

@@ -177,6 +177,12 @@ async fn reload_trunks_handler(State(state): State<AppState>, client_ip: ClientA
     {
         Ok(metrics) => {
             let total = metrics.total;
+            state
+                .sip_server()
+                .inner
+                .data_context
+                .reload_did_index()
+                .await;
             if let Some(ref console) = state.console {
                 console.clear_pending_reload();
             }

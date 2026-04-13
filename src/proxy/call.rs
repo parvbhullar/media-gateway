@@ -9,7 +9,10 @@ use crate::proxy::data::ProxyDataContext;
 use crate::proxy::proxy_call::CallSessionBuilder;
 use crate::proxy::routing::{
     RouteRule, SourceTrunk, TrunkConfig, build_source_trunk,
-    matcher::{RouteResourceLookup, match_invite},
+    matcher::{
+        DidLookup, RouteResourceLookup, build_did_extension_route_result, did_lookup_result,
+        match_invite,
+    },
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -192,6 +195,55 @@ impl RouteInvite for DefaultRouteInvite {
                             ));
                         }
                     }
+                }
+            }
+
+            // ─── DID-first lookup ────────────────────────────────────────
+            if let Some(source) = source_trunk.as_ref() {
+                let did_index = self.data_context.did_index();
+                let default_country = self.data_context.did_default_country();
+                let strict = self.data_context.did_strict_mode();
+                let to_user = extract_to_user(origin).unwrap_or_default();
+
+                match did_lookup_result(
+                    &did_index,
+                    default_country.as_deref(),
+                    &to_user,
+                    &source.name,
+                    strict,
+                ) {
+                    DidLookup::ShortCircuitExtension(ext) => {
+                        info!(
+                            did = %to_user,
+                            extension = %ext,
+                            trunk = %source.name,
+                            "inbound DID resolved directly to extension"
+                        );
+                        return build_did_extension_route_result(option, &ext);
+                    }
+                    DidLookup::Reject(detail) => {
+                        let reason = q850_reason_value(
+                            &rsipstack::sip::StatusCode::Forbidden,
+                            Some(&detail),
+                        );
+                        warn!(
+                            trunk = %source.name,
+                            reason = %reason,
+                            "rejecting inbound INVITE due to DID ownership mismatch"
+                        );
+                        return Ok(RouteResult::Abort(
+                            rsipstack::sip::StatusCode::Forbidden,
+                            Some(reason),
+                        ));
+                    }
+                    DidLookup::KnownNoExtension { number, .. } => {
+                        debug!(
+                            did = %number,
+                            trunk = %source.name,
+                            "inbound DID recognized, no direct extension; falling through to rules"
+                        );
+                    }
+                    DidLookup::FallThrough => {}
                 }
             }
         }

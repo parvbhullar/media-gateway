@@ -768,8 +768,59 @@ async fn delete_extension(
         )
             .into_response();
     }
-    match ExtensionEntity::delete_by_id(id).exec(state.db()).await {
+    let db = state.db();
+
+    // Load the extension row first so we know its short identifier
+    // (the user-facing number that DIDs point at). We null out any DID
+    // pointers before deleting the row so runtime routing doesn't hold
+    // a dangling reference.
+    let ext_row = match ExtensionEntity::find_by_id(id).one(db).await {
+        Ok(Some(m)) => Some(m),
+        Ok(None) => None,
+        Err(err) => {
+            warn!("failed to load extension {} for delete: {}", id, err);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"message": err.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    let nulled = if let Some(row) = ext_row.as_ref() {
+        use crate::models::did;
+        match did::Model::null_extension(db, &row.extension).await {
+            Ok(n) => n,
+            Err(err) => {
+                warn!(
+                    "failed to null DID extension pointer for {} ({}): {}; aborting extension delete",
+                    id, row.extension, err
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"message": "failed to clear DID references"})),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        0
+    };
+
+    match ExtensionEntity::delete_by_id(id).exec(db).await {
         Ok(r) => {
+            if nulled > 0 {
+                // Reload the DID index so runtime routing no longer sees
+                // the stale extension pointer. Same plumbing as did.rs.
+                if let Some(app_state) = state.app_state() {
+                    app_state
+                        .sip_server()
+                        .inner
+                        .data_context
+                        .reload_did_index()
+                        .await;
+                }
+            }
             state.mark_pending_reload();
             Json(json!({"status": r.rows_affected})).into_response()
         }
@@ -995,5 +1046,42 @@ mod tests {
         };
         let resp = create_extension(State(state), AuthRequired(user), Json(payload)).await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn delete_extension_nulls_did_pointer() {
+        use crate::models::did::{self, NewDid};
+
+        let state = setup_state().await;
+        let db = state.db();
+
+        // Seed an extension "1001".
+        let ext = insert_extension(db, "1001").await;
+
+        // Seed a DID pointing at it (with extension_number = "1001").
+        did::Model::upsert(
+            db,
+            NewDid {
+                number: "+14158675309".into(),
+                trunk_name: Some("t".into()),
+                extension_number: Some("1001".into()),
+                failover_trunk: None,
+                label: None,
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Delete the extension.
+        let resp =
+            delete_extension(AxumPath(ext.id), State(state.clone()), AuthRequired(dummy_user()))
+                .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // DID row still exists but extension_number is now None.
+        let row = did::Model::get(db, "+14158675309").await.unwrap().unwrap();
+        assert!(row.extension_number.is_none());
+        assert_eq!(row.trunk_name.as_deref(), Some("t"));
     }
 }
