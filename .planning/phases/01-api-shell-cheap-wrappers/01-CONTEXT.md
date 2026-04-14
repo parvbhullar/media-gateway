@@ -40,10 +40,11 @@ Every item below is a LOCKED decision from the design doc and PROJECT.md Key Dec
 ### Adapter Pattern (SHELL-05)
 
 - **Pure data-fetch fns** are extracted from existing console handlers into module-level `pub(crate) async fn` functions.
-- Signature must be `(&DatabaseConnection, TypedInput) -> Result<TypedOutput, DbErr>`.
-- **No `State`, no `Response`, no `AuthRequired`** in the pure fn signature — that's what lets both `ConsoleState` and `AppState` call them.
+- **Default signature** (for DB-bound helpers): `(&DatabaseConnection, TypedInput) -> Result<TypedOutput, DbErr>`. Plans 01 (DIDs), 02 (Gateways), 03 (CDRs) all follow this.
+- **Exception — non-DB state helpers:** pure fns that read from registrar, locator, active-call registry, reload guard, or any other in-memory state component accept `&AppState` instead of `&DatabaseConnection`. Plans 04 (Diagnostics — registrar/locator) and 05 (System — reload guard, active call count) use this. The exception is limited to non-DB helpers; any helper that touches the DB MUST use the default signature.
+- **No `State`, no `Response`, no `AuthRequired`, no `AxumJson`** in any pure fn signature — that's what lets both `ConsoleState` HTML handlers and `AppState` JSON handlers call them.
 - Both the HTML handler (keeps its existing signature with `State<Arc<ConsoleState>>`) and the new JSON handler (takes `State<AppState>`) call the same pure fn.
-- The pure fns live in the same file as the existing console handler, keyed on `&DatabaseConnection` only.
+- The pure fns live in the same file as the existing console handler (or in `handler/ami.rs` for system-level helpers).
 
 ### No new State bridge needed
 
@@ -130,7 +131,7 @@ Each new file exposes exactly one `pub fn router() -> Router<AppState>`. No glob
   3. `404 Not Found` on missing resource
   4. `400 Bad Request` or `409 Conflict` on bad input (whichever applies)
 - Test fixtures seed via existing `src/fixtures.rs`.
-- New test modules must be registered in `scripts/run_tests.sh` per project CLAUDE.md convention.
+- `cargo test` discovers new `tests/api_v1_*.rs` files automatically. `scripts/run_tests.sh` does not exist in this repo — do NOT add references to it.
 
 ### Console render-parity spot check (MIG-03)
 
@@ -187,7 +188,7 @@ Areas the design doc does not fully lock. Planner and implementer should choose 
 4. **Task 1.4 — CDRs** (~1 day): extract pure fns from `console/handlers/call_record.rs`, create `api_v1/cdrs.rs`, 3 live routes + 2 501 stubs, tests.
 5. **Task 1.5 — Diagnostics** (~1 day): extract from `console/handlers/diagnostics.rs` and proxy modules, create `api_v1/diagnostics.rs`, 4 routes + summary aggregator, tests.
 6. **Task 1.6 — System** (~0.5 day): create `api_v1/system.rs` wrapping `handler/ami.rs` data, 2 routes (health + reload), tests.
-7. **Task 1.7 — Integration test wiring** (~1 day): ensure all new `tests/api_v1_*.rs` files registered in `scripts/run_tests.sh`, fixtures seeded, 401/happy/404/400-409 coverage verified for every route.
+7. **Task 1.7 — Integration test wiring** (~1 day): ensure all new `tests/api_v1_*.rs` files are discovered by `cargo test`, fixtures seeded via `src/fixtures.rs`, 401/happy/404/400-409 coverage verified for every route.
 
 **Ordering rationale:** DIDs first because it's the simplest schema and proves the pattern end-to-end. Gateways writes second because the view type already exists. CDRs third because it introduces pagination. Diagnostics fourth because it mixes console + proxy modules. System last because it's the thinnest wrapper.
 
@@ -209,8 +210,8 @@ Areas the design doc does not fully lock. Planner and implementer should choose 
 - `src/console/handlers/sip_trunk.rs` (extract pure fns)
 - `src/console/handlers/call_record.rs` (extract pure fns)
 - `src/console/handlers/diagnostics.rs` (extract pure fns)
-- `src/handler/ami.rs` (extract pure fns)
-- `scripts/run_tests.sh` (register new test modules)
+- `src/handler/ami.rs` (extract pure fns; add `health_snapshot` + `reload_all`)
+- `src/fixtures.rs` (seed DIDs, CDRs, API key rows for integration tests)
 
 **Not touched in Phase 1:**
 - `src/proxy/*` (no hot-path changes)
@@ -267,12 +268,17 @@ Phase 1 validation is straightforward:
 **Regression:**
 - Full existing `cargo test` suite must continue to pass — Phase 1 must not break any existing test.
 
-**Verification commands (per project CLAUDE.md):**
+**Verification commands:**
 ```bash
-cargo build --all-targets
-cargo test
-cargo clippy --all-targets
-bash scripts/run_tests.sh api_v1_phase1
+cargo build -p media-gateway --all-targets
+cargo test -p media-gateway
+cargo clippy -p media-gateway --all-targets -- -D warnings
+# Per-plan test subsets:
+cargo test -p media-gateway --test api_v1_dids
+cargo test -p media-gateway --test api_v1_gateways
+cargo test -p media-gateway --test api_v1_cdrs
+cargo test -p media-gateway --test api_v1_diagnostics
+cargo test -p media-gateway --test api_v1_system
 ```
 
 </deferred>
