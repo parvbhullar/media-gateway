@@ -5,6 +5,7 @@
 //! sub-routers into (gateway health, routing, security, DIDs, etc.).
 
 pub mod auth;
+pub mod common;
 pub mod error;
 pub mod gateways;
 
