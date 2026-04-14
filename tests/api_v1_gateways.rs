@@ -193,3 +193,249 @@ async fn trunk_test_404_on_missing_gateway() {
         .unwrap();
     assert_eq!(resp.status().as_u16(), 404);
 }
+
+// ---------------------------------------------------------------------------
+// Write routes (Phase 1 Plan 01-02)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn create_gateway_requires_auth() {
+    let state = test_state_empty().await;
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/gateways")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"name":"carrier-x"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 401);
+}
+
+#[tokio::test]
+async fn create_gateway_happy_path_returns_201() {
+    let (state, token) = test_state_with_api_key("create-happy").await;
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/gateways")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"name":"carrier-new","sip_server":"sip.example.net:5060","transport":"udp","direction":"outbound"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 201);
+    let body = body_json(resp).await;
+    assert_eq!(body["name"], "carrier-new");
+    assert_eq!(body["transport"], "udp");
+    assert_eq!(body["direction"], "outbound");
+    assert_eq!(body["proxy_addr"], "sip.example.net:5060");
+}
+
+#[tokio::test]
+async fn create_gateway_duplicate_returns_409() {
+    let (state, token) = test_state_with_api_key("create-dup").await;
+    insert_trunk(&state, "carrier-dup", Some("sip.example.com:5060")).await;
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/gateways")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"name":"carrier-dup"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 409);
+    let body = body_json(resp).await;
+    assert_eq!(body["code"], "conflict");
+}
+
+#[tokio::test]
+async fn create_gateway_empty_name_returns_400() {
+    let (state, token) = test_state_with_api_key("create-empty").await;
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/gateways")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"name":"  "}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+}
+
+#[tokio::test]
+async fn update_gateway_requires_auth() {
+    let state = test_state_empty().await;
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/gateways/x")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 401);
+}
+
+#[tokio::test]
+async fn update_gateway_happy_path() {
+    let (state, token) = test_state_with_api_key("update-happy").await;
+    insert_trunk(&state, "carrier-upd", Some("sip.old.com:5060")).await;
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/gateways/carrier-upd")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"sip_server":"sip.new.com:5060","is_active":false}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = body_json(resp).await;
+    assert_eq!(body["name"], "carrier-upd");
+    assert_eq!(body["proxy_addr"], "sip.new.com:5060");
+    assert_eq!(body["is_active"], false);
+}
+
+#[tokio::test]
+async fn update_gateway_missing_returns_404() {
+    let (state, token) = test_state_with_api_key("update-missing").await;
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/gateways/ghost")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"is_active":true}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
+}
+
+#[tokio::test]
+async fn delete_gateway_requires_auth() {
+    let state = test_state_empty().await;
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/gateways/x")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 401);
+}
+
+#[tokio::test]
+async fn delete_gateway_happy_path_returns_204() {
+    let (state, token) = test_state_with_api_key("delete-happy").await;
+    insert_trunk(&state, "carrier-del", None).await;
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/gateways/carrier-del")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 204);
+}
+
+#[tokio::test]
+async fn delete_gateway_missing_returns_404() {
+    let (state, token) = test_state_with_api_key("delete-missing").await;
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/gateways/ghost")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 404);
+}
+
+#[tokio::test]
+async fn delete_gateway_with_referencing_did_returns_409() {
+    let (state, token) = test_state_with_api_key("delete-engaged").await;
+    insert_trunk(&state, "carrier-engaged", None).await;
+    // Seed a DID that references the trunk
+    rustpbx::models::did::Model::upsert(
+        state.db(),
+        rustpbx::models::did::NewDid {
+            number: "+14155550101".into(),
+            trunk_name: Some("carrier-engaged".into()),
+            extension_number: None,
+            failover_trunk: None,
+            label: None,
+            enabled: true,
+        },
+    )
+    .await
+    .unwrap();
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/gateways/carrier-engaged")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 409);
+    let body = body_json(resp).await;
+    assert_eq!(body["code"], "conflict");
+    assert!(
+        body["error"].as_str().unwrap().contains("+14155550101"),
+        "error message should cite the referencing DID"
+    );
+}
