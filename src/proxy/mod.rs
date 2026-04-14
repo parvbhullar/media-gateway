@@ -12,6 +12,7 @@ pub mod active_call_registry;
 pub mod auth;
 pub mod call;
 pub mod data;
+pub mod gateway_health;
 pub mod locator;
 pub mod locator_db;
 pub mod locator_webhook;

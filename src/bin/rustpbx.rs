@@ -5,9 +5,12 @@ use dotenvy::dotenv;
 use rustpbx::{
     app::{AppStateBuilder, create_router},
     config::Config,
+    handler::api_v1::auth::issue_api_key,
     handler::middleware::request_log::AccessLogEventFormat,
+    models::{api_key, create_db},
     observability, preflight, version,
 };
+use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::path::PathBuf;
@@ -73,6 +76,78 @@ enum Commands {
     CheckConfig,
     /// Initialize with fixture data (extensions, routes, wholesale demo data)
     Fixtures,
+    /// Manage `/api/v1/*` Bearer-token API keys.
+    #[command(subcommand)]
+    ApiKey(ApiKeyCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum ApiKeyCmd {
+    /// Create a new API key. Prints the plaintext token exactly once.
+    Create {
+        /// Human-readable name. Must be unique.
+        name: String,
+        /// Optional free-form description stored alongside the hash.
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// List every API key row (active + revoked).
+    List,
+    /// Revoke an API key by name. Subsequent requests will fail with 401.
+    Revoke {
+        /// Name of the key to revoke.
+        name: String,
+    },
+}
+
+async fn run_api_key_cmd(database_url: &str, cmd: ApiKeyCmd) -> Result<()> {
+    let db = create_db(database_url).await?;
+    match cmd {
+        ApiKeyCmd::Create { name, description } => {
+            let issued = issue_api_key();
+            let am = api_key::ActiveModel {
+                name: Set(name.clone()),
+                hash_sha256: Set(issued.hash.clone()),
+                description: Set(description),
+                created_at: Set(Utc::now()),
+                ..Default::default()
+            };
+            am.insert(&db).await?;
+            println!("API key created. Store this token — it will NOT be shown again:");
+            println!("  {}", issued.plaintext);
+            println!("name={} sha256={}", name, issued.hash);
+        }
+        ApiKeyCmd::List => {
+            let rows = api_key::Entity::find().all(&db).await?;
+            if rows.is_empty() {
+                println!("(no api keys)");
+            } else {
+                for r in rows {
+                    let status = if r.revoked_at.is_some() {
+                        "revoked"
+                    } else {
+                        "active"
+                    };
+                    println!(
+                        "{:<24} {:<8} created={} last_used={:?}",
+                        r.name, status, r.created_at, r.last_used_at
+                    );
+                }
+            }
+        }
+        ApiKeyCmd::Revoke { name } => {
+            let row = api_key::Entity::find()
+                .filter(api_key::Column::Name.eq(name.clone()))
+                .one(&db)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("api key '{}' not found", name))?;
+            let mut am: api_key::ActiveModel = row.into();
+            am.revoked_at = Set(Some(Utc::now()));
+            am.update(&db).await?;
+            println!("Revoked {}", name);
+        }
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -132,6 +207,14 @@ async fn main() -> Result<()> {
 
         rustpbx::fixtures::run_fixtures(state).await?;
         println!("Fixtures initialized successfully.");
+        return Ok(());
+    }
+
+    if matches!(cli.command, Some(Commands::ApiKey(_))) {
+        let Some(Commands::ApiKey(cmd)) = cli.command else {
+            unreachable!()
+        };
+        run_api_key_cmd(&config.database_url, cmd).await?;
         return Ok(());
     }
 

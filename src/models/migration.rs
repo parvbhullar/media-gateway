@@ -31,6 +31,8 @@ impl MigratorTrait for Migrator {
             Box::new(super::system_config::Migration),
             Box::new(super::pending_upload::Migration),
             Box::new(super::did::Migration),
+            Box::new(super::api_key::Migration),
+            Box::new(super::add_sip_trunk_health_columns::Migration),
         ]
     }
 }

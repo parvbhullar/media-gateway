@@ -134,6 +134,13 @@ pub struct Model {
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
     pub last_health_check_at: Option<DateTimeUtc>,
+    pub health_check_interval_secs: Option<i32>,
+    pub failure_threshold: Option<i32>,
+    pub recovery_threshold: Option<i32>,
+    #[sea_orm(default_value = "0")]
+    pub consecutive_failures: i32,
+    #[sea_orm(default_value = "0")]
+    pub consecutive_successes: i32,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -203,6 +210,21 @@ impl MigrationTrait for Migration {
                     .col(timestamp(Column::CreatedAt).default(Expr::current_timestamp()))
                     .col(timestamp(Column::UpdatedAt).default(Expr::current_timestamp()))
                     .col(timestamp_null(Column::LastHealthCheckAt))
+                    .col(integer_null(Column::HealthCheckIntervalSecs))
+                    .col(integer_null(Column::FailureThreshold))
+                    .col(integer_null(Column::RecoveryThreshold))
+                    .col(
+                        ColumnDef::new(Column::ConsecutiveFailures)
+                            .integer()
+                            .not_null()
+                            .default(0),
+                    )
+                    .col(
+                        ColumnDef::new(Column::ConsecutiveSuccesses)
+                            .integer()
+                            .not_null()
+                            .default(0),
+                    )
                     .to_owned(),
             )
             .await?;

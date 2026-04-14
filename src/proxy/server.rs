@@ -671,6 +671,23 @@ impl SipServerBuilder {
             );
         }
         inner.endpoint.inner.allows.lock().replace(allow_methods);
+
+        // Plan 1: spawn the gateway OPTIONS health monitor. Outbound trunks
+        // get periodically probed and `sip_trunk.status` is flipped between
+        // `healthy`/`offline` on threshold crossings.
+        if let Some(db) = inner.database.clone() {
+            let endpoint_inner = inner.endpoint.inner.clone();
+            let monitor = Arc::new(crate::proxy::gateway_health::GatewayHealthMonitor::new(
+                db,
+                Some(endpoint_inner),
+            ));
+            let cancel = inner.cancel_token.child_token();
+            info!("starting gateway_health monitor");
+            crate::utils::spawn(async move {
+                monitor.run(cancel).await;
+            });
+        }
+
         Ok(SipServer {
             inner,
             modules: Arc::new(modules),

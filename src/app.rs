@@ -675,6 +675,7 @@ pub fn create_router(state: AppState) -> Router {
 
     // Merge call and WebSocket handlers with static file serving
     let call_routes = crate::handler::ami_router(state.clone()).with_state(state.clone());
+    let api_v1 = crate::handler::api_v1::api_v1_router(state.clone());
     #[allow(unused_mut)]
     let mut router = router
         .route(
@@ -684,6 +685,7 @@ pub fn create_router(state: AppState) -> Router {
         .merge(state.addon_registry.get_routers(state.clone()))
         .nest_service("/static", static_files_service)
         .merge(call_routes)
+        .merge(api_v1)
         .layer(cors);
 
     // Add RWI WebSocket endpoint if configured
