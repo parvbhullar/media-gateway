@@ -248,17 +248,142 @@ Tracked but not in this milestone's roadmap:
 
 ## Traceability
 
-Populated during roadmap creation.
+Every v2.0 requirement maps to exactly one phase.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| (populated by roadmapper) | | |
+| SHELL-01 | Phase 1 | Pending |
+| SHELL-02 | Phase 1 | Pending |
+| SHELL-03 | Phase 1 | Pending |
+| SHELL-04 | Phase 1 | Pending |
+| SHELL-05 | Phase 1 | Pending |
+| GWY-01 | Phase 1 | Pending |
+| GWY-02 | Phase 1 | Pending |
+| GWY-03 | Phase 1 | Pending |
+| GWY-04 | Phase 1 | Pending |
+| DID-01 | Phase 1 | Pending |
+| DID-02 | Phase 1 | Pending |
+| DID-03 | Phase 1 | Pending |
+| DID-04 | Phase 1 | Pending |
+| CDR-01 | Phase 1 | Pending |
+| CDR-02 | Phase 1 | Pending |
+| CDR-03 | Phase 1 | Pending |
+| CDR-04 | Phase 1 | Pending |
+| CDR-05 | Phase 11 | Pending |
+| CDR-06 | Phase 11 | Pending |
+| CDR-07 | Phase 11 | Pending |
+| DIAG-01 | Phase 1 | Pending |
+| DIAG-02 | Phase 1 | Pending |
+| DIAG-03 | Phase 1 | Pending |
+| DIAG-04 | Phase 1 | Pending |
+| DIAG-05 | Phase 1 | Pending |
+| SYS-01 | Phase 1 | Pending |
+| SYS-02 | Phase 1 | Pending |
+| SYS-03 | Phase 11 | Pending |
+| SYS-04 | Phase 11 | Pending |
+| SYS-05 | Phase 11 | Pending |
+| SYS-06 | Phase 11 | Pending |
+| LSTN-01 | Phase 12 | Pending |
+| LSTN-02 | Phase 12 | Pending |
+| LSTN-03 | Phase 12 | Pending |
+| LSTN-04 | Phase 12 | Pending |
+| TRK-01 | Phase 2 | Pending |
+| TRK-02 | Phase 2 | Pending |
+| TRK-03 | Phase 2 | Pending |
+| TRK-04 | Phase 2 | Pending |
+| TRK-05 | Phase 2 | Pending |
+| TSUB-01 | Phase 3 | Pending |
+| TSUB-02 | Phase 3 | Pending |
+| TSUB-03 | Phase 3 | Pending |
+| TSUB-04 | Phase 5 | Pending |
+| TSUB-05 | Phase 5 | Pending |
+| TSUB-06 | Phase 5 | Pending |
+| TSUB-07 | Phase 5 | Pending |
+| RTE-01 | Phase 6 | Pending |
+| RTE-02 | Phase 6 | Pending |
+| RTE-03 | Phase 3 | Pending |
+| RTE-04 | Phase 6 | Pending |
+| RTE-05 | Phase 6 | Pending |
+| TRN-01 | Phase 8 | Pending |
+| TRN-02 | Phase 8 | Pending |
+| TRN-03 | Phase 8 | Pending |
+| TRN-04 | Phase 8 | Pending |
+| TRN-05 | Phase 8 | Pending |
+| TRN-06 | Phase 8 | Pending |
+| MAN-01 | Phase 9 | Pending |
+| MAN-02 | Phase 9 | Pending |
+| MAN-03 | Phase 9 | Pending |
+| MAN-04 | Phase 9 | Pending |
+| MAN-05 | Phase 9 | Pending |
+| MAN-06 | Phase 9 | Pending |
+| MAN-07 | Phase 9 | Pending |
+| SEC-01 | Phase 10 | Pending |
+| SEC-02 | Phase 10 | Pending |
+| SEC-03 | Phase 10 | Pending |
+| SEC-04 | Phase 10 | Pending |
+| SEC-05 | Phase 10 | Pending |
+| SEC-06 | Phase 10 | Pending |
+| CALL-01 | Phase 4 | Pending |
+| CALL-02 | Phase 4 | Pending |
+| CALL-03 | Phase 4 | Pending |
+| CALL-04 | Phase 4 | Pending |
+| CALL-05 | Phase 4 | Pending |
+| CALL-06 | Phase 4 | Pending |
+| CALL-07 | Phase 4 | Pending |
+| CALL-08 | Phase 4 | Pending |
+| CALL-09 | Phase 4 | Pending |
+| CALL-10 | Phase 4 | Pending |
+| WH-01 | Phase 7 | Pending |
+| WH-02 | Phase 7 | Pending |
+| WH-03 | Phase 7 | Pending |
+| WH-04 | Phase 7 | Pending |
+| WH-05 | Phase 7 | Pending |
+| WH-06 | Phase 7 | Pending |
+| EPUA-01 | Phase 13 | Pending |
+| EPUA-02 | Phase 13 | Pending |
+| EPUA-03 | Phase 13 | Pending |
+| EPUA-04 | Phase 13 | Pending |
+| EPUA-05 | Phase 13 | Pending |
+| APP-01 | Phase 13 | Pending |
+| APP-02 | Phase 13 | Pending |
+| APP-03 | Phase 13 | Pending |
+| APP-04 | Phase 13 | Pending |
+| APP-05 | Phase 13 | Pending |
+| APP-06 | Phase 13 | Pending |
+| REC-01 | Phase 12 | Pending |
+| REC-02 | Phase 12 | Pending |
+| REC-03 | Phase 12 | Pending |
+| REC-04 | Phase 12 | Pending |
+| REC-05 | Phase 12 | Pending |
+| REC-06 | Phase 12 | Pending |
+| REC-07 | Phase 12 | Pending |
+| TEN-01 | Phase 13 | Pending |
+| TEN-02 | Phase 13 | Pending |
+| TEN-03 | Phase 13 | Pending |
+| TEN-04 | Phase 13 | Pending |
+| TEN-05 | Phase 13 | Pending |
+| TEN-06 | Phase 13 | Pending |
+| IT-01 | Phase 1 | Pending |
+| IT-02 | Phase 9 | Pending |
+| IT-03 | Phase 5 | Pending |
+| IT-04 | Phase 13 | Pending |
+| IT-05 | Phase 13 | Pending |
+| MIG-01 | Phase 2 | Pending |
+| MIG-02 | Phase 12 | Pending |
+| MIG-03 | Phase 1 | Pending |
+| MIG-04 | Phase 11 | Pending |
 
 **Coverage:**
 - v2.0 requirements: 120 total
-- Mapped to phases: 0
-- Unmapped: 120 ⚠️ (roadmapper will fill)
+- Mapped to phases: 120
+- Unmapped: 0 ✓
+
+**Cross-cutting requirement notes:**
+- IT-01 (test scaffolding convention) anchors in Phase 1 but applies to every subsequent sub-router — each phase must write its own test file following the convention.
+- IT-02 (Translations + Manipulations pipeline tests) anchors in Phase 9 where both engines are live; Phase 8 ships the Translations-only portion of this test.
+- MIG-03 (console render-parity spot check) anchors in Phase 1 but applies to every phase that refactors a console handler into a `pub(crate)` data fn.
+- MIG-01 anchors in Phase 2 (first new table — `trunk_groups`); each later phase introducing new tables inherits the same additive-migration contract.
 
 ---
 *Requirements defined: 2026-04-14*
-*Last updated: 2026-04-14 after initial definition*
+*Last updated: 2026-04-15 after roadmap creation*
