@@ -6,6 +6,7 @@
 
 pub mod auth;
 pub mod common;
+pub mod dids;
 pub mod error;
 pub mod gateways;
 
@@ -22,9 +23,9 @@ pub fn api_v1_router(state: AppState) -> Router {
     // Sub-routers from later plans register here.
     let protected: Router<AppState> = Router::new()
         .merge(gateways::router())
+        .merge(dids::router())
         // Plan 2: .merge(routing::router())
         // Plan 3: .merge(security::router())
-        // Plan 4: .merge(dids::router())
         ;
 
     Router::<AppState>::new()
