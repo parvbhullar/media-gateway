@@ -295,10 +295,17 @@ default('RustPBX') }}{% endblock %}
                             <div class="rounded-lg border border-dashed border-slate-200 bg-slate-50 px-3 py-3 text-sm text-slate-600">
                                 {% if dids_count and dids_count > 0 %}
                                     <p class="font-semibold text-slate-800">{{ dids_count }} number(s) assigned</p>
+                                    {% if dids_numbers %}
+                                        <ul class="mt-2 flex flex-wrap gap-1.5">
+                                            {% for number in dids_numbers %}
+                                                <li class="inline-flex items-center rounded-md bg-white px-2 py-0.5 font-mono text-xs text-slate-700 ring-1 ring-slate-200">{{ number }}</li>
+                                            {% endfor %}
+                                        </ul>
+                                    {% endif %}
                                 {% else %}
                                     <p class="text-slate-500">No numbers assigned</p>
                                 {% endif %}
-                                <p class="mt-1 text-xs text-slate-500">
+                                <p class="mt-2 text-xs text-slate-500">
                                     Managed on the
                                     <a href="{{ (base_path | default('/console')) }}/dids/page"
                                         class="font-semibold text-sky-600 hover:text-sky-500">Numbers page</a>.

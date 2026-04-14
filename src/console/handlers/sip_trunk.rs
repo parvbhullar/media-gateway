@@ -161,9 +161,12 @@ async fn page_sip_trunk_detail(
                 let _ = tenant_link;
             }
 
-            let dids_count = crate::models::did::Model::count_by_trunk(db, &model.name)
+            let assigned_dids = crate::models::did::Model::list_by_trunk(db, &model.name)
                 .await
-                .unwrap_or(0);
+                .unwrap_or_default();
+            let dids_count = assigned_dids.len() as u64;
+            let dids_numbers: Vec<&str> =
+                assigned_dids.iter().map(|d| d.number.as_str()).collect();
 
             state.render_with_headers(
                 "console/sip_trunk_detail.html",
@@ -176,6 +179,7 @@ async fn page_sip_trunk_detail(
                     "update_url": state.url_for(&format!("/sip-trunk/{id}")),
                     "current_user": current_user,
                     "dids_count": dids_count,
+                    "dids_numbers": dids_numbers,
                 }),
                 &headers,
             )
