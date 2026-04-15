@@ -292,6 +292,14 @@ impl GatewayHealthMonitor {
         self
     }
 
+    /// Test/observability helper: snapshot the current tally for a single
+    /// gateway id. Returns `None` if the monitor has never ticked against
+    /// this gateway. Used by the GWY-04 integration test to prove a newly
+    /// created gateway is observable after one `tick_once()` invocation.
+    pub async fn tally_snapshot(&self, gateway_id: i64) -> Option<HealthTally> {
+        self.tallies.lock().await.get(&gateway_id).cloned()
+    }
+
     /// Run the loop until `cancel` fires.
     pub async fn run(self: Arc<Self>, cancel: CancellationToken) {
         tracing::info!(

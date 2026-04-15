@@ -439,3 +439,92 @@ async fn delete_gateway_with_referencing_did_returns_409() {
         "error message should cite the referencing DID"
     );
 }
+
+// ---------------------------------------------------------------------------
+// GWY-04: newly created gateway is picked up by the DB-polling
+// GatewayHealthMonitor on the very next tick_once() invocation.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn newly_created_gateway_appears_in_health_tallies_on_next_tick() {
+    use rustpbx::models::sip_trunk;
+    use rustpbx::proxy::gateway_health::{GatewayHealthMonitor, ProbeOutcome};
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+    let (state, token) = test_state_with_api_key("gwy04-tally").await;
+
+    // 1. POST /api/v1/gateways — create a new outbound gateway with
+    //    health_check_interval_secs=0 so tick_once probes it immediately
+    //    regardless of last_health_check_at.
+    let create_body = serde_json::json!({
+        "name": "gwy04-test",
+        "display_name": "GWY-04 test gateway",
+        "direction": "outbound",
+        "sip_server": "127.0.0.1:65530",
+        "transport": "udp",
+        "is_active": true,
+        "health_check_interval_secs": 0,
+        "failure_threshold": 3,
+        "recovery_threshold": 2,
+    });
+
+    let app = rustpbx::app::create_router(state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/gateways")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        201,
+        "POST /api/v1/gateways should return 201 CREATED"
+    );
+
+    // 2. Read back the assigned id by name so we don't depend on the
+    //    response body shape for the pk.
+    let inserted = sip_trunk::Entity::find()
+        .filter(sip_trunk::Column::Name.eq("gwy04-test"))
+        .one(state.db())
+        .await
+        .expect("find inserted gateway")
+        .expect("gateway should exist");
+    let gateway_id = inserted.id;
+
+    // 3. Build a GatewayHealthMonitor against the same DB the AppState
+    //    uses. The monitor is DB-polling by design — there is no
+    //    register_trunk API. The only contract is: ticking against the
+    //    DB after insert should observe the new row.
+    let monitor = GatewayHealthMonitor::new(state.db().clone(), None);
+
+    // 4. Drive one tick with an injected probe that never actually hits
+    //    the network. `tick_with_probe` exercises the same find-and-fold
+    //    path as `tick_once` but lets us stub the probe outcome.
+    let probe_stub = |_t: sip_trunk::Model| async move {
+        ProbeOutcome {
+            ok: false,
+            latency_ms: 1,
+            detail: "gwy04-stub".into(),
+        }
+    };
+    monitor
+        .tick_with_probe(probe_stub)
+        .await
+        .expect("tick_with_probe failed");
+
+    // 5. The monitor must now carry a tally for our newly-inserted
+    //    gateway id — proving the DB-polling design works end-to-end
+    //    with the POST /gateways path.
+    let tally = monitor.tally_snapshot(gateway_id).await;
+    assert!(
+        tally.is_some(),
+        "expected monitor to observe gateway {} after one tick",
+        gateway_id
+    );
+}
