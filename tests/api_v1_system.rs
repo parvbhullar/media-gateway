@@ -173,21 +173,46 @@ async fn reload_populates_per_step_outcomes() {
 
 #[tokio::test]
 async fn concurrent_reload_cas_conflict_returns_409() {
-    // SYS-02 gap closure: the CAS serialization must be observable, not
-    // just present in code. Spawn two concurrent reload requests via
-    // tokio::spawn (stronger parallelism than plain tokio::join! which
-    // can run both futures on the same poller). Exactly one should win
-    // the CAS (200) and the other lose it (409).
+    // SYS-02 gap closure: the CAS serialization must be observable in
+    // tests, not just present in code.
+    //
+    // **Why this test is NOT a naive tokio::spawn race:**
+    // The empty-fixture reload path completes in sub-millisecond time
+    // on modern hardware — faster than tokio can even hand a spawned
+    // task from one worker to another. A pure `tokio::spawn(A);
+    // tokio::spawn(B);` race is flaky because task A can fully
+    // complete `reload_all`, drop the guard, and return 200 BEFORE
+    // task B is ever polled. We verified this empirically: across 5
+    // runs with N=8 barrier-aligned spawns, 2 runs still produced
+    // ok=2, conflict=6 because the first winner finished before the
+    // second wave landed.
+    //
+    // **Deterministic design:**
+    // 1. Pre-flip `state.reload_requested` to `true` — this EXACTLY
+    //    mimics the on-wire condition "a prior reload is still
+    //    in-flight when request B arrives". The CAS in `reload_all`
+    //    will observe the flag set and take the conflict branch.
+    // 2. Send request A — must return 409 (CAS loses).
+    // 3. Clear the flag and send request B — must return 200 (CAS
+    //    wins). This proves the flag isn't "stuck" and the reload
+    //    path works end-to-end after a conflict was returned.
+    //
+    // This deterministically exercises the CAS-conflict code path,
+    // which is exactly what "observable in tests, not just in code"
+    // means for a branch that has no externally-observable side effect
+    // other than the HTTP status code.
+    use std::sync::atomic::Ordering;
+
     let (state, token) = test_state_with_api_key("sys-reload-race").await;
 
-    let token_a = token.clone();
-    let token_b = token.clone();
-    let state_a = state.clone();
-    let state_b = state.clone();
+    // 1. Simulate "another reload in progress" by pre-acquiring the flag.
+    state.reload_requested.store(true, Ordering::SeqCst);
 
-    let call_reload = |state: rustpbx::app::AppState, token: String| async move {
-        let app = rustpbx::app::create_router(state);
-        app.oneshot(
+    // 2. A reload request must now hit the CAS-conflict branch and
+    //    return 409 Conflict with the JSON error envelope.
+    let app_conflict = rustpbx::app::create_router(state.clone());
+    let resp_conflict = app_conflict
+        .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/api/v1/system/reload")
@@ -196,29 +221,43 @@ async fn concurrent_reload_cas_conflict_returns_409() {
                 .unwrap(),
         )
         .await
-        .unwrap()
-    };
-
-    let h_a = tokio::spawn(call_reload(state_a, token_a));
-    let h_b = tokio::spawn(call_reload(state_b, token_b));
-
-    let resp_a = h_a.await.expect("task a panicked");
-    let resp_b = h_b.await.expect("task b panicked");
-
-    let mut statuses = [resp_a.status(), resp_b.status()];
-    statuses.sort_by_key(|s| s.as_u16());
-
+        .unwrap();
     assert_eq!(
-        statuses[0],
-        StatusCode::OK,
-        "expected one 200 OK, got {:?}",
-        statuses
-    );
-    assert_eq!(
-        statuses[1],
+        resp_conflict.status(),
         StatusCode::CONFLICT,
-        "expected one 409 Conflict, got {:?}",
-        statuses
+        "reload while reload_requested=true must return 409"
+    );
+    let body = body_json(resp_conflict).await;
+    assert_eq!(body["code"], "conflict");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("reload already in progress"),
+        "error message must describe the conflict: {body}"
+    );
+
+    // 3. Clear the flag and confirm the happy path still works on the
+    //    same AppState. This proves the CAS mechanism is reversible
+    //    and a returned 409 does not leak flag state.
+    state.reload_requested.store(false, Ordering::SeqCst);
+
+    let app_ok = rustpbx::app::create_router(state.clone());
+    let resp_ok = app_ok
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/system/reload")
+                .header(header::AUTHORIZATION, bearer(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp_ok.status(),
+        StatusCode::OK,
+        "reload must succeed after the in-progress flag is cleared"
     );
 }
 
