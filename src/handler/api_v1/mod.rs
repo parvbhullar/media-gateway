@@ -11,6 +11,7 @@ pub mod diagnostics;
 pub mod dids;
 pub mod error;
 pub mod gateways;
+pub mod system;
 
 use axum::{Router, middleware};
 
@@ -28,6 +29,7 @@ pub fn api_v1_router(state: AppState) -> Router {
         .merge(dids::router())
         .merge(cdrs::router())
         .merge(diagnostics::router())
+        .merge(system::router())
         // Plan 2: .merge(routing::router())
         // Plan 3: .merge(security::router())
         ;
