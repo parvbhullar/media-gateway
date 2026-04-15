@@ -5,6 +5,7 @@
 //! sub-routers into (gateway health, routing, security, DIDs, etc.).
 
 pub mod auth;
+pub mod cdrs;
 pub mod common;
 pub mod dids;
 pub mod error;
@@ -24,6 +25,7 @@ pub fn api_v1_router(state: AppState) -> Router {
     let protected: Router<AppState> = Router::new()
         .merge(gateways::router())
         .merge(dids::router())
+        .merge(cdrs::router())
         // Plan 2: .merge(routing::router())
         // Plan 3: .merge(security::router())
         ;
