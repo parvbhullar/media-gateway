@@ -7,6 +7,7 @@
 pub mod auth;
 pub mod cdrs;
 pub mod common;
+pub mod diagnostics;
 pub mod dids;
 pub mod error;
 pub mod gateways;
@@ -26,6 +27,7 @@ pub fn api_v1_router(state: AppState) -> Router {
         .merge(gateways::router())
         .merge(dids::router())
         .merge(cdrs::router())
+        .merge(diagnostics::router())
         // Plan 2: .merge(routing::router())
         // Plan 3: .merge(security::router())
         ;
