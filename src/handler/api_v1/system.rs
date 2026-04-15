@@ -15,12 +15,9 @@
 //! A `ReloadGuard` with a `Drop` impl releases the flag on both success
 //! and error paths so a panic mid-reload cannot leave the flag stuck.
 //!
-//! Phase 1 ships a minimal `reload_all` that flips the guard, sleeps
-//! briefly, and returns the elapsed_ms. Wiring it to the actual AMI
-//! reload subsystems (trunks / routes / acl / app) is deferred — the
-//! locked response shape is `{reloaded, elapsed_ms}` and this plan
-//! honors it exactly with a no-op `reloaded` list of the 4 steps so
-//! the contract is stable for later plans to fill in.
+//! Reload executes the trunks / routes / acl steps sequentially via
+//! `reload_steps::*`. The `reload/app` step (config-file reload with
+//! validation + dry-run) is deferred — see `deferred-items.md`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -36,6 +33,7 @@ use serde::Serialize;
 
 use crate::app::AppState;
 use crate::handler::api_v1::error::{ApiError, ApiResult};
+use crate::handler::api_v1::reload_steps::{self, ReloadStepOutcome};
 
 // ---------------------------------------------------------------------------
 // Wire types (CONTEXT.md locked shapes)
@@ -51,7 +49,15 @@ pub struct HealthResponse {
 
 #[derive(Debug, Serialize)]
 pub struct ReloadResponse {
+    /// Legacy Phase-1 field — list of step names that succeeded.
+    /// Kept for backwards compatibility with any client that locked
+    /// this shape in the stub era. Mirrors `steps[].step`.
     pub reloaded: Vec<&'static str>,
+
+    /// New in 01-06 — per-step outcome with elapsed_ms and changed_count.
+    pub steps: Vec<ReloadStepOutcome>,
+
+    /// Total elapsed_ms across all steps.
     pub elapsed_ms: u64,
 }
 
@@ -150,16 +156,23 @@ pub(crate) async fn reload_all(state: &AppState) -> ApiResult<ReloadResponse> {
     }
     let _guard = ReloadGuard(&state.reload_requested);
 
-    let start = Instant::now();
+    let overall_start = Instant::now();
+    let mut steps: Vec<ReloadStepOutcome> = Vec::with_capacity(3);
 
-    // Phase 1 stub: record the 4 steps but do not hook the actual AMI
-    // reload subsystems. The locked response shape is {reloaded,
-    // elapsed_ms}; a later plan will replace this no-op body with real
-    // calls into the trunks / routes / acl / app reload paths.
-    let reloaded = vec!["trunks", "routes", "acl", "app"];
+    // Trunks first — routes depend on fresh trunk ids for fk validation.
+    steps.push(reload_steps::reload_trunks_step(state).await?);
+
+    // Routes after trunks.
+    steps.push(reload_steps::reload_routes_step(state).await?);
+
+    // ACL last — independent of the other two, runs synchronously.
+    steps.push(reload_steps::reload_acl_step(state).await?);
+
+    let reloaded: Vec<&'static str> = steps.iter().map(|s| s.step).collect();
 
     Ok(ReloadResponse {
         reloaded,
-        elapsed_ms: start.elapsed().as_millis() as u64,
+        steps,
+        elapsed_ms: overall_start.elapsed().as_millis() as u64,
     })
 }
