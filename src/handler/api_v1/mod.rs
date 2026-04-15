@@ -11,6 +11,7 @@ pub mod diagnostics;
 pub mod dids;
 pub mod error;
 pub mod gateways;
+pub mod reload_steps;
 pub mod system;
 
 use axum::{Router, middleware};

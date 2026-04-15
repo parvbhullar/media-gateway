@@ -88,3 +88,9 @@ impl IntoResponse for ApiError {
 }
 
 pub type ApiResult<T> = Result<T, ApiError>;
+
+impl From<crate::handler::api_v1::reload_steps::ReloadStepError> for ApiError {
+    fn from(err: crate::handler::api_v1::reload_steps::ReloadStepError) -> Self {
+        ApiError::internal(err.to_string())
+    }
+}
