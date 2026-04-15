@@ -2,15 +2,15 @@
 gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: Carrier Control Plane — Feature Parity
-status: executing
-stopped_at: Phase 1 reconciled from git history — 5/5 plans shipped with 2 blocker gaps (SYS-02 stub, GWY-04 health hook); Phase 2 ready to plan
-last_updated: "2026-04-15T00:00:00.000Z"
-last_activity: 2026-04-15 -- Phase 1 reconciled from git history (commits 6f24907..ee6e053); 20/26 must-haves VERIFIED, 6 gaps recorded in 01-VERIFICATION.md
+status: phase_verified
+stopped_at: Phase 1 verified (23/26 + 3 deferred) after Plan 01-06 gap closure; ready to plan Phase 2
+last_updated: "2026-04-16T00:00:00.000Z"
+last_activity: 2026-04-16 — Phase 1 re-verified after gap closure (Plan 01-06); SYS-02, SYS-02-test, GWY-04 closed; 78/78 tests passing; 3 items formally deferred with explicit targets
 progress:
   total_phases: 13
   completed_phases: 1
-  total_plans: 5
-  completed_plans: 5
+  total_plans: 6
+  completed_plans: 6
   percent: 8
 ---
 
@@ -21,21 +21,21 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-14)
 
 **Core value:** Every SIP call — carrier-in, carrier-out, or bridged to WebRTC/WebSocket — is routed, controlled, observed, and billed through a single Rust binary with a first-class REST API.
-**Current focus:** Phase 2 — Trunk Groups Schema & Core CRUD (Phase 1 shipped with known gaps)
+**Current focus:** Phase 2 — Trunk Groups Schema & Core CRUD (Phase 1 verified)
 
 ## Current Position
 
 Phase: 2 of 13 (Trunk Groups Schema & Core CRUD) — next to plan
 Plan: — (no plans drafted yet for Phase 2)
-Status: Phase 1 complete (with gaps), ready to plan Phase 2
-Last activity: 2026-04-15 — Retroactive reconciliation of Phase 1 from git history
+Status: Phase 1 verified, ready to plan Phase 2
+Last activity: 2026-04-16 — Phase 1 re-verified after Plan 01-06 gap closure
 
 Progress: [█░░░░░░░░░] 8%  (1 of 13 phases)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 5 (all on 2026-04-15 in a single execution burst)
+- Total plans completed: 6 (5 on 2026-04-15 + 1 gap-closure on 2026-04-16)
 - Average duration: —
 - Total execution time: —
 
@@ -43,38 +43,46 @@ Progress: [█░░░░░░░░░] 8%  (1 of 13 phases)
 
 | Phase | Plans | Completed | Status |
 |-------|-------|-----------|--------|
-| 1. API Shell & Cheap Wrappers | 5 | 5 | Shipped with 2 blocker gaps (see 01-VERIFICATION.md) |
+| 1. API Shell & Cheap Wrappers | 6 | 6 | Verified (23/26 + 3 deferred) — see 01-VERIFICATION.md |
 
-## Phase 1 Reconciliation (2026-04-15)
+## Phase 1 Re-verification (2026-04-16)
 
-Phase 1 code shipped in commits `6f24907..ee6e053` on 2026-04-15 but the
-SUMMARY / VERIFICATION artifacts were never created. A retroactive audit
-(see `.planning/phases/01-api-shell-cheap-wrappers/01-VERIFICATION.md`)
-reconstructed the execution record and scored the phase goal-backward
-against its locked must-haves.
+Phase 1 was retroactively reconciled on 2026-04-15 with 20/26 must-haves
+verified and 6 gaps. Plan 01-06 landed on 2026-04-16 to close the 2
+blockers and the 1 high-severity gap, and to formally defer the 3 remaining
+non-blocker items.
 
-**Result:** 20/26 must-haves VERIFIED, 6 gaps identified:
+**Result:** `gaps_found (20/26)` → `verified (23/26 + 3 deferred)`.
 
-- **[BLOCKER] SYS-02 reload is a no-op stub** — `src/handler/api_v1/system.rs:141-165`
-  records four step names but calls no reload logic. Module docstring and
-  commit message both admit this. Must be wired to real `handler::ami`
-  reload functions before the route can be considered shipped.
-- **[BLOCKER] GWY-04 gateway health hook not wired** — `create_gateway`
-  does not call `proxy::gateway_health` registration. One locked truth
-  unmet.
-- **[HIGH] Missing concurrent-reload race test** — guard-release test
-  exists, CAS conflict branch unobserved.
-- **[MEDIUM] DIAG-05 contract drift** — `diagnostics/summary` omits
-  `recent_flood_events` + `recent_auth_failures` slots (they will land in
-  Phase 10 Security Suite; CONTEXT.md should be updated to acknowledge
-  the deferral).
-- **[MEDIUM] SHELL-05 partial** — console handler pure-fn extraction not
-  performed; api_v1 uses SeaORM model layer directly as the shared sink.
-  Defensible, documented in `dids.rs:1-12`, but literal plan promise unmet.
-- **[LOW] MIG-03 spot-checks not documented** — no plan commit recorded
-  the manual console render-parity check.
+**Closed gaps (commits 78c8580..5565ef6):**
 
-All 75 api_v1 integration tests pass against the current tree.
+- **SYS-02 reload real work** — `src/handler/api_v1/system.rs:147-178`
+  now calls `reload_steps::reload_{trunks,routes,acl}_step` sequentially
+  with fail-fast `?` propagation. Step helpers live in the new
+  `src/handler/api_v1/reload_steps.rs` module (commit 78c8580), wired
+  into `reload_all` in caf1eb1. Test
+  `reload_populates_per_step_outcomes` asserts `steps.len()==3` with
+  real `elapsed_ms` / `changed_count` fields.
+- **SYS-02 CAS conflict test** — `concurrent_reload_cas_conflict_returns_409`
+  deterministically pre-flips `reload_requested` to exercise the CAS
+  branch, asserts 409 + `code: conflict`, then clears flag and asserts
+  200 (commit 9b30752, hardened to deterministic by 35c0c76).
+- **GWY-04 health observability** — new `GatewayHealthMonitor::tally_snapshot(id)`
+  accessor (`src/proxy/gateway_health.rs:299`); test
+  `newly_created_gateway_appears_in_health_tallies_on_next_tick` POSTs
+  a gateway, drives `tick_with_probe(stub)`, asserts tally observable.
+  Truth #9 in `01-02-PLAN.md:53` corrected with audit comment to match
+  the DB-polling design (commit cd22569).
+
+**Deferred items (tracked in `deferred-items.md`):**
+
+- **DIAG-05** → Phase 10 Security Suite (flood/auth-failure trackers land then)
+- **SHELL-05** → ADR-closed (model-layer sharing accepted as the adapter sink)
+- **MIG-03** → Manual QA before merge of `sip_fix` (no templates touched)
+- **reload_app** → Phase 11 System Polish (4th reload step with dry-run semantics)
+
+**Test suite:** 78/78 passing (75 baseline + 3 new from Plan 01-06). No
+regressions.
 
 ## Accumulated Context
 
@@ -82,7 +90,7 @@ All 75 api_v1 integration tests pass against the current tree.
 
 Decisions are logged in PROJECT.md Key Decisions table. Recent decisions affecting current work:
 
-- Wrap console logic via module-level `pub(crate)` data fns keyed on `&DatabaseConnection` — *note: Phase 1 deviated and used the SeaORM model layer as the shared sink instead. CONTEXT.md should be updated before Phase 2 to codify or revert this.*
+- Wrap console logic via module-level `pub(crate)` data fns keyed on `&DatabaseConnection` — **superseded 2026-04-16:** Phase 1 deliberately routed reuse through the SeaORM model layer instead; accepted as ADR-style deviation in `deferred-items.md` (SHELL-05).
 - Introduce `trunk_groups` + `trunk_group_members` instead of collapsing trunks into sip_trunks
 - Endpoints = SIP user-agents in `/api/v1/endpoints`; SIP listeners remain config-only (read-only projection)
 - Translations run before routing; Manipulations run after routing
@@ -98,20 +106,18 @@ Decisions are logged in PROJECT.md Key Decisions table. Recent decisions affecti
 
 ### Pending Todos
 
-- [BLOCKER] Fix SYS-02 reload stub (see 01-VERIFICATION.md gap #1)
-- [BLOCKER] Wire GWY-04 health hook in `create_gateway` (see gap #2)
-- Add concurrent-reload race test (gap #3)
-- Decide DIAG-05 drift: ship zero slots now OR update CONTEXT.md to defer (gap #4)
-- Reconcile SHELL-05 doctrine: codify "model layer is the adapter sink" OR back-fill `console/handlers/*` pure fns (gap #5)
+- Plan Phase 2 — Trunk Groups Schema & Core CRUD
+- Before merging `sip_fix` to `main`: manual MIG-03 render-parity spot check (5 console pages)
+- Phase 10: surface flood + auth-failure stats in `/diagnostics/summary` (DIAG-05)
+- Phase 11: extend `/system/reload` with `reload_app` dry-run semantics (reload_app deferral)
 
 ### Blockers/Concerns
 
 - The `sip_trunk` / `trunk_group` dual-shape schema lands in Phase 2 and is the highest-risk migration — gates Phases 3, 5, 6
 - Proxy hot-path changes (Phase 5 enforcement, Phase 8 translations hook, Phase 9 manipulations dispatch) each need integration tests before merge
-- Phase 1 blockers (SYS-02 stub, GWY-04 health hook) are non-gating for Phase 2 planning but must land before Phase 2 ships
 
 ## Session Continuity
 
-Last session: 2026-04-15
-Stopped at: Phase 1 reconciled from git history — SUMMARY + VERIFICATION files reconstructed, STATE bumped to reflect reality. Ready to plan Phase 2.
+Last session: 2026-04-16
+Stopped at: Phase 1 verified (23/26 + 3 deferred) after Plan 01-06 gap closure. Ready to plan Phase 2.
 Resume file: .planning/phases/01-api-shell-cheap-wrappers/01-VERIFICATION.md
