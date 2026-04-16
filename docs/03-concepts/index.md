@@ -1,15 +1,21 @@
-# 03 — Concepts
+# Concepts
 
-Core ideas behind SuperSip.
+Core ideas behind SuperSip. Read these to understand how the system works
+before diving into subsystem details or integration guides.
 
-## Contents
+## Architecture
+- [SIP & B2BUA](sip-and-b2bua.md) — How SuperSip handles SIP dialogs
+- [Routing Pipeline](routing-pipeline.md) — From INVITE to call dispatch
+- [Media Fabric](media-fabric.md) — RTP, codecs, WebRTC bridging, conferencing
 
-- `call-model.md` — Call lifecycle and state machine *(pending)*
-- `sip-transaction.md` — SIP transaction and dialog handling *(pending)*
-- `media-pipeline.md` — RTP media path and codec negotiation *(pending)*
-- `rwi.md` — Real-time WebSocket Integration protocol *(pending)*
-- `carrier-model.md` — Carrier, trunk, and routing abstractions *(pending)*
-- `event-system.md` — Internal event bus and webhook dispatch *(pending)*
-- `call-center.md` — Call center (CC) requirements, architecture, and queue design
-- `ai-first-architecture.md` — AI-first contact center development plan
-- `i18n.md` — Console and addon internationalization (i18n) scheme
+## Control & Recording
+- [RWI Model](rwi-model.md) — Real-time WebSocket call control concepts
+- [Recording Model](recording-model.md) — CDRs, SipFlow, transcription
+
+## Security
+- [Security Model](security-model.md) — Auth, ACL, RBAC, TLS
+
+## Domain Knowledge
+- [Call Center](call-center.md) — CC requirements & architecture (中文)
+- [AI-First Architecture](ai-first-architecture.md) — AI-native CC design (中文)
+- [Internationalization](i18n.md) — Multi-language support system

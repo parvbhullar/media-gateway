@@ -1001,7 +1001,7 @@ fn update_uri_host(uri: &rsipstack::sip::Uri, new_host: &str) -> Result<rsipstac
 }
 
 /// Select trunk
-fn select_trunk(
+pub(crate) fn select_trunk(
     dest_config: &crate::proxy::routing::DestConfig,
     select_method: &str,
     hash_key: &Option<String>,

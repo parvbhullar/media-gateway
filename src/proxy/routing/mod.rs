@@ -21,6 +21,7 @@ mod http_tests;
 pub mod matcher;
 #[cfg(test)]
 mod tests;
+pub mod trunk_group_resolver;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigOrigin {
