@@ -5,6 +5,7 @@ use std::time::Duration;
 
 pub mod add_did_trunk_group_name_column;
 pub mod add_leg_timeline_column;
+pub mod add_media_config_column;
 pub mod add_rewrite_columns;
 pub mod add_sip_trunk_health_columns;
 pub mod add_sip_trunk_register_columns;
@@ -19,6 +20,7 @@ pub mod call_record_indices;
 pub mod call_record_optimization_indices;
 pub mod department;
 pub mod did;
+pub mod drop_credentials_column;
 pub mod extension;
 pub mod extension_department;
 pub mod frequency_limit;
@@ -32,8 +34,10 @@ pub mod sip_trunk;
 pub mod system_config;
 pub mod system_notification;
 pub mod pending_upload;
+pub mod trunk_credentials;
 pub mod trunk_group;
 pub mod trunk_group_member;
+pub mod trunk_origination_uris;
 pub mod user;
 pub mod wholesale_agent;
 

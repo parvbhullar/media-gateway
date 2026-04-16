@@ -72,9 +72,12 @@ pub struct Model {
     pub display_name: Option<String>,
     pub direction: SipTrunkDirection,
     pub distribution_mode: TrunkGroupDistributionMode,
-    pub credentials: Option<Json>,
     pub acl: Option<Json>,
     pub nofailover_sip_codes: Option<Json>,
+    // Phase 3 Plan 03-01 (TSUB-03): media configuration JSON blob.
+    // Additive per D-09. Shape:
+    //   {codecs: ["pcmu","pcma"], dtmf_mode, srtp, media_mode}
+    pub media_config: Option<Json>,
     pub is_active: bool,
     pub metadata: Option<Json>,
     pub created_at: DateTimeUtc,
@@ -117,9 +120,13 @@ impl MigrationTrait for Migration {
                             .char_len(32)
                             .default(TrunkGroupDistributionMode::default().as_str()),
                     )
-                    .col(json_null(Column::Credentials))
                     .col(json_null(Column::Acl))
                     .col(json_null(Column::NofailoverSipCodes))
+                    // Phase 3 Plan 03-01 (TSUB-03, D-09): media config JSON.
+                    // Added to fresh-DB CREATE so new installs don't need
+                    // the add_media_config_column alter (which is the
+                    // upgrade path for Phase-2-era DBs and is idempotent).
+                    .col(json_null(Column::MediaConfig))
                     .col(boolean(Column::IsActive).default(true))
                     .col(json_null(Column::Metadata))
                     .col(timestamp(Column::CreatedAt).default(Expr::current_timestamp()))

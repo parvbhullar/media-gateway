@@ -41,6 +41,15 @@ impl MigratorTrait for Migrator {
             Box::new(super::trunk_group::Migration),
             Box::new(super::trunk_group_member::Migration),
             Box::new(super::add_did_trunk_group_name_column::Migration),
+            // Phase 3 Plan 03-01 — TSUB-01..03 sub-resource schema.
+            // Order is load-bearing:
+            //   1. Create new sub-resource tables (FK to existing rustpbx_trunk_groups.id)
+            //   2. Add media_config column (additive, idempotent)
+            //   3. Drop credentials column LAST so any in-flight reads succeed during deploy
+            Box::new(super::trunk_credentials::Migration),
+            Box::new(super::trunk_origination_uris::Migration),
+            Box::new(super::add_media_config_column::Migration),
+            Box::new(super::drop_credentials_column::Migration),
         ]
     }
 }
