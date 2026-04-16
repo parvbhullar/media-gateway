@@ -1,6 +1,6 @@
 # AI优先呼叫中心开发方案
 
-> 基于 rustpbx + CC Addon + CC App + CC WebPhone 的分层架构
+> 基于 SuperSip + CC Addon + CC App + CC WebPhone 的分层架构
 ## 1. 总体架构
 
 ### 1.1 系统分层图 (Mermaid)
@@ -14,7 +14,7 @@ flowchart TB
         AIBot["AI Bot<br/>独立SIP UA"]
     end
     
-    subgraph Rustpbx["rustpbx (通信底座)"]
+    subgraph Rustpbx["SuperSip (通信底座)"]
         subgraph Core["核心能力"]
             SIP[SIP Stack]
             Media[Media Engine]
@@ -143,7 +143,7 @@ AI优先IVR: 用户 → 自然语言 → AI Bot理解 → 意图处理/信息收
 
 | 模块 | 技术栈 | 核心职责 | 关键能力 |
 |------|--------|----------|----------|
-| **rustpbx** | Rust | 通信底座 | SIP/WebRTC、媒体桥接、RWI接口、基础IVR |
+| **SuperSip** | Rust | 通信底座 | SIP/WebRTC、媒体桥接、RWI接口、基础IVR |
 | **CC Addon** | Rust | 内核增强 | 队列调度引擎、技能匹配、AI IVR、3PCC控制器、PCM流输出 |
 | **CC App** | Go | 业务编排 | 坐席管理、ASR服务、3PCC编排、In-Dialog消息、质检报表 |
 | **CC WebPhone** | Vue/React+JsSIP | 坐席交互 | WebRTC通话、In-Dialog渲染、班长控制面板 |
@@ -325,7 +325,7 @@ flowchart TD
     Start([坐席操作]) --> BuildMsg[构造 SIP MESSAGE Body]
     
     BuildMsg --> SIPSend[WebPhone.send MESSAGE<br/>In-Dialog]
-    SIPSend --> RustpbxRecv[rustpbx 接收 MESSAGE]
+    SIPSend --> RustpbxRecv[SuperSip 接收 MESSAGE]
     RustpbxRecv --> HTTPFwd[HTTP POST 转发到 CC App]
     
     HTTPFwd --> Validate[验证请求]
@@ -352,7 +352,7 @@ flowchart TD
     WaitEvent --> EventReceived{事件类型}
     Wait3PCCEvent --> ThreePCCEvent{3PCC事件}
     
-    EventReceived -->|ringing| MSGRinging[CC App → rustpbx<br/>MESSAGE transfer.ringing]
+    EventReceived -->|ringing| MSGRinging[CC App → SuperSip<br/>MESSAGE transfer.ringing]
     EventReceived -->|connected| MSGConnected[MESSAGE transfer.connected]
     EventReceived -->|completed| MSGCompleted[MESSAGE transfer.completed]
     EventReceived -->|failed| MSGFailed[MESSAGE transfer.failed]
@@ -361,7 +361,7 @@ flowchart TD
     ThreePCCEvent -->|invite.connected| MSG3Connected[MESSAGE 3pcc.invite.connected]
     ThreePCCEvent -->|merged| MSG3Merged[MESSAGE 3pcc.merged]
     
-    MSGRinging --> PushToPhone[rustpbx 转发 MESSAGE<br/>到 WebPhone]
+    MSGRinging --> PushToPhone[SuperSip 转发 MESSAGE<br/>到 WebPhone]
     MSGConnected --> PushToPhone
     MSGCompleted --> PushToPhone
     MSGFailed --> PushToPhone
@@ -488,7 +488,7 @@ sequenceDiagram
     participant W as WebPhone
     participant C as CC App
     participant A as Addon
-    participant R as rustpbx
+    participant R as SuperSip
     
     W->>C: HTTP POST /transfer
     C->>A: HTTP POST /transfer
@@ -507,7 +507,7 @@ SIP MESSAGE (In-Dialog) 方式：
 ```mermaid
 sequenceDiagram
     participant W as WebPhone
-    participant R as rustpbx
+    participant R as SuperSip
     participant C as CC App
     participant A as Addon
     
@@ -526,7 +526,7 @@ sequenceDiagram
 
 **优势:**
 1. 标准 SIP 方法，与通话使用同一 Call-ID，天然 In-Dialog
-2. rustpbx 作为网关，统一转发到 CC App
+2. SuperSip 作为网关，统一转发到 CC App
 3. 支持请求-响应模式，每个 command 都有对应的 event
 4. 中间状态通过 MESSAGE 推送，实时性好
 5. JsSIP 等库原生支持 MESSAGE
@@ -539,7 +539,7 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant W as WebPhone
-    participant R as rustpbx
+    participant R as SuperSip
     participant C as CC App
     participant A as Addon
     
@@ -569,7 +569,7 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant W as WebPhone
-    participant R as rustpbx
+    participant R as SuperSip
     participant C as CC App
     
     W->>R: MESSAGE subscribe_asr
@@ -595,7 +595,7 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant W as WebPhone
-    participant R as rustpbx
+    participant R as SuperSip
     participant C as CC App
     
     Note over C: 检测到客户情绪异常
@@ -614,7 +614,7 @@ sequenceDiagram
 // 使用 JsSIP 发送 SIP MESSAGE
 
 // Step 1: 坐席点击"咨询专家"，发送 SIP MESSAGE
-const message = ua.sendMessage('sip:cc@rustpbx.example.com', JSON.stringify({
+const message = ua.sendMessage('sip:cc@supersip.example.com', JSON.stringify({
   message_id: 'req-consult-001',
   type: 'call.3pcc.invite',
   payload: {
@@ -636,7 +636,7 @@ message.on('succeeded', (data) => {
   // data.body = { type: 'response.ok', payload: { invite_id: 'inv-001', status: 'initiated' } }
 });
 
-// Step 3: 专家振铃，收到 rustpbx 转发的 MESSAGE
+// Step 3: 专家振铃，收到 SuperSip 转发的 MESSAGE
 ua.on('newMessage', (data) => {
   const msg = JSON.parse(data.request.body);
   
@@ -652,8 +652,8 @@ ua.on('newMessage', (data) => {
   }
 });
 
-// Step 5: 坐席点击"合并三方"unction mergeConference() {
-  ua.sendMessage('sip:cc@rustpbx.example.com', JSON.stringify({
+// Step 5: 坐席点击"合并三方"unction mergeConference() {
+  ua.sendMessage('sip:cc@supersip.example.com', JSON.stringify({
     message_id: 'req-merge-001',
     type: 'call.3pcc.merge',
     payload: {
@@ -673,8 +673,8 @@ ua.on('newMessage', (data) => {
   }
 });
 
-// Step 7: 咨询结束，坐席点击"让专家离开"unction kickExpert() {
-  ua.sendMessage('sip:cc@rustpbx.example.com', JSON.stringify({
+// Step 7: 咨询结束，坐席点击"让专家离开"unction kickExpert() {
+  ua.sendMessage('sip:cc@supersip.example.com', JSON.stringify({
     message_id: 'req-kick-001',
     type: 'call.3pcc.kick',
     payload: {
@@ -698,11 +698,11 @@ ua.on('newMessage', (data) => {
 ### 4.4 SIP MESSAGE 格式规范
 
 ```
-MESSAGE sip:cc@rustpbx.example.com SIP/2.0
+MESSAGE sip:cc@supersip.example.com SIP/2.0
 Via: SIP/2.0/WSS 192.168.1.100:5060;branch=z9hG4bK776asdhds
 Max-Forwards: 70
-To: <sip:cc@rustpbx.example.com>;tag=a6c85cf
-From: <sip:agent-001@rustpbx.example.com>;tag=1928301774
+To: <sip:cc@supersip.example.com>;tag=a6c85cf
+From: <sip:agent-001@supersip.example.com>;tag=1928301774
 Call-ID: a84b4c76e66710  <-- 与当前通话相同的 Call-ID (In-Dialog)
 CSeq: 314159 MESSAGE
 Content-Type: application/vnd.cc+json
@@ -727,8 +727,8 @@ Content-Length: ...
 ```
 SIP/2.0 200 OK
 Via: SIP/2.0/WSS 192.168.1.100:5060;branch=z9hG4bK776asdhds
-From: <sip:agent-001@rustpbx.example.com>;tag=1928301774
-To: <sip:cc@rustpbx.example.com>;tag=a6c85cf
+From: <sip:agent-001@supersip.example.com>;tag=1928301774
+To: <sip:cc@supersip.example.com>;tag=a6c85cf
 Call-ID: a84b4c76e66710
 CSeq: 314159 MESSAGE
 Content-Type: application/vnd.cc+json
@@ -749,7 +749,7 @@ Content-Length: ...
 
 ```mermaid
 flowchart LR
-    R["rustpbx<br/>SIP Stack / Media"]
+    R["SuperSip<br/>SIP Stack / Media"]
     A["CC Addon<br/>Queue / 3PCC"]
     C["CC App<br/>业务编排"]
     W["CC WebPhone<br/>JsSIP"]
@@ -765,7 +765,7 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    R["rustpbx<br/>Media Leg"]
+    R["SuperSip<br/>Media Leg"]
     A["CC Addon<br/>PCM Encoder"]
     C["CC App<br/>ASR Engine"]
     W["CC WebPhone<br/>Display"]
@@ -784,7 +784,7 @@ flowchart LR
 
 ### 6.0 通信通道职责划分
 
-基于 rustpbx 已有能力，CC 系统使用 **三层通信通道**：
+基于 SuperSip 已有能力，CC 系统使用 **三层通信通道**：
 
 ```mermaid
 flowchart TB
@@ -817,7 +817,7 @@ flowchart TB
 1. **RWI 保持现状**：已有的实时控制通道继续使用
 2. **Addon 新增 HTTP REST**：供 CC App 管理队列、坐席、配置
 3. **Webhook 保持现状**：Addon 推送事件给 CC App
-4. **SIP MESSAGE**：WebPhone 与 rustpbx 之间的 In-Dialog 控制
+4. **SIP MESSAGE**：WebPhone 与 SuperSip 之间的 In-Dialog 控制
 
 ### 6.1 Addon HTTP REST 接口 (CC App → Addon)
 
@@ -1028,7 +1028,7 @@ POST /api/v1/calls/{call_id}/streams
 Response: 201 Created
 {
   "stream_id": "stream-abc",
-  "ws_url": "wss://rustpbx.example.com/ws/pcm/stream-abc",
+  "ws_url": "wss://supersip.example.com/ws/pcm/stream-abc",
   "started_at": "2026-04-10T10:30:00Z"
 }
 
@@ -1047,12 +1047,12 @@ GET /api/v1/calls/{call_id}/streams
 // POST /webhook/call-events
 // POST /webhook/queue-events
 
-// ===== WebPhone → rustpbx → CC App (SIP MESSAGE) =====
+// ===== WebPhone → SuperSip → CC App (SIP MESSAGE) =====
 // 使用 JsSIP 库
 
 const ua = new JsSIP.UA({
-  uri: 'sip:agent-001@rustpbx.example.com',
-  ws_servers: 'wss://rustpbx.example.com/ws',
+  uri: 'sip:agent-001@supersip.example.com',
+  ws_servers: 'wss://supersip.example.com/ws',
   // ...
 });
 
@@ -1061,7 +1061,7 @@ ua.start();
 // 发起 SIP MESSAGE
 function sendCCMessage(body) {
   const message = ua.sendMessage(
-    'sip:cc@rustpbx.example.com',  // CC 服务 URI
+    'sip:cc@supersip.example.com',  // CC 服务 URI
     JSON.stringify(body),
     { contentType: 'application/vnd.cc+json' }
   );
@@ -1152,7 +1152,7 @@ interface SuggestionPayload {
 
 ### 6.3 SIP MESSAGE 控制协议
 
-WebPhone 与 rustpbx 之间通过 **SIP MESSAGE** 方法传递控制指令，rustpbx 转发给 CC App 处理。所有 MESSAGE 都使用与通话相同的 `Call-ID`，确保 In-Dialog。
+WebPhone 与 SuperSip 之间通过 **SIP MESSAGE** 方法传递控制指令，SuperSip 转发给 CC App 处理。所有 MESSAGE 都使用与通话相同的 `Call-ID`，确保 In-Dialog。
 
 #### 6.3.1 坐席 → CC App (MESSAGE 请求)
 
@@ -1492,10 +1492,10 @@ stateDiagram-v2
 flowchart TB
     LB["负载均衡层<br/>Nginx / HAProxy / K8s Ingress"]
     
-    subgraph RustpbxCluster["rustpbx 集群"]
-        R1["rustpbx-1<br/>SIP/Media"]
-        R2["rustpbx-2<br/>SIP/Media"]
-        R3["rustpbx-n<br/>SIP/Media"]
+    subgraph RustpbxCluster["SuperSip 集群"]
+        R1["SuperSip-1<br/>SIP/Media"]
+        R2["SuperSip-2<br/>SIP/Media"]
+        R3["SuperSip-n<br/>SIP/Media"]
     end
     
     Redis["Redis<br/>状态共享"]
@@ -1575,7 +1575,7 @@ flowchart TB
 - [ ] ASR集成
 - [ ] 话术推荐
 - [ ] 上下文传递
-- [ ] AI ↔ 人工无缝切换
+- [ ] AI <-> 人工无缝切换
 - [ ] **排队体验优化**: 位置播报、预计等待时长计算
 - [ ] **高级分配策略**: 基于技能权重、负载均衡的复合策略
 - [ ] **多实例支持**: instance_id 字段设计，集群状态同步
@@ -1594,15 +1594,15 @@ flowchart TB
 
 | 决策项 | 选择 | 理由 | 与FS对比 |
 |--------|------|------|---------|
-| 转接策略 | REFER优先+3PCC回退 | 兼容性好，成功率高 | ✅ 优于FS基础桥接 |
-| AI架构 | 独立SIP UA | 不影响核心链路，独立扩展 | ✅ FS无原生AI支持 |
-| ASR流 | PCM流输出到CC App | 解耦媒体处理，支持多ASR引擎 | ✅ FS无原生ASR |
-| 控制协议 | SIP MESSAGE (In-Dialog) + HTTP | 标准SIP+浏览器友好 | ✅ 优于FS命令行API |
-| **通信通道** | **RWI + HTTP REST + Webhook** | 复用rustpbx已有能力 | ✅ 架构最简 |
-| 队列策略 | 9种策略(补齐中) | 覆盖FS全部策略+SkillFirst | ⚠️ M2补齐ring-all等4种 |
-| 坐席统计 | 扩展统计字段 | 支持least-talk-time等策略 | ⚠️ M2添加统计字段 |
-| 状态同步 | Redis + Event Webhook | 实时+可靠 | ✅ 优于FS单实例 |
-| 数据库 | PostgreSQL + TimescaleDB | 关系数据+时序数据 | ✅ 与FS ODBC等价 |
+| 转接策略 | REFER优先+3PCC回退 | 兼容性好，成功率高 | 优于FS基础桥接 |
+| AI架构 | 独立SIP UA | 不影响核心链路，独立扩展 | FS无原生AI支持 |
+| ASR流 | PCM流输出到CC App | 解耦媒体处理，支持多ASR引擎 | FS无原生ASR |
+| 控制协议 | SIP MESSAGE (In-Dialog) + HTTP | 标准SIP+浏览器友好 | 优于FS命令行API |
+| **通信通道** | **RWI + HTTP REST + Webhook** | 复用SuperSip已有能力 | 架构最简 |
+| 队列策略 | 9种策略(补齐中) | 覆盖FS全部策略+SkillFirst | M2补齐ring-all等4种 |
+| 坐席统计 | 扩展统计字段 | 支持least-talk-time等策略 | M2添加统计字段 |
+| 状态同步 | Redis + Event Webhook | 实时+可靠 | 优于FS单实例 |
+| 数据库 | PostgreSQL + TimescaleDB | 关系数据+时序数据 | 与FS ODBC等价 |
 
 ### 接口通道详细分工
 
@@ -1634,10 +1634,10 @@ flowchart TB
 
 | 通道 | 方向 | 典型调用 | 频率 |
 |------|------|---------|------|
-| **RWI** | CC App ↔ Addon | originate, answer, bridge, transfer | 高（通话中） |
+| **RWI** | CC App <-> Addon | originate, answer, bridge, transfer | 高（通话中） |
 | **HTTP REST** | CC App → Addon | queue.enqueue, agent.login, skill.create | 中（管理操作） |
 | **Webhook** | Addon → CC App | call.answered, queue.joined, agent.connected | 高（事件流） |
-| **SIP MESSAGE** | WebPhone ↔ rustpbx | transfer.initiate, 3pcc.invite | 中（坐席操作） |
+| **SIP MESSAGE** | WebPhone <-> SuperSip | transfer.initiate, 3pcc.invite | 中（坐席操作） |
 
 ---
 
@@ -1647,16 +1647,16 @@ flowchart TB
 
 ### 12.1 功能对比矩阵
 
-| 功能维度 | FreeSWITCH | rustpbx CC (当前设计) | 差距 | 优先级 |
+| 功能维度 | FreeSWITCH | SuperSip CC (当前设计) | 差距 | 优先级 |
 |---------|-----------|---------------------|------|--------|
-| **队列分配策略** | 9种 | 5种 | ⚠️ 缺4种 | P1 |
-| **坐席统计字段** | 完整(calls_answered等) | 基础状态 | ⚠️ 不完整 | P1 |
-| **失败重试机制** | 延迟惩罚策略 | 简单重试 | ⚠️ 不完善 | P2 |
-| **多实例支持** | instance_id | 单机 | ⚠️ 待设计 | P2 |
-| **监控/质检** | uuid-standby基础 | 完整班长功能 | ✅ 领先 | - |
-| **AI集成** | 无原生 | AI优先架构 | ✅ 领先 | - |
-| **3PCC转接** | 基础 | REFER+3PCC回退 | ✅ 领先 | - |
-| **WebPhone** | 需自研 | 内置SIP MESSAGE | ✅ 领先 | - |
+| **队列分配策略** | 9种 | 5种 | 缺4种 | P1 |
+| **坐席统计字段** | 完整(calls_answered等) | 基础状态 | 不完整 | P1 |
+| **失败重试机制** | 延迟惩罚策略 | 简单重试 | 不完善 | P2 |
+| **多实例支持** | instance_id | 单机 | 待设计 | P2 |
+| **监控/质检** | uuid-standby基础 | 完整班长功能 | 领先 | - |
+| **AI集成** | 无原生 | AI优先架构 | 领先 | - |
+| **3PCC转接** | 基础 | REFER+3PCC回退 | 领先 | - |
+| **WebPhone** | 需自研 | 内置SIP MESSAGE | 领先 | - |
 
 ### 12.2 需补齐功能详解
 
@@ -1947,8 +1947,13 @@ CREATE TABLE tiers (
 
 ## 14. 参考文档
 
-1. **本文档**: `docs/cc_ai_first_architecture.md` - AI优先呼叫中心开发方案
+1. **本文档**: `docs/03-concepts/ai-first-architecture.md` - AI优先呼叫中心开发方案
 2. **FS对比分析**: `docs/cc_vs_freeswitch_comparison.md` - 与 FreeSWITCH mod_callcenter 详细对比
-3. **原始需求**: `docs/cc.md` - 呼叫中心需求与技术方案
-4. **RWI接口**: `docs/rwi.md` - Real-time WebSocket Interface 文档
-5. **API集成**: `docs/api_integration_guide.md` - HTTP API 集成指南
+3. **原始需求**: `docs/03-concepts/call-center.md` - 呼叫中心需求与技术方案
+4. **RWI接口**: `docs/05-integration/rwi-protocol.md` - Real-time WebSocket Interface 文档
+5. **API集成**: `docs/05-integration/http-router.md` - HTTP API 集成指南
+
+---
+**Status:** ✅ Shipped
+**Source:** `docs/cc_ai_first_architecture.md`
+**Last reviewed:** 2026-04-16

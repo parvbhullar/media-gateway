@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: milestone
-status: planning
-stopped_at: Completed 02-01-PLAN.md
-last_updated: "2026-04-16T09:59:51.777Z"
-last_activity: 2026-04-16 — Phase 1 re-verified after Plan 01-06 gap closure
+status: executing
+stopped_at: Phase 1 verified (23/26 + 3 deferred) after Plan 01-06 gap closure. Ready to plan Phase 2.
+last_updated: "2026-04-15T22:28:13.098Z"
+last_activity: 2026-04-15 -- Phase 02 execution started
 progress:
   total_phases: 13
   completed_phases: 1
   total_plans: 9
-  completed_plans: 7
-  percent: 78
+  completed_plans: 6
+  percent: 67
 ---
 
 # Project State
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-14)
 
 **Core value:** Every SIP call — carrier-in, carrier-out, or bridged to WebRTC/WebSocket — is routed, controlled, observed, and billed through a single Rust binary with a first-class REST API.
-**Current focus:** Phase 2 — Trunk Groups Schema & Core CRUD (Phase 1 verified)
+**Current focus:** Phase 02 — trunk-groups-schema-core-crud
 
 ## Current Position
 
-Phase: 2 of 13 (Trunk Groups Schema & Core CRUD) — next to plan
-Plan: — (no plans drafted yet for Phase 2)
-Status: Phase 1 verified, ready to plan Phase 2
-Last activity: 2026-04-16 — Phase 1 re-verified after Plan 01-06 gap closure
+Phase: 02 (trunk-groups-schema-core-crud) — EXECUTING
+Plan: 1 of 3
+Status: Executing Phase 02
+Last activity: 2026-04-15 -- Phase 02 execution started
 
 Progress: [█░░░░░░░░░] 8%  (1 of 13 phases)
 
@@ -45,7 +45,6 @@ Progress: [█░░░░░░░░░] 8%  (1 of 13 phases)
 | Phase | Plans | Completed | Status |
 |-------|-------|-----------|--------|
 | 1. API Shell & Cheap Wrappers | 6 | 6 | Verified (23/26 + 3 deferred) — see 01-VERIFICATION.md |
-| Phase 02 P01 | 862 | 3 tasks | 9 files |
 
 ## Phase 1 Re-verification (2026-04-16)
 
@@ -101,7 +100,6 @@ Decisions are logged in PROJECT.md Key Decisions table. Recent decisions affecti
 - Security suite moves from static file-loaded CIDR to DB-backed runtime store
 - Sub-accounts default to a single `root` account so Phases 1-12 don't retroactively need scoping
 - Production hardening deferred to v2.1
-- [Phase 02]: TrunkGroupDistributionMode enum with 6 variants; re-export SipTrunkDirection from sip_trunk module; N+1 member loading acceptable for Phase 2
 
 ### Roadmap Evolution
 
@@ -123,6 +121,6 @@ Decisions are logged in PROJECT.md Key Decisions table. Recent decisions affecti
 
 ## Session Continuity
 
-Last session: 2026-04-16T09:59:51.775Z
-Stopped at: Completed 02-01-PLAN.md
-Resume file: None
+Last session: 2026-04-16
+Stopped at: Phase 1 verified (23/26 + 3 deferred) after Plan 01-06 gap closure. Ready to plan Phase 2.
+Resume file: .planning/phases/01-api-shell-cheap-wrappers/01-VERIFICATION.md

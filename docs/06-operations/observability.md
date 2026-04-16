@@ -1,6 +1,6 @@
 # Observability
 
-RustPBX supports two tiers of observability, controlled by Cargo feature flags:
+SuperSip supports two tiers of observability, controlled by Cargo feature flags:
 
 | Tier | Feature flag | What you get |
 |---|---|---|
@@ -71,7 +71,7 @@ Missing or incorrect tokens receive **HTTP 401** with a `WWW-Authenticate: Beare
 
 ### Metrics reference
 
-All metrics emitted by RustPBX, organized by category:
+All metrics emitted by SuperSip, organized by category:
 
 #### System & Build Info
 
@@ -317,3 +317,8 @@ histogram_quantile(0.95, rate(rustpbx_call_duration_seconds_bucket[5m]))
 # P95 talk time for answered calls
 histogram_quantile(0.95, rate(rustpbx_call_talk_time_seconds_bucket[5m]))
 ```
+
+---
+**Status:** ✅ Shipped
+**Source:** `docs/observability.md`
+**Last reviewed:** 2026-04-16

@@ -1,15 +1,15 @@
-# RustPBX API Integration Guide
+# SuperSip API Integration Guide — HTTP Router & Webhooks
 
-RustPBX provides a comprehensive set of HTTP APIs and Webhooks designed to make it a fully programmable **Software Defined PBX (SD-PBX)**. This guide details how to integrate your external business logic (CRM, ERP, AI assistants, billing systems) with RustPBX.
+SuperSip provides a comprehensive set of HTTP APIs and Webhooks designed to make it a fully programmable **Software Defined PBX (SD-PBX)**. This guide details how to integrate your external business logic (CRM, ERP, AI assistants, billing systems) with SuperSip.
 
 ---
 
-## 🏗️ Architecture Overview
+## Architecture Overview
 
-RustPBX interacts with external systems in two ways:
+SuperSip interacts with external systems in two ways:
 
-1.  **Inbound API (REST)**: Your system calls RustPBX to manage resources (extensions, trunks) or control active calls.
-2.  **Outbound Webhooks**: RustPBX calls your system to make routing decisions, report events, or authenticate users.
+1.  **Inbound API (REST)**: Your system calls SuperSip to manage resources (extensions, trunks) or control active calls.
+2.  **Outbound Webhooks**: SuperSip calls your system to make routing decisions, report events, or authenticate users.
 
 | Mechanism | Direction | Type | Use Case |
 | :--- | :--- | :--- | :--- |
@@ -21,12 +21,14 @@ RustPBX interacts with external systems in two ways:
 | **Locator Webhook** | Outbound | Webhook | Real-time registration/unregistration events |
 | **Call Record Push** | Outbound | Webhook | Push CDR JSON + Audio files to external server |
 
+> For the inbound REST API (Console API, Active Call Control, AMI), see [console-api.md](console-api.md).
+
 ---
 
-## 📡 1. Outbound Webhooks (RustPBX → Your Server)
+## Outbound Webhooks (SuperSip → Your Server)
 
 ### 1.1 HTTP Router (Dynamic Call Routing)
-**The most powerful extension point.** Instead of static routing rules, RustPBX asks your API "Receive call from A to B, what should I do?".
+**The most powerful extension point.** Instead of static routing rules, SuperSip asks your API "Receive call from A to B, what should I do?".
 
 - **Trigger**: Every incoming SIP INVITE.
 - **Config**:
@@ -148,76 +150,18 @@ Push call details and recording file immediately after a call ends.
 
 ---
 
-## 🔌 2. Inbound REST API (You → RustPBX)
-
-**Base URL**: `http://<rustpbx-ip>:8080/console`  
-**Authentication**: Session cookie (login via `/console/login`) or API Token (future).
-
-### 2.1 Active Call Control
-Manage calls that are currently in progress.
-
-**List Active Calls**:
-`GET /console/calls/active`
-
-**Control a Call**:
-`POST /console/calls/active/{call_id}/commands`
-
-**Payloads**:
-1. **Hangup**:
-   ```json
-   { "action": "hangup", "reason": "admin_kick" }
-   ```
-2. **Blind Transfer**:
-   ```json
-   { "action": "transfer", "target": "sip:1002@pbx.com" }
-   ```
-3. **Mute/Unmute**:
-   ```json
-   { "action": "mute", "track_id": "audio-0" } // use 'unmute' to reverse
-   ```
-4. **Force Answer** (for ringing channels):
-   ```json
-   { 
-     "action": "accept", 
-     "sdp": "v=0..." // Server-generated SDP answer
-   }
-   ```
-
-### 2.2 System Management (CRUD)
-
-| Resource | Endpoint | Methods | Description |
-| :--- | :--- | :--- | :--- |
-| **Extensions** | `/console/extensions` | `GET`, `POST`, `PUT`, `DELETE` | Manage SIP users |
-| **Trunks** | `/console/sip-trunk` | `GET`, `POST`, `PUT`, `DELETE` | Manage upstream carriers |
-| **Routes** | `/console/routing` | `GET`, `POST`, `PUT`, `DELETE` | Manage dial plan rules |
-| **CDRs** | `/console/call-records` | `GET`, `POST` (Search) | Query history |
-| **Recording** | `/console/call-records/{id}/recording` | `GET` | Stream audio file |
-| **SIP Flow** | `/console/call-records/{id}/sip-flow` | `GET` | Get PCAP-like ladder diagram JSON |
-
-### 2.3 AMI (Admin Interface)
-Low-level system operations. Protected by IP whitelist (`[ami].allows` in config).
-
-**Base URL**: `http://<rustpbx-ip>:8080/ami/v1`
-
-- **Health**: `GET /health` - System vital stats (uptime, active calls, load).
-- **Reload**: `POST /reload/trunks`, `/reload/routes`, `/reload/acl` - Hot reload config without restart.
-- **Shutdown**: `POST /shutdown` - Graceful shutdown (stops accepting new calls, waits for active ones).
-- **Dialogs**: `GET /dialogs` - Raw dump of internal SIP dialog states (for debugging).
-
----
-
-## 🛠️ Integration Workflows
+## Integration Workflows
 
 ### Scenario A: CRM Click-to-Dial
 1. User clicks phone number in CRM.
 2. CRM backend sends `POST /api/v1/commands` (Future feature) OR uses AMI to originate call.
-3. *Current workaround*: CRM sends SIP REFER to RustPBX or uses a dedicated "Click-to-Dial" SIP extension that the web-app registers as.
+3. *Current workaround*: CRM sends SIP REFER to SuperSip or uses a dedicated "Click-to-Dial" SIP extension that the web-app registers as.
 
 ### Scenario B: AI Voice Assistant
-1. Inbound call hits RustPBX.
+1. Inbound call hits SuperSip.
 2. **HTTP Router** sends INVITE details to AI backend.
 3. AI Backend returns `{"action": "forward", "targets": ["sip:ai-bot-service@internal"]}`.
-4. RustPBX routes audio to the AI bot via SIP/RTP.
+4. SuperSip routes audio to the AI bot via SIP/RTP.
 
 ### Scenario C: Billing System
 1. **User Backend** authenticates user, checking balance > 0.
@@ -229,3 +173,8 @@ Low-level system operations. Protected by IP whitelist (`[ami].allows` in config
 1. Configure `[recording] enabled = true`.
 2. Configure `[callrecord] type = "s3"`.
 3. All calls are recorded locally, then asynchronously uploaded to AWS S3 / MinIO for long-term archival.
+
+---
+**Status:** ✅ Shipped
+**Source:** `docs/api_integration_guide.md`
+**Last reviewed:** 2026-04-16

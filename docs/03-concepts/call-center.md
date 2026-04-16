@@ -1,10 +1,10 @@
-# 呼叫中心（CC）+ Web 坐席需求与技术方案（基于 rustpbx）
+# 呼叫中心（CC）+ Web 坐席需求与技术方案（基于 SuperSip）
 
 更新时间：2026-03-27
 
 ## 1. 目标与范围
 
-目标：基于 rustpbx 构建一套可商用的呼叫中心应用，覆盖 Web 坐席、技能组（Skill Group）、转接（含 REFER/3PCC 回退）、IVR 转人工、通后评分评价、主管质检与运营报表能力。AI 接待为可选增强模块，不影响核心链路。
+目标：基于 SuperSip 构建一套可商用的呼叫中心应用，覆盖 Web 坐席、技能组（Skill Group）、转接（含 REFER/3PCC 回退）、IVR 转人工、通后评分评价、主管质检与运营报表能力。AI 接待为可选增强模块，不影响核心链路。
 
 范围：
 - 坐席工作台（Web Agent）
@@ -90,11 +90,11 @@
 
 ## 3. 技术选型结论：独立 App 还是 Addon
 
-结论：采用“独立 App + Addon 增强”的混合方案。
+结论：采用"独立 App + Addon 增强"的混合方案。
 
 1. 独立 App（推荐作为主形态）
 - 负责：Web 坐席、业务编排、CRM/工单集成、质检评分、BI。
-- 通过 rustpbx 的 RWI/REST/Webhook 实现控制与数据采集。
+- 通过 SuperSip 的 RWI/REST/Webhook 实现控制与数据采集。
 - 优势：迭代快、可独立扩展、业务边界清晰。
 
 2. Addon（用于深度内核扩展）
@@ -115,7 +115,7 @@
 - QA/Survey Service：评分、质检、工单联动。
 - BI Service：指标聚合与报表导出。
 
-2. rustpbx 能力层
+2. SuperSip 能力层
 - SIP/媒体/桥接。
 - RWI：实时通话控制（originate/answer/transfer/queue/supervisor）。
 - HTTP Router：来话动态路由。
@@ -194,27 +194,27 @@
 ## 9. 最终建议
 
 - 主体：独立 CC App（业务与前端）。
-- 底座：rustpbx（SIP/媒体/实时控制）。
+- 底座：SuperSip（SIP/媒体/实时控制）。
 - 补强：按需 Addon（内核深集成能力）。
 - AI 接待：可选，以独立 SIP UA 形式接入，不影响核心链路（详见第 11 节）。
 
-这条路线在工程效率、业务迭代速度、以及与 rustpbx 现有能力匹配度上最优。
+这条路线在工程效率、业务迭代速度、以及与 SuperSip 现有能力匹配度上最优。
 
-## 10. 直连模式落地（Web 坐席直连 rustpbx，CC App 管理 rustpbx）
+## 10. 直连模式落地（Web 坐席直连 SuperSip，CC App 管理 SuperSip）
 
 结论：该模式可行，且建议作为默认实施方案。
 
 ### 10.1 连接拓扑
 
 1. Web 坐席（浏览器）
-- SIP over WebSocket 直连 rustpbx。
-- 浏览器与 rustpbx 建立 WebRTC 媒体链路。
+- SIP over WebSocket 直连 SuperSip。
+- 浏览器与 SuperSip 建立 WebRTC 媒体链路。
 
 2. CC App（业务后台）
-- 通过 RWI/REST/Webhook 管理 rustpbx。
+- 通过 RWI/REST/Webhook 管理 SuperSip。
 - 不直接承载媒体，仅承载业务编排与状态聚合。
 
-3. rustpbx（通信底座）
+3. SuperSip（通信底座）
 - 承载 SIP 信令、媒体桥接、队列执行与录音话单。
 
 ### 10.2 职责边界（必须明确）
@@ -228,14 +228,14 @@
 - 技能组与队列策略、IVR 转人工规则、超时溢出。
 - 通后处理、评价、质检、运营报表。
 
-3. rustpbx 负责
+3. SuperSip 负责
 - 呼叫建立与媒体稳定性。
 - 转接执行（REFER 优先 + 3PCC 回退）。
 - 事件输出与录音/CDR 归档。
 
 ### 10.3 控制冲突治理（关键）
 
-为避免“前端和 CC 后台同时控制同一通话”导致状态错乱，必须实施以下约束：
+为避免"前端和 CC 后台同时控制同一通话"导致状态错乱，必须实施以下约束：
 
 1. 单通话单控制者
 - 同一时刻仅允许一个控制源写操作（agent_ui 或 cc_orchestrator）。
@@ -254,24 +254,24 @@
 - 断线恢复后按序回放，必要时触发全量对账（list_calls + active calls）。
 
 补充结论（执行口径）：
-- Web 坐席与 rustpbx 直连主要用于 SIP 信令与媒体承载。
+- Web 坐席与 SuperSip 直连主要用于 SIP 信令与媒体承载。
 - 涉及业务编排的高级控制（咨询转、三方加入、监督、批量策略）应走 Web 坐席 -> CC App -> RWI。
-- 浏览器侧只表达“业务意图”，不直接决定 REFER/3PCC/会议桥分支，避免前后端双写同一通话状态。
+- 浏览器侧只表达"业务意图"，不直接决定 REFER/3PCC/会议桥分支，避免前后端双写同一通话状态。
 
 ### 10.4 最小接口清单（建议）
 
-1. Web 坐席 <-> rustpbx（SIP/WS）
+1. Web 坐席 <-> SuperSip（SIP/WS）
 - register / unregister
 - invite / answer / bye
 - hold / unhold / dtmf
 
-2. CC App <-> rustpbx（RWI）
+2. CC App <-> SuperSip（RWI）
 - session.subscribe / session.list_calls
 - call.originate / call.answer / call.hangup
 - call.transfer / call.transfer.attended / call.transfer.complete / call.transfer.cancel
 - queue.enqueue / queue.dequeue / queue.hold / queue.unhold
 
-3. rustpbx -> CC App（Webhook/事件）
+3. SuperSip -> CC App（Webhook/事件）
 - 通话生命周期事件（incoming, answered, bridged, hangup）
 - 转接结果事件（accepted, failed, transferred）
 - CDR 与录音回调
@@ -279,8 +279,8 @@
 ### 10.5 REFER 回退策略在直连模式中的位置
 
 1. 策略执行层
-- 策略在 rustpbx 执行，不放在浏览器侧。
-- 浏览器只发起“转接意图”，不自行决定 REFER/3PCC 分支。
+- 策略在 SuperSip 执行，不放在浏览器侧。
+- 浏览器只发起"转接意图"，不自行决定 REFER/3PCC 分支。
 
 2. 回退触发条件（建议）
 - 对端 405/420/501 或能力表标记不支持 REFER。
@@ -291,8 +291,8 @@
 - 便于统计回退率与兼容性问题。
 
 边界补充：
-- REFER/3PCC 回退主要用于“转接”事务（盲转/咨询转完成）。
-- “把第三人加入当前通话并三方同时在线”优先定义为会议合并（conference merge），不以 REFER 作为主路径。
+- REFER/3PCC 回退主要用于"转接"事务（盲转/咨询转完成）。
+- "把第三人加入当前通话并三方同时在线"优先定义为会议合并（conference merge），不以 REFER 作为主路径。
 
 ### 10.6 实施顺序（增量上线）
 
@@ -312,7 +312,7 @@
 
 - 坐席浏览器异常断开后 30 秒内可自动恢复并同步状态。
 - 同一 call_id 不出现双控制源并发写冲突。
-- REFER 失败回退 3PCC 后，坐席端仅看到一次业务级“转接成功/失败”终态。
+- REFER 失败回退 3PCC 后，坐席端仅看到一次业务级"转接成功/失败"终态。
 - 回退链路的失败原因可在日志与指标中追踪到 trunk/UA 维度。
 
 ## 10.8 三方加入会话（坐席拉第三方）推荐流程
@@ -322,13 +322,13 @@
 1. 总体原则
 - 主流程采用服务端会议桥（conference bridge / merge）。
 - 控制路径采用 Web 坐席 -> CC App -> RWI。
-- 媒体路径仍可保持浏览器与 rustpbx 直连，不要求 CC App 承载媒体。
+- 媒体路径仍可保持浏览器与 SuperSip 直连，不要求 CC App 承载媒体。
 
 2. 建议时序
 - Step 1：坐席与客户已通话（Leg-A=connected）。
-- Step 2：坐席在前端发起“咨询第三方”意图，CC App 通过 RWI 置客户保持并发起 Leg-B。
+- Step 2：坐席在前端发起"咨询第三方"意图，CC App 通过 RWI 置客户保持并发起 Leg-B。
 - Step 3：第三方接通后，坐席先与第三方私聊确认（consult_connected）。
-- Step 4：坐席点击“加入会话”，CC App 通过 RWI 执行 merge，将 Leg-A、Leg-B、坐席合并到同一会议桥。
+- Step 4：坐席点击"加入会话"，CC App 通过 RWI 执行 merge，将 Leg-A、Leg-B、坐席合并到同一会议桥。
 - Step 5：合并成功后进入 merged；若失败则回滚到客户通话（back_to_customer），并保留失败原因。
 
 3. 状态机（最小集合）
@@ -343,12 +343,12 @@
 - call.conference.merge_failed（含 reason/mode）
 
 5. 与转接策略关系
-- 若业务动作是”把客户交给第三方并退出”，使用 transfer（REFER 优先 + 3PCC fallback）。
-- 若业务动作是”三方同时在线继续沟通”，使用 conference merge。
+- 若业务动作是"把客户交给第三方并退出"，使用 transfer（REFER 优先 + 3PCC fallback）。
+- 若业务动作是"三方同时在线继续沟通"，使用 conference merge。
 
 ## 11. AI 接待模块（可选）
 
-### 11.1 为什么 AI 不应内嵌于 rustpbx
+### 11.1 为什么 AI 不应内嵌于 SuperSip
 
 1. 接口不兼容
    - rustpbx 的 `AudioSource` trait 使用同步 `read_samples(&mut self, buffer: &mut [i16]) -> usize` 接口。
@@ -370,7 +370,7 @@
 来电
   │
   ▼
-rustpbx（SIP B2BUA）
+SuperSip（SIP B2BUA）
   │  HTTP Router Webhook (每次 INVITE 触发)
   ▼
 CC App（路由决策）
@@ -389,40 +389,40 @@ CC App（路由决策）
                                       │
                                       │ 完成接待后
                                       │ POST /console/calls/active/{id}/commands
-                                      │ { “action”: “transfer”, “target”: “queue:support” }
+                                      │ { "action": "transfer", "target": "queue:support" }
                                       ▼
-                              rustpbx 执行转接 → 人工坐席
+                              SuperSip 执行转接 → 人工坐席
 ```
 
-### 11.3 AI Bot 与 rustpbx 的接口契约
+### 11.3 AI Bot 与 SuperSip 的接口契约
 
 1. AI Bot 注册（SIP REGISTER）
-   - AI Bot 以普通 SIP 分机身份注册到 rustpbx。
+   - AI Bot 以普通 SIP 分机身份注册到 SuperSip。
    - 支持多实例注册同一账号（并发接待）或多账号（容量水平扩展）。
 
 2. 来电接入（HTTP Router Webhook → CC App → 路由到 AI Bot）
    - CC App 在路由决策中将 target 指向 AI Bot 分机号（如 `ai-bot-01`）。
-   - rustpbx 向该分机发 INVITE，AI Bot 接听并开始 ASR+LLM+TTS 流水线。
+   - SuperSip 向该分机发 INVITE，AI Bot 接听并开始 ASR+LLM+TTS 流水线。
 
 3. 上下文传递
-   - HTTP Router Webhook 响应可携带 `headers` / `extensions` 字段，rustpbx 将其附加到 INVITE。
+   - HTTP Router Webhook 响应可携带 `headers` / `extensions` 字段，SuperSip 将其附加到 INVITE。
    - AI Bot 从 SIP INVITE 的自定义头（`X-CC-Context`）或 INFO 消息中读取业务上下文（来源渠道、IVR 路径、客户标签）。
 
-4. 转人工（AI Bot → rustpbx REST）
+4. 转人工（AI Bot → SuperSip REST）
    - AI Bot 判断需要转人工时，调用：
      ```
      POST /console/calls/active/{session_id}/commands
      Content-Type: application/json
-     { “action”: “transfer”, “target”: “queue:skill_group_name” }
+     { "action": "transfer", "target": "queue:skill_group_name" }
      ```
-   - rustpbx 执行转接（B2BUA 模式），AI Bot 的腿自动挂断。
+   - SuperSip 执行转接（B2BUA 模式），AI Bot 的腿自动挂断。
    - CC App 通过 CDR Webhook 收到转接结果，将 AI 对话摘要写入 interaction 记录。
 
 5. AI Bot 主动挂断
    - 意图明确无需人工时（已完成服务），调用：
      ```
      POST /console/calls/active/{session_id}/commands
-     { “action”: “hangup” }
+     { "action": "hangup" }
      ```
 
 ### 11.4 AI 可选性保障（不影响核心链路）
@@ -438,11 +438,11 @@ CC App（路由决策）
 
 3. 并发容量
    - AI Bot 实例数决定 AI 接待并发上限。
-   - 超出容量的来电自动走非 AI 路径（CC App 路由层控制，rustpbx 无感知）。
+   - 超出容量的来电自动走非 AI 路径（CC App 路由层控制，SuperSip 无感知）。
 
-### 11.5 rustpbx 侧最小变更需求
+### 11.5 SuperSip 侧最小变更需求
 
-AI Bot 独立 SIP UA 方案对 rustpbx 的改动极小：
+AI Bot 独立 SIP UA 方案对 SuperSip 的改动极小：
 
 | 需求 | 现状 | 变更量 |
 |------|------|--------|
@@ -471,7 +471,7 @@ AI Bot 独立 SIP UA 方案对 rustpbx 的改动极小：
 
 ### 12.1 现有实现盘点
 
-rustpbx 当前有三套 Queue 相关模块，各自独立、尚未打通：
+SuperSip 当前有三套 Queue 相关模块，各自独立、尚未打通：
 
 | 组件 | 位置 | 职责 | 状态 |
 |------|------|------|------|
@@ -546,7 +546,7 @@ action = { type = "queue", target = "billing_queue", skills = ["billing", "engli
 
 #### 12.2.3 通用事件实时推送 Webhook
 
-当前 rustpbx 仅有 `LocatorWebhook`（注册事件）和 `CallRecordHook`（事后 CDR），缺少通话实时事件推送。CC App 必须实时感知以下事件才能做调度决策和坐席弹屏。
+当前 SuperSip 仅有 `LocatorWebhook`（注册事件）和 `CallRecordHook`（事后 CDR），缺少通话实时事件推送。CC App 必须实时感知以下事件才能做调度决策和坐席弹屏。
 
 **新增 Event Webhook 配置**：
 
@@ -606,7 +606,7 @@ retry_count = 2
 | `queue.agent_pause` | 暂停接听（WrapUp / Break） | `QueueAgentPaused` |
 | `queue.agent_resume` | 恢复接听 | `QueueAgentResumed` |
 
-**数据模型**（CC App 侧持久化，rustpbx 通过 RWI 同步）：
+**数据模型**（CC App 侧持久化，SuperSip 通过 RWI 同步）：
 
 ```
 queue_member: queue_id, agent_id, skills, priority, penalty, paused, paused_reason
@@ -691,7 +691,7 @@ EntryAction::Callback {
 3. CC App 在队列空闲时通过 RWI originate 发起回呼。
 4. 客户接听后走正常 Queue 流程分配坐席。
 
-回呼引擎放在 CC App 侧，rustpbx 只负责收集意图和挂断。
+回呼引擎放在 CC App 侧，SuperSip 只负责收集意图和挂断。
 
 #### 12.3.6 通后评价 IVR
 
@@ -833,7 +833,7 @@ action = { redirect_queue = "overflow-pool" }
 | SkillFirst | 技能匹配度最高的优先 | 按 `skill_score(agent, required)` 排序 |
 | WeightedRandom | 加权随机（技能权重 + 负载权重） | 随机但倾向低负载高技能坐席 |
 
-策略选择在 CC App 的 Routing Orchestrator 中执行，通过 RWI originate 指令让 rustpbx 执行振铃。
+策略选择在 CC App 的 Routing Orchestrator 中执行，通过 RWI originate 指令让 SuperSip 执行振铃。
 
 ### 12.5 改造优先级与依赖关系
 
@@ -887,13 +887,13 @@ P2（高级能力）
 
 ## 13. 新增方案：CC Addon + CC App(Go) + CC Phone(Vue/JS)
 
-本节将“cc addon + cc app + cc phone”的构想整理为可落地需求与 workflow，作为第 12 节之后的实施蓝图。
+本节将"cc addon + cc app + cc phone"的构想整理为可落地需求与 workflow，作为第 12 节之后的实施蓝图。
 
 ### 13.1 目标与分层
 
-目标：在保留 rustpbx 作为通信底座的前提下，新增三层协作架构。
+目标：在保留 SuperSip 作为通信底座的前提下，新增三层协作架构。
 
-1. CC Addon（Rust，运行于 rustpbx 侧）
+1. CC Addon（Rust，运行于 SuperSip 侧）
 - 负责与 CC App 的调度桥接。
 - 负责 IVR/Queue/坐席状态/Skill Group 的内核侧执行与同步。
 - 负责 RWI 与媒体侧能力封装（含 PCM 流输出）。
@@ -967,7 +967,7 @@ FR-6 配置、监控、测试验证
 
 3. 稳定性
 - ASR 或 CC App 异常不得影响 PBX 基础通话。
-- 音频流传输故障时自动降级为“无 ASR”模式，主通话不受阻。
+- 音频流传输故障时自动降级为"无 ASR"模式，主通话不受阻。
 
 4. 可观测性
 - 指标：队列等待、转接成功率、3PCC 失败率、监听接管次数、ASR 时延与错误率。
@@ -990,7 +990,7 @@ FR-6 配置、监控、测试验证
 
 #### Workflow B：坐席通过 in-dialog message 发起 3PCC
 
-1. 坐席在 CC Phone 点击“咨询第三方/三方通话”，发送 in-dialog message（含 call_id、target、request_id）。
+1. 坐席在 CC Phone 点击"咨询第三方/三方通话"，发送 in-dialog message（含 call_id、target、request_id）。
 2. CC App 校验权限、状态与并发锁（owner）。
 3. CC App 调用 Addon/RWI 执行 3PCC（originate -> consult -> merge）。
 4. 执行结果事件回传至 CC App，再推送给 CC Phone 统一终态（success/failed/cancelled）。
@@ -1055,3 +1055,8 @@ FR-6 配置、监控、测试验证
 3. 坐席可通过 in-dialog message 成功发起 3PCC，失败可回滚。
 4. CC App 可完成监听/接管与队列调度，审计链路完整。
 5. 全链路压测下，主通话稳定性不因 ASR/调度波动而显著下降。
+
+---
+**Status:** ✅ Shipped
+**Source:** `docs/cc.md`
+**Last reviewed:** 2026-04-16
