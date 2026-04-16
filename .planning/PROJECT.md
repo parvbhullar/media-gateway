@@ -12,7 +12,7 @@ Every SIP call — carrier-in, carrier-out, or bridged to WebRTC/WebSocket — i
 
 ### Validated
 
-<!-- Shipped in v1.0 baseline and confirmed valuable. -->
+<!-- Shipped in v1.0 baseline or validated through milestone phases. -->
 
 - rsipstack-based SIP proxy with B2BUA dual-dialog architecture
 - Media bridge with RTP relay, codec negotiation, transcoding
@@ -28,6 +28,10 @@ Every SIP call — carrier-in, carrier-out, or bridged to WebRTC/WebSocket — i
 - SQL-backed storage via SeaORM with migrations
 - AMI management router for health, reload, diagnostics, shutdown
 - `/api/v1/*` bootstrap: Bearer-token auth middleware + gateway read + trunk-test
+- Trunk groups entity layer (`trunk_groups` + `trunk_group_members`) with full CRUD -- Phase 2
+- Distribution mode dispatch (round_robin, weight_based, hash_callid, hash_src_ip, hash_destination) -- Phase 2
+- Gateway validation on trunk group membership + engagement-tracked delete -- Phase 2
+- Additive migration preserving all legacy `sip_trunk` rows -- Phase 2
 - Addons framework: archive, queue, voicemail, telemetry, observability, IVR editor, enterprise auth
 - Docker multi-stage builds (aarch64, x86_64, commerce variant)
 - TLS/ACME for the console surface
@@ -141,7 +145,7 @@ Every SIP call — carrier-in, carrier-out, or bridged to WebRTC/WebSocket — i
 | Decision | Rationale | Outcome |
 |----------|-----------|---------|
 | Wrap console logic via module-level `pub(crate)` data fns keyed on `&DatabaseConnection` | Both ConsoleState and AppState already share the same DB handle; no new bridge needed | — Pending |
-| Introduce `trunk_groups` + `trunk_group_members` instead of collapsing trunks into sip_trunks | Collapse breaks the 19-route CARRIER-API trunk sub-resource contract; additive migration keeps existing rows intact | — Pending |
+| Introduce `trunk_groups` + `trunk_group_members` instead of collapsing trunks into sip_trunks | Collapse breaks the 19-route CARRIER-API trunk sub-resource contract; additive migration keeps existing rows intact | Validated Phase 2 |
 | Endpoints = SIP user-agents in `/api/v1/endpoints`; SIP listeners remain config-only | Vobiz and media-gateway's own registrar model treat endpoint as user-agent; CARRIER-API listener routes become a read-only projection under a different path | — Pending |
 | Translations run before routing; Manipulations run after routing | Routing must see normalized numbers; manipulations may depend on the chosen trunk | — Pending |
 | Security suite moves from static file-loaded CIDR to DB-backed runtime store | Required for GET/PATCH firewall routes and auto-block lifecycle | — Pending |
@@ -149,4 +153,4 @@ Every SIP call — carrier-in, carrier-out, or bridged to WebRTC/WebSocket — i
 | Production hardening (load test, OTel, TLS/mTLS, OpenAPI, Dockerfile.carrier) deferred to v2.1 | Features and hardening are separate commitments; cleaner to split milestones | — Pending |
 
 ---
-*Last updated: 2026-04-14 after milestone v2.0 initialization*
+*Last updated: 2026-04-16 after Phase 2*
