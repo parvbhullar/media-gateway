@@ -66,7 +66,7 @@ Requirement IDs follow `[CATEGORY]-[NUMBER]`. All v2.0 requirements are user/ope
 
 ### Trunk Groups (TRK)
 
-- [ ] **TRK-01**: A new `rustpbx_trunk_groups` table and `rustpbx_trunk_group_members` join table exist; legacy `sip_trunk` rows are untouched
+- [x] **TRK-01**: A new `rustpbx_trunk_groups` table and `rustpbx_trunk_group_members` join table exist; legacy `sip_trunk` rows are untouched
 - [ ] **TRK-02**: Operator can CRUD trunk groups via `/api/v1/trunks` with name, direction, distribution mode, gateway member list, credentials, acl, nofailover_sip_codes
 - [ ] **TRK-03**: Creating or updating a trunk group validates that every referenced gateway exists; returns 400 on missing reference
 - [ ] **TRK-04**: Deleting a trunk group is blocked with 409 if any DID or routing record references it
@@ -186,7 +186,7 @@ Requirement IDs follow `[CATEGORY]-[NUMBER]`. All v2.0 requirements are user/ope
 
 ### Migration Safety (MIG)
 
-- [ ] **MIG-01**: All new tables ship with backward-compatible migrations that run on existing databases without data loss
+- [x] **MIG-01**: All new tables ship with backward-compatible migrations that run on existing databases without data loss
 - [ ] **MIG-02**: Every migration has a documented rollback path (or is explicitly documented as forward-only)
 - [ ] **MIG-03**: Console UI routes render identically on every page touched by a refactor (sip_trunks, dids, call_records, routing, settings, diagnostics) — verified by spot check before phase merge
 - [ ] **MIG-04**: Existing `ami.rs` endpoints continue to respond until their `/api/v1/system/*` equivalents are documented as the supported surface
@@ -287,7 +287,7 @@ Every v2.0 requirement maps to exactly one phase.
 | LSTN-02 | Phase 12 | Pending |
 | LSTN-03 | Phase 12 | Pending |
 | LSTN-04 | Phase 12 | Pending |
-| TRK-01 | Phase 2 | Pending |
+| TRK-01 | Phase 2 | Complete |
 | TRK-02 | Phase 2 | Pending |
 | TRK-03 | Phase 2 | Pending |
 | TRK-04 | Phase 2 | Pending |
@@ -368,7 +368,7 @@ Every v2.0 requirement maps to exactly one phase.
 | IT-03 | Phase 5 | Pending |
 | IT-04 | Phase 13 | Pending |
 | IT-05 | Phase 13 | Pending |
-| MIG-01 | Phase 2 | Pending |
+| MIG-01 | Phase 2 | Complete |
 | MIG-02 | Phase 12 | Pending |
 | MIG-03 | Phase 1 | Pending |
 | MIG-04 | Phase 11 | Pending |

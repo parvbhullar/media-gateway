@@ -1,17 +1,17 @@
 ---
 gsd_state_version: 1.0
 milestone: v2.0
-milestone_name: Carrier Control Plane — Feature Parity
-status: phase_verified
-stopped_at: Phase 1 verified (23/26 + 3 deferred) after Plan 01-06 gap closure; ready to plan Phase 2
-last_updated: "2026-04-16T00:00:00.000Z"
-last_activity: 2026-04-16 — Phase 1 re-verified after gap closure (Plan 01-06); SYS-02, SYS-02-test, GWY-04 closed; 78/78 tests passing; 3 items formally deferred with explicit targets
+milestone_name: milestone
+status: planning
+stopped_at: Completed 02-01-PLAN.md
+last_updated: "2026-04-16T09:59:51.777Z"
+last_activity: 2026-04-16 — Phase 1 re-verified after Plan 01-06 gap closure
 progress:
   total_phases: 13
   completed_phases: 1
-  total_plans: 6
-  completed_plans: 6
-  percent: 8
+  total_plans: 9
+  completed_plans: 7
+  percent: 78
 ---
 
 # Project State
@@ -35,6 +35,7 @@ Progress: [█░░░░░░░░░] 8%  (1 of 13 phases)
 ## Performance Metrics
 
 **Velocity:**
+
 - Total plans completed: 6 (5 on 2026-04-15 + 1 gap-closure on 2026-04-16)
 - Average duration: —
 - Total execution time: —
@@ -44,6 +45,7 @@ Progress: [█░░░░░░░░░] 8%  (1 of 13 phases)
 | Phase | Plans | Completed | Status |
 |-------|-------|-----------|--------|
 | 1. API Shell & Cheap Wrappers | 6 | 6 | Verified (23/26 + 3 deferred) — see 01-VERIFICATION.md |
+| Phase 02 P01 | 862 | 3 tasks | 9 files |
 
 ## Phase 1 Re-verification (2026-04-16)
 
@@ -63,10 +65,12 @@ non-blocker items.
   into `reload_all` in caf1eb1. Test
   `reload_populates_per_step_outcomes` asserts `steps.len()==3` with
   real `elapsed_ms` / `changed_count` fields.
+
 - **SYS-02 CAS conflict test** — `concurrent_reload_cas_conflict_returns_409`
   deterministically pre-flips `reload_requested` to exercise the CAS
   branch, asserts 409 + `code: conflict`, then clears flag and asserts
   200 (commit 9b30752, hardened to deterministic by 35c0c76).
+
 - **GWY-04 health observability** — new `GatewayHealthMonitor::tally_snapshot(id)`
   accessor (`src/proxy/gateway_health.rs:299`); test
   `newly_created_gateway_appears_in_health_tallies_on_next_tick` POSTs
@@ -97,6 +101,7 @@ Decisions are logged in PROJECT.md Key Decisions table. Recent decisions affecti
 - Security suite moves from static file-loaded CIDR to DB-backed runtime store
 - Sub-accounts default to a single `root` account so Phases 1-12 don't retroactively need scoping
 - Production hardening deferred to v2.1
+- [Phase 02]: TrunkGroupDistributionMode enum with 6 variants; re-export SipTrunkDirection from sip_trunk module; N+1 member loading acceptable for Phase 2
 
 ### Roadmap Evolution
 
@@ -118,6 +123,6 @@ Decisions are logged in PROJECT.md Key Decisions table. Recent decisions affecti
 
 ## Session Continuity
 
-Last session: 2026-04-16
-Stopped at: Phase 1 verified (23/26 + 3 deferred) after Plan 01-06 gap closure. Ready to plan Phase 2.
-Resume file: .planning/phases/01-api-shell-cheap-wrappers/01-VERIFICATION.md
+Last session: 2026-04-16T09:59:51.775Z
+Stopped at: Completed 02-01-PLAN.md
+Resume file: None
