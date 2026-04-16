@@ -990,6 +990,9 @@ pub struct RoutingState {
     /// Round-robin counters for each destination group
     round_robin_counters: Arc<Mutex<HashMap<String, usize>>>,
     pub policy_guard: Option<Arc<crate::call::policy::PolicyGuard>>,
+    /// Optional database handle for DB-driven routing (trunk_group dispatch).
+    /// None in most unit tests; Some in production via RoutingState::new_with_db.
+    pub db: Option<sea_orm::DatabaseConnection>,
 }
 
 impl Default for RoutingState {
@@ -1249,11 +1252,27 @@ mod tests {
 }
 
 impl RoutingState {
+    /// Legacy zero-arg constructor preserved for tests and diagnostics.
+    /// Production code (src/proxy/call.rs) should use `new_with_db`.
     pub fn new() -> Self {
+        Self::new_with_db(None)
+    }
+
+    /// Construct a RoutingState with an optional DatabaseConnection so the
+    /// matcher-level trunk_group dispatch branch can run DB lookups.
+    pub fn new_with_db(db: Option<sea_orm::DatabaseConnection>) -> Self {
         Self {
             round_robin_counters: Arc::new(Mutex::new(HashMap::new())),
             policy_guard: None,
+            db,
         }
+    }
+
+    /// Accessor for the optional DB handle. Used by
+    /// matcher.rs::try_select_via_trunk_group to decide whether to
+    /// attempt DB-driven trunk_group detection.
+    pub fn db(&self) -> Option<&sea_orm::DatabaseConnection> {
+        self.db.as_ref()
     }
 
     /// Get the next trunk index for round-robin selection

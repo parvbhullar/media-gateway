@@ -382,7 +382,7 @@ impl CallModule {
 
     pub fn new(config: Arc<ProxyConfig>, server: SipServerRef) -> Self {
         let dialog_layer = server.dialog_layer.clone();
-        let mut routing_state = RoutingState::new();
+        let mut routing_state = RoutingState::new_with_db(server.database.clone());
         let limiter = server
             .frequency_limiter
             .clone()

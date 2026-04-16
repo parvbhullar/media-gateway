@@ -1,11 +1,13 @@
-# 08 — Contributing
+# Contributing
 
 How to set up, navigate, extend, and test SuperSip.
 
 ## Contents
 
-- `dev-setup.md` — Development environment setup *(pending)*
-- `repo-layout.md` — Repository structure and module map *(pending)*
-- `coding-standards.md` — Style guide and linting rules *(pending)*
-- `testing.md` — Test framework and running tests *(pending)*
-- `pr-workflow.md` — Pull request process and review checklist *(pending)*
+| Guide | Description |
+|-------|-------------|
+| [Dev Setup](dev-setup.md) | Dependencies, build, run, feature flags |
+| [Code Map](code-map.md) | Entry points, module dependency flow |
+| [Adding a Phase](adding-a-phase.md) | How v2.0 planning + execution works |
+| [Testing](testing.md) | Test suite, conventions, fixtures |
+| [Style Guide](style-guide.md) | Naming, errors, adapters, commits |

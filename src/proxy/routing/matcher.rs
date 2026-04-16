@@ -38,6 +38,47 @@ pub trait RouteResourceLookup: Send + Sync {
     async fn load_queue(&self, path: &str) -> Result<Option<RouteQueueConfig>>;
 }
 
+/// Try to resolve dest_config as a trunk_group name. If the single-name dest
+/// is a known trunk_group, delegate to the resolver+dispatch helper. If not,
+/// return Ok(None) so the caller falls through to the existing select_trunk
+/// path unchanged.
+async fn try_select_via_trunk_group(
+    db: Option<&sea_orm::DatabaseConnection>,
+    dest_config: &crate::proxy::routing::DestConfig,
+    option: &InviteOption,
+    routing_state: Arc<RoutingState>,
+    trunks: Option<&HashMap<String, TrunkConfig>>,
+) -> Result<Option<String>> {
+    let db = match db {
+        Some(d) => d,
+        None => return Ok(None),
+    };
+    let group_name = match dest_config {
+        crate::proxy::routing::DestConfig::Single(name) => name.clone(),
+        crate::proxy::routing::DestConfig::Multiple(_) => return Ok(None),
+    };
+    use crate::models::trunk_group::{Column as TgColumn, Entity as TgEntity};
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    let is_group = TgEntity::find()
+        .filter(TgColumn::Name.eq(group_name.clone()))
+        .one(db)
+        .await?
+        .is_some();
+    if !is_group {
+        return Ok(None);
+    }
+    let selected =
+        crate::proxy::routing::trunk_group_resolver::select_gateway_for_trunk_group(
+            db,
+            &group_name,
+            option,
+            routing_state,
+            trunks,
+        )
+        .await?;
+    Ok(Some(selected))
+}
+
 /// Main routing function
 ///
 /// Routes INVITE requests based on configured routing rules and trunk configurations:
@@ -316,14 +357,25 @@ async fn match_invite_impl(
             ActionType::Forward => {
                 if let Some(dest_config) = &rule.action.dest {
                     if mode == MatchMode::Execute {
-                        let selected_trunk = select_trunk(
+                        let selected_trunk = match try_select_via_trunk_group(
+                            routing_state.db(),
                             dest_config,
-                            &rule.action.select,
-                            &rule.action.hash_key,
                             &option,
                             routing_state.clone(),
                             trunks,
-                        )?;
+                        )
+                        .await?
+                        {
+                            Some(name) => name,
+                            None => select_trunk(
+                                dest_config,
+                                &rule.action.select,
+                                &rule.action.hash_key,
+                                &option,
+                                routing_state.clone(),
+                                trunks,
+                            )?,
+                        };
 
                         if let Some(trace) = &mut trace {
                             trace.selected_trunk = Some(selected_trunk.clone());
@@ -424,14 +476,25 @@ async fn match_invite_impl(
                     })?;
 
                     if mode == MatchMode::Execute {
-                        let selected_trunk = select_trunk(
+                        let selected_trunk = match try_select_via_trunk_group(
+                            routing_state.db(),
                             dest_config,
-                            &rule.action.select,
-                            &rule.action.hash_key,
                             &option,
                             routing_state.clone(),
                             trunks,
-                        )?;
+                        )
+                        .await?
+                        {
+                            Some(name) => name,
+                            None => select_trunk(
+                                dest_config,
+                                &rule.action.select,
+                                &rule.action.hash_key,
+                                &option,
+                                routing_state.clone(),
+                                trunks,
+                            )?,
+                        };
 
                         if let Some(trace) = &mut trace {
                             trace.selected_trunk = Some(selected_trunk.clone());
