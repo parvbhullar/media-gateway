@@ -65,6 +65,12 @@ pub struct Model {
     pub enabled: bool,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
+    /// Forward reference for Phase 3+ DID → trunk_group routing.
+    /// Phase 2 Plan 02-01 introduces the column so the TRK-04 engagement
+    /// check has a real target to scan. Phase 1 DID handlers do not
+    /// touch this column (the `NewDid` struct does not carry it and the
+    /// upsert `update_columns(...)` list deliberately excludes it).
+    pub trunk_group_name: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -96,6 +102,11 @@ impl Model {
             enabled: Set(new.enabled),
             created_at: Set(now),
             updated_at: Set(now),
+            // Phase 2 Plan 02-01: new column forward-referenced by the
+            // trunk_group routing work. Phase 1 upsert path deliberately
+            // does not touch it (NotSet so existing rows keep their value
+            // and new rows default to NULL).
+            ..Default::default()
         };
         Entity::insert(active)
             .on_conflict(

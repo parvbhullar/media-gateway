@@ -3,6 +3,7 @@ use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbB
 use sea_orm_migration::MigratorTrait;
 use std::time::Duration;
 
+pub mod add_did_trunk_group_name_column;
 pub mod add_leg_timeline_column;
 pub mod add_rewrite_columns;
 pub mod add_sip_trunk_health_columns;
@@ -31,6 +32,8 @@ pub mod sip_trunk;
 pub mod system_config;
 pub mod system_notification;
 pub mod pending_upload;
+pub mod trunk_group;
+pub mod trunk_group_member;
 pub mod user;
 pub mod wholesale_agent;
 

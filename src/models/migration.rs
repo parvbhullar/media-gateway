@@ -33,6 +33,14 @@ impl MigratorTrait for Migrator {
             Box::new(super::did::Migration),
             Box::new(super::api_key::Migration),
             Box::new(super::add_sip_trunk_health_columns::Migration),
+            // Phase 2 Plan 02-01 — trunk groups.
+            // Order is load-bearing: trunk_group must run before
+            // trunk_group_member (FK dependency), and the additive DID
+            // column comes last so the ordering assertion in the plan's
+            // verify block is unambiguous.
+            Box::new(super::trunk_group::Migration),
+            Box::new(super::trunk_group_member::Migration),
+            Box::new(super::add_did_trunk_group_name_column::Migration),
         ]
     }
 }
