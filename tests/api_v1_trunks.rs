@@ -7,6 +7,12 @@
 //!
 //! NOTE: atomicity verified by inspection of the tx boundary in
 //! create_trunk / update_trunk / delete_trunk.
+//!
+//! Phase 3 Plan 03-01 deviation (D-02): `create_trunk_persists_credentials_acl_nofailover`
+//! is split into ACL-only (this file, renamed `create_trunk_persists_acl_nofailover`)
+//! and credentials-via-sub-resource (rebuilt in `tests/api_v1_trunk_credentials.rs`
+//! happy-path test by Plan 03-02). The Phase 2 inline `credentials` field on the
+//! /trunks POST body is GONE — POST /trunks no longer accepts a `credentials` field.
 
 use axum::{
     body::Body,
@@ -349,13 +355,17 @@ async fn create_trunk_happy_path_returns_201() {
     assert_eq!(members[1]["position"], 1);
 }
 
+/// Phase 3 Plan 03-01 (D-02): renamed from
+/// `create_trunk_persists_credentials_acl_nofailover`. The credentials
+/// half is removed — `credentials` is no longer a trunk_group POST field;
+/// Plan 03-02 rebuilds that coverage in
+/// `tests/api_v1_trunk_credentials.rs` against the new sub-resource.
 #[tokio::test]
-async fn create_trunk_persists_credentials_acl_nofailover() {
+async fn create_trunk_persists_acl_nofailover() {
     let (state, token) =
         test_state_with_api_key("trunks-create-creds").await;
     insert_trunk(&state, "gw-creds").await;
 
-    let creds = json!({"auth_username": "user1", "auth_password": "pw"});
     let acl =
         json!({"allowed_cidrs": ["10.0.0.0/8"], "denied_cidrs": []});
     let nofailover = json!([503, 502]);
@@ -375,7 +385,6 @@ async fn create_trunk_persists_credentials_acl_nofailover() {
                     json!({
                         "name": "tg-creds",
                         "members": [{"gateway_name": "gw-creds"}],
-                        "credentials": creds,
                         "acl": acl,
                         "nofailover_sip_codes": nofailover
                     })
@@ -404,7 +413,6 @@ async fn create_trunk_persists_credentials_acl_nofailover() {
         .unwrap();
     assert_eq!(resp2.status().as_u16(), 200);
     let body = body_json(resp2).await;
-    assert_eq!(body["credentials"]["auth_username"], "user1");
     assert_eq!(body["acl"]["allowed_cidrs"][0], "10.0.0.0/8");
     assert_eq!(body["nofailover_sip_codes"][0], 503);
     assert_eq!(body["nofailover_sip_codes"][1], 502);
