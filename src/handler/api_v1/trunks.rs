@@ -31,6 +31,10 @@ use crate::models::trunk_group_member::{
     self, Column as TrunkMemberColumn, Entity as TrunkMemberEntity,
     Model as TrunkMemberModel,
 };
+use crate::models::did::{
+    Column as DidColumn, Entity as DidEntity,
+};
+use crate::models::routing::Entity as RouteEntity;
 use crate::models::sip_trunk::{
     Column as SipTrunkColumn, Entity as SipTrunkEntity,
 };
@@ -511,24 +515,218 @@ async fn create_trunk(
 }
 
 // ---------------------------------------------------------------------------
-// Write stubs -- 501 pending Plan 02-02 Task 2
+// Update handler (PUT -- full member replacement + scalar patch)
 // ---------------------------------------------------------------------------
 
 async fn update_trunk(
-    State(_): State<AppState>,
-    Path(_): Path<String>,
-    Json(_): Json<serde_json::Value>,
-) -> ApiResult<StatusCode> {
-    Err(ApiError::not_implemented(
-        "trunk group write endpoints land in Plan 02-02",
-    ))
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<UpdateTrunkRequest>,
+) -> ApiResult<Json<TrunkView>> {
+    let db = state.db();
+
+    // Load existing
+    let existing = TrunkGroupEntity::find()
+        .filter(TrunkGroupColumn::Name.eq(name.clone()))
+        .one(db)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .ok_or_else(|| {
+            ApiError::not_found(format!(
+                "trunk group '{}' not found",
+                name
+            ))
+        })?;
+
+    // Validate distribution_mode if provided, else keep existing
+    let mode = if let Some(ref dm) = req.distribution_mode {
+        parse_distribution_mode(Some(dm.as_str()))?
+    } else {
+        existing.distribution_mode
+    };
+    validate_distribution_mode(mode)?;
+
+    // Validate direction if provided
+    let direction = if let Some(ref d) = req.direction {
+        parse_direction(Some(d.as_str()))?
+    } else {
+        existing.direction
+    };
+
+    // Validate gateway refs
+    validate_gateway_refs(db, &req.members).await?;
+
+    // Begin transaction
+    let tx = db
+        .begin()
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    // Build ActiveModel for scalar updates
+    let mut am: trunk_group::ActiveModel = existing.clone().into();
+    am.direction = Set(direction);
+    am.distribution_mode = Set(mode);
+    if let Some(v) = req.display_name {
+        am.display_name = Set(Some(v));
+    }
+    if let Some(v) = req.credentials {
+        am.credentials = Set(Some(v));
+    }
+    if let Some(v) = req.acl {
+        am.acl = Set(Some(v));
+    }
+    if let Some(v) = req.nofailover_sip_codes {
+        am.nofailover_sip_codes = Set(Some(v));
+    }
+    if let Some(v) = req.is_active {
+        am.is_active = Set(v);
+    }
+    am.updated_at = Set(Utc::now());
+
+    let updated = am
+        .update(&tx)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    // Delete all existing members
+    TrunkMemberEntity::delete_many()
+        .filter(TrunkMemberColumn::TrunkGroupId.eq(existing.id))
+        .exec(&tx)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    // Re-insert from request
+    for (idx, member) in req.members.iter().enumerate() {
+        let member_am = trunk_group_member::ActiveModel {
+            trunk_group_id: Set(existing.id),
+            gateway_name: Set(member.gateway_name.clone()),
+            weight: Set(member.weight.unwrap_or(100)),
+            priority: Set(member.priority.unwrap_or(0)),
+            position: Set(idx as i32),
+            ..Default::default()
+        };
+        member_am
+            .insert(&tx)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+    }
+
+    // Commit
+    tx.commit()
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    // Reload members
+    let members = TrunkMemberEntity::find()
+        .filter(TrunkMemberColumn::TrunkGroupId.eq(updated.id))
+        .all(db)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    Ok(Json(view_from(updated, members)))
+}
+
+// ---------------------------------------------------------------------------
+// Delete handler with engagement check (TRK-04)
+// ---------------------------------------------------------------------------
+
+/// Check whether any DID or routing record references this trunk group.
+///
+/// Returns `Err(ApiError::conflict(...))` if a reference is found,
+/// preventing deletion.
+async fn engagement_check_trunk_group(
+    db: &sea_orm::DatabaseConnection,
+    name: &str,
+) -> ApiResult<()> {
+    // TODO(phase-6): replace the routes scan below with an indexed
+    // trunk_group_id FK check once RTE-01 lands.
+
+    // Step 1: DIDs scan (indexed via trunk_group_name column)
+    let did_ref = DidEntity::find()
+        .filter(DidColumn::TrunkGroupName.eq(name))
+        .one(db)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    if let Some(did) = did_ref {
+        return Err(ApiError::conflict(format!(
+            "trunk group '{}' is referenced by DID '{}' \
+             and cannot be deleted",
+            name, did.number
+        )));
+    }
+
+    // Step 2: Routes scan (best-effort JSON scan of target_trunks)
+    let routes = RouteEntity::find()
+        .all(db)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    for route in &routes {
+        if let Some(ref target_trunks) = route.target_trunks {
+            let has_ref = match target_trunks {
+                serde_json::Value::Array(arr) => {
+                    arr.iter().any(|v| v.as_str() == Some(name))
+                }
+                serde_json::Value::Object(obj) => {
+                    obj.values()
+                        .any(|v| v.as_str() == Some(name))
+                }
+                _ => false,
+            };
+            if has_ref {
+                return Err(ApiError::conflict(format!(
+                    "trunk group '{}' is referenced by route \
+                     '{}' and cannot be deleted",
+                    name, route.name
+                )));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 async fn delete_trunk(
-    State(_): State<AppState>,
-    Path(_): Path<String>,
+    State(state): State<AppState>,
+    Path(name): Path<String>,
 ) -> ApiResult<StatusCode> {
-    Err(ApiError::not_implemented(
-        "trunk group write endpoints land in Plan 02-02",
-    ))
+    let db = state.db();
+
+    // Load existing
+    let existing = TrunkGroupEntity::find()
+        .filter(TrunkGroupColumn::Name.eq(name.clone()))
+        .one(db)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .ok_or_else(|| {
+            ApiError::not_found(format!(
+                "trunk group '{}' not found",
+                name
+            ))
+        })?;
+
+    // Engagement check -- 409 if referenced
+    engagement_check_trunk_group(db, &name).await?;
+
+    // Transactional delete: members first, then group
+    let tx = db
+        .begin()
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    TrunkMemberEntity::delete_many()
+        .filter(TrunkMemberColumn::TrunkGroupId.eq(existing.id))
+        .exec(&tx)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    TrunkGroupEntity::delete_by_id(existing.id)
+        .exec(&tx)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
