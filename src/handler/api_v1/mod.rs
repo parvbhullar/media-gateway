@@ -13,6 +13,7 @@ pub mod error;
 pub mod gateways;
 pub mod reload_steps;
 pub mod system;
+pub mod trunks;
 
 use axum::{Router, middleware};
 
@@ -31,6 +32,7 @@ pub fn api_v1_router(state: AppState) -> Router {
         .merge(cdrs::router())
         .merge(diagnostics::router())
         .merge(system::router())
+        .merge(trunks::router())
         // Plan 2: .merge(routing::router())
         // Plan 3: .merge(security::router())
         ;
