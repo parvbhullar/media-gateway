@@ -15,7 +15,10 @@ before diving into subsystem details or integration guides.
 ## Security
 - [Security Model](security-model.md) — Auth, ACL, RBAC, TLS
 
-## Domain Knowledge
-- [Call Center](call-center.md) — CC requirements & architecture (中文)
-- [AI-First Architecture](ai-first-architecture.md) — AI-native CC design (中文)
-- [Internationalization](i18n.md) — Multi-language support system
+## Domain Knowledge (中文 / Chinese)
+
+These documents are in Chinese and live in the `zh/` subdirectory:
+
+- [Call Center](zh/call-center.md) — CC requirements & architecture
+- [AI-First Architecture](zh/ai-first-architecture.md) — AI-native CC design
+- [Internationalization](zh/i18n.md) — Multi-language support system
