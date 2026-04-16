@@ -56,10 +56,18 @@ v2.0 closes the gap between media-gateway's rich data plane (rsipstack proxy, Se
 **Goal**: Ship schema-level trunk sub-resources (credentials, origination URIs, media config) and the routing dry-run endpoint, all without touching the proxy hot path.
 **Depends on**: Phase 2
 **Requirements**: TSUB-01, TSUB-02, TSUB-03, RTE-03
+**Plans:** 5 plans
 **Success Criteria** (what must be TRUE):
   1. Operator can CRUD per-trunk credentials and origination URIs via `/api/v1/trunks/{name}/credentials` and `/origination_uris`
   2. Operator can GET and PUT per-trunk media config (codec list, dtmf mode, srtp, media mode)
   3. `POST /api/v1/routing/resolve` dry-runs a caller/destination pair against the live routing engine and returns the chosen target(s) without placing a call
+
+Plans:
+- [ ] 03-01-PLAN.md — Schema migrations (4) + 4 stub sub-routers wired into mod.rs + Phase 2 test split
+- [ ] 03-02-PLAN.md — TSUB-01: trunk credentials full implementation + IT-01 tests
+- [ ] 03-03-PLAN.md — TSUB-02: trunk origination URIs full implementation + IT-01 tests
+- [ ] 03-04-PLAN.md — TSUB-03: trunk media config GET/PUT + IT-01 tests
+- [ ] 03-05-PLAN.md — RTE-03: /routing/resolve dry-run via match_invite_with_trace + IT-01 tests
 
 ### Phase 4: Active Calls & Mid-Call Control
 **Goal**: Expose the active call registry and dispatch mid-call REST commands through the existing `proxy_call/session.rs` path.
@@ -171,7 +179,7 @@ Phases execute in numeric order: 1 → 2 → 3 → ... → 13
 |-------|----------------|--------|-----------|
 | 1. API Shell & Cheap Wrappers | 0/TBD | Not started | - |
 | 2. Trunk Groups Schema & Core CRUD | 0/TBD | Not started | - |
-| 3. Trunk Sub-Resources L1 & Routing Resolve | 0/TBD | Not started | - |
+| 3. Trunk Sub-Resources L1 & Routing Resolve | 0/5 | Planned | - |
 | 4. Active Calls & Mid-Call Control | 0/TBD | Not started | - |
 | 5. Trunk Enforcement | 0/TBD | Not started | - |
 | 6. Routing Tables, Records & Distribution | 0/TBD | Not started | - |
