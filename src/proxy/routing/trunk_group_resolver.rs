@@ -31,6 +31,7 @@ pub enum TrunkGroupResolveError {
 }
 
 /// The output of resolving a trunk_group name into dispatch parameters.
+#[derive(Debug)]
 pub struct ResolvedTrunkGroup {
     pub dest_config: DestConfig,
     pub select_method: &'static str,
