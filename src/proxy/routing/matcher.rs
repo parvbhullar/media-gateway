@@ -18,16 +18,19 @@ use crate::{
     proxy::routing::{ActionType, RouteQueueConfig, RouteRule, SourceTrunk, TrunkConfig},
 };
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct RouteTrace {
     pub matched_rule: Option<String>,
     pub selected_trunk: Option<String>,
+    /// Set when the route dest resolved through a trunk_group; holds the
+    /// trunk_group name while `selected_trunk` holds the resolved gateway.
+    pub trunk_group_name: Option<String>,
     pub used_default_route: bool,
     pub rewrite_operations: Vec<String>,
     pub abort: Option<RouteAbortTrace>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RouteAbortTrace {
     pub code: u16,
     pub reason: Option<String>,
@@ -357,28 +360,40 @@ async fn match_invite_impl(
             ActionType::Forward => {
                 if let Some(dest_config) = &rule.action.dest {
                     if mode == MatchMode::Execute {
-                        let selected_trunk = match try_select_via_trunk_group(
-                            routing_state.db(),
-                            dest_config,
-                            &option,
-                            routing_state.clone(),
-                            trunks,
-                        )
-                        .await?
-                        {
-                            Some(name) => name,
-                            None => select_trunk(
+                        let (selected_trunk, via_trunk_group) =
+                            match try_select_via_trunk_group(
+                                routing_state.db(),
                                 dest_config,
-                                &rule.action.select,
-                                &rule.action.hash_key,
                                 &option,
                                 routing_state.clone(),
                                 trunks,
-                            )?,
-                        };
+                            )
+                            .await?
+                            {
+                                Some(gateway) => {
+                                    let tg_name = if let crate::proxy::routing::DestConfig::Single(n) = dest_config {
+                                        Some(n.clone())
+                                    } else {
+                                        None
+                                    };
+                                    (gateway, tg_name)
+                                }
+                                None => (
+                                    select_trunk(
+                                        dest_config,
+                                        &rule.action.select,
+                                        &rule.action.hash_key,
+                                        &option,
+                                        routing_state.clone(),
+                                        trunks,
+                                    )?,
+                                    None,
+                                ),
+                            };
 
                         if let Some(trace) = &mut trace {
                             trace.selected_trunk = Some(selected_trunk.clone());
+                            trace.trunk_group_name = via_trunk_group;
                         }
 
                         if let Some(trunk_config) = trunks
@@ -476,28 +491,40 @@ async fn match_invite_impl(
                     })?;
 
                     if mode == MatchMode::Execute {
-                        let selected_trunk = match try_select_via_trunk_group(
-                            routing_state.db(),
-                            dest_config,
-                            &option,
-                            routing_state.clone(),
-                            trunks,
-                        )
-                        .await?
-                        {
-                            Some(name) => name,
-                            None => select_trunk(
+                        let (selected_trunk, via_trunk_group) =
+                            match try_select_via_trunk_group(
+                                routing_state.db(),
                                 dest_config,
-                                &rule.action.select,
-                                &rule.action.hash_key,
                                 &option,
                                 routing_state.clone(),
                                 trunks,
-                            )?,
-                        };
+                            )
+                            .await?
+                            {
+                                Some(gateway) => {
+                                    let tg_name = if let crate::proxy::routing::DestConfig::Single(n) = dest_config {
+                                        Some(n.clone())
+                                    } else {
+                                        None
+                                    };
+                                    (gateway, tg_name)
+                                }
+                                None => (
+                                    select_trunk(
+                                        dest_config,
+                                        &rule.action.select,
+                                        &rule.action.hash_key,
+                                        &option,
+                                        routing_state.clone(),
+                                        trunks,
+                                    )?,
+                                    None,
+                                ),
+                            };
 
                         if let Some(trace) = &mut trace {
                             trace.selected_trunk = Some(selected_trunk.clone());
+                            trace.trunk_group_name = via_trunk_group;
                         }
 
                         if let Some(trunk_config) = trunks
