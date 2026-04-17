@@ -458,6 +458,8 @@ impl CallModule {
             .with_external_ip(self.inner.server.rtp_config.external_ip.clone())
             .with_rtp_start_port(self.inner.server.rtp_config.start_port.clone())
             .with_rtp_end_port(self.inner.server.rtp_config.end_port.clone())
+            .with_webrtc_start_port(self.inner.server.rtp_config.webrtc_start_port.clone())
+            .with_webrtc_end_port(self.inner.server.rtp_config.webrtc_end_port.clone())
             .with_ice_servers(self.inner.server.rtp_config.ice_servers.clone());
 
         let caller_is_same_realm = self
@@ -574,7 +576,9 @@ impl CallModule {
         let queue_targets = pending_queue
             .as_ref()
             .and_then(|plan| plan.dial_strategy.clone());
-        let targets = if let Some(queue_targets) = queue_targets {
+        let targets = if pending_app.is_some() {
+            DialStrategy::Sequential(vec![])
+        } else if let Some(queue_targets) = queue_targets {
             queue_targets
         } else if let Some(option) = preview_forward.as_ref() {
             let target = Location {
@@ -1076,103 +1080,6 @@ impl CallModule {
                 return Ok(());
             }
         };
-
-        // For re-INVITE and UPDATE with SDP, we want to ensure they get an SDP answer.
-        // We can retrieve the current answer from the session's shared state.
-        let is_reinvite = tx.original.method == rsipstack::sip::Method::Invite;
-        let is_update = tx.original.method == rsipstack::sip::Method::Update;
-        let has_sdp = !tx.original.body.is_empty();
-
-        if (is_reinvite || is_update) && has_sdp {
-            debug!(%dialog_id, "Processing re-INVITE/UPDATE with SDP");
-            if let Some(handle) = self
-                .inner
-                .server
-                .active_call_registry
-                .get_handle_by_dialog(&dialog_id.to_string())
-            {
-                debug!(%dialog_id, "Found handle for dialog");
-                if let Some(snapshot) = handle.snapshot() {
-                    debug!(%dialog_id, callee_dialogs_count = snapshot.callee_dialogs.len(), "Got snapshot");
-                    let offer_sdp = String::from_utf8_lossy(&tx.original.body).to_string();
-                    let mut forwarded = false;
-
-                    for callee_dialog_id in &snapshot.callee_dialogs {
-                        debug!(%dialog_id, %callee_dialog_id, "Trying to forward to callee dialog");
-                        if let Some(mut callee_dialog) =
-                            self.inner.dialog_layer.get_dialog(callee_dialog_id)
-                        {
-                            debug!(%dialog_id, %callee_dialog_id, "Found callee dialog");
-                            let body = offer_sdp.clone().into_bytes();
-                            let headers = vec![rsipstack::sip::Header::ContentType(
-                                "application/sdp".into(),
-                            )];
-
-                            let resp = match &mut callee_dialog {
-                                Dialog::ClientInvite(d) => {
-                                    debug!(%dialog_id, "Calling reinvite on ClientInvite dialog");
-                                    match d.reinvite(Some(headers), Some(body)).await {
-                                        Ok(r) => {
-                                            debug!(%dialog_id, "reinvite succeeded");
-                                            Some(r)
-                                        }
-                                        Err(e) => {
-                                            debug!(%dialog_id, error = %e, "reinvite failed");
-                                            None
-                                        }
-                                    }
-                                }
-                                _ => {
-                                    debug!(%dialog_id, "Callee dialog is not ClientInvite type");
-                                    None
-                                }
-                            };
-
-                            if let Some(response_opt) = resp {
-                                if let Some(response) = response_opt {
-                                    if !response.body().is_empty() {
-                                        let answer_sdp =
-                                            String::from_utf8_lossy(response.body()).to_string();
-                                        debug!(%dialog_id, ?tx.original.method, "Forwarding re-INVITE to callee, received SDP answer");
-                                        let headers = vec![rsipstack::sip::Header::ContentType(
-                                            "application/sdp".into(),
-                                        )];
-                                        tx.reply_with(
-                                            rsipstack::sip::StatusCode::OK,
-                                            headers,
-                                            Some(answer_sdp.into_bytes()),
-                                        )
-                                        .await
-                                        .map_err(|e| anyhow!(e))?;
-                                        forwarded = true;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if forwarded {
-                        return dialog.handle(tx).await.map_err(|e| anyhow!(e));
-                    }
-
-                    if let Some(sdp) = snapshot.answer_sdp {
-                        debug!(%dialog_id, ?tx.original.method, "Replying to mid-dialog request with cached SDP");
-                        let headers = vec![rsipstack::sip::Header::ContentType(
-                            "application/sdp".into(),
-                        )];
-                        tx.reply_with(
-                            rsipstack::sip::StatusCode::OK,
-                            headers,
-                            Some(sdp.into_bytes()),
-                        )
-                        .await
-                        .map_err(|e| anyhow!(e))?;
-                        return dialog.handle(tx).await.map_err(|e| anyhow!(e));
-                    }
-                }
-            }
-        }
 
         dialog.handle(tx).await.map_err(|e| anyhow!(e))
     }
