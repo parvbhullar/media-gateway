@@ -435,7 +435,7 @@ None. All infrastructure already exists:
 
 ---
 
-## Open Questions
+## Open Questions (RESOLVED)
 
 None. Every scope guardrail from CONTEXT is resolved via codebase-verified citations above.
 
