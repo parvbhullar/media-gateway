@@ -73,11 +73,19 @@ Plans:
 **Goal**: Expose the active call registry and dispatch mid-call REST commands through the existing `proxy_call/session.rs` path.
 **Depends on**: Phase 2
 **Requirements**: CALL-01, CALL-02, CALL-03, CALL-04, CALL-05, CALL-06, CALL-07, CALL-08, CALL-09, CALL-10
+**Plans:** 5 plans
 **Success Criteria** (what must be TRUE):
   1. Operator can list active calls with pagination and retrieve a single call by id
   2. Operator can hangup, transfer (attended and blind), and mute/unmute an active call leg
   3. Operator can inject `play`, `speak`, `dtmf`, and `record` commands into a live call and observe them land via the active call registry
   4. All mid-call operations dispatch through the existing `active_call_registry` → `proxy_call/session.rs` path with no new proxy modules
+
+Plans:
+- [ ] 04-01-PLAN.md — Payload relocation (CallCommandPayload → call/runtime) + CALL-01/02 list/get foundation
+- [ ] 04-02-PLAN.md — CALL-03/05 hangup + mute/unmute via leg→track_id constants
+- [ ] 04-03-PLAN.md — CALL-04 transfer (blind + attended + complete + cancel) with CommandResult/SessionSnapshot extensions
+- [ ] 04-04-PLAN.md — CALL-06/07/08 play + speak + dtmf with pre-dispatch probes and SendDtmf timing extension
+- [ ] 04-05-PLAN.md — CALL-09 record with auto-path + transcribe marker + full-suite regression
 
 ### Phase 5: Trunk Enforcement (Capacity, ACL, Codec Filter)
 **Goal**: Promote per-trunk capacity, ACL, and codec filtering from schema into proxy hot-path enforcement so the sub-resources become observable in call outcomes.
@@ -180,7 +188,7 @@ Phases execute in numeric order: 1 → 2 → 3 → ... → 13
 | 1. API Shell & Cheap Wrappers | 0/TBD | Not started | - |
 | 2. Trunk Groups Schema & Core CRUD | 0/TBD | Not started | - |
 | 3. Trunk Sub-Resources L1 & Routing Resolve | 0/5 | Planned | - |
-| 4. Active Calls & Mid-Call Control | 0/TBD | Not started | - |
+| 4. Active Calls & Mid-Call Control | 0/5 | Planned | - |
 | 5. Trunk Enforcement | 0/TBD | Not started | - |
 | 6. Routing Tables, Records & Distribution | 0/TBD | Not started | - |
 | 7. Webhook Pipeline | 0/TBD | Not started | - |
