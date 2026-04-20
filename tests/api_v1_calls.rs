@@ -636,3 +636,242 @@ async fn unmute_happy_dispatches_callee_track() {
         panic!("expected UnmuteTrack, got {:?}", cmd);
     }
 }
+
+// ── Plan 04-03 — transfer / complete / cancel tests ──────────────────────
+//
+// CALL-04 + CALL-10 coverage: blind + attended transfer start via the
+// tagged `/transfer` route, and attended complete / cancel via
+// `/transfer/{complete,cancel}`. Attended-start asserts that the
+// `pending_consult_leg_id` stamped into the handle's SessionSnapshot
+// surfaces in the response body. `parse_target` normalization is
+// exercised via the E.164 happy-path test and the bad-target 400 test.
+
+#[tokio::test]
+async fn transfer_requires_auth() {
+    let state = test_state_empty().await;
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/calls/any/transfer")
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"type":"blind","target":"sip:1001@x"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 401);
+}
+
+#[tokio::test]
+async fn blind_transfer_dispatches() {
+    let (state, token) = test_state_with_api_key("xfer-blind").await;
+    let (_handle, mut rx) = seed_active_call(&state, "sess-xfer", true);
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/calls/sess-xfer/transfer")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    r#"{"type":"blind","target":"sip:1001@example.com"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp.into_body()).await;
+    assert_eq!(body["message"], "dispatched");
+
+    let cmd = rx
+        .try_recv()
+        .expect("Transfer should have been dispatched");
+    if let CallCommand::Transfer {
+        leg_id,
+        target,
+        attended,
+    } = cmd
+    {
+        assert_eq!(leg_id.as_str(), "sess-xfer");
+        assert_eq!(target, "sip:1001@example.com");
+        assert!(!attended);
+    } else {
+        panic!("expected Transfer, got {:?}", cmd);
+    }
+}
+
+#[tokio::test]
+async fn blind_transfer_e164_normalizes_with_localhost_fallback() {
+    let (state, token) = test_state_with_api_key("xfer-e164").await;
+    // Test config doesn't set external_ip → handler uses "127.0.0.1" fallback.
+    let (_handle, mut rx) = seed_active_call(&state, "sess-e164", true);
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/calls/sess-e164/transfer")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"type":"blind","target":"+14155551234"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let cmd = rx.try_recv().unwrap();
+    if let CallCommand::Transfer { target, .. } = cmd {
+        assert_eq!(target, "sip:+14155551234@127.0.0.1");
+    } else {
+        panic!("expected Transfer, got {:?}", cmd);
+    }
+}
+
+#[tokio::test]
+async fn attended_transfer_returns_consult_leg_id() {
+    let (state, token) = test_state_with_api_key("xfer-attended").await;
+    let registry = state.sip_server().inner.active_call_registry.clone();
+    // Pre-stamp the handle's snapshot with a pending_consult_leg_id so the
+    // handler picks it up post-dispatch. Simulates what the SIP session's
+    // attended-transfer handler would do in production per D-20.
+    let (handle, mut _rx) = SipSession::with_handle(SessionId::from("sess-att"));
+    handle.update_snapshot(SessionSnapshot {
+        id: SessionId::from("sess-att"),
+        state: SessionState::Active,
+        leg_count: 2,
+        bridge_active: true,
+        media_path: MediaPathMode::Anchored,
+        answer_sdp: None,
+        callee_dialogs: Vec::new(),
+        pending_consult_leg_id: Some("consult-abc-123".to_string()),
+    });
+    registry.upsert(
+        make_entry(
+            "sess-att",
+            ActiveProxyCallStatus::Talking,
+            "+1",
+            "+2",
+            "outbound",
+        ),
+        handle,
+    );
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/calls/sess-att/transfer")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Content-Type", "application/json")
+                .body(Body::from(
+                    r#"{"type":"attended","target":"sip:1001@x"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp.into_body()).await;
+    assert_eq!(body["message"], "dispatched");
+    assert_eq!(body["consult_leg_id"], "consult-abc-123");
+}
+
+#[tokio::test]
+async fn transfer_invalid_target_returns_400() {
+    let (state, token) = test_state_with_api_key("xfer-bad-target").await;
+    let (_handle, _rx) = seed_active_call(&state, "sess-bad", true);
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/calls/sess-bad/transfer")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"type":"blind","target":"not-a-uri"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp.into_body()).await;
+    assert_eq!(body["code"], "bad_request");
+    assert!(body["error"].as_str().unwrap().contains("target"));
+}
+
+#[tokio::test]
+async fn transfer_complete_dispatches() {
+    let (state, token) = test_state_with_api_key("xfer-complete").await;
+    let (_handle, mut rx) = seed_active_call(&state, "sess-complete", true);
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/calls/sess-complete/transfer/complete")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"consult_leg":"consult-xyz"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let cmd = rx.try_recv().unwrap();
+    if let CallCommand::TransferComplete { consult_leg } = cmd {
+        assert_eq!(consult_leg.as_str(), "consult-xyz");
+    } else {
+        panic!("expected TransferComplete, got {:?}", cmd);
+    }
+}
+
+#[tokio::test]
+async fn transfer_cancel_dispatches_and_unknown_call_is_404() {
+    let (state, token) = test_state_with_api_key("xfer-cancel").await;
+    let (_handle, mut rx) = seed_active_call(&state, "sess-cancel", true);
+
+    // Happy cancel.
+    let app = rustpbx::app::create_router(state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/calls/sess-cancel/transfer/cancel")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"consult_leg":"cc-1"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cmd = rx.try_recv().unwrap();
+    assert!(matches!(cmd, CallCommand::TransferCancel { .. }));
+
+    // Unknown call returns 404.
+    let app2 = rustpbx::app::create_router(state);
+    let resp2 = app2
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/calls/does-not-exist/transfer/cancel")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"consult_leg":"anything"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::NOT_FOUND);
+}
