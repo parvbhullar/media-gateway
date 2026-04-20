@@ -280,6 +280,7 @@ async fn get_active_call_by_id_returns_rich_view() {
         media_path: MediaPathMode::Anchored,
         answer_sdp: None,
         callee_dialogs: Vec::new(),
+        pending_consult_leg_id: None,
     });
     registry.upsert(
         make_entry(
@@ -359,6 +360,7 @@ fn seed_active_call(
             media_path: MediaPathMode::Anchored,
             answer_sdp: None,
             callee_dialogs: Vec::new(),
+            pending_consult_leg_id: None,
         });
     }
     registry.upsert(

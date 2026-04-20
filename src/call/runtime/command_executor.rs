@@ -18,6 +18,14 @@ pub struct CommandResult {
     pub media_degraded: bool,
     /// Degradation reason (if media was degraded)
     pub degradation_reason: Option<String>,
+    /// Optional structured payload returned alongside success (e.g.,
+    /// `consult_leg_id` for attended transfers). Defaults to `None`.
+    ///
+    /// Extension point for Plan 04-03 attended-transfer response path: the
+    /// api_v1 handler reads the payload value and merges it into the HTTP
+    /// response via `map_command_result(..., extra)`.
+    #[serde(default)]
+    pub payload: Option<serde_json::Value>,
 }
 
 impl CommandResult {
@@ -29,6 +37,7 @@ impl CommandResult {
             affected_leg: None,
             media_degraded: false,
             degradation_reason: None,
+            payload: None,
         }
     }
 
@@ -40,6 +49,22 @@ impl CommandResult {
             affected_leg: Some(leg),
             media_degraded: false,
             degradation_reason: None,
+            payload: None,
+        }
+    }
+
+    /// Create a successful result with a structured payload.
+    ///
+    /// Used by Plan 04-03 attended-transfer response path — the api_v1
+    /// handler reads the payload value and merges it into the HTTP response.
+    pub fn success_with_payload(payload: serde_json::Value) -> Self {
+        Self {
+            success: true,
+            message: None,
+            affected_leg: None,
+            media_degraded: false,
+            degradation_reason: None,
+            payload: Some(payload),
         }
     }
 
@@ -51,6 +76,7 @@ impl CommandResult {
             affected_leg: None,
             media_degraded: false,
             degradation_reason: None,
+            payload: None,
         }
     }
 
@@ -62,6 +88,7 @@ impl CommandResult {
             affected_leg: None,
             media_degraded: true,
             degradation_reason: Some(reason.into()),
+            payload: None,
         }
     }
 
@@ -73,7 +100,14 @@ impl CommandResult {
             affected_leg: None,
             media_degraded: false,
             degradation_reason: None,
+            payload: None,
         }
+    }
+}
+
+impl Default for CommandResult {
+    fn default() -> Self {
+        Self::success()
     }
 }
 

@@ -21,6 +21,18 @@ pub struct SessionSnapshot {
     pub answer_sdp: Option<String>,
     #[serde(skip)]
     pub callee_dialogs: Vec<DialogId>,
+    /// Post-dispatch attended transfer consult-leg id. Stamped by the
+    /// session's `CallCommand::Transfer { attended: true }` handler BEFORE
+    /// the SIP REFER lands. Read by `src/handler/api_v1/calls.rs` to
+    /// populate the attended-transfer response body. `None` in all other
+    /// states.
+    ///
+    /// INVARIANT (Plan 04-03, D-20): the session-layer attended-transfer
+    /// handler MUST call `update_snapshot` with this field populated before
+    /// returning success so the api_v1 handler's post-dispatch read can
+    /// observe the consult leg id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_consult_leg_id: Option<String>,
 }
 use crate::call::domain::SessionPolicy;
 use crate::call::sip::{ClientDialogGuard, ServerDialogGuard};
@@ -534,6 +546,13 @@ impl SipSession {
             media_path: self.media_profile.path,
             answer_sdp: self.answer.clone(),
             callee_dialogs,
+            // Plan 04-03 D-20 invariant: session-layer attended-transfer
+            // handler is responsible for stamping this field via
+            // `update_snapshot` before the REFER lands. The default
+            // snapshot refresh clears it — this is correct because
+            // pending_consult_leg_id is a point-in-time handshake value,
+            // not a session-durable field.
+            pending_consult_leg_id: None,
         };
 
         *self.snapshot_cache.write() = Some(snapshot);
