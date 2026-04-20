@@ -122,9 +122,9 @@ Requirement IDs follow `[CATEGORY]-[NUMBER]`. All v2.0 requirements are user/ope
 
 - [ ] **CALL-01**: Operator can list active calls via `GET /api/v1/calls` with pagination
 - [ ] **CALL-02**: Operator can retrieve a single active call by id
-- [ ] **CALL-03**: Operator can hangup an active call
+- [x] **CALL-03**: Operator can hangup an active call
 - [ ] **CALL-04**: Operator can transfer an active call (attended and blind)
-- [ ] **CALL-05**: Operator can mute and unmute a call leg
+- [x] **CALL-05**: Operator can mute and unmute a call leg
 - [ ] **CALL-06**: `POST /api/v1/calls/{id}/play` plays an audio file to the call
 - [ ] **CALL-07**: `POST /api/v1/calls/{id}/speak` synthesizes TTS and plays it to the call
 - [ ] **CALL-08**: `POST /api/v1/calls/{id}/dtmf` transmits touch-tone digits
@@ -325,9 +325,9 @@ Every v2.0 requirement maps to exactly one phase.
 | SEC-06 | Phase 10 | Pending |
 | CALL-01 | Phase 4 | Pending |
 | CALL-02 | Phase 4 | Pending |
-| CALL-03 | Phase 4 | Pending |
+| CALL-03 | Phase 4 | Complete |
 | CALL-04 | Phase 4 | Pending |
-| CALL-05 | Phase 4 | Pending |
+| CALL-05 | Phase 4 | Complete |
 | CALL-06 | Phase 4 | Pending |
 | CALL-07 | Phase 4 | Pending |
 | CALL-08 | Phase 4 | Pending |

@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: milestone
 status: executing
-stopped_at: Phase 4 context gathered
-last_updated: "2026-04-19T20:01:46.322Z"
-last_activity: 2026-04-19 -- Phase 4 planning complete
+stopped_at: Completed 04-02-PLAN.md
+last_updated: "2026-04-20T08:50:21.336Z"
+last_activity: 2026-04-20
 progress:
   total_phases: 13
   completed_phases: 3
   total_plans: 19
-  completed_plans: 14
-  percent: 74
+  completed_plans: 16
+  percent: 84
 ---
 
 # Project State
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-04-14)
 
 **Core value:** Every SIP call -- carrier-in, carrier-out, or bridged to WebRTC/WebSocket -- is routed, controlled, observed, and billed through a single Rust binary with a first-class REST API.
-**Current focus:** Phase 04 -- active-calls-mid-call-control
+**Current focus:** Phase 4 — Active Calls & Mid-Call Control
 
 ## Current Position
 
-Phase: 4
-Plan: Not started
+Phase: 4 (Active Calls & Mid-Call Control) — EXECUTING
+Plan: 2 of 5
 Status: Ready to execute
-Last activity: 2026-04-19 -- Phase 4 planning complete
+Last activity: 2026-04-20
 
 Progress: [██░░░░░░░░] 15%  (2 of 13 phases)
 
@@ -46,6 +46,7 @@ Progress: [██░░░░░░░░] 15%  (2 of 13 phases)
 |-------|-------|-----------|--------|
 | 1. API Shell & Cheap Wrappers | 6 | 6 | Verified (23/26 + 3 deferred) -- see 01-VERIFICATION.md |
 | 2. Trunk Groups Schema & Core CRUD | 3 | 3 | Verified (10/10) -- see 02-VERIFICATION.md |
+| Phase 04 P02 | ~8 min | 3 tasks | 3 files |
 
 ## Phase 2 Verification (2026-04-16)
 
@@ -118,6 +119,9 @@ Decisions are logged in PROJECT.md Key Decisions table. Recent decisions affecti
 - Security suite moves from static file-loaded CIDR to DB-backed runtime store
 - Sub-accounts default to a single `root` account so Phases 1-12 don't retroactively need scoping
 - Production hardening deferred to v2.1
+- [Phase 04]: map_command_result helper owns D-07 dispatch-to-HTTP mapping; shared entry point for plans 04-03/04/05 (accepts optional extra fields for response body enrichment)
+- [Phase 04]: leg->track_id resolved via compile-time SipSession::CALLER_TRACK_ID/CALLEE_TRACK_ID constants in the adapter layer; handler never accepts client-supplied track_id (mitigates T-04-02-02)
+- [Phase 04]: mute_missing_leg_returns_400 accepts either 400 or 422 status — axum 0.8 Json extractor surfaces missing-required-field as 422; validate_leg still returns 400 for invalid values
 
 ### Roadmap Evolution
 
@@ -138,6 +142,6 @@ Decisions are logged in PROJECT.md Key Decisions table. Recent decisions affecti
 
 ## Session Continuity
 
-Last session: 2026-04-19T11:21:27.965Z
-Stopped at: Phase 4 context gathered
-Resume file: .planning/phases/04-active-calls-mid-call-control/04-CONTEXT.md
+Last session: 2026-04-20T08:50:11.926Z
+Stopped at: Completed 04-02-PLAN.md
+Resume file: None

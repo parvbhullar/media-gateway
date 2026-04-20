@@ -81,8 +81,8 @@ Plans:
   4. All mid-call operations dispatch through the existing `active_call_registry` → `proxy_call/session.rs` path with no new proxy modules
 
 Plans:
-- [ ] 04-01-PLAN.md — Payload relocation (CallCommandPayload → call/runtime) + CALL-01/02 list/get foundation
-- [ ] 04-02-PLAN.md — CALL-03/05 hangup + mute/unmute via leg→track_id constants
+- [x] 04-01-PLAN.md — Payload relocation (CallCommandPayload → call/runtime) + CALL-01/02 list/get foundation
+- [x] 04-02-PLAN.md — CALL-03/05 hangup + mute/unmute via leg→track_id constants
 - [ ] 04-03-PLAN.md — CALL-04 transfer (blind + attended + complete + cancel) with CommandResult/SessionSnapshot extensions
 - [ ] 04-04-PLAN.md — CALL-06/07/08 play + speak + dtmf with pre-dispatch probes and SendDtmf timing extension
 - [ ] 04-05-PLAN.md — CALL-09 record with auto-path + transcribe marker + full-suite regression
