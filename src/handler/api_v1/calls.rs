@@ -114,6 +114,40 @@ pub struct LegRequest {
     pub leg: String,
 }
 
+// ── Phase 4 Plan 04-03 — transfer request bodies (D-19, D-20) ───────────
+
+/// Body for `POST /api/v1/calls/{id}/transfer`. Tagged enum per D-19:
+///
+/// ```json
+/// {"type": "blind",    "target": "sip:1001@x.com"}          // leg defaults to callee
+/// {"type": "attended", "target": "+14155551234", "leg": "caller"}
+/// ```
+///
+/// `leg` is a `String` (not `Leg`) so the handler validates via
+/// `validate_leg` and returns the branded `ApiError::bad_request` shape on
+/// invalid values rather than serde's default rejection envelope.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
+pub enum TransferRequest {
+    Blind {
+        target: String,
+        #[serde(default)]
+        leg: Option<String>,
+    },
+    Attended {
+        target: String,
+        #[serde(default)]
+        leg: Option<String>,
+    },
+}
+
+/// Body for `POST /api/v1/calls/{id}/transfer/{complete,cancel}`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsultLegRequest {
+    pub consult_leg: String,
+}
+
 // ── Router ───────────────────────────────────────────────────────────────
 
 pub fn router() -> Router<AppState> {
@@ -124,6 +158,10 @@ pub fn router() -> Router<AppState> {
         .route("/calls/{id}/hangup", post(hangup_call))
         .route("/calls/{id}/mute", post(mute_call))
         .route("/calls/{id}/unmute", post(unmute_call))
+        // Phase 4 Plan 04-03 — CALL-04, CALL-10
+        .route("/calls/{id}/transfer", post(transfer_call))
+        .route("/calls/{id}/transfer/complete", post(transfer_complete))
+        .route("/calls/{id}/transfer/cancel", post(transfer_cancel))
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -225,6 +263,53 @@ fn require_session(
     registry
         .get_handle(session_id)
         .ok_or_else(|| ApiError::not_found(format!("active call '{}' not found", session_id)))
+}
+
+/// Normalize a transfer target to a validated SIP URI string (Plan 04-03,
+/// D-22).
+///
+/// Accepts:
+/// - A SIP URI (`sip:...` or `sips:...`) — validated via
+///   `rsipstack::sip::Uri::try_from` and passed through unchanged.
+/// - A bare E.164 number (`+14155551234`) — normalized to
+///   `sip:<number>@<external_ip>` where `external_ip` defaults to
+///   `"127.0.0.1"` when `Config::external_ip` is `None`. Production
+///   deployments MUST set `external_ip` so transfers reach the right host.
+///
+/// Everything else → 400 `bad_request`. This mirrors the validation in
+/// `transfer_to_uri` (`src/proxy/proxy_call/session.rs:2410`) so invalid
+/// URIs are rejected at the API boundary rather than blowing up at REFER
+/// time with an opaque 500.
+fn parse_target(raw: &str, external_ip: Option<&str>) -> ApiResult<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(ApiError::bad_request("empty target"));
+    }
+    if raw.starts_with("sip:") || raw.starts_with("sips:") {
+        rsipstack::sip::Uri::try_from(raw).map_err(|e| {
+            ApiError::bad_request(format!("invalid target URI '{}': {:?}", raw, e))
+        })?;
+        return Ok(raw.to_string());
+    }
+    // Bare E.164: '+' prefix + all-digit body.
+    if raw.starts_with('+')
+        && raw.len() > 1
+        && raw[1..].chars().all(|c| c.is_ascii_digit())
+    {
+        let host = external_ip.unwrap_or("127.0.0.1");
+        let uri = format!("sip:{}@{}", raw, host);
+        rsipstack::sip::Uri::try_from(uri.as_str()).map_err(|e| {
+            ApiError::bad_request(format!(
+                "invalid external_ip configuration '{}': {:?}",
+                host, e
+            ))
+        })?;
+        return Ok(uri);
+    }
+    Err(ApiError::bad_request(format!(
+        "invalid target '{}': expected SIP URI (sip:/sips:) or E.164 (+...)",
+        raw
+    )))
 }
 
 /// Map `dispatch_console_command`'s `Result<CommandResult>` to an HTTP
@@ -421,6 +506,99 @@ async fn unmute_call(
     map_command_result(dispatch_console_command(&registry, &id, payload), None)
 }
 
+// ── Phase 4 Plan 04-03 — transfer handlers (CALL-04, CALL-10) ────────────
+//
+// All three routes dispatch through `dispatch_console_command` verbatim so
+// CALL-10's "existing dispatch path" property holds by construction. Target
+// normalization happens in `parse_target` before dispatch (D-22). Attended
+// transfers read `pending_consult_leg_id` from the handle's snapshot
+// post-dispatch and surface it via `map_command_result`'s `extra`
+// parameter — the session-layer attended-transfer handler owns stamping
+// the snapshot field BEFORE returning per D-20.
+
+async fn transfer_call(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<TransferRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let registry = state.sip_server().inner.active_call_registry.clone();
+    let handle = require_session(&registry, &id)?;
+    let external_ip = state.config().external_ip.as_deref();
+
+    let (target_raw, leg_raw, attended) = match req {
+        TransferRequest::Blind { target, leg } => (target, leg, false),
+        TransferRequest::Attended { target, leg } => (target, leg, true),
+    };
+
+    let target = parse_target(&target_raw, external_ip)?;
+    let leg = leg_raw
+        .as_deref()
+        .map(validate_leg)
+        .transpose()?
+        // D-21: default leg = callee when omitted.
+        .unwrap_or(Leg::Callee);
+
+    let payload = if attended {
+        CallCommandPayload::AttendedTransferStart {
+            target,
+            leg: Some(leg),
+        }
+    } else {
+        CallCommandPayload::BlindTransfer {
+            target,
+            leg: Some(leg),
+        }
+    };
+
+    let dispatch_result = dispatch_console_command(&registry, &id, payload);
+
+    // For attended transfers, read the snapshot post-dispatch and surface
+    // `pending_consult_leg_id` in the response body. Best-effort per
+    // threat register T-04-03-05: if the SIP session hasn't stamped the
+    // snapshot yet, the client sees a 200 without `consult_leg_id` and
+    // can retry or fall back to hangup-webhook-driven tracking.
+    let extra = if attended {
+        handle
+            .snapshot()
+            .and_then(|s| s.pending_consult_leg_id)
+            .map(|consult| json!({ "consult_leg_id": consult }))
+    } else {
+        None
+    };
+
+    map_command_result(dispatch_result, extra)
+}
+
+async fn transfer_complete(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<ConsultLegRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let registry = state.sip_server().inner.active_call_registry.clone();
+    // 404 pre-check per D-08.
+    let _ = require_session(&registry, &id)?;
+
+    let payload = CallCommandPayload::AttendedTransferComplete {
+        consult_leg: req.consult_leg,
+    };
+    map_command_result(dispatch_console_command(&registry, &id, payload), None)
+}
+
+async fn transfer_cancel(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<ConsultLegRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let registry = state.sip_server().inner.active_call_registry.clone();
+    // 404 pre-check per D-08.
+    let _ = require_session(&registry, &id)?;
+
+    let payload = CallCommandPayload::AttendedTransferCancel {
+        consult_leg: req.consult_leg,
+    };
+    map_command_result(dispatch_console_command(&registry, &id, payload), None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,5 +697,47 @@ mod tests {
         let res = map_command_result(Ok(CommandResult::success()), Some(extra)).unwrap();
         assert_eq!(res.0["message"], "dispatched");
         assert_eq!(res.0["consult_leg_id"], "leg-consult-42");
+    }
+
+    // ── Phase 4 Plan 04-03 — parse_target (D-22) ──────────────────────────
+
+    #[test]
+    fn parse_target_sip_uri_passes_through() {
+        let out = parse_target("sip:1001@example.com", None).unwrap();
+        assert_eq!(out, "sip:1001@example.com");
+    }
+
+    #[test]
+    fn parse_target_sips_uri_passes_through() {
+        let out = parse_target("sips:alice@secure.example.com", None).unwrap();
+        assert_eq!(out, "sips:alice@secure.example.com");
+    }
+
+    #[test]
+    fn parse_target_e164_with_external_ip() {
+        let out = parse_target("+14155551234", Some("1.2.3.4")).unwrap();
+        assert_eq!(out, "sip:+14155551234@1.2.3.4");
+    }
+
+    #[test]
+    fn parse_target_e164_without_external_ip_uses_localhost() {
+        let out = parse_target("+14155551234", None).unwrap();
+        assert_eq!(out, "sip:+14155551234@127.0.0.1");
+    }
+
+    #[test]
+    fn parse_target_rejects_plain_number() {
+        assert!(parse_target("4155551234", None).is_err());
+    }
+
+    #[test]
+    fn parse_target_rejects_empty() {
+        assert!(parse_target("", None).is_err());
+        assert!(parse_target("   ", None).is_err());
+    }
+
+    #[test]
+    fn parse_target_rejects_garbage() {
+        assert!(parse_target("not-a-uri-or-e164", None).is_err());
     }
 }
