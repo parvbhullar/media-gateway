@@ -20,7 +20,7 @@
 use crate::call::adapters::{console_to_call_command, rwi_to_call_command};
 use crate::call::domain::CallCommand;
 use crate::call::runtime::{CommandResult, ExecutionContext, MediaCapabilityCheck, CommandSource};
-use crate::console::handlers::call_control::CallCommandPayload;
+use crate::call::runtime::command_payload::CallCommandPayload;
 use crate::proxy::active_call_registry::ActiveProxyCallRegistry;
 use crate::rwi::session::RwiCommandPayload;
 use std::sync::Arc;

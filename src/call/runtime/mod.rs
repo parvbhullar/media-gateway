@@ -38,6 +38,7 @@
 mod app_runtime;
 mod command_dispatch;
 mod command_executor;
+pub mod command_payload;       // Phase 4 Plan 04-01 — D-10
 mod conference_manager;
 mod default_app_runtime;
 mod queue_manager;
@@ -54,6 +55,7 @@ mod integration_tests;
 pub use app_runtime::*;
 pub use command_dispatch::*;
 pub use command_executor::*;
+pub use command_payload::*;    // CallCommandPayload, Leg, PlaySource, ApiPlayOptions
 pub use conference_manager::*;
 pub use default_app_runtime::*;
 pub use queue_manager::*;

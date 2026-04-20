@@ -3,7 +3,7 @@
 //! Converts `CallCommandPayload` (from HTTP API) to unified `CallCommand`.
 
 use crate::call::domain::*;
-use crate::console::handlers::call_control::CallCommandPayload;
+use crate::call::runtime::command_payload::CallCommandPayload;
 use crate::callrecord::CallRecordHangupReason;
 use anyhow::Result;
 
@@ -69,6 +69,41 @@ pub fn console_to_call_command(
         CallCommandPayload::Mute { track_id } => Ok(CallCommand::MuteTrack { track_id }),
 
         CallCommandPayload::Unmute { track_id } => Ok(CallCommand::UnmuteTrack { track_id }),
+
+        // ── Phase 4 API variants — filled in by later plans ─────────────
+        CallCommandPayload::BlindTransfer { .. } => {
+            Err(anyhow::anyhow!("BlindTransfer not yet wired; see plan 04-03"))
+        }
+        CallCommandPayload::AttendedTransferStart { .. } => {
+            Err(anyhow::anyhow!("AttendedTransferStart not yet wired; see plan 04-03"))
+        }
+        CallCommandPayload::AttendedTransferComplete { .. } => {
+            Err(anyhow::anyhow!("AttendedTransferComplete not yet wired; see plan 04-03"))
+        }
+        CallCommandPayload::AttendedTransferCancel { .. } => {
+            Err(anyhow::anyhow!("AttendedTransferCancel not yet wired; see plan 04-03"))
+        }
+        CallCommandPayload::ApiMute { .. } => {
+            Err(anyhow::anyhow!("ApiMute not yet wired; see plan 04-02"))
+        }
+        CallCommandPayload::ApiUnmute { .. } => {
+            Err(anyhow::anyhow!("ApiUnmute not yet wired; see plan 04-02"))
+        }
+        CallCommandPayload::Play { .. } => {
+            Err(anyhow::anyhow!("Play not yet wired; see plan 04-04"))
+        }
+        CallCommandPayload::Speak { .. } => {
+            Err(anyhow::anyhow!("Speak not yet wired; see plan 04-04"))
+        }
+        CallCommandPayload::Dtmf { .. } => {
+            Err(anyhow::anyhow!("Dtmf not yet wired; see plan 04-04"))
+        }
+        CallCommandPayload::Record { .. } => {
+            Err(anyhow::anyhow!("Record not yet wired; see plan 04-05"))
+        }
+        CallCommandPayload::ApiHangup { .. } => {
+            Err(anyhow::anyhow!("ApiHangup not yet wired; see plan 04-02"))
+        }
     }
 }
 

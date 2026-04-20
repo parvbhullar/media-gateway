@@ -10,6 +10,11 @@ use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 
+// Re-export so `crate::console::handlers::call_control::CallCommandPayload`
+// continues to resolve. The canonical home is
+// `crate::call::runtime::command_payload` per Phase 4 Plan 04-01 (D-10).
+pub use crate::call::runtime::command_payload::CallCommandPayload;
+
 const DEFAULT_ACTIVE_CALL_LIMIT: usize = 50;
 const MAX_ACTIVE_CALL_LIMIT: usize = 500;
 
@@ -27,30 +32,6 @@ pub fn urls() -> Router<Arc<ConsoleState>> {
 pub struct ActiveCallListQuery {
     #[serde(default)]
     limit: Option<usize>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case")]
-pub enum CallCommandPayload {
-    Hangup {
-        reason: Option<String>,
-        code: Option<u16>,
-        initiator: Option<String>,
-    },
-    #[serde(alias = "accept")]
-    Accept {
-        callee: Option<String>,
-        sdp: Option<String>,
-    },
-    Transfer {
-        target: String,
-    },
-    Mute {
-        track_id: String,
-    },
-    Unmute {
-        track_id: String,
-    },
 }
 
 pub async fn list_active_calls(
