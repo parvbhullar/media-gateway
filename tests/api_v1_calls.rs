@@ -6,7 +6,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
 use chrono::{DateTime, Duration, Utc};
 use common::{test_state_empty, test_state_with_api_key};
-use rustpbx::call::domain::{MediaPathMode, SessionState};
+use rustpbx::call::domain::{CallCommand, MediaPathMode, SessionState};
 use rustpbx::call::runtime::SessionId;
 use rustpbx::proxy::active_call_registry::{ActiveProxyCallEntry, ActiveProxyCallStatus};
 use rustpbx::proxy::proxy_call::sip_session::{SessionSnapshot, SipSession, SipSessionHandle};
@@ -330,4 +330,307 @@ async fn get_active_call_unknown_returns_404() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     let body = body_json(resp.into_body()).await;
     assert_eq!(body["code"], "not_found");
+}
+
+// ── Plan 04-02 — hangup / mute / unmute tests ────────────────────────────
+//
+// These tests exercise the full IT-01 matrix for CALL-03 and CALL-05:
+// auth (401), happy dispatch (200) with wire-level CallCommand assertion,
+// 404 on unknown session, 400 on bad body, 409 when media tracks aren't
+// established, 409 when the command mpsc is closed.
+
+/// Seed a session into the registry and optionally stamp a 2-leg snapshot.
+///
+/// Returns the handle (so callers can later update the snapshot) and the
+/// cmd_rx so the test can assert the exact CallCommand that lands.
+fn seed_active_call(
+    state: &rustpbx::app::AppState,
+    session_id: &str,
+    with_snapshot: bool,
+) -> (SipSessionHandle, mpsc::UnboundedReceiver<CallCommand>) {
+    let registry = state.sip_server().inner.active_call_registry.clone();
+    let (handle, rx) = SipSession::with_handle(SessionId::from(session_id));
+    if with_snapshot {
+        handle.update_snapshot(SessionSnapshot {
+            id: SessionId::from(session_id),
+            state: SessionState::Active,
+            leg_count: 2,
+            bridge_active: true,
+            media_path: MediaPathMode::Anchored,
+            answer_sdp: None,
+            callee_dialogs: Vec::new(),
+        });
+    }
+    registry.upsert(
+        make_entry(
+            session_id,
+            ActiveProxyCallStatus::Talking,
+            "+1",
+            "+2",
+            "outbound",
+        ),
+        handle.clone(),
+    );
+    (handle, rx)
+}
+
+// ── Hangup ───────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn hangup_requires_auth() {
+    let state = test_state_empty().await;
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/calls/any/hangup")
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 401);
+}
+
+#[tokio::test]
+async fn hangup_dispatches_via_registry() {
+    let (state, token) = test_state_with_api_key("hangup-happy").await;
+    let (_handle, mut rx) = seed_active_call(&state, "sess-hangup", true);
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/calls/sess-hangup/hangup")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"reason":"by_caller","code":200}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp.into_body()).await;
+    assert_eq!(body["message"], "dispatched");
+
+    let cmd = rx
+        .try_recv()
+        .expect("Hangup command should have been dispatched");
+    assert!(matches!(cmd, CallCommand::Hangup(_)));
+}
+
+#[tokio::test]
+async fn hangup_unknown_session_returns_404() {
+    let (state, token) = test_state_with_api_key("hangup-404").await;
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/calls/nope/hangup")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = body_json(resp.into_body()).await;
+    assert_eq!(body["code"], "not_found");
+}
+
+#[tokio::test]
+async fn hangup_dropped_rx_returns_409() {
+    let (state, token) = test_state_with_api_key("hangup-409").await;
+    let (_handle, rx) = seed_active_call(&state, "sess-dropped", true);
+    // Drop the receiver — next send_command returns "channel closed".
+    drop(rx);
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/calls/sess-dropped/hangup")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = body_json(resp.into_body()).await;
+    assert_eq!(body["code"], "conflict");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("command dispatch failed")
+    );
+}
+
+// ── Mute ─────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn mute_requires_auth() {
+    let state = test_state_empty().await;
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/calls/any/mute")
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"leg":"caller"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 401);
+}
+
+#[tokio::test]
+async fn mute_happy_dispatches_caller_track() {
+    let (state, token) = test_state_with_api_key("mute-happy").await;
+    let (_handle, mut rx) = seed_active_call(&state, "sess-mute", true);
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/calls/sess-mute/mute")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"leg":"caller"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let cmd = rx
+        .try_recv()
+        .expect("MuteTrack should have been dispatched");
+    if let CallCommand::MuteTrack { track_id } = cmd {
+        assert_eq!(track_id, "caller-track");
+    } else {
+        panic!("expected MuteTrack, got {:?}", cmd);
+    }
+}
+
+#[tokio::test]
+async fn mute_missing_leg_returns_400() {
+    let (state, token) = test_state_with_api_key("mute-400-missing").await;
+    let (_handle, _rx) = seed_active_call(&state, "sess-x", true);
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/calls/sess-x/mute")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // Axum 0.8 returns 422 Unprocessable Entity for valid-JSON-but-missing-
+    // required-field; older versions returned 400. Either way it's a client
+    // error — accept the 4xx as the invariant (the exact status varies by
+    // axum version; what matters is the request is rejected).
+    let s = resp.status().as_u16();
+    assert!(
+        s == 400 || s == 422,
+        "expected 4xx rejection for missing 'leg', got {}",
+        s
+    );
+}
+
+#[tokio::test]
+async fn mute_invalid_leg_returns_400() {
+    let (state, token) = test_state_with_api_key("mute-400-invalid").await;
+    let (_handle, _rx) = seed_active_call(&state, "sess-y", true);
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/calls/sess-y/mute")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"leg":"both"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp.into_body()).await;
+    assert_eq!(body["code"], "bad_request");
+    assert!(body["error"].as_str().unwrap().contains("invalid leg"));
+}
+
+#[tokio::test]
+async fn mute_without_media_tracks_returns_409() {
+    let (state, token) = test_state_with_api_key("mute-409").await;
+    // with_snapshot=false → handle.snapshot() is None → 409.
+    let (_handle, _rx) = seed_active_call(&state, "sess-no-media", false);
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/calls/sess-no-media/mute")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"leg":"caller"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = body_json(resp.into_body()).await;
+    assert_eq!(body["code"], "conflict");
+    assert!(body["error"].as_str().unwrap().contains("media tracks"));
+}
+
+// ── Unmute ───────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn unmute_happy_dispatches_callee_track() {
+    let (state, token) = test_state_with_api_key("unmute-happy").await;
+    let (_handle, mut rx) = seed_active_call(&state, "sess-unmute", true);
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/calls/sess-unmute/unmute")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"leg":"callee"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let cmd = rx
+        .try_recv()
+        .expect("UnmuteTrack should have been dispatched");
+    if let CallCommand::UnmuteTrack { track_id } = cmd {
+        assert_eq!(track_id, "callee-track");
+    } else {
+        panic!("expected UnmuteTrack, got {:?}", cmd);
+    }
 }
