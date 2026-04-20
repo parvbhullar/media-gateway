@@ -17,7 +17,7 @@ pub(crate) mod media_peer;
 pub(crate) mod reporter;
 pub(crate) mod session_timer;
 pub(crate) mod state;
-pub(crate) mod sip_session;
+pub mod sip_session;  // Phase 4 Plan 04-01: widened so integration tests can construct SipSession::with_handle + SessionSnapshot fixtures.
 
 #[cfg(test)]
 pub(crate) mod test_util;
