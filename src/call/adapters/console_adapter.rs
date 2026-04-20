@@ -72,17 +72,35 @@ pub fn console_to_call_command(
         CallCommandPayload::Unmute { track_id } => Ok(CallCommand::UnmuteTrack { track_id }),
 
         // ── Phase 4 API variants — filled in by later plans ─────────────
-        CallCommandPayload::BlindTransfer { .. } => {
-            Err(anyhow::anyhow!("BlindTransfer not yet wired; see plan 04-03"))
+        CallCommandPayload::BlindTransfer { target, leg } => {
+            // `leg` accepted for forward-compat per D-21 (default=callee);
+            // SIP session-layer picks the leg from its dialog state today.
+            let _ = leg;
+            Ok(CallCommand::Transfer {
+                leg_id: LegId::new(session_id),
+                target,
+                attended: false,
+            })
         }
-        CallCommandPayload::AttendedTransferStart { .. } => {
-            Err(anyhow::anyhow!("AttendedTransferStart not yet wired; see plan 04-03"))
+        CallCommandPayload::AttendedTransferStart { target, leg } => {
+            // `leg` accepted for forward-compat per D-21 (default=callee);
+            // SIP session-layer picks the leg from its dialog state today.
+            let _ = leg;
+            Ok(CallCommand::Transfer {
+                leg_id: LegId::new(session_id),
+                target,
+                attended: true,
+            })
         }
-        CallCommandPayload::AttendedTransferComplete { .. } => {
-            Err(anyhow::anyhow!("AttendedTransferComplete not yet wired; see plan 04-03"))
+        CallCommandPayload::AttendedTransferComplete { consult_leg } => {
+            Ok(CallCommand::TransferComplete {
+                consult_leg: LegId::new(consult_leg),
+            })
         }
-        CallCommandPayload::AttendedTransferCancel { .. } => {
-            Err(anyhow::anyhow!("AttendedTransferCancel not yet wired; see plan 04-03"))
+        CallCommandPayload::AttendedTransferCancel { consult_leg } => {
+            Ok(CallCommand::TransferCancel {
+                consult_leg: LegId::new(consult_leg),
+            })
         }
         CallCommandPayload::ApiMute { leg } => {
             let track_id = match leg {
@@ -238,5 +256,70 @@ mod tests {
         };
         let cmd = console_to_call_command(payload, "sess-x").unwrap();
         assert!(matches!(cmd, CallCommand::Hangup(_)));
+    }
+
+    // ── Phase 4 Plan 04-03 — Blind / Attended Transfer* ──────────────────
+
+    #[test]
+    fn test_blind_transfer_conversion() {
+        let payload = CallCommandPayload::BlindTransfer {
+            target: "sip:1001@example.com".to_string(),
+            leg: Some(Leg::Callee),
+        };
+        let cmd = console_to_call_command(payload, "sess-xfer").unwrap();
+        if let CallCommand::Transfer {
+            leg_id,
+            target,
+            attended,
+        } = cmd
+        {
+            assert_eq!(leg_id.as_str(), "sess-xfer");
+            assert_eq!(target, "sip:1001@example.com");
+            assert!(!attended);
+        } else {
+            panic!("expected Transfer");
+        }
+    }
+
+    #[test]
+    fn test_attended_transfer_start_conversion() {
+        let payload = CallCommandPayload::AttendedTransferStart {
+            target: "sip:1001@example.com".to_string(),
+            leg: None,
+        };
+        let cmd = console_to_call_command(payload, "sess-att").unwrap();
+        assert!(matches!(
+            cmd,
+            CallCommand::Transfer {
+                attended: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_attended_transfer_complete_conversion() {
+        let payload = CallCommandPayload::AttendedTransferComplete {
+            consult_leg: "consult-123".to_string(),
+        };
+        let cmd = console_to_call_command(payload, "sess-att").unwrap();
+        if let CallCommand::TransferComplete { consult_leg } = cmd {
+            assert_eq!(consult_leg.as_str(), "consult-123");
+        } else {
+            panic!("expected TransferComplete");
+        }
+    }
+
+    #[test]
+    fn test_attended_transfer_cancel_conversion() {
+        let payload = CallCommandPayload::AttendedTransferCancel {
+            consult_leg: "consult-xyz".to_string(),
+        };
+        let cmd = console_to_call_command(payload, "sess-att").unwrap();
+        if let CallCommand::TransferCancel { consult_leg } = cmd {
+            assert_eq!(consult_leg.as_str(), "consult-xyz");
+        } else {
+            panic!("expected TransferCancel");
+        }
     }
 }
