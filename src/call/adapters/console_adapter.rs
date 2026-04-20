@@ -3,8 +3,9 @@
 //! Converts `CallCommandPayload` (from HTTP API) to unified `CallCommand`.
 
 use crate::call::domain::*;
-use crate::call::runtime::command_payload::CallCommandPayload;
+use crate::call::runtime::command_payload::{CallCommandPayload, Leg};
 use crate::callrecord::CallRecordHangupReason;
+use crate::proxy::proxy_call::sip_session::SipSession;
 use anyhow::Result;
 
 /// Convert hangup reason string to CallRecordHangupReason
@@ -83,11 +84,19 @@ pub fn console_to_call_command(
         CallCommandPayload::AttendedTransferCancel { .. } => {
             Err(anyhow::anyhow!("AttendedTransferCancel not yet wired; see plan 04-03"))
         }
-        CallCommandPayload::ApiMute { .. } => {
-            Err(anyhow::anyhow!("ApiMute not yet wired; see plan 04-02"))
+        CallCommandPayload::ApiMute { leg } => {
+            let track_id = match leg {
+                Leg::Caller => SipSession::CALLER_TRACK_ID.to_string(),
+                Leg::Callee => SipSession::CALLEE_TRACK_ID.to_string(),
+            };
+            Ok(CallCommand::MuteTrack { track_id })
         }
-        CallCommandPayload::ApiUnmute { .. } => {
-            Err(anyhow::anyhow!("ApiUnmute not yet wired; see plan 04-02"))
+        CallCommandPayload::ApiUnmute { leg } => {
+            let track_id = match leg {
+                Leg::Caller => SipSession::CALLER_TRACK_ID.to_string(),
+                Leg::Callee => SipSession::CALLEE_TRACK_ID.to_string(),
+            };
+            Ok(CallCommand::UnmuteTrack { track_id })
         }
         CallCommandPayload::Play { .. } => {
             Err(anyhow::anyhow!("Play not yet wired; see plan 04-04"))
@@ -101,8 +110,11 @@ pub fn console_to_call_command(
         CallCommandPayload::Record { .. } => {
             Err(anyhow::anyhow!("Record not yet wired; see plan 04-05"))
         }
-        CallCommandPayload::ApiHangup { .. } => {
-            Err(anyhow::anyhow!("ApiHangup not yet wired; see plan 04-02"))
+        CallCommandPayload::ApiHangup { reason, code } => {
+            let cdr_reason = parse_hangup_reason(reason.as_deref());
+            let mut cmd = HangupCommand::local("api", cdr_reason, code);
+            cmd = cmd.with_cascade(HangupCascade::All);
+            Ok(CallCommand::Hangup(cmd))
         }
     }
 }
@@ -157,5 +169,74 @@ mod tests {
         } else {
             panic!("Expected MuteTrack command");
         }
+    }
+
+    // ── Phase 4 Plan 04-02 — ApiMute / ApiUnmute / ApiHangup ─────────────
+
+    #[test]
+    fn test_api_mute_caller_converts_to_caller_track() {
+        let payload = CallCommandPayload::ApiMute { leg: Leg::Caller };
+        let cmd = console_to_call_command(payload, "sess-x").unwrap();
+        if let CallCommand::MuteTrack { track_id } = cmd {
+            assert_eq!(track_id, "caller-track");
+        } else {
+            panic!("expected MuteTrack");
+        }
+    }
+
+    #[test]
+    fn test_api_mute_callee_converts_to_callee_track() {
+        let payload = CallCommandPayload::ApiMute { leg: Leg::Callee };
+        let cmd = console_to_call_command(payload, "sess-x").unwrap();
+        if let CallCommand::MuteTrack { track_id } = cmd {
+            assert_eq!(track_id, "callee-track");
+        } else {
+            panic!("expected MuteTrack");
+        }
+    }
+
+    #[test]
+    fn test_api_unmute_caller_converts() {
+        let payload = CallCommandPayload::ApiUnmute { leg: Leg::Caller };
+        let cmd = console_to_call_command(payload, "sess-x").unwrap();
+        assert!(matches!(
+            cmd,
+            CallCommand::UnmuteTrack { track_id } if track_id == "caller-track"
+        ));
+    }
+
+    #[test]
+    fn test_api_unmute_callee_converts() {
+        let payload = CallCommandPayload::ApiUnmute { leg: Leg::Callee };
+        let cmd = console_to_call_command(payload, "sess-x").unwrap();
+        assert!(matches!(
+            cmd,
+            CallCommand::UnmuteTrack { track_id } if track_id == "callee-track"
+        ));
+    }
+
+    #[test]
+    fn test_api_hangup_converts_with_api_initiator() {
+        let payload = CallCommandPayload::ApiHangup {
+            reason: Some("by_caller".to_string()),
+            code: Some(200),
+        };
+        let cmd = console_to_call_command(payload, "sess-x").unwrap();
+        if let CallCommand::Hangup(hc) = cmd {
+            assert_eq!(hc.code, Some(200));
+            assert!(matches!(hc.cascade, HangupCascade::All));
+        } else {
+            panic!("expected Hangup");
+        }
+    }
+
+    #[test]
+    fn test_api_hangup_without_reason_or_code() {
+        let payload = CallCommandPayload::ApiHangup {
+            reason: None,
+            code: None,
+        };
+        let cmd = console_to_call_command(payload, "sess-x").unwrap();
+        assert!(matches!(cmd, CallCommand::Hangup(_)));
     }
 }
