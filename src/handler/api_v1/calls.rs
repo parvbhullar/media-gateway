@@ -19,19 +19,26 @@
 //! sibling marker and trigger transcription. If no STT infrastructure is
 //! wired yet, the marker sits harmlessly until a future phase consumes it.
 
+use std::sync::Arc;
+
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    routing::get,
+    routing::{get, post},
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 use crate::app::AppState;
+use crate::call::runtime::command_payload::{CallCommandPayload, Leg};
+use crate::call::runtime::{CommandResult, dispatch_console_command};
 use crate::handler::api_v1::common::{PaginatedResponse, Pagination};
 use crate::handler::api_v1::error::{ApiError, ApiResult};
-use crate::proxy::active_call_registry::{ActiveProxyCallEntry, ActiveProxyCallStatus};
-use crate::proxy::proxy_call::sip_session::SessionSnapshot;
+use crate::proxy::active_call_registry::{
+    ActiveProxyCallEntry, ActiveProxyCallRegistry, ActiveProxyCallStatus,
+};
+use crate::proxy::proxy_call::sip_session::{SessionSnapshot, SipSessionHandle};
 
 // ── Wire types (SHELL-04) ────────────────────────────────────────────────
 
@@ -85,12 +92,38 @@ impl CallListQuery {
     }
 }
 
+// ── Phase 4 Plan 04-02 — command request bodies ──────────────────────────
+
+/// Body for `POST /api/v1/calls/{id}/hangup`. Both fields optional.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HangupRequest {
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub code: Option<u16>,
+}
+
+/// Body for `POST /api/v1/calls/{id}/{mute,unmute}`. `leg` required.
+///
+/// Uses `String` (not `Leg`) so the handler can reject invalid values with a
+/// clean `ApiError::bad_request` message rather than serde's default shape.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegRequest {
+    pub leg: String,
+}
+
 // ── Router ───────────────────────────────────────────────────────────────
 
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/calls", get(list_active_calls))
         .route("/calls/{id}", get(get_active_call))
+        // Phase 4 Plan 04-02 — CALL-03, CALL-05, CALL-10
+        .route("/calls/{id}/hangup", post(hangup_call))
+        .route("/calls/{id}/mute", post(mute_call))
+        .route("/calls/{id}/unmute", post(unmute_call))
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -156,6 +189,91 @@ fn entry_to_view(
         status: status_to_str(entry.status).to_string(),
         snapshot,
     }
+}
+
+// ── Phase 4 Plan 04-02 — command dispatch helpers (D-07, D-08, D-09) ─────
+
+/// Validate a `leg` string (case-insensitive) into the typed `Leg` enum.
+fn validate_leg(raw: &str) -> ApiResult<Leg> {
+    match raw.to_ascii_lowercase().as_str() {
+        "caller" => Ok(Leg::Caller),
+        "callee" => Ok(Leg::Callee),
+        _ => Err(ApiError::bad_request(format!(
+            "invalid leg '{}' (expected 'caller' or 'callee')",
+            raw
+        ))),
+    }
+}
+
+/// 409 pre-check per D-09: mute/unmute require a negotiated media session.
+/// We look at the cached snapshot — if it's missing or reports fewer than two
+/// legs, the media tracks aren't ready yet.
+fn require_media_ready(handle: &SipSessionHandle) -> ApiResult<()> {
+    match handle.snapshot() {
+        Some(s) if s.leg_count >= 2 => Ok(()),
+        _ => Err(ApiError::conflict("media tracks not yet established")),
+    }
+}
+
+/// 404 pre-check per D-08: resolve the session handle before any dispatch
+/// attempt so "unknown session" is always a clean 404 and never a dispatch-
+/// level failure.
+fn require_session(
+    registry: &Arc<ActiveProxyCallRegistry>,
+    session_id: &str,
+) -> ApiResult<SipSessionHandle> {
+    registry
+        .get_handle(session_id)
+        .ok_or_else(|| ApiError::not_found(format!("active call '{}' not found", session_id)))
+}
+
+/// Map `dispatch_console_command`'s `Result<CommandResult>` to an HTTP
+/// response per D-07.
+///
+/// Successful dispatch → 200 `{"message":"dispatched"}` with optional `extra`
+/// fields merged in (used by plan 04-03 for `consult_leg_id` and plan 04-05
+/// for the recording `path`).
+///
+/// Plans 04-03/04/05 reuse this helper verbatim — it is the single entry
+/// point that owns the dispatch → HTTP status mapping.
+fn map_command_result(
+    result: anyhow::Result<CommandResult>,
+    extra: Option<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let cr = result.map_err(|e| ApiError::internal(format!("{}", e)))?;
+    if cr.success {
+        let mut body = json!({"message": "dispatched"});
+        if let Some(extra_val) = extra {
+            if let (Some(obj), Some(extra_obj)) =
+                (body.as_object_mut(), extra_val.as_object())
+            {
+                for (k, v) in extra_obj {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        return Ok(Json(body));
+    }
+    let msg = cr.message.unwrap_or_default();
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("not found") {
+        return Err(ApiError::not_found(msg));
+    }
+    if lower.contains("failed to dispatch") {
+        return Err(ApiError::conflict(format!(
+            "command dispatch failed: {}",
+            msg
+        )));
+    }
+    if lower.contains("not supported") {
+        // Safety-net status mapping (per research fix option #1 — plan 04-04
+        // ships pre-dispatch probes as the primary defense). Returns 400
+        // (not 501) because the request is semantically malformed for our
+        // current deployment — the feature is conceptually supported but
+        // unwired.
+        return Err(ApiError::bad_request(msg));
+    }
+    Err(ApiError::internal(msg))
 }
 
 // ── Handlers ─────────────────────────────────────────────────────────────
@@ -254,6 +372,55 @@ async fn get_active_call(
     Ok(Json(entry_to_view(entry, snap)))
 }
 
+// ── Phase 4 Plan 04-02 — command handlers (CALL-03, CALL-05, CALL-10) ────
+//
+// All three routes dispatch through `dispatch_console_command` verbatim so
+// CALL-10's "existing dispatch path" property holds by construction.
+
+async fn hangup_call(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<HangupRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let registry = state.sip_server().inner.active_call_registry.clone();
+    // 404 pre-check before dispatch (D-08).
+    let _ = require_session(&registry, &id)?;
+
+    let payload = CallCommandPayload::ApiHangup {
+        reason: req.reason,
+        code: req.code,
+    };
+    map_command_result(dispatch_console_command(&registry, &id, payload), None)
+}
+
+async fn mute_call(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<LegRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let leg = validate_leg(&req.leg)?;
+    let registry = state.sip_server().inner.active_call_registry.clone();
+    let handle = require_session(&registry, &id)?;
+    require_media_ready(&handle)?;
+
+    let payload = CallCommandPayload::ApiMute { leg };
+    map_command_result(dispatch_console_command(&registry, &id, payload), None)
+}
+
+async fn unmute_call(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<LegRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let leg = validate_leg(&req.leg)?;
+    let registry = state.sip_server().inner.active_call_registry.clone();
+    let handle = require_session(&registry, &id)?;
+    require_media_ready(&handle)?;
+
+    let payload = CallCommandPayload::ApiUnmute { leg };
+    map_command_result(dispatch_console_command(&registry, &id, payload), None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,5 +467,57 @@ mod tests {
         assert!(substring_matches_ci(&h, "1234"));
         assert!(!substring_matches_ci(&h, "999"));
         assert!(!substring_matches_ci(&None, "anything"));
+    }
+
+    // ── Phase 4 Plan 04-02 — validate_leg + map_command_result ────────────
+
+    #[test]
+    fn validate_leg_accepts_mixed_case() {
+        assert_eq!(validate_leg("caller").unwrap(), Leg::Caller);
+        assert_eq!(validate_leg("CALLER").unwrap(), Leg::Caller);
+        assert_eq!(validate_leg("Callee").unwrap(), Leg::Callee);
+        assert_eq!(validate_leg("callee").unwrap(), Leg::Callee);
+    }
+
+    #[test]
+    fn validate_leg_rejects_garbage() {
+        assert!(validate_leg("both").is_err());
+        assert!(validate_leg("").is_err());
+        assert!(validate_leg("CALLER ").is_err()); // trailing space
+    }
+
+    #[test]
+    fn map_command_result_success_returns_dispatched() {
+        let res = map_command_result(Ok(CommandResult::success()), None).unwrap();
+        assert_eq!(res.0["message"], "dispatched");
+    }
+
+    #[test]
+    fn map_command_result_not_found_returns_404() {
+        let err = map_command_result(
+            Ok(CommandResult::failure("session abc not found")),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn map_command_result_dispatch_failure_returns_409() {
+        let err = map_command_result(
+            Ok(CommandResult::failure("failed to dispatch: channel closed")),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::CONFLICT);
+        assert!(err.message.contains("command dispatch failed"));
+    }
+
+    #[test]
+    fn map_command_result_merges_extra_fields() {
+        let extra = json!({"consult_leg_id": "leg-consult-42"});
+        let res = map_command_result(Ok(CommandResult::success()), Some(extra)).unwrap();
+        assert_eq!(res.0["message"], "dispatched");
+        assert_eq!(res.0["consult_leg_id"], "leg-consult-42");
     }
 }
