@@ -5,6 +5,7 @@
 //! sub-routers into (gateway health, routing, security, DIDs, etc.).
 
 pub mod auth;
+pub mod calls;                    // Phase 4 Plan 04-01 — CALL-01, CALL-02
 pub mod cdrs;
 pub mod common;
 pub mod diagnostics;
@@ -41,6 +42,7 @@ pub fn api_v1_router(state: AppState) -> Router {
         .merge(trunk_origination_uris::router())   // Phase 3 — TSUB-02
         .merge(trunk_media::router())              // Phase 3 — TSUB-03
         .merge(routing::router())                  // Phase 3 — RTE-03
+        .merge(calls::router())                    // Phase 4 Plan 04-01 — CALL-01, CALL-02
         ;
 
     Router::<AppState>::new()
