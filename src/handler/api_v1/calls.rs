@@ -31,7 +31,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::app::AppState;
-use crate::call::runtime::command_payload::{CallCommandPayload, Leg};
+use crate::call::runtime::command_payload::{
+    ApiPlayOptions, CallCommandPayload, Leg, PlaySource,
+};
 use crate::call::runtime::{CommandResult, dispatch_console_command};
 use crate::handler::api_v1::common::{PaginatedResponse, Pagination};
 use crate::handler::api_v1::error::{ApiError, ApiResult};
@@ -148,6 +150,53 @@ pub struct ConsultLegRequest {
     pub consult_leg: String,
 }
 
+// ── Phase 4 Plan 04-04 — media-command request bodies (D-12, D-13, D-14) ─
+
+/// Body for `POST /api/v1/calls/{id}/play`. `source` is tagged:
+///
+/// ```json
+/// {"source":{"type":"file","path":"/abs/path.wav"},"leg":"callee","loop":true}
+/// {"source":{"type":"url","url":"https://..."}}   // 400 not_supported pre-dispatch
+/// ```
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlayRequest {
+    pub source: PlaySource,
+    #[serde(default)]
+    pub leg: Option<String>,
+    #[serde(default, rename = "loop")]
+    pub loop_playback: Option<bool>,
+    #[serde(default)]
+    pub interrupt_on_dtmf: Option<bool>,
+}
+
+/// Body for `POST /api/v1/calls/{id}/speak`. Phase 4 always rejects
+/// pre-dispatch per D-13 (TTS engine not wired).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpeakRequest {
+    pub text: String,
+    #[serde(default)]
+    pub voice: Option<String>,
+    #[serde(default)]
+    pub leg: Option<String>,
+}
+
+/// Body for `POST /api/v1/calls/{id}/dtmf`. Digits validated by
+/// `validate_dtmf_digits`; default leg resolved from `entry.direction`
+/// when omitted.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DtmfRequest {
+    pub digits: String,
+    #[serde(default)]
+    pub duration_ms: Option<u32>,
+    #[serde(default)]
+    pub inter_digit_ms: Option<u32>,
+    #[serde(default)]
+    pub leg: Option<String>,
+}
+
 // ── Router ───────────────────────────────────────────────────────────────
 
 pub fn router() -> Router<AppState> {
@@ -162,6 +211,10 @@ pub fn router() -> Router<AppState> {
         .route("/calls/{id}/transfer", post(transfer_call))
         .route("/calls/{id}/transfer/complete", post(transfer_complete))
         .route("/calls/{id}/transfer/cancel", post(transfer_cancel))
+        // Phase 4 Plan 04-04 — CALL-06, CALL-07, CALL-08, CALL-10
+        .route("/calls/{id}/play", post(play_on_call))
+        .route("/calls/{id}/speak", post(speak_on_call))
+        .route("/calls/{id}/dtmf", post(dtmf_on_call))
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -599,6 +652,137 @@ async fn transfer_cancel(
     map_command_result(dispatch_console_command(&registry, &id, payload), None)
 }
 
+// ── Phase 4 Plan 04-04 — media-command helpers (D-12, D-13, D-14) ────────
+
+/// Validate DTMF digits against the allow-list `[0-9A-Da-d*#]` (D-14).
+///
+/// Rejects empty strings and any character outside the RFC-4733 DTMF set.
+fn validate_dtmf_digits(digits: &str) -> ApiResult<()> {
+    if digits.is_empty() {
+        return Err(ApiError::bad_request("empty dtmf digits"));
+    }
+    for c in digits.chars() {
+        let ok = matches!(c, '0'..='9' | 'A'..='D' | 'a'..='d' | '*' | '#');
+        if !ok {
+            return Err(ApiError::bad_request(format!(
+                "invalid dtmf char '{}' (allowed: 0-9, A-D, *, #)",
+                c
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the default DTMF target leg from the call entry's direction
+/// when the request body omits `leg` (D-14).
+///
+/// - `inbound` → DTMF targets the `caller` leg (the party that dialed in).
+/// - everything else (including `outbound`) → `callee` leg.
+fn default_leg_from_direction(direction: &str) -> Leg {
+    if direction.eq_ignore_ascii_case("inbound") {
+        Leg::Caller
+    } else {
+        Leg::Callee
+    }
+}
+
+// ── Phase 4 Plan 04-04 — media-command handlers (CALL-06, 07, 08, 10) ────
+
+async fn play_on_call(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<PlayRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let registry = state.sip_server().inner.active_call_registry.clone();
+    let _ = require_session(&registry, &id)?;
+
+    // Pre-dispatch variant probe (RESEARCH §6 — primary defense).
+    // `handle_play` in the session layer hard-rejects non-File variants
+    // with a message that would otherwise leak through as 500. Rejecting
+    // here keeps the 4xx clean.
+    if let PlaySource::Url { .. } = req.source {
+        return Err(ApiError::not_supported(
+            "url playback not wired; see CALL-06 deferred item",
+        ));
+    }
+
+    let leg = req
+        .leg
+        .as_deref()
+        .map(validate_leg)
+        .transpose()?
+        // D-21 default leg = callee when omitted.
+        .unwrap_or(Leg::Callee);
+
+    // Build `ApiPlayOptions` only if the caller supplied at least one
+    // option — otherwise leave `options: None` so the session layer can
+    // use its own defaults (see `PlayOptions::default`).
+    let options = if req.loop_playback.is_some() || req.interrupt_on_dtmf.is_some() {
+        Some(ApiPlayOptions {
+            loop_playback: req.loop_playback.unwrap_or(false),
+            interrupt_on_dtmf: req.interrupt_on_dtmf.unwrap_or(true),
+        })
+    } else {
+        None
+    };
+
+    let payload = CallCommandPayload::Play {
+        source: req.source,
+        leg: Some(leg),
+        options,
+    };
+    map_command_result(dispatch_console_command(&registry, &id, payload), None)
+}
+
+async fn speak_on_call(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<SpeakRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let registry = state.sip_server().inner.active_call_registry.clone();
+    // 404 pre-check so unknown sessions still get the D-08-clean 404
+    // response rather than a 400 that masks the missing session.
+    let _ = require_session(&registry, &id)?;
+
+    // D-13 + RESEARCH §6: TTS is not wired in `handle_play` (which
+    // hard-rejects non-File variants). Phase 4 always rejects `/speak`
+    // up-front rather than letting dispatch fall through to a confusing
+    // 500. Consume the body so `deny_unknown_fields` still catches
+    // malformed input before we short-circuit.
+    let _ = (req.text, req.voice, req.leg);
+    Err(ApiError::not_supported(
+        "tts engine not wired; see CALL-07 deferred item",
+    ))
+}
+
+async fn dtmf_on_call(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<DtmfRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    validate_dtmf_digits(&req.digits)?;
+
+    let registry = state.sip_server().inner.active_call_registry.clone();
+    // Resolve the session entry once — we need it for `direction` when
+    // `leg` is omitted. This also serves as the D-08 404 pre-check.
+    let entry = registry
+        .get(&id)
+        .ok_or_else(|| ApiError::not_found(format!("active call '{}' not found", id)))?;
+
+    let leg = match req.leg.as_deref() {
+        Some(raw) => validate_leg(raw)?,
+        None => default_leg_from_direction(&entry.direction),
+    };
+
+    let payload = CallCommandPayload::Dtmf {
+        digits: req.digits,
+        duration_ms: req.duration_ms,
+        inter_digit_ms: req.inter_digit_ms,
+        leg: Some(leg),
+    };
+    map_command_result(dispatch_console_command(&registry, &id, payload), None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -739,5 +923,47 @@ mod tests {
     #[test]
     fn parse_target_rejects_garbage() {
         assert!(parse_target("not-a-uri-or-e164", None).is_err());
+    }
+
+    // ── Phase 4 Plan 04-04 — validate_dtmf_digits / default_leg_from_direction
+
+    #[test]
+    fn validate_dtmf_digits_accepts_full_charset() {
+        assert!(validate_dtmf_digits("0123456789").is_ok());
+        assert!(validate_dtmf_digits("ABCD*#").is_ok());
+        assert!(validate_dtmf_digits("abcd").is_ok());
+        assert!(validate_dtmf_digits("1*2#3A4B").is_ok());
+    }
+
+    #[test]
+    fn validate_dtmf_digits_rejects_empty() {
+        assert!(validate_dtmf_digits("").is_err());
+    }
+
+    #[test]
+    fn validate_dtmf_digits_rejects_out_of_charset() {
+        // 'e' is NOT in the DTMF set (only A-D are valid).
+        let err = validate_dtmf_digits("12e").unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("invalid dtmf"));
+
+        // 'E' is ALSO out of charset.
+        assert!(validate_dtmf_digits("E").is_err());
+
+        // Whitespace / control chars rejected.
+        assert!(validate_dtmf_digits("1 2").is_err());
+        assert!(validate_dtmf_digits("1\n2").is_err());
+    }
+
+    #[test]
+    fn default_leg_from_direction_maps_correctly() {
+        assert_eq!(default_leg_from_direction("inbound"), Leg::Caller);
+        assert_eq!(default_leg_from_direction("INBOUND"), Leg::Caller);
+        assert_eq!(default_leg_from_direction("outbound"), Leg::Callee);
+        // Unknown direction falls back to callee (safest default for
+        // dispatch-initiated DTMF — operator is presumed to be driving
+        // the outbound leg unless told otherwise).
+        assert_eq!(default_leg_from_direction("unknown"), Leg::Callee);
+        assert_eq!(default_leg_from_direction(""), Leg::Callee);
     }
 }

@@ -75,6 +75,22 @@ impl ApiError {
             message: msg.into(),
         }
     }
+
+    /// 400 Bad Request with `code: "not_supported"`.
+    ///
+    /// Used by pre-dispatch feature probes (Phase 4 Plan 04-04) when the
+    /// request shape is valid but the addressed feature is not wired in the
+    /// current build — e.g. `/play` with a `url` source, or `/speak` (TTS
+    /// not wired). Returns 400 (not 501) because the request is malformed
+    /// for THIS deployment: the operator can fix it by switching to a
+    /// supported variant.
+    pub fn not_supported(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code: "not_supported",
+            message: msg.into(),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
