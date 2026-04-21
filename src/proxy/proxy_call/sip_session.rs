@@ -2982,8 +2982,16 @@ impl SipSession {
                 }
             }
 
-            CallCommand::SendDtmf { leg_id, digits } => {
-                match self.handle_send_dtmf(leg_id, digits).await {
+            CallCommand::SendDtmf {
+                leg_id,
+                digits,
+                duration_ms,
+                inter_digit_ms,
+            } => {
+                match self
+                    .handle_send_dtmf(leg_id, digits, duration_ms, inter_digit_ms)
+                    .await
+                {
                     Ok(_) => CommandResult::success(),
                     Err(e) => CommandResult::failure(&e.to_string()),
                 }
@@ -3841,7 +3849,18 @@ impl SipSession {
         Ok(())
     }
 
-    async fn handle_send_dtmf(&mut self, leg_id: LegId, digits: String) -> Result<()> {
+    async fn handle_send_dtmf(
+        &mut self,
+        leg_id: LegId,
+        digits: String,
+        duration_ms: Option<u32>,
+        inter_digit_ms: Option<u32>,
+    ) -> Result<()> {
+        // TODO(phase-hardening, D-14b): honor per-digit duration / inter-digit
+        // overrides in the SIP INFO payload. Phase 4 accepts the fields on the
+        // wire but continues to use the existing hardcoded defaults below.
+        let _ = (duration_ms, inter_digit_ms);
+
         if !self.legs.contains_key(&leg_id) {
             return Err(anyhow!("Leg not found: {}", leg_id));
         }
@@ -4297,6 +4316,8 @@ mod tests {
         let result = handle.send_command(CallCommand::SendDtmf {
             leg_id: LegId::from("caller"),
             digits: "1234".to_string(),
+            duration_ms: None,
+            inter_digit_ms: None,
         });
         assert!(result.is_ok());
 

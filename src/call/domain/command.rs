@@ -123,6 +123,15 @@ pub enum CallCommand {
         leg_id: LegId,
         /// DTMF digits to send
         digits: String,
+        /// Optional per-digit duration override (ms). `None` uses the
+        /// session-layer default (160 ms today). Phase 4 accepts the field
+        /// on the wire but the SIP-layer consumer does NOT honor the
+        /// override yet — deferred to a future hardening pass (D-14b).
+        #[serde(default)]
+        duration_ms: Option<u32>,
+        /// Optional inter-digit gap override (ms). Same deferral as above.
+        #[serde(default)]
+        inter_digit_ms: Option<u32>,
     },
 
     /// Start recording
