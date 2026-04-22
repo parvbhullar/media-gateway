@@ -197,6 +197,30 @@ pub struct DtmfRequest {
     pub leg: Option<String>,
 }
 
+// ── Phase 4 Plan 04-05 — record request body (D-18) ─────────────────────
+
+/// Body for `POST /api/v1/calls/{id}/record`. All fields optional.
+///
+/// - `path`: absolute path inside the recorder tree; auto-generated when absent.
+/// - `format`: `"wav"` (default) or `"mp3"`.
+/// - `beep`: play a beep before recording starts (default `false`).
+/// - `max_duration_secs`: hard cap on recording length.
+/// - `transcribe`: when `true`, handler drops a `.transcribe.marker` sibling
+///   file next to the recording for Phase 7 post-processing.
+#[derive(Debug, Default, Deserialize)]
+pub struct RecordRequest {
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub format: Option<String>,
+    #[serde(default)]
+    pub beep: Option<bool>,
+    #[serde(default)]
+    pub max_duration_secs: Option<u32>,
+    #[serde(default)]
+    pub transcribe: Option<bool>,
+}
+
 // ── Router ───────────────────────────────────────────────────────────────
 
 pub fn router() -> Router<AppState> {
@@ -215,6 +239,8 @@ pub fn router() -> Router<AppState> {
         .route("/calls/{id}/play", post(play_on_call))
         .route("/calls/{id}/speak", post(speak_on_call))
         .route("/calls/{id}/dtmf", post(dtmf_on_call))
+        // Phase 4 Plan 04-05 — CALL-09, CALL-10
+        .route("/calls/{id}/record", post(record_call))
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -783,6 +809,115 @@ async fn dtmf_on_call(
     map_command_result(dispatch_console_command(&registry, &id, payload), None)
 }
 
+// ── Phase 4 Plan 04-05 — record helpers + handler (CALL-09, D-18) ────────
+
+/// Validate and normalise the recording format string.
+///
+/// Returns `"wav"` when `raw` is `None`. Accepts `"wav"` and `"mp3"` (case-
+/// insensitive). All other values → 400.
+fn validate_recording_format(raw: Option<&str>) -> ApiResult<String> {
+    match raw {
+        None => Ok("wav".to_string()),
+        Some(s) => match s.to_ascii_lowercase().as_str() {
+            "wav" | "mp3" => Ok(s.to_ascii_lowercase()),
+            _ => Err(ApiError::bad_request(format!(
+                "invalid format '{}' (expected 'wav' or 'mp3')",
+                s
+            ))),
+        },
+    }
+}
+
+/// Resolve the recording output path.
+///
+/// When `explicit` is `None` the path is auto-generated as
+/// `<recorder_root>/<session_id>-<unix_ts>.<format>`.
+///
+/// When `explicit` is supplied the function verifies:
+/// 1. Not empty / whitespace-only.
+/// 2. Does not contain `".."` (path traversal guard).
+/// 3. Is absolute.
+/// 4. Starts with the `recorder_root` tree (confinement guard).
+fn resolve_recording_path(
+    explicit: Option<&str>,
+    session_id: &str,
+    format: &str,
+    recorder_path: &str,
+) -> ApiResult<String> {
+    use std::path::{Path, PathBuf};
+    let recorder_root = PathBuf::from(recorder_path);
+    if let Some(raw) = explicit {
+        if raw.trim().is_empty() {
+            return Err(ApiError::bad_request("empty recording path"));
+        }
+        if raw.contains("..") {
+            return Err(ApiError::bad_request(
+                "recording path must not contain '..'",
+            ));
+        }
+        let p = Path::new(raw);
+        if !p.is_absolute() {
+            return Err(ApiError::bad_request("recording path must be absolute"));
+        }
+        if !p.starts_with(&recorder_root) {
+            return Err(ApiError::bad_request(format!(
+                "recording path must be inside recorder tree '{}'",
+                recorder_root.display()
+            )));
+        }
+        return Ok(raw.to_string());
+    }
+    let ts = chrono::Utc::now().timestamp();
+    let filename = format!("{}-{}.{}", session_id, ts, format);
+    Ok(recorder_root.join(filename).to_string_lossy().to_string())
+}
+
+/// Best-effort: drop an empty marker file next to the recording so Phase 7
+/// post-processing consumers know to transcribe this recording.
+///
+/// Failures are logged as warnings — a missing marker is never fatal.
+fn maybe_drop_transcribe_marker(path: &str, transcribe: bool) {
+    if !transcribe {
+        return;
+    }
+    let marker = format!("{}.transcribe.marker", path);
+    match std::fs::File::create(&marker) {
+        Ok(_) => tracing::info!("dropped transcribe marker: {}", marker),
+        Err(e) => tracing::warn!(
+            "failed to drop transcribe marker '{}': {}",
+            marker,
+            e
+        ),
+    }
+}
+
+async fn record_call(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<RecordRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let registry = state.sip_server().inner.active_call_registry.clone();
+    // 404 pre-check (D-08).
+    let _ = require_session(&registry, &id)?;
+
+    let format = validate_recording_format(req.format.as_deref())?;
+    let recorder_path = state.config().recorder_path();
+    let resolved =
+        resolve_recording_path(req.path.as_deref(), &id, &format, &recorder_path)?;
+
+    maybe_drop_transcribe_marker(&resolved, req.transcribe.unwrap_or(false));
+
+    let payload = CallCommandPayload::Record {
+        path: Some(resolved.clone()),
+        format: Some(format),
+        beep: req.beep,
+        max_duration_secs: req.max_duration_secs,
+        transcribe: req.transcribe,
+    };
+    let extra = Some(serde_json::json!({ "path": resolved }));
+    map_command_result(dispatch_console_command(&registry, &id, payload), extra)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -965,5 +1100,105 @@ mod tests {
         // the outbound leg unless told otherwise).
         assert_eq!(default_leg_from_direction("unknown"), Leg::Callee);
         assert_eq!(default_leg_from_direction(""), Leg::Callee);
+    }
+
+    // ── Phase 4 Plan 04-05 — validate_recording_format / resolve_recording_path
+
+    #[test]
+    fn validate_recording_format_defaults_to_wav() {
+        assert_eq!(validate_recording_format(None).unwrap(), "wav");
+    }
+
+    #[test]
+    fn validate_recording_format_accepts_wav_and_mp3() {
+        assert_eq!(validate_recording_format(Some("wav")).unwrap(), "wav");
+        assert_eq!(validate_recording_format(Some("WAV")).unwrap(), "wav");
+        assert_eq!(validate_recording_format(Some("mp3")).unwrap(), "mp3");
+        assert_eq!(validate_recording_format(Some("MP3")).unwrap(), "mp3");
+    }
+
+    #[test]
+    fn validate_recording_format_rejects_unknown() {
+        let err = validate_recording_format(Some("flac")).unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("format"));
+        assert!(validate_recording_format(Some("ogg")).is_err());
+        assert!(validate_recording_format(Some("")).is_err());
+    }
+
+    #[test]
+    fn resolve_recording_path_auto_generates_with_session_and_format() {
+        let path =
+            resolve_recording_path(None, "sess-abc", "wav", "/var/recordings").unwrap();
+        assert!(
+            path.starts_with("/var/recordings/"),
+            "auto path must start with recorder root, got: {}",
+            path
+        );
+        assert!(
+            path.contains("sess-abc"),
+            "auto path must contain session_id, got: {}",
+            path
+        );
+        assert!(
+            path.ends_with(".wav"),
+            "auto path must end with .wav, got: {}",
+            path
+        );
+    }
+
+    #[test]
+    fn resolve_recording_path_rejects_traversal() {
+        let err = resolve_recording_path(
+            Some("/var/recordings/../../etc/passwd"),
+            "sess",
+            "wav",
+            "/var/recordings",
+        )
+        .unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(err.message.contains(".."));
+    }
+
+    #[test]
+    fn resolve_recording_path_rejects_relative() {
+        let err = resolve_recording_path(
+            Some("relative/path.wav"),
+            "sess",
+            "wav",
+            "/var/recordings",
+        )
+        .unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(err.message.to_ascii_lowercase().contains("absolute"));
+    }
+
+    #[test]
+    fn resolve_recording_path_rejects_outside_tree() {
+        let err = resolve_recording_path(
+            Some("/etc/passwd.wav"),
+            "sess",
+            "wav",
+            "/var/recordings",
+        )
+        .unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(
+            err.message.contains("recorder tree"),
+            "expected 'recorder tree' in error, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn resolve_recording_path_accepts_in_tree_explicit() {
+        let result = resolve_recording_path(
+            Some("/var/recordings/custom.wav"),
+            "sess",
+            "wav",
+            "/var/recordings",
+        )
+        .unwrap();
+        assert_eq!(result, "/var/recordings/custom.wav");
     }
 }
