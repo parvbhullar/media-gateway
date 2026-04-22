@@ -182,8 +182,24 @@ pub fn console_to_call_command(
             duration_ms,
             inter_digit_ms,
         }),
-        CallCommandPayload::Record { .. } => {
-            Err(anyhow::anyhow!("Record not yet wired; see plan 04-05"))
+        CallCommandPayload::Record {
+            path,
+            format,
+            beep,
+            max_duration_secs,
+            transcribe: _,
+        } => {
+            let resolved_path = path.unwrap_or_else(|| {
+                format!("{}-{}.wav", session_id, chrono::Utc::now().timestamp())
+            });
+            Ok(CallCommand::StartRecording {
+                config: crate::call::domain::RecordConfig {
+                    path: resolved_path,
+                    max_duration_secs,
+                    beep: beep.unwrap_or(false),
+                    format,
+                },
+            })
         }
         CallCommandPayload::ApiHangup { reason, code } => {
             let cdr_reason = parse_hangup_reason(reason.as_deref());
@@ -499,6 +515,58 @@ mod tests {
             assert!(inter_digit_ms.is_none());
         } else {
             panic!("expected SendDtmf");
+        }
+    }
+
+    // ── Phase 4 Plan 04-05 — Record ──────────────────────────────────────
+
+    #[test]
+    fn test_record_happy_path_explicit_fields() {
+        let payload = CallCommandPayload::Record {
+            path: Some("/recordings/call-123.wav".to_string()),
+            format: Some("wav".to_string()),
+            beep: Some(true),
+            max_duration_secs: Some(3600),
+            transcribe: Some(false),
+        };
+        let cmd = console_to_call_command(payload, "sess-rec").unwrap();
+        if let CallCommand::StartRecording { config } = cmd {
+            assert_eq!(config.path, "/recordings/call-123.wav");
+            assert_eq!(config.format.as_deref(), Some("wav"));
+            assert!(config.beep);
+            assert_eq!(config.max_duration_secs, Some(3600));
+        } else {
+            panic!("expected StartRecording, got {:?}", cmd);
+        }
+    }
+
+    #[test]
+    fn test_record_defaults_auto_path_and_no_beep() {
+        let payload = CallCommandPayload::Record {
+            path: None,
+            format: None,
+            beep: None,
+            max_duration_secs: None,
+            transcribe: None,
+        };
+        let cmd = console_to_call_command(payload, "sess-default").unwrap();
+        if let CallCommand::StartRecording { config } = cmd {
+            // Auto-generated path must contain session_id and end in .wav.
+            assert!(
+                config.path.contains("sess-default"),
+                "auto path must contain session_id, got: {}",
+                config.path
+            );
+            assert!(
+                config.path.ends_with(".wav"),
+                "auto path must end with .wav, got: {}",
+                config.path
+            );
+            assert!(!config.beep, "beep should default to false");
+            assert!(config.max_duration_secs.is_none());
+            assert!(config.format.is_none());
+        } else {
+            panic!("expected StartRecording, got {:?}", cmd);
         }
     }
 }
