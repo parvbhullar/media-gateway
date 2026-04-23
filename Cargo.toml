@@ -60,7 +60,7 @@ instant-acme = { version = "0.8.5", optional = true }
 anyhow = "1"
 async-trait = "0.1.88"
 async-stream = "0.3.6"
-axum = { version = "0.8.8", features = ["ws", "tokio", "multipart"] }
+axum = { version = "0.8.9", features = ["ws", "tokio", "multipart"] }
 bytes = "1"
 futures = "0.3.31"
 rustls = { version = "0.23.36", features = ["ring"] }
@@ -69,7 +69,7 @@ serde = { version = "1", features = ["derive"] }
 glob = "0.3.3"
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1.51.0", features = ["full", "tracing"] }
+tokio = { version = "1.52.0", features = ["full", "tracing"] }
 tokio-stream = { version = "0.1.18", features = ["net", "sync"] }
 parking_lot = "0.12"
 dashmap = "6"
@@ -85,14 +85,14 @@ uuid = { version = "1.23.0", features = ["v4"] }
 clap = { version = "4.6.0", features = ["derive"] }
 toml = "1.1.2"
 toml_edit = { version = "0.25.11", features = ["serde"] }
-rand = "0.10.0"
+rand = "0.10.1"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10.4"
-rsipstack = "0.5.3"
+rsipstack = "0.5.7"
 #rsipstack = { path = "../rsipstack" }
 audio-codec = { version = "0.3.30", default-features = false }
-rustrtc = "0.3.47"
 #rustrtc = { path = "../rustrtc" }
+rustrtc = "0.3.51"
 reqwest = { version = "0.13", features = [
     "json",
     "stream",
@@ -201,3 +201,7 @@ required-features = ["opus"]
 [[bin]]
 name = "verify-i18n"
 path = "tools/verify_i18n.rs"
+
+[[bin]]
+name = "dump-mysql-schema"
+path = "src/bin/dump_mysql_schema.rs"

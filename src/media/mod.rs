@@ -2,8 +2,8 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use audio_codec::CodecType;
 use rustrtc::{
-    Attribute, IceServer, MediaKind, PeerConnection, RtcConfiguration, RtpCodecParameters, SdpType,
-    SessionDescription, TransceiverDirection, TransportMode,
+    Attribute, IceServer, IceTransportPolicy, MediaKind, PeerConnection, RtcConfiguration,
+    RtpCodecParameters, SdpType, SessionDescription, TransceiverDirection, TransportMode,
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -568,13 +568,47 @@ impl RtpTrackBuilder {
             }
         };
 
+        let has_turn_server = self.ice_servers.iter().any(|server| {
+            server.urls.iter().any(|url| {
+                let u = url.trim_start().to_ascii_lowercase();
+                u.starts_with("turn:") || u.starts_with("turns:")
+            })
+        });
+        let audio_capabilities = match self.mode {
+            TransportMode::WebRtc => negotiate::MediaNegotiator::default_webrtc_codecs(),
+            TransportMode::Rtp | TransportMode::Srtp => {
+                negotiate::MediaNegotiator::default_rtp_codecs()
+            }
+        }
+        .into_iter()
+        .filter_map(|codec| {
+            negotiate::CodecInfo {
+                payload_type: codec.payload_type(),
+                clock_rate: codec.clock_rate(),
+                channels: codec.channels() as u16,
+                codec,
+            }
+            .to_audio_capability()
+        })
+        .collect();
+
         let config = RtcConfiguration {
             ice_servers: self.ice_servers,
+            ice_transport_policy: if self.mode == TransportMode::WebRtc && has_turn_server {
+                IceTransportPolicy::Relay
+            } else {
+                IceTransportPolicy::All
+            },
             transport_mode: self.mode,
             rtp_start_port: self.rtp_start_port,
             rtp_end_port: self.rtp_end_port,
             external_ip: self.external_ip,
             enable_latching: self.enable_latching,
+            media_capabilities: Some(rustrtc::config::MediaCapabilities {
+                audio: audio_capabilities,
+                video: self.video_capabilities.clone(),
+                application: None,
+            }),
             ssrc_start: rand::random::<u32>(),
             sdp_compatibility,
             ..Default::default()

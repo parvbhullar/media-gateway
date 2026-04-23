@@ -172,7 +172,20 @@ pub async fn probe_trunk(
     }
     .with_tag(make_tag());
 
-    let via = match endpoint.get_via(None, None) {
+    // Resolve the trunk's configured transport so the Via header and
+    // underlying connection use the correct protocol (TCP/TLS/UDP).
+    let transport = match trunk.sip_transport {
+        crate::models::sip_trunk::SipTransport::Tcp => rsipstack::sip::Transport::Tcp,
+        crate::models::sip_trunk::SipTransport::Tls => rsipstack::sip::Transport::Tls,
+        crate::models::sip_trunk::SipTransport::Udp => rsipstack::sip::Transport::Udp,
+    };
+    let addrs = endpoint.transport_layer.get_addrs();
+    let sip_addr = addrs
+        .iter()
+        .find(|a| a.r#type == Some(transport))
+        .or_else(|| addrs.first())
+        .cloned();
+    let via = match endpoint.get_via(sip_addr, None) {
         Ok(v) => v,
         Err(e) => {
             return ProbeOutcome {
@@ -204,6 +217,14 @@ pub async fn probe_trunk(
         }
     };
     let mut tx = Transaction::new_client(key, request, endpoint.clone(), None);
+
+    // Set the destination with the correct transport so the transaction layer
+    // opens a TCP/TLS connection instead of falling back to UDP.
+    let dest_addr = rsipstack::transport::SipAddr::try_from(&server_uri);
+    if let Ok(mut dest_sip_addr) = dest_addr {
+        dest_sip_addr.r#type = Some(transport);
+        tx.destination = Some(dest_sip_addr);
+    }
 
     // 5. Send, then await the first non-provisional response or time out.
     if let Err(e) = tx.send().await {

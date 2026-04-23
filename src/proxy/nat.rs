@@ -1,4 +1,4 @@
-use rsipstack::sip::SipMessage;
+use rsipstack::sip::{SipMessage, ToTypedHeader};
 use rsipstack::{transaction::endpoint::MessageInspector, transport::SipAddr};
 use std::net::IpAddr;
 use tracing::debug;
@@ -121,7 +121,27 @@ impl NatInspector {
 }
 
 impl MessageInspector for NatInspector {
-    fn before_send(&self, msg: SipMessage, _dest: Option<&SipAddr>) -> SipMessage {
+    fn before_send(&self, msg: SipMessage, dest: Option<&SipAddr>) -> SipMessage {
+        // Align the outgoing request's Via transport with the destination's
+        // transport. rsipstack's make_request uses the first transport in
+        // the endpoint (usually UDP) for Via, even when the transaction is
+        // being sent over TCP/TLS — this causes the remote end to try
+        // replying over UDP, which fails silently.
+        let mut msg = msg;
+        if let (SipMessage::Request(req), Some(dest)) = (&mut msg, dest) {
+            if let Some(dest_transport) = dest.r#type {
+                for header in req.headers.iter_mut() {
+                    if let rsipstack::sip::Header::Via(via) = header {
+                        if let Ok(mut typed) = via.typed() {
+                            if typed.transport != dest_transport {
+                                typed.transport = dest_transport;
+                                *via = typed.into();
+                            }
+                        }
+                    }
+                }
+            }
+        }
         msg
     }
 
