@@ -61,6 +61,26 @@ pub trait CallRouter: Send + Sync {
     ) -> Result<Dialplan, RouteError>;
 }
 
+/// Extract the caller's IP from an incoming request (prefers Via `received`
+/// param, falls back to Via sent-by host). Used to pick the local interface
+/// that routes back to the caller for Contact/SDP.
+fn extract_peer_ip_from_request(req: &rsipstack::sip::Request) -> Option<IpAddr> {
+    use rsipstack::sip::ToTypedHeader;
+    let via = req.via_header().ok()?;
+    let typed = via.typed().ok()?;
+    for param in &typed.params {
+        if let rsipstack::sip::Param::Received(r) = param {
+            if let Ok(ip) = r.parse() {
+                return Some(ip);
+            }
+        }
+    }
+    match typed.uri.host() {
+        rsipstack::sip::Host::IpAddr(ip) => Some(*ip),
+        rsipstack::sip::Host::Domain(_) => None,
+    }
+}
+
 fn q850_cause_from_status(code: &rsipstack::sip::StatusCode) -> u16 {
     match u16::from(code.clone()) {
         400 | 401 | 402 | 403 | 405 | 406 | 407 | 421 | 603 => 21, // call rejected / not allowed
@@ -938,7 +958,16 @@ impl CallModule {
 
         let mut dialplan = dialplan;
         if dialplan.caller_contact.is_none() {
-            if let Some(contact_uri) = self.inner.server.default_contact_uri() {
+            // Use the local IP that routes to the caller, so the caller can
+            // actually reach us for ACK/BYE. Falls back to default when the
+            // caller's IP can't be extracted.
+            let caller_peer_ip = extract_peer_ip_from_request(&tx.original);
+            let contact_uri = self
+                .inner
+                .server
+                .contact_uri_for_peer(caller_peer_ip)
+                .or_else(|| self.inner.server.default_contact_uri());
+            if let Some(contact_uri) = contact_uri {
                 let contact = rsipstack::sip::typed::Contact {
                     display_name: None,
                     uri: contact_uri,

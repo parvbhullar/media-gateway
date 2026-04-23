@@ -143,6 +143,10 @@ pub struct SipSession {
     pub media_bridge: Option<Arc<crate::media::bridge::BridgePeer>>,
     pub caller_is_webrtc: bool,
     pub callee_is_webrtc: bool,
+    /// IP of the caller (from the incoming INVITE's Via/Contact). Used to
+    /// pick the correct local interface IP for Contact and SDP so the
+    /// caller can actually reach us for ACK/RTP.
+    pub caller_peer_ip: Option<std::net::IpAddr>,
 }
 
 #[derive(Clone)]
@@ -222,12 +226,45 @@ impl AppFactory for BuiltinAppFactory {
     }
 }
 
+/// Extract the caller's IP from an incoming request. Prefers the Via
+/// `received` parameter (set by the transport on arrival), falls back to
+/// the Via sent-by host. This is the address the caller can receive
+/// responses from — matching interfaces is based on it.
+fn extract_peer_ip_from_request(req: &rsipstack::sip::Request) -> Option<std::net::IpAddr> {
+    use rsipstack::sip::{ToTypedHeader, prelude::HeadersExt};
+    let via = req.via_header().ok()?;
+    let typed = via.typed().ok()?;
+
+    for param in &typed.params {
+        if let rsipstack::sip::Param::Received(r) = param {
+            if let Ok(ip) = r.parse() {
+                return Some(ip);
+            }
+        }
+    }
+
+    match typed.uri.host() {
+        rsipstack::sip::Host::IpAddr(ip) => Some(*ip),
+        rsipstack::sip::Host::Domain(_) => None,
+    }
+}
+
 impl SipSession {
     pub const CALLER_TRACK_ID: &'static str = "caller-track";
     pub const CALLEE_TRACK_ID: &'static str = "callee-track";
     pub const CALLER_FORWARDING_TRACK_ID: &'static str = "caller-forwarding-track";
     pub const CALLEE_FORWARDING_TRACK_ID: &'static str = "callee-forwarding-track";
     const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+
+    /// IP to advertise in caller-side SDP (c=/o= lines). Uses the local
+    /// interface that routes to the caller, falling back to the configured
+    /// external_ip when the caller IP is unknown or routing lookup fails.
+    fn caller_facing_ip_str(&self) -> Option<String> {
+        self.caller_peer_ip
+            .and_then(crate::proxy::server::local_ip_for_peer)
+            .map(|ip| ip.to_string())
+            .or_else(|| self.server.rtp_config.external_ip.clone())
+    }
 
     pub fn with_handle(id: SessionId) -> (SipSessionHandle, mpsc::UnboundedReceiver<CallCommand>) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -344,6 +381,7 @@ impl SipSession {
         } else {
             Some(String::from_utf8_lossy(initial.body()).to_string())
         };
+        let caller_peer_ip = extract_peer_ip_from_request(&initial);
 
         let session = Self {
             id: session_id.clone(),
@@ -393,6 +431,7 @@ impl SipSession {
             media_bridge: None,
             caller_is_webrtc: false,
             callee_is_webrtc: false,
+            caller_peer_ip,
         };
 
         (session, sip_handle, cmd_rx)
@@ -408,12 +447,18 @@ impl SipSession {
         let session_id = context.session_id.clone();
         info!(session_id = %session_id, "Starting unified SIP session");
 
+        // Determine the caller's IP from the incoming INVITE so Contact/SDP
+        // advertise the local interface that is actually reachable from the
+        // caller's network. Without this, a private-network carrier would
+        // see our external IP in Contact/SDP and fail to deliver ACK/RTP.
+        let caller_peer_ip = extract_peer_ip_from_request(&tx.original);
+
         let local_contact = context
             .dialplan
             .caller_contact
             .as_ref()
             .map(|c| c.uri.clone())
-            .or_else(|| server.default_contact_uri());
+            .or_else(|| server.contact_uri_for_peer(caller_peer_ip));
 
         let (state_tx, state_rx) = mpsc::unbounded_channel();
 
@@ -1733,8 +1778,8 @@ impl SipSession {
                     .with_cancel_token(self.caller_peer.cancel_token())
                     .with_enable_latching(self.server.proxy_config.enable_latching);
 
-                if let Some(ref external_ip) = self.server.rtp_config.external_ip {
-                    track_builder = track_builder.with_external_ip(external_ip.clone());
+                if let Some(ip) = self.caller_facing_ip_str() {
+                    track_builder = track_builder.with_external_ip(ip);
                 }
 
                 let (start_port, end_port) = if caller_is_webrtc {
@@ -2086,8 +2131,8 @@ impl SipSession {
                 }
             }
 
-            if let Some(ref external_ip) = self.server.rtp_config.external_ip {
-                bridge_builder = bridge_builder.with_external_ip(external_ip.clone());
+            if let Some(ip) = self.caller_facing_ip_str() {
+                bridge_builder = bridge_builder.with_external_ip(ip);
             }
 
             if let Some(ref ice_servers) = self.server.rtp_config.ice_servers {
@@ -2349,8 +2394,8 @@ impl SipSession {
             .with_cancel_token(self.caller_peer.cancel_token())
             .with_enable_latching(self.server.proxy_config.enable_latching);
 
-        if let Some(ref external_ip) = self.server.rtp_config.external_ip {
-            track_builder = track_builder.with_external_ip(external_ip.clone());
+        if let Some(ip) = self.caller_facing_ip_str() {
+            track_builder = track_builder.with_external_ip(ip);
         }
 
         let (start_port, end_port) = if caller_is_webrtc {
