@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: milestone
 status: executing
-stopped_at: Completed 04-04-PLAN.md
-last_updated: "2026-04-21T12:36:14Z"
-last_activity: 2026-04-21
+stopped_at: Completed 04-05-PLAN.md (Phase 4 done)
+last_updated: "2026-04-25T00:00:00Z"
+last_activity: 2026-04-25
 progress:
   total_phases: 13
-  completed_phases: 3
+  completed_phases: 4
   total_plans: 19
-  completed_plans: 17
-  percent: 89
+  completed_plans: 19
+  percent: 100
 ---
 
 # Project State
@@ -25,12 +25,12 @@ See: .planning/PROJECT.md (updated 2026-04-14)
 
 ## Current Position
 
-Phase: 4 (Active Calls & Mid-Call Control) — EXECUTING
-Plan: 4 of 5
-Status: Ready to execute
-Last activity: 2026-04-21
+Phase: 4 (Active Calls & Mid-Call Control) — COMPLETE
+Plan: 5 of 5 (final wave landed)
+Status: Phase 4 sign-off — ready for Phase 5 (Trunk Enforcement)
+Last activity: 2026-04-25
 
-Progress: [██░░░░░░░░] 15%  (2 of 13 phases)
+Progress: [███░░░░░░░] 31%  (4 of 13 phases)
 
 ## Performance Metrics
 
@@ -46,6 +46,8 @@ Progress: [██░░░░░░░░] 15%  (2 of 13 phases)
 |-------|-------|-----------|--------|
 | 1. API Shell & Cheap Wrappers | 6 | 6 | Verified (23/26 + 3 deferred) -- see 01-VERIFICATION.md |
 | 2. Trunk Groups Schema & Core CRUD | 3 | 3 | Verified (10/10) -- see 02-VERIFICATION.md |
+| 3. Trunk Sub-Resources L1 & Routing Resolve | 3 | 3 | Verified -- see 03-*-SUMMARY.md |
+| 4. Active Calls & Mid-Call Control | 5 | 5 | Done (CALL-01..10) -- see 04-05-SUMMARY.md |
 | Phase 04 P02 | ~8 min | 3 tasks | 3 files |
 
 ## Phase 2 Verification (2026-04-16)
@@ -142,6 +144,7 @@ Decisions are logged in PROJECT.md Key Decisions table. Recent decisions affecti
 
 ## Session Continuity
 
-Last session: 2026-04-21T12:36:14Z
-Stopped at: Completed 04-04-PLAN.md
+Last session: 2026-04-25T00:00:00Z
+Stopped at: Completed 04-05-PLAN.md (Phase 4 sign-off; CALL-01..10 closed; 12 mid-call routes shipped)
 Resume file: None
+Next: Phase 5 — Trunk Enforcement (independent of Phase 4)
