@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use chrono::Utc;
 use rustpbx::{
     app::{AppState, AppStateBuilder},
-    config::Config,
+    config::{Config, RecordingPolicy},
     handler::api_v1::auth::{IssuedKey, issue_api_key},
     models::api_key,
 };
@@ -69,6 +69,43 @@ pub async fn test_state_empty() -> AppState {
 /// Returns the plaintext token so the caller can send it as a Bearer.
 pub async fn test_state_with_api_key(name: &str) -> (AppState, String) {
     let state = test_state_empty().await;
+    let IssuedKey { plaintext, hash } = issue_api_key();
+    let am = api_key::ActiveModel {
+        name: Set(name.to_string()),
+        hash_sha256: Set(hash),
+        description: Set(None),
+        created_at: Set(Utc::now()),
+        ..Default::default()
+    };
+    am.insert(state.db())
+        .await
+        .expect("failed to insert test api_key");
+    (state, plaintext)
+}
+
+/// Build an `AppState` with a custom absolute recorder root, plus one API key.
+///
+/// Returns `(state, token, recorder_root_path)`.  The caller is responsible
+/// for creating the directory with `std::fs::create_dir_all` before the test
+/// needs to write into it.
+pub async fn test_state_with_recorder(
+    name: &str,
+    recorder_root: &str,
+) -> (AppState, String) {
+    let mut cfg = test_config();
+    cfg.recording = Some(RecordingPolicy {
+        enabled: false,
+        auto_start: Some(false),
+        path: Some(recorder_root.to_string()),
+        ..Default::default()
+    });
+    let state = AppStateBuilder::new()
+        .with_config(cfg)
+        .with_skip_sip_bind()
+        .build()
+        .await
+        .expect("failed to build test AppState with recorder");
+
     let IssuedKey { plaintext, hash } = issue_api_key();
     let am = api_key::ActiveModel {
         name: Set(name.to_string()),

@@ -5,7 +5,7 @@ mod common;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode};
 use chrono::{DateTime, Duration, Utc};
-use common::{test_state_empty, test_state_with_api_key};
+use common::{test_state_empty, test_state_with_api_key, test_state_with_recorder};
 use rustpbx::call::domain::{CallCommand, MediaPathMode, SessionState};
 use rustpbx::call::runtime::SessionId;
 use rustpbx::proxy::active_call_registry::{ActiveProxyCallEntry, ActiveProxyCallStatus};
@@ -1269,6 +1269,263 @@ async fn dtmf_unknown_session_returns_404() {
                 .header("Authorization", format!("Bearer {}", token))
                 .header("Content-Type", "application/json")
                 .body(Body::from(r#"{"digits":"1"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// ── Plan 04-05 — record / transcribe marker tests ────────────────────────
+
+/// Build an isolated absolute recorder root for a test. Caller must clean
+/// it up afterwards if marker files were created.
+fn fresh_recorder_root(label: &str) -> String {
+    let pid = std::process::id();
+    let n = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("rustpbx-rec-{}-{}-{}", label, pid, n));
+    std::fs::create_dir_all(&path).expect("create recorder root");
+    path.display().to_string()
+}
+
+#[tokio::test]
+async fn record_requires_auth() {
+    let state = test_state_empty().await;
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/calls/any/record")
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 401);
+}
+
+#[tokio::test]
+async fn record_auto_path_and_marker() {
+    let recorder_root = fresh_recorder_root("auto");
+    let (state, token) = test_state_with_recorder("record-auto", &recorder_root).await;
+    let (_handle, mut rx) = seed_active_call(&state, "sess-rec", true);
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/calls/sess-rec/record")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"transcribe":true}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp.into_body()).await;
+    assert_eq!(body["message"], "dispatched");
+    let resolved_path = body["path"].as_str().unwrap().to_string();
+    assert!(
+        resolved_path.starts_with(&recorder_root),
+        "resolved path '{}' must be under recorder root '{}'",
+        resolved_path,
+        recorder_root
+    );
+    assert!(resolved_path.contains("sess-rec-"));
+    assert!(resolved_path.ends_with(".wav"));
+
+    // Marker file should exist alongside the resolved path.
+    let marker = format!("{}.transcribe.marker", resolved_path);
+    assert!(
+        std::fs::metadata(&marker).is_ok(),
+        "marker '{}' not found",
+        marker
+    );
+
+    // Dispatch should have landed.
+    let cmd = rx.try_recv().unwrap();
+    assert!(matches!(cmd, CallCommand::StartRecording { .. }));
+
+    // Cleanup
+    let _ = std::fs::remove_file(&marker);
+    let _ = std::fs::remove_dir_all(&recorder_root);
+}
+
+#[tokio::test]
+async fn record_no_transcribe_skips_marker() {
+    let recorder_root = fresh_recorder_root("nomark");
+    let (state, token) = test_state_with_recorder("record-no-marker", &recorder_root).await;
+    let (_handle, mut rx) = seed_active_call(&state, "sess-no-mk", true);
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/calls/sess-no-mk/record")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp.into_body()).await;
+    let resolved_path = body["path"].as_str().unwrap().to_string();
+    let marker = format!("{}.transcribe.marker", resolved_path);
+    assert!(
+        std::fs::metadata(&marker).is_err(),
+        "marker should NOT exist when transcribe=false"
+    );
+    let _ = rx.try_recv();
+    let _ = std::fs::remove_dir_all(&recorder_root);
+}
+
+#[tokio::test]
+async fn record_explicit_in_tree_path_works() {
+    let recorder_root = fresh_recorder_root("explicit");
+    let (state, token) = test_state_with_recorder("record-explicit", &recorder_root).await;
+    let (_handle, mut rx) = seed_active_call(&state, "sess-explicit", true);
+
+    let explicit_path = format!("{}/custom.wav", recorder_root);
+    let body_str = format!(r#"{{"path":"{}"}}"#, explicit_path);
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/calls/sess-explicit/record")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Content-Type", "application/json")
+                .body(Body::from(body_str))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp.into_body()).await;
+    assert_eq!(body["path"], explicit_path);
+    let _ = rx.try_recv();
+    let _ = std::fs::remove_dir_all(&recorder_root);
+}
+
+#[tokio::test]
+async fn record_invalid_format_returns_400() {
+    let recorder_root = fresh_recorder_root("badfmt");
+    let (state, token) = test_state_with_recorder("record-bad-fmt", &recorder_root).await;
+    let (_handle, _rx) = seed_active_call(&state, "sess-fmt", true);
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/calls/sess-fmt/record")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"format":"flac"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp.into_body()).await;
+    assert!(body["error"].as_str().unwrap().contains("format"));
+    let _ = std::fs::remove_dir_all(&recorder_root);
+}
+
+#[tokio::test]
+async fn record_path_traversal_returns_400() {
+    let recorder_root = fresh_recorder_root("trav");
+    let (state, token) = test_state_with_recorder("record-trav", &recorder_root).await;
+    let (_handle, _rx) = seed_active_call(&state, "sess-trav", true);
+
+    let body_str = format!(r#"{{"path":"{}/../../etc/passwd"}}"#, recorder_root);
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/calls/sess-trav/record")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Content-Type", "application/json")
+                .body(Body::from(body_str))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp.into_body()).await;
+    assert!(body["error"].as_str().unwrap().contains(".."));
+    let _ = std::fs::remove_dir_all(&recorder_root);
+}
+
+#[tokio::test]
+async fn record_relative_path_returns_400() {
+    let recorder_root = fresh_recorder_root("rel");
+    let (state, token) = test_state_with_recorder("record-rel", &recorder_root).await;
+    let (_handle, _rx) = seed_active_call(&state, "sess-rel", true);
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/calls/sess-rel/record")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"path":"some/relative.wav"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let _ = std::fs::remove_dir_all(&recorder_root);
+}
+
+#[tokio::test]
+async fn record_outside_tree_returns_400() {
+    let recorder_root = fresh_recorder_root("outside");
+    let (state, token) = test_state_with_recorder("record-outside", &recorder_root).await;
+    let (_handle, _rx) = seed_active_call(&state, "sess-out", true);
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/calls/sess-out/record")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{"path":"/etc/passwd.wav"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp.into_body()).await;
+    assert!(body["error"].as_str().unwrap().contains("recorder tree"));
+    let _ = std::fs::remove_dir_all(&recorder_root);
+}
+
+#[tokio::test]
+async fn record_unknown_session_returns_404() {
+    let (state, token) = test_state_with_api_key("record-404").await;
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/calls/nope/record")
+                .header("Authorization", format!("Bearer {}", token))
+                .header("Content-Type", "application/json")
+                .body(Body::from(r#"{}"#))
                 .unwrap(),
         )
         .await
