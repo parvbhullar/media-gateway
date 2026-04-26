@@ -212,6 +212,16 @@ async fn resolve_unknown_destination_returns_not_handled() {
     let body = body_json(resp).await;
     assert_eq!(body["result"], "not_handled");
     assert_eq!(body["target"], Value::Null);
+    // Phase 6 Plan 06-01 (D-30 plumbing): the response surface MUST carry
+    // `matched_record_id` so Wave 3 (06-04) has a place to write the
+    // matched record's UUIDv4. Wave 1 always sets it to null.
+    let obj = body.as_object().expect("response must be a JSON object");
+    assert!(
+        obj.contains_key("matched_record_id"),
+        "response missing matched_record_id key: {:?}",
+        obj.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(body["matched_record_id"], Value::Null);
 }
 
 // =========================================================================

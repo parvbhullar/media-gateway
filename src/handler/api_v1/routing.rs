@@ -55,6 +55,10 @@ pub struct ResolveRouteResponse {
     pub result: String,
     pub matched_table: Option<String>,
     pub matched_record_index: Option<i32>,
+    /// Phase 6 Plan 06-01 — D-30 plumbing. Wave 3 (06-04) populates this
+    /// with the matched record's UUIDv4 from `supersip_routing_tables`.
+    /// Always `None` until 06-04 lands.
+    pub matched_record_id: Option<String>,
     pub match_reason: Option<String>,
     pub target: Option<ResolveTarget>,
     pub selected_gateway: Option<String>,
@@ -198,6 +202,7 @@ async fn resolve_route(
                 result: "matched".into(),
                 matched_table: None,
                 matched_record_index: None,
+                matched_record_id: None,
                 match_reason: trace.matched_rule.clone(),
                 target,
                 selected_gateway,
@@ -208,6 +213,7 @@ async fn resolve_route(
             result: "not_handled".into(),
             matched_table: None,
             matched_record_index: None,
+            matched_record_id: None,
             match_reason: None,
             target: None,
             selected_gateway: None,
@@ -217,6 +223,7 @@ async fn resolve_route(
             result: "abort".into(),
             matched_table: None,
             matched_record_index: None,
+            matched_record_id: None,
             match_reason: reason
                 .clone()
                 .or_else(|| Some(format!("aborted with status {:?}", status))),
@@ -229,6 +236,7 @@ async fn resolve_route(
             result: "reject".into(),
             matched_table: None,
             matched_record_index: None,
+            matched_record_id: None,
             match_reason: Some(format!("{} ({})", reason, code)),
             target: None,
             selected_gateway: None,
@@ -238,6 +246,7 @@ async fn resolve_route(
             result: "matched".into(),
             matched_table: None,
             matched_record_index: None,
+            matched_record_id: None,
             match_reason: trace.matched_rule.clone(),
             target: trace.selected_trunk.as_ref().map(|n| ResolveTarget {
                 kind: "queue".into(),
@@ -250,6 +259,7 @@ async fn resolve_route(
             result: "matched".into(),
             matched_table: None,
             matched_record_index: None,
+            matched_record_id: None,
             match_reason: trace.matched_rule.clone(),
             target: Some(ResolveTarget {
                 kind: "application".into(),

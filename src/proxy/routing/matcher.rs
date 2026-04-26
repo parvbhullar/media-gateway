@@ -33,6 +33,11 @@ pub struct RouteTrace {
     pub used_default_route: bool,
     pub rewrite_operations: Vec<String>,
     pub abort: Option<RouteAbortTrace>,
+    /// Phase 6 Plan 06-01 — D-30 plumbing. Wave 3 (06-04) populates this
+    /// with the matched record's UUIDv4 when a `supersip_routing_tables`
+    /// record matches. Always `None` until 06-04 lands.
+    #[serde(default)]
+    pub matched_record_id: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
