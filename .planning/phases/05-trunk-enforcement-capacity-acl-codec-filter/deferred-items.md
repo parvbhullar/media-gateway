@@ -1,0 +1,1 @@
+[05-02 deferred] tests/api_v1_trunks.rs::create_trunk_persists_acl_nofailover failing 422 vs 201 — owned by Plan 05-03 (ACL POST/GET round-trip on /trunks). Not a Plan 05-02 regression; my code does not touch trunks.rs nor mod.rs.
