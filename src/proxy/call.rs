@@ -11,7 +11,7 @@ use crate::proxy::routing::{
     RouteRule, SourceTrunk, TrunkConfig, build_source_trunk,
     matcher::{
         DidLookup, RouteResourceLookup, build_did_extension_route_result, did_lookup_result,
-        match_invite, match_invite_with_codecs,
+        match_invite_with_codecs,
     },
 };
 use anyhow::{Result, anyhow};

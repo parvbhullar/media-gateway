@@ -81,11 +81,18 @@ impl TrunkCapacityGate {
             self.max_calls.store(mc, Ordering::Release);
         }
         if let Some(cps) = max_cps {
-            self.bucket_max.store(cps, Ordering::Release);
-            // Refill to new max immediately so admins increasing the cap see effect now.
-            self.bucket_tokens.store(cps, Ordering::Release);
-            self.bucket_last_refill_ms
-                .store(now_epoch_ms(), Ordering::Release);
+            // Only reset bucket_tokens when the cap actually changes, so the
+            // hot-path call from `ensure_gate` (which feeds in the same
+            // limits read from DB on every INVITE) is a no-op for the CPS
+            // bucket. Without this guard, a steady stream of INVITEs would
+            // continually refill the bucket and the CPS gate would never
+            // surface CpsExhausted.
+            let prev = self.bucket_max.swap(cps, Ordering::AcqRel);
+            if prev != cps {
+                self.bucket_tokens.store(cps, Ordering::Release);
+                self.bucket_last_refill_ms
+                    .store(now_epoch_ms(), Ordering::Release);
+            }
         }
     }
 
