@@ -34,6 +34,7 @@ pub mod sip_trunk;
 pub mod system_config;
 pub mod system_notification;
 pub mod pending_upload;
+pub mod trunk_acl_entries;
 pub mod trunk_capacity;
 pub mod trunk_credentials;
 pub mod trunk_group;
