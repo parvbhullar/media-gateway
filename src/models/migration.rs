@@ -50,6 +50,15 @@ impl MigratorTrait for Migrator {
             Box::new(super::trunk_origination_uris::Migration),
             Box::new(super::add_media_config_column::Migration),
             Box::new(super::drop_credentials_column::Migration),
+            // Phase 5 Plan 05-01 — TSUB-04 (capacity) + TSUB-05 (ACL).
+            // Order is load-bearing (FK + safe-drop):
+            //   1. Create supersip_trunk_capacity (UNIQUE FK to rustpbx_trunk_groups.id)
+            //   2. Create supersip_trunk_acl_entries (FK CASCADE)
+            //   3. Drop legacy rustpbx_trunk_groups.acl LAST so any in-flight reads
+            //      during deploy succeed; mirrors Phase 3 D-02 ordering.
+            Box::new(super::trunk_capacity::Migration),
+            Box::new(super::trunk_acl_entries::Migration),
+            Box::new(super::drop_acl_column::Migration),
         ]
     }
 }
