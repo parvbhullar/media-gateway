@@ -35,9 +35,20 @@ pub struct RouteTrace {
     pub abort: Option<RouteAbortTrace>,
     /// Phase 6 Plan 06-01 — D-30 plumbing. Wave 3 (06-04) populates this
     /// with the matched record's UUIDv4 when a `supersip_routing_tables`
-    /// record matches. Always `None` until 06-04 lands.
+    /// record matches.
     #[serde(default)]
     pub matched_record_id: Option<String>,
+    /// Phase 6 Plan 06-04 — name of the supersip_routing_tables row that
+    /// produced the match (D-30).
+    #[serde(default)]
+    pub matched_table: Option<String>,
+    /// Phase 6 Plan 06-04 — `position` field of the matched record (D-30).
+    #[serde(default)]
+    pub matched_record_index: Option<i32>,
+    /// Phase 6 Plan 06-04 — typed evaluation events (D-31). Each entry is
+    /// a JSON object: `{event: "<name>", ...fields}`.
+    #[serde(default)]
+    pub events: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -425,6 +436,152 @@ async fn match_invite_impl(
     peer_ip: Option<std::net::IpAddr>,
 ) -> Result<(RouteResult, Option<Permit>)> {
     let mut option = option;
+
+    // ── Phase 6 Plan 06-04 (D-06) — consult supersip_routing_tables ──
+    // Fresh DB read per INVITE (D-29). Only runs when a DB connection is
+    // available; tests + dry-run paths without a populated routing-tables
+    // schema produce None here and fall through to the legacy in-memory
+    // `routes` arg unchanged.
+    if let Some(db) = routing_state.db() {
+        let caller_user_for_supersip =
+            option.caller.user().unwrap_or_default().to_string();
+        let dest_user_for_supersip =
+            option.callee.user().unwrap_or_default().to_string();
+        let src_ip_str = peer_ip.map(|ip| ip.to_string());
+        let empty_headers: HashMap<String, String> = HashMap::new();
+        let supersip = crate::proxy::routing::table_matcher::match_against_supersip_tables(
+            db,
+            direction,
+            &caller_user_for_supersip,
+            &dest_user_for_supersip,
+            src_ip_str.as_deref(),
+            &empty_headers,
+        )
+        .await;
+
+        match supersip {
+            Ok(Some(Ok(info))) => {
+                // Wire trace metadata for /resolve (D-30).
+                if let Some(trace) = &mut trace {
+                    trace.matched_table = Some(info.table_name.clone());
+                    trace.matched_record_index = Some(info.position);
+                    trace.matched_record_id = Some(info.record_id.clone());
+                    trace.events.extend(info.events.clone());
+                    trace.used_default_route = info.used_default;
+                }
+
+                // Translate target → RouteResult.
+                use crate::proxy::routing::match_types::RoutingTarget as RT;
+                match info.target {
+                    RT::Reject { code, reason } => {
+                        if let Some(trace) = &mut trace {
+                            trace.abort = Some(RouteAbortTrace {
+                                code,
+                                reason: Some(reason.clone()),
+                            });
+                        }
+                        return Ok((
+                            RouteResult::Abort(code.into(), Some(reason)),
+                            None,
+                        ));
+                    }
+                    RT::TrunkGroup { name } => {
+                        if let Some(trace) = &mut trace {
+                            trace.trunk_group_name = Some(name.clone());
+                        }
+                        // For Execute mode, resolve to a gateway via
+                        // the existing trunk_group resolver.
+                        if mode == MatchMode::Execute {
+                            let dest_cfg =
+                                crate::proxy::routing::DestConfig::Single(name.clone());
+                            let selected = match try_select_via_trunk_group(
+                                Some(db),
+                                &dest_cfg,
+                                &option,
+                                routing_state.clone(),
+                                trunks,
+                            )
+                            .await?
+                            {
+                                Some(gw) => gw,
+                                None => name.clone(),
+                            };
+                            if let Some(trace) = &mut trace {
+                                trace.selected_trunk = Some(selected.clone());
+                            }
+                            if let Some(trunk_config) =
+                                trunks.as_ref().and_then(|t| t.get(&selected))
+                            {
+                                apply_trunk_config(&mut option, trunk_config)?;
+                            }
+                        } else {
+                            if let Some(trace) = &mut trace {
+                                trace.selected_trunk = Some(name.clone());
+                            }
+                        }
+                        return Ok((RouteResult::Forward(option, None), None));
+                    }
+                    RT::Gateway { name } => {
+                        if let Some(trace) = &mut trace {
+                            trace.selected_trunk = Some(name.clone());
+                        }
+                        if mode == MatchMode::Execute {
+                            if let Some(trunk_config) =
+                                trunks.as_ref().and_then(|t| t.get(&name))
+                            {
+                                apply_trunk_config(&mut option, trunk_config)?;
+                            }
+                        }
+                        return Ok((RouteResult::Forward(option, None), None));
+                    }
+                    RT::NextTable { .. } => {
+                        // Should have been resolved transitively by the
+                        // table_matcher; surface as abort if it leaks.
+                        if let Some(trace) = &mut trace {
+                            trace.abort = Some(RouteAbortTrace {
+                                code: 500,
+                                reason: Some("unresolved_next_table".to_string()),
+                            });
+                        }
+                        return Ok((
+                            RouteResult::Abort(
+                                rsipstack::sip::StatusCode::ServerInternalError,
+                                Some("unresolved_next_table".to_string()),
+                            ),
+                            None,
+                        ));
+                    }
+                }
+            }
+            Ok(Some(Err(e))) => {
+                // Routing loop, depth exceeded, or missing target.
+                let reason = e.to_string();
+                if let Some(trace) = &mut trace {
+                    trace.abort = Some(RouteAbortTrace {
+                        code: rsipstack::sip::StatusCode::ServerInternalError.into(),
+                        reason: Some(reason.clone()),
+                    });
+                }
+                return Ok((
+                    RouteResult::Abort(
+                        rsipstack::sip::StatusCode::ServerInternalError,
+                        Some(reason),
+                    ),
+                    None,
+                ));
+            }
+            Ok(None) => {
+                // No supersip table matched — fall through to legacy.
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "supersip_routing_tables read failed; falling back to legacy routes"
+                );
+            }
+        }
+    }
+
     let routes = match routes {
         Some(routes) => routes,
         None => return Ok((RouteResult::NotHandled(option, None), None)),

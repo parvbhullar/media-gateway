@@ -200,9 +200,9 @@ async fn resolve_route(
             };
             ResolveRouteResponse {
                 result: "matched".into(),
-                matched_table: None,
-                matched_record_index: None,
-                matched_record_id: None,
+                matched_table: trace.matched_table.clone(),
+                matched_record_index: trace.matched_record_index,
+                matched_record_id: trace.matched_record_id.clone(),
                 match_reason: trace.matched_rule.clone(),
                 target,
                 selected_gateway,
