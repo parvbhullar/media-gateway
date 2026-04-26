@@ -71,6 +71,11 @@ pub struct SipServerInner {
     pub locator_events: Option<LocatorEventSender>,
     pub sip_flow: Option<SipFlow>,
     pub active_call_registry: Arc<ActiveProxyCallRegistry>,
+    /// Phase 5 Plan 05-04: per-trunk-group capacity-gate state (max_calls
+    /// atomic + max_cps token bucket). Shared with the routing matcher
+    /// (via RoutingState) and the GET /capacity handler.
+    pub trunk_capacity_state:
+        Arc<crate::proxy::trunk_capacity_state::TrunkCapacityState>,
     pub frequency_limiter: Option<Arc<dyn FrequencyLimiter>>,
     pub call_record_hooks: Arc<Vec<Box<dyn crate::callrecord::CallRecordHook>>>,
     pub runnings_tx: Arc<AtomicUsize>,
@@ -562,6 +567,9 @@ impl SipServerBuilder {
         }
 
         let active_call_registry = Arc::new(ActiveProxyCallRegistry::new());
+        // Phase 5 Plan 05-04: capacity-gate state shared between matcher and GET /capacity
+        let trunk_capacity_state =
+            Arc::new(crate::proxy::trunk_capacity_state::TrunkCapacityState::new());
         let presence_manager = Arc::new(PresenceManager::new(database.clone()));
         presence_manager.load_from_db().await.ok();
 
@@ -587,6 +595,7 @@ impl SipServerBuilder {
             locator_events: Some(locator_events),
             sip_flow,
             active_call_registry,
+            trunk_capacity_state,
             frequency_limiter: self.frequency_limiter,
             call_record_hooks: Arc::new(self.call_record_hooks),
             runnings_tx: Arc::new(AtomicUsize::new(0)),

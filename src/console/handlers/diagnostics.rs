@@ -1357,6 +1357,18 @@ async fn route_evaluate(
             request.uri.to_string(),
             Vec::new(),
         ),
+        // Phase 5 Plan 05-04: trunk-enforcement reject is rendered as an Abort
+        // for the diagnostics view (same shape, just preserves the reason).
+        RouteResult::Reject { code, reason, .. } => (
+            RouteOutcomeView::Abort(RouteAbortOutcome {
+                code: code as u16,
+                reason: Some(reason),
+            }),
+            original_option.caller.to_string(),
+            original_option.callee.to_string(),
+            request.uri.to_string(),
+            Vec::new(),
+        ),
         RouteResult::Application {
             option, app_name, ..
         } => {

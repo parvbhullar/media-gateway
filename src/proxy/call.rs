@@ -11,7 +11,7 @@ use crate::proxy::routing::{
     RouteRule, SourceTrunk, TrunkConfig, build_source_trunk,
     matcher::{
         DidLookup, RouteResourceLookup, build_did_extension_route_result, did_lookup_result,
-        match_invite,
+        match_invite, match_invite_with_codecs,
     },
 };
 use anyhow::{Result, anyhow};
@@ -103,6 +103,99 @@ fn resolve_unhandled_targets(
         )));
     }
     Ok(DialStrategy::Sequential(locs))
+}
+
+/// Phase 5 Plan 05-04 (D-18, T-05-04-02): Extract audio codec names from a
+/// caller's SDP offer for the codec-intersection enforcement gate. Best-effort
+/// parser — pulls codec names from `a=rtpmap:<pt> <name>/<rate>` lines first;
+/// falls back to RTP payload-type numbers from the `m=audio ... <pt> <pt>`
+/// line so that `intersect_codecs` (which normalises both forms) still works
+/// on offers that lack rtpmap entries for static PTs (0, 8, 9, 18).
+///
+/// Returns an empty Vec when the body is empty or contains no audio media.
+pub fn extract_caller_audio_codecs(sdp_body: &[u8]) -> Vec<String> {
+    if sdp_body.is_empty() {
+        return Vec::new();
+    }
+    let body = match std::str::from_utf8(sdp_body) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut codec_names: Vec<String> = Vec::new();
+    let mut audio_pts: Vec<String> = Vec::new();
+    let mut in_audio_section = false;
+
+    for raw in body.lines() {
+        let line = raw.trim_end_matches('\r');
+        if let Some(rest) = line.strip_prefix("m=") {
+            // start of a new media section
+            in_audio_section = rest.starts_with("audio");
+            if in_audio_section {
+                // m=audio <port> <proto> <pt> <pt> ...
+                let mut tokens = rest.split_whitespace();
+                let _ = tokens.next(); // "audio"
+                let _port = tokens.next();
+                let _proto = tokens.next();
+                for pt in tokens {
+                    audio_pts.push(pt.to_string());
+                }
+            }
+        } else if in_audio_section {
+            if let Some(rest) = line.strip_prefix("a=rtpmap:") {
+                // <pt> <name>/<rate>[/<channels>]
+                let mut tokens = rest.split_whitespace();
+                let _pt = tokens.next();
+                if let Some(name_rate) = tokens.next() {
+                    let name = name_rate.split('/').next().unwrap_or(name_rate);
+                    if !name.is_empty() {
+                        codec_names.push(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if !codec_names.is_empty() {
+        codec_names
+    } else {
+        // Fallback: payload-type numbers (intersect_codecs normalises 0/8/9/18)
+        audio_pts
+    }
+}
+
+#[cfg(test)]
+mod sdp_parse_tests {
+    use super::extract_caller_audio_codecs;
+
+    #[test]
+    fn parses_rtpmap_names() {
+        let sdp = b"v=0\r\nm=audio 5004 RTP/AVP 0 8\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\n";
+        assert_eq!(
+            extract_caller_audio_codecs(sdp),
+            vec!["PCMU".to_string(), "PCMA".to_string()]
+        );
+    }
+
+    #[test]
+    fn falls_back_to_payload_types_when_no_rtpmap() {
+        let sdp = b"v=0\r\nm=audio 5004 RTP/AVP 0 8 18\r\n";
+        assert_eq!(
+            extract_caller_audio_codecs(sdp),
+            vec!["0".to_string(), "8".to_string(), "18".to_string()]
+        );
+    }
+
+    #[test]
+    fn empty_when_no_audio_section() {
+        let sdp = b"v=0\r\nm=video 5006 RTP/AVP 96\r\na=rtpmap:96 H264/90000\r\n";
+        assert!(extract_caller_audio_codecs(sdp).is_empty());
+    }
+
+    #[test]
+    fn empty_when_body_empty() {
+        assert!(extract_caller_audio_codecs(b"").is_empty());
+    }
 }
 
 pub fn q850_reason_value(code: &rsipstack::sip::StatusCode, detail: Option<&str>) -> String {
@@ -248,7 +341,14 @@ impl RouteInvite for DefaultRouteInvite {
             }
         }
         let resource_lookup = self.data_context.as_ref() as &dyn RouteResourceLookup;
-        match_invite(
+        // Phase 5 Plan 05-04 (D-18): extract caller-offered audio codec names
+        // from the original SDP so the matcher can run the codec-intersection
+        // gate. Empty list when no SDP / no audio section — matcher's gate
+        // is effectively disabled in that case (D-20 allow-all).
+        let caller_codecs = extract_caller_audio_codecs(&origin.body);
+        // Phase 5 Plan 05-04 (D-15, D-16): peer IP for per-trunk ACL eval.
+        let peer_ip = peer_ip_from_request(origin);
+        let (route_result, _permit) = match_invite_with_codecs(
             if trunks_snapshot.is_empty() {
                 None
             } else {
@@ -265,8 +365,16 @@ impl RouteInvite for DefaultRouteInvite {
             source_trunk.as_ref(),
             self.routing_state.clone(),
             direction,
+            caller_codecs,
+            peer_ip,
         )
-        .await
+        .await?;
+        // Note: `_permit` is dropped here (releases capacity gate immediately).
+        // Permit→registry attach during call lifecycle is a deferred follow-up
+        // (see deferred-items.md). Capacity-gate REJECTION still works
+        // correctly — the gate increments and rejects above the limit before
+        // the permit drops.
+        Ok(route_result)
     }
 
     async fn preview_route(
@@ -280,7 +388,9 @@ impl RouteInvite for DefaultRouteInvite {
             self.build_context(origin, direction).await;
 
         let resource_lookup = self.data_context.as_ref() as &dyn RouteResourceLookup;
-        match_invite(
+        let caller_codecs = extract_caller_audio_codecs(&origin.body);
+        let peer_ip = peer_ip_from_request(origin);
+        let (route_result, _permit) = match_invite_with_codecs(
             if trunks_snapshot.is_empty() {
                 None
             } else {
@@ -297,9 +407,21 @@ impl RouteInvite for DefaultRouteInvite {
             source_trunk.as_ref(),
             self.routing_state.clone(),
             direction,
+            caller_codecs,
+            peer_ip,
         )
-        .await
+        .await?;
+        Ok(route_result)
     }
+}
+
+/// Phase 5 Plan 05-04: best-effort peer-IP extraction from the topmost Via
+/// header (used for per-trunk ACL eval). Returns None when Via is missing or
+/// the host is not parseable as an IP.
+fn peer_ip_from_request(req: &rsipstack::sip::Request) -> Option<std::net::IpAddr> {
+    let via = req.via_header().ok()?;
+    let (_, target) = SipConnection::parse_target_from_via(via).ok()?;
+    target.host.try_into().ok()
 }
 
 impl DefaultRouteInvite {
@@ -383,6 +505,9 @@ impl CallModule {
     pub fn new(config: Arc<ProxyConfig>, server: SipServerRef) -> Self {
         let dialog_layer = server.dialog_layer.clone();
         let mut routing_state = RoutingState::new_with_db(server.database.clone());
+        // Phase 5 Plan 05-04: share the capacity-gate state with the matcher.
+        routing_state = routing_state
+            .with_trunk_capacity_state(server.trunk_capacity_state.clone());
         let limiter = server
             .frequency_limiter
             .clone()
@@ -561,6 +686,22 @@ impl CallModule {
                     reason.unwrap_or_else(|| "route aborted during preview".to_string())
                 );
                 return Err(RouteError::from((err, Some(code))));
+            }
+            // Phase 5 Plan 05-04: trunk-enforcement reject mapped to a SIP
+            // status. `retry_after_secs` is preserved in the reason text for
+            // logs; wire-level Retry-After header injection is a follow-up.
+            RouteResult::Reject {
+                code,
+                reason,
+                retry_after_secs,
+            } => {
+                let detail = match retry_after_secs {
+                    Some(secs) => format!("{} (retry-after={})", reason, secs),
+                    None => reason,
+                };
+                let status = rsipstack::sip::StatusCode::from(code);
+                let err = anyhow::anyhow!(detail);
+                return Err(RouteError::from((err, Some(status))));
             }
             RouteResult::Application {
                 option: _,

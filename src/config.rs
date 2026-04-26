@@ -830,6 +830,16 @@ pub enum RouteResult {
     },
     NotHandled(InviteOption, Option<DialplanHints>),
     Abort(StatusCode, Option<String>),
+    /// Phase 5 Plan 05-04: Trunk-enforcement reject. Distinct from `Abort`
+    /// because it carries a structured `reason` (one of
+    /// `trunk_capacity_exhausted`, `trunk_cps_exhausted`, `trunk_acl_blocked`,
+    /// `codec_mismatch_488`) and an optional `Retry-After` value (set for
+    /// 503 responses per D-09).
+    Reject {
+        code: u16,
+        reason: String,
+        retry_after_secs: Option<u32>,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]

@@ -52,31 +52,27 @@ pub struct TrunkCapacityView {
 }
 
 impl TrunkCapacityView {
-    /// Build a view from a stored row. Negative DB values would indicate
-    /// data corruption (the column is u32 at the wire layer); coerce via
-    /// `try_into().ok()` so a corrupt negative reads as null rather than
-    /// panicking. Live counts are placeholders zero in this plan.
-    fn from_row(row: &TcapModel) -> Self {
+    /// Build a view from a stored row, with live counters from the registry
+    /// and the per-trunk-group capacity gate (Plan 05-04, D-02 + D-04).
+    fn from_row(row: &TcapModel, current_active: u32, current_cps_rate: u32) -> Self {
         Self {
             max_calls: row.max_calls.and_then(|v| u32::try_from(v).ok()),
             max_cps: row.max_cps.and_then(|v| u32::try_from(v).ok()),
-            // TODO(Plan 05-04): wire current_active to ActiveProxyCallRegistry
-            //                   and current_cps_rate to TrunkCapacityState
-            //                   token bucket. Until then return zeros so
-            //                   operators see the response shape early.
-            current_active: 0,
-            current_cps_rate: 0,
+            current_active,
+            current_cps_rate,
         }
     }
 
     /// Default shape returned when the trunk has no capacity row yet
-    /// (D-01: missing row == unlimited == both fields null).
-    fn defaults() -> Self {
+    /// (D-01: missing row == unlimited == both fields null). Live counters
+    /// are still surfaced so operators can see in-flight calls even before
+    /// they configure max_calls.
+    fn defaults(current_active: u32, current_cps_rate: u32) -> Self {
         Self {
             max_calls: None,
             max_cps: None,
-            current_active: 0,
-            current_cps_rate: 0,
+            current_active,
+            current_cps_rate,
         }
     }
 }
@@ -158,9 +154,24 @@ async fn get_capacity(
     let db = state.db();
     let trunk_group_id = lookup_trunk_group_id(db, &name).await?;
 
+    // Phase 5 Plan 05-04 (D-02, D-04, TSUB-07):
+    // current_active counts entries in the registry whose trunk_group_name
+    // matches the requested trunk; current_cps_rate is read from the live
+    // token bucket (tokens consumed in the current 1s window).
+    let current_active = state
+        .sip_server()
+        .inner
+        .active_call_registry
+        .count_active_for_trunk(&name);
+    let current_cps_rate = state
+        .sip_server()
+        .inner
+        .trunk_capacity_state
+        .snapshot_cps_rate(trunk_group_id);
+
     let view = match find_capacity_row(db, trunk_group_id).await? {
-        Some(row) => TrunkCapacityView::from_row(&row),
-        None => TrunkCapacityView::defaults(),
+        Some(row) => TrunkCapacityView::from_row(&row, current_active, current_cps_rate),
+        None => TrunkCapacityView::defaults(current_active, current_cps_rate),
     };
     Ok(Json(view))
 }
@@ -213,5 +224,32 @@ async fn put_capacity(
         }
     };
 
-    Ok(Json(TrunkCapacityView::from_row(&stored)))
+    // Phase 5 Plan 05-04: PUT also propagates the new limits into the live
+    // capacity gate (so an operator-issued change takes effect immediately
+    // for in-flight admission checks) and re-surfaces the same live
+    // current_active / current_cps_rate snapshot the GET handler returns.
+    let new_max_calls = req.max_calls;
+    let new_max_cps = req.max_cps;
+    state
+        .sip_server()
+        .inner
+        .trunk_capacity_state
+        .update_limits(trunk_group_id, new_max_calls, new_max_cps);
+
+    let current_active = state
+        .sip_server()
+        .inner
+        .active_call_registry
+        .count_active_for_trunk(&name);
+    let current_cps_rate = state
+        .sip_server()
+        .inner
+        .trunk_capacity_state
+        .snapshot_cps_rate(trunk_group_id);
+
+    Ok(Json(TrunkCapacityView::from_row(
+        &stored,
+        current_active,
+        current_cps_rate,
+    )))
 }

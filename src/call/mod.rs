@@ -993,6 +993,11 @@ pub struct RoutingState {
     /// Optional database handle for DB-driven routing (trunk_group dispatch).
     /// None in most unit tests; Some in production via RoutingState::new_with_db.
     pub db: Option<sea_orm::DatabaseConnection>,
+    /// Phase 5 Plan 05-04: Per-trunk-group capacity gates (max_calls atomic +
+    /// max_cps token bucket). None in unit tests that don't exercise gates;
+    /// Some in production wiring via SipServerInner.
+    pub trunk_capacity_state:
+        Option<Arc<crate::proxy::trunk_capacity_state::TrunkCapacityState>>,
 }
 
 impl Default for RoutingState {
@@ -1265,7 +1270,17 @@ impl RoutingState {
             round_robin_counters: Arc::new(Mutex::new(HashMap::new())),
             policy_guard: None,
             db,
+            trunk_capacity_state: None,
         }
+    }
+
+    /// Phase 5 Plan 05-04: attach the per-trunk capacity-gate state.
+    pub fn with_trunk_capacity_state(
+        mut self,
+        state: Arc<crate::proxy::trunk_capacity_state::TrunkCapacityState>,
+    ) -> Self {
+        self.trunk_capacity_state = Some(state);
+        self
     }
 
     /// Accessor for the optional DB handle. Used by
@@ -1273,6 +1288,13 @@ impl RoutingState {
     /// attempt DB-driven trunk_group detection.
     pub fn db(&self) -> Option<&sea_orm::DatabaseConnection> {
         self.db.as_ref()
+    }
+
+    /// Phase 5 Plan 05-04 accessor for the capacity-gate state.
+    pub fn trunk_capacity_state(
+        &self,
+    ) -> Option<&Arc<crate::proxy::trunk_capacity_state::TrunkCapacityState>> {
+        self.trunk_capacity_state.as_ref()
     }
 
     /// Get the next trunk index for round-robin selection

@@ -238,6 +238,18 @@ impl TrunkCapacityState {
             .map(|g| g.current_active())
             .unwrap_or(0)
     }
+
+    /// Phase 5 Plan 05-04: idempotent live limits update for the trunk group.
+    /// Creates a fresh gate when none exists yet (allows the PUT /capacity
+    /// handler to pre-warm the limits before the first INVITE arrives).
+    pub fn update_limits(
+        &self,
+        trunk_group_id: i64,
+        max_calls: Option<u32>,
+        max_cps: Option<u32>,
+    ) {
+        self.ensure_gate(trunk_group_id, max_calls, max_cps);
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────

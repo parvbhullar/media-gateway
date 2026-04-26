@@ -93,6 +93,9 @@ pub async fn create_test_server_with_config(
         locator_events: Some(locator_events_tx),
         sip_flow: None,
         active_call_registry: Arc::new(ActiveProxyCallRegistry::new()),
+        trunk_capacity_state: Arc::new(
+            crate::proxy::trunk_capacity_state::TrunkCapacityState::new(),
+        ),
         frequency_limiter: None,
         call_record_hooks: Arc::new(Vec::new()),
         runnings_tx: Arc::new(AtomicUsize::new(0)),

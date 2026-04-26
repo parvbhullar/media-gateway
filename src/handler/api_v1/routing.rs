@@ -224,6 +224,16 @@ async fn resolve_route(
             selected_gateway: None,
             trace: trace_vec,
         },
+        RouteResult::Reject { code, reason, .. } => ResolveRouteResponse {
+            // Phase 5 Plan 05-04: trunk-enforcement reject (403/488/503).
+            result: "reject".into(),
+            matched_table: None,
+            matched_record_index: None,
+            match_reason: Some(format!("{} ({})", reason, code)),
+            target: None,
+            selected_gateway: None,
+            trace: trace_vec,
+        },
         RouteResult::Queue { .. } => ResolveRouteResponse {
             result: "matched".into(),
             matched_table: None,

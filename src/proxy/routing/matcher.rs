@@ -15,7 +15,12 @@ use tracing::info;
 use crate::{
     call::{DialDirection, RoutingState, policy::PolicyCheckStatus},
     config::{DialplanHints, RouteResult},
-    proxy::routing::{ActionType, RouteQueueConfig, RouteRule, SourceTrunk, TrunkConfig},
+    proxy::routing::{
+        ActionType, RouteQueueConfig, RouteRule, SourceTrunk, TrunkConfig,
+        codec_normalize::intersect_codecs,
+    },
+    proxy::trunk_acl_eval::{AclVerdict, evaluate_acl_rules},
+    proxy::trunk_capacity_state::{AcquireOutcome, Permit},
 };
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
@@ -116,6 +121,46 @@ pub async fn match_invite(
         direction,
         MatchMode::Execute,
         None,
+        Vec::new(),
+        None,
+    )
+    .await
+    .map(|(r, _)| r)
+}
+
+/// Phase 5 Plan 05-04: extended entry point that accepts a caller-codec list
+/// (extracted from SDP by the caller; the matcher does not parse SDP) and a
+/// peer IP for per-trunk ACL evaluation. Used by `src/proxy/call.rs`.
+///
+/// Returns `(RouteResult, Option<Permit>)`. The Permit, when present, must
+/// be attached to the registry entry via
+/// `ActiveProxyCallRegistry::attach_permit` so that capacity is released
+/// when the call ends (RAII drop).
+pub async fn match_invite_with_codecs(
+    trunks: Option<&HashMap<String, TrunkConfig>>,
+    routes: Option<&Vec<RouteRule>>,
+    resource_lookup: Option<&dyn RouteResourceLookup>,
+    option: InviteOption,
+    origin: &rsipstack::sip::Request,
+    source_trunk: Option<&SourceTrunk>,
+    routing_state: Arc<RoutingState>,
+    direction: &DialDirection,
+    caller_codecs: Vec<String>,
+    peer_ip: Option<std::net::IpAddr>,
+) -> Result<(RouteResult, Option<Permit>)> {
+    match_invite_impl(
+        trunks,
+        routes,
+        resource_lookup,
+        option,
+        origin,
+        source_trunk,
+        routing_state,
+        direction,
+        MatchMode::Execute,
+        None,
+        caller_codecs,
+        peer_ip,
     )
     .await
 }
@@ -142,6 +187,42 @@ pub async fn match_invite_with_trace(
         direction,
         MatchMode::Execute,
         Some(trace),
+        Vec::new(),
+        None,
+    )
+    .await
+    .map(|(r, _)| r)
+}
+
+/// Phase 5 Plan 05-04: trace + caller_codecs + peer_ip variant. Returns the
+/// optional Permit alongside the RouteResult, mirroring
+/// `match_invite_with_codecs`.
+pub async fn match_invite_with_trace_and_codecs(
+    trunks: Option<&HashMap<String, TrunkConfig>>,
+    routes: Option<&Vec<RouteRule>>,
+    resource_lookup: Option<&dyn RouteResourceLookup>,
+    option: InviteOption,
+    origin: &rsipstack::sip::Request,
+    source_trunk: Option<&SourceTrunk>,
+    routing_state: Arc<RoutingState>,
+    direction: &DialDirection,
+    trace: &mut RouteTrace,
+    caller_codecs: Vec<String>,
+    peer_ip: Option<std::net::IpAddr>,
+) -> Result<(RouteResult, Option<Permit>)> {
+    match_invite_impl(
+        trunks,
+        routes,
+        resource_lookup,
+        option,
+        origin,
+        source_trunk,
+        routing_state,
+        direction,
+        MatchMode::Execute,
+        Some(trace),
+        caller_codecs,
+        peer_ip,
     )
     .await
 }
@@ -167,8 +248,161 @@ pub async fn inspect_invite(
         direction,
         MatchMode::Inspect,
         None,
+        Vec::new(),
+        None,
     )
     .await
+    .map(|(r, _)| r)
+}
+
+/// Phase 5 Plan 05-04: Look up trunk_group_id for `name`, returning None when
+/// the DB or row is absent. Errors on DB connection failure.
+async fn lookup_trunk_group_id_for_name(
+    db: &sea_orm::DatabaseConnection,
+    name: &str,
+) -> Result<Option<i64>> {
+    use crate::models::trunk_group::{Column as TgColumn, Entity as TgEntity};
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    Ok(TgEntity::find()
+        .filter(TgColumn::Name.eq(name))
+        .one(db)
+        .await?
+        .map(|m| m.id))
+}
+
+/// Phase 5 Plan 05-04: Read the per-trunk ACL ruleset (ordered by `position`).
+/// Returns an empty Vec when no rows exist (D-14 default-allow path).
+async fn load_trunk_acl_rules(
+    db: &sea_orm::DatabaseConnection,
+    trunk_group_id: i64,
+) -> Result<Vec<String>> {
+    use crate::models::trunk_acl_entries::{
+        Column as AclColumn, Entity as AclEntity,
+    };
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
+    let rows = AclEntity::find()
+        .filter(AclColumn::TrunkGroupId.eq(trunk_group_id))
+        .order_by_asc(AclColumn::Position)
+        .all(db)
+        .await?;
+    Ok(rows.into_iter().map(|r| r.rule).collect())
+}
+
+/// Phase 5 Plan 05-04: Read max_calls + max_cps for the trunk group
+/// (None when no row exists or both fields are NULL → unlimited per D-04).
+async fn load_capacity_limits(
+    db: &sea_orm::DatabaseConnection,
+    trunk_group_id: i64,
+) -> Result<(Option<u32>, Option<u32>)> {
+    use crate::models::trunk_capacity::{
+        Column as CapColumn, Entity as CapEntity,
+    };
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    if let Some(row) = CapEntity::find()
+        .filter(CapColumn::TrunkGroupId.eq(trunk_group_id))
+        .one(db)
+        .await?
+    {
+        let max_calls = row.max_calls.and_then(|v| u32::try_from(v).ok());
+        let max_cps = row.max_cps.and_then(|v| u32::try_from(v).ok());
+        Ok((max_calls, max_cps))
+    } else {
+        Ok((None, None))
+    }
+}
+
+/// Phase 5 Plan 05-04: Apply the three enforcement gates (ACL → capacity →
+/// codec) for the resolved trunk group. Returns:
+/// - `Ok(Ok(Some(permit)))` — gates passed, permit acquired (move into entry)
+/// - `Ok(Ok(None))` — gates passed, no capacity gate (no DB or no group row)
+/// - `Ok(Err(reject))` — gate denied; `reject` is a ready `RouteResult::Reject`
+/// - `Err(e)` — DB failure
+async fn apply_phase5_gates(
+    routing_state: &Arc<RoutingState>,
+    trunk_group_name: &str,
+    caller_codecs: &[String],
+    peer_ip: Option<std::net::IpAddr>,
+    trunk_codecs: Option<&Vec<String>>,
+) -> Result<std::result::Result<Option<Permit>, RouteResult>> {
+    let db = match routing_state.db() {
+        Some(d) => d,
+        None => return Ok(Ok(None)),
+    };
+    let group_id =
+        match lookup_trunk_group_id_for_name(db, trunk_group_name).await? {
+            Some(id) => id,
+            None => return Ok(Ok(None)),
+        };
+
+    // Gate 1: per-trunk ACL (D-15, D-16, D-17 fresh read per INVITE)
+    if let Some(ip) = peer_ip {
+        let rules = load_trunk_acl_rules(db, group_id).await?;
+        if let AclVerdict::Deny = evaluate_acl_rules(&rules, ip) {
+            info!(
+                trunk = %trunk_group_name,
+                peer_ip = %ip,
+                "trunk ACL deny → 403"
+            );
+            return Ok(Err(RouteResult::Reject {
+                code: 403,
+                reason: "trunk_acl_blocked".to_string(),
+                retry_after_secs: None,
+            }));
+        }
+    }
+
+    // Gate 2: capacity (max_calls + max_cps token bucket, D-03 + D-09)
+    let permit = if let Some(cap_state) = routing_state.trunk_capacity_state() {
+        let (max_calls, max_cps) = load_capacity_limits(db, group_id).await?;
+        match cap_state.try_acquire(group_id, max_calls, max_cps) {
+            AcquireOutcome::Ok(permit) => Some(permit),
+            AcquireOutcome::CallsExhausted => {
+                info!(
+                    trunk = %trunk_group_name,
+                    "trunk capacity exhausted (max_calls) → 503"
+                );
+                return Ok(Err(RouteResult::Reject {
+                    code: 503,
+                    reason: "trunk_capacity_exhausted".to_string(),
+                    retry_after_secs: Some(5),
+                }));
+            }
+            AcquireOutcome::CpsExhausted => {
+                info!(
+                    trunk = %trunk_group_name,
+                    "trunk CPS exhausted → 503"
+                );
+                return Ok(Err(RouteResult::Reject {
+                    code: 503,
+                    reason: "trunk_cps_exhausted".to_string(),
+                    retry_after_secs: Some(5),
+                }));
+            }
+        }
+    } else {
+        None
+    };
+
+    // Gate 3: codec intersection (D-18, D-20 empty trunk list = allow-all)
+    if let Some(trunk_codec_list) = trunk_codecs {
+        if !trunk_codec_list.is_empty() {
+            let chosen = intersect_codecs(caller_codecs, trunk_codec_list);
+            if chosen.is_empty() {
+                info!(
+                    trunk = %trunk_group_name,
+                    "codec intersection empty → 488"
+                );
+                drop(permit); // T-05-04-10: release capacity on codec reject
+                return Ok(Err(RouteResult::Reject {
+                    code: 488,
+                    reason: "codec_mismatch_488".to_string(),
+                    retry_after_secs: None,
+                }));
+            }
+        }
+    }
+
+    Ok(Ok(permit))
 }
 
 async fn match_invite_impl(
@@ -182,11 +416,13 @@ async fn match_invite_impl(
     direction: &DialDirection,
     mode: MatchMode,
     mut trace: Option<&mut RouteTrace>,
-) -> Result<RouteResult> {
+    caller_codecs: Vec<String>,
+    peer_ip: Option<std::net::IpAddr>,
+) -> Result<(RouteResult, Option<Permit>)> {
     let mut option = option;
     let routes = match routes {
         Some(routes) => routes,
-        None => return Ok(RouteResult::NotHandled(option, None)),
+        None => return Ok((RouteResult::NotHandled(option, None), None)),
     };
 
     // Extract URI information early to avoid borrowing conflicts
@@ -306,9 +542,12 @@ async fn match_invite_impl(
                             reason: Some(reason.clone()),
                         });
                     }
-                    return Ok(RouteResult::Abort(
-                        rsipstack::sip::StatusCode::Forbidden,
-                        Some(reason),
+                    return Ok((
+                        RouteResult::Abort(
+                            rsipstack::sip::StatusCode::Forbidden,
+                            Some(reason),
+                        ),
+                        None,
                     ));
                 }
             }
@@ -337,7 +576,10 @@ async fn match_invite_impl(
                             reason: reason.clone(),
                         });
                     }
-                    return Ok(RouteResult::Abort(reject_config.code.into(), reason));
+                    return Ok((
+                        RouteResult::Abort(reject_config.code.into(), reason),
+                        None,
+                    ));
                 } else {
                     if let Some(trace) = &mut trace {
                         trace.abort = Some(RouteAbortTrace {
@@ -345,7 +587,10 @@ async fn match_invite_impl(
                             reason: None,
                         });
                     }
-                    return Ok(RouteResult::Abort(rsipstack::sip::StatusCode::Forbidden, None));
+                    return Ok((
+                        RouteResult::Abort(rsipstack::sip::StatusCode::Forbidden, None),
+                        None,
+                    ));
                 }
             }
             ActionType::Busy => {
@@ -355,9 +600,13 @@ async fn match_invite_impl(
                         reason: None,
                     });
                 }
-                return Ok(RouteResult::Abort(rsipstack::sip::StatusCode::BusyHere, None));
+                return Ok((
+                    RouteResult::Abort(rsipstack::sip::StatusCode::BusyHere, None),
+                    None,
+                ));
             }
             ActionType::Forward => {
+                let mut phase5_permit: Option<Permit> = None;
                 if let Some(dest_config) = &rule.action.dest {
                     if mode == MatchMode::Execute {
                         let (selected_trunk, via_trunk_group) =
@@ -393,7 +642,7 @@ async fn match_invite_impl(
 
                         if let Some(trace) = &mut trace {
                             trace.selected_trunk = Some(selected_trunk.clone());
-                            trace.trunk_group_name = via_trunk_group;
+                            trace.trunk_group_name = via_trunk_group.clone();
                         }
 
                         if let Some(trunk_config) = trunks
@@ -427,9 +676,12 @@ async fn match_invite_impl(
                                                 reason: Some(reason.clone()),
                                             });
                                         }
-                                        return Ok(RouteResult::Abort(
-                                            rsipstack::sip::StatusCode::Forbidden,
-                                            Some(reason),
+                                        return Ok((
+                                            RouteResult::Abort(
+                                                rsipstack::sip::StatusCode::Forbidden,
+                                                Some(reason),
+                                            ),
+                                            None,
                                         ));
                                     }
                                 }
@@ -443,9 +695,41 @@ async fn match_invite_impl(
                         } else {
                             info!("Trunk '{}' not found in configuration", selected_trunk);
                         }
+
+                        // Phase 5 Plan 05-04: enforcement gates (ACL → capacity → codec)
+                        if let Some(group_name) = &via_trunk_group {
+                            let trunk_codecs = hints
+                                .as_ref()
+                                .and_then(|h| h.allow_codecs.as_ref());
+                            match apply_phase5_gates(
+                                &routing_state,
+                                group_name,
+                                &caller_codecs,
+                                peer_ip,
+                                trunk_codecs,
+                            )
+                            .await?
+                            {
+                                Ok(permit) => phase5_permit = permit,
+                                Err(reject) => {
+                                    if let Some(trace) = &mut trace {
+                                        if let RouteResult::Reject {
+                                            code, reason, ..
+                                        } = &reject
+                                        {
+                                            trace.abort = Some(RouteAbortTrace {
+                                                code: *code,
+                                                reason: Some(reason.clone()),
+                                            });
+                                        }
+                                    }
+                                    return Ok((reject, None));
+                                }
+                            }
+                        }
                     }
                 }
-                return Ok(RouteResult::Forward(option, hints));
+                return Ok((RouteResult::Forward(option, hints), phase5_permit));
             }
             ActionType::Queue => {
                 let queue_ref = rule
@@ -485,6 +769,7 @@ async fn match_invite_impl(
                     queue_plan.label = Some(queue_ref.clone());
                 }
                 let needs_trunk = queue_plan.dial_strategy.is_none();
+                let mut phase5_permit_q: Option<Permit> = None;
                 if needs_trunk {
                     let dest_config = rule.action.dest.as_ref().ok_or_else(|| {
                         anyhow!("queue action requires 'dest' or inline queue targets")
@@ -524,7 +809,7 @@ async fn match_invite_impl(
 
                         if let Some(trace) = &mut trace {
                             trace.selected_trunk = Some(selected_trunk.clone());
-                            trace.trunk_group_name = via_trunk_group;
+                            trace.trunk_group_name = via_trunk_group.clone();
                         }
 
                         if let Some(trunk_config) = trunks
@@ -558,23 +843,61 @@ async fn match_invite_impl(
                                                 reason: Some(reason.clone()),
                                             });
                                         }
-                                        return Ok(RouteResult::Abort(
-                                            rsipstack::sip::StatusCode::Forbidden,
-                                            Some(reason),
+                                        return Ok((
+                                            RouteResult::Abort(
+                                                rsipstack::sip::StatusCode::Forbidden,
+                                                Some(reason),
+                                            ),
+                                            None,
                                         ));
                                     }
                                 }
                             }
                             apply_trunk_config(&mut option, trunk_config)?;
                         }
+
+                        // Phase 5 Plan 05-04: enforcement gates (ACL → capacity → codec)
+                        if let Some(group_name) = &via_trunk_group {
+                            let trunk_codecs = hints
+                                .as_ref()
+                                .and_then(|h| h.allow_codecs.as_ref());
+                            match apply_phase5_gates(
+                                &routing_state,
+                                group_name,
+                                &caller_codecs,
+                                peer_ip,
+                                trunk_codecs,
+                            )
+                            .await?
+                            {
+                                Ok(permit) => phase5_permit_q = permit,
+                                Err(reject) => {
+                                    if let Some(trace) = &mut trace {
+                                        if let RouteResult::Reject {
+                                            code, reason, ..
+                                        } = &reject
+                                        {
+                                            trace.abort = Some(RouteAbortTrace {
+                                                code: *code,
+                                                reason: Some(reason.clone()),
+                                            });
+                                        }
+                                    }
+                                    return Ok((reject, None));
+                                }
+                            }
+                        }
                     }
                 }
 
-                return Ok(RouteResult::Queue {
-                    option,
-                    queue: queue_plan,
-                    hints,
-                });
+                return Ok((
+                    RouteResult::Queue {
+                        option,
+                        queue: queue_plan,
+                        hints,
+                    },
+                    phase5_permit_q,
+                ));
             }
             ActionType::Application => {
                 let app_name = rule
@@ -583,17 +906,20 @@ async fn match_invite_impl(
                     .as_ref()
                     .ok_or_else(|| anyhow!("application action requires 'app' field"))?;
 
-                return Ok(RouteResult::Application {
-                    option,
-                    app_name: app_name.clone(),
-                    app_params: rule.action.app_params.clone(),
-                    auto_answer: rule.action.auto_answer,
-                });
+                return Ok((
+                    RouteResult::Application {
+                        option,
+                        app_name: app_name.clone(),
+                        app_params: rule.action.app_params.clone(),
+                        auto_answer: rule.action.auto_answer,
+                    },
+                    None,
+                ));
             }
         }
     }
 
-    return Ok(RouteResult::NotHandled(option, None));
+    return Ok((RouteResult::NotHandled(option, None), None));
 }
 
 /// Context for rule matching to reduce function arguments
