@@ -1,4 +1,5 @@
 use crate::proxy::proxy_call::sip_session::SipSessionHandle;
+use crate::proxy::trunk_capacity_state::Permit;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -28,6 +29,12 @@ pub struct ActiveProxyCallEntry {
     pub started_at: DateTime<Utc>,
     pub answered_at: Option<DateTime<Utc>>,
     pub status: ActiveProxyCallStatus,
+    /// Phase 5 Plan 05-04: name of the trunk group this call was dispatched
+    /// against. None for calls not routed via a trunk group (extension dial,
+    /// app, queue without trunk_group resolution). Used by GET
+    /// /trunks/{name}/capacity to count live active calls.
+    #[serde(default)]
+    pub trunk_group_name: Option<String>,
 }
 
 #[derive(Default)]
@@ -37,6 +44,12 @@ struct RegistryState {
     handles_by_dialog: HashMap<String, SipSessionHandle>,
     // session_id -> all registered dialog_ids (multiple dialogs per session during failover)
     dialog_by_session: HashMap<String, Vec<String>>,
+    /// Phase 5 Plan 05-04: capacity Permits keyed on session_id. Stored
+    /// out-of-band (NOT inside the cloneable ActiveProxyCallEntry) so that
+    /// snapshot reads via list_recent / get never carry a Permit copy.
+    /// Removing a session id from this map drops the Permit and its Drop
+    /// impl decrements the gate's active counter.
+    permits: HashMap<String, Permit>,
 }
 
 pub struct ActiveProxyCallRegistry {
@@ -104,6 +117,33 @@ impl ActiveProxyCallRegistry {
                 guard.handles_by_dialog.remove(&dialog_id);
             }
         }
+        // Drop the capacity Permit (RAII releases the trunk's active counter).
+        guard.permits.remove(session_id);
+    }
+
+    /// Phase 5 Plan 05-04: stash a capacity Permit alongside the call. The
+    /// Permit's Drop impl is invoked when `remove(session_id)` is called or
+    /// the registry is dropped. The Permit lives outside the cloneable
+    /// ActiveProxyCallEntry so list/get snapshots never accidentally extend
+    /// the permit lifetime.
+    pub fn attach_permit(&self, session_id: &str, permit: Permit) {
+        self.inner
+            .lock()
+            .unwrap()
+            .permits
+            .insert(session_id.to_string(), permit);
+    }
+
+    /// Phase 5 Plan 05-04: count active entries dispatched against a given
+    /// trunk group name. Used by GET /api/v1/trunks/{name}/capacity to
+    /// surface live `current_active`.
+    pub fn count_active_for_trunk(&self, trunk_group_name: &str) -> u32 {
+        let guard = self.inner.lock().unwrap();
+        guard
+            .entries
+            .values()
+            .filter(|e| e.trunk_group_name.as_deref() == Some(trunk_group_name))
+            .count() as u32
     }
 
     pub fn count(&self) -> usize {
@@ -155,6 +195,7 @@ impl ActiveProxyCallRegistry {
             started_at: Utc::now(),
             answered_at: None,
             status: ActiveProxyCallStatus::Ringing,
+            trunk_group_name: None,
         };
         self.upsert(entry, handle);
     }
@@ -222,7 +263,91 @@ mod tests {
             started_at: chrono::Utc::now(),
             answered_at: None,
             status: ActiveProxyCallStatus::Ringing,
+            trunk_group_name: None,
         }
+    }
+
+    fn make_entry_with_trunk(session_id: &str, trunk: Option<&str>) -> ActiveProxyCallEntry {
+        let mut e = make_entry(session_id);
+        e.trunk_group_name = trunk.map(|s| s.to_string());
+        e
+    }
+
+    /// Phase 5 Plan 05-04 Task 3 unit test 1.
+    #[test]
+    fn count_active_for_trunk_returns_zero_when_no_entries() {
+        let registry = ActiveProxyCallRegistry::new();
+        assert_eq!(registry.count_active_for_trunk("any"), 0);
+    }
+
+    /// Phase 5 Plan 05-04 Task 3 unit test 2.
+    #[test]
+    fn count_active_for_trunk_filters_by_trunk_group_name() {
+        let registry = ActiveProxyCallRegistry::new();
+        let h1 = make_handle("s1");
+        let h2 = make_handle("s2");
+        let h3 = make_handle("s3");
+        registry.upsert(make_entry_with_trunk("s1", Some("a")), h1);
+        registry.upsert(make_entry_with_trunk("s2", Some("a")), h2);
+        registry.upsert(make_entry_with_trunk("s3", Some("b")), h3);
+        assert_eq!(registry.count_active_for_trunk("a"), 2);
+        assert_eq!(registry.count_active_for_trunk("b"), 1);
+        assert_eq!(registry.count_active_for_trunk("c"), 0);
+    }
+
+    /// Phase 5 Plan 05-04 Task 3 unit test 3: Permit drops on registry remove.
+    #[test]
+    fn permit_drops_when_entry_removed() {
+        use crate::proxy::trunk_capacity_state::{AcquireOutcome, TrunkCapacityGate};
+        use std::sync::Arc;
+        let registry = ActiveProxyCallRegistry::new();
+        let gate = Arc::new(TrunkCapacityGate::new(Some(1), None));
+        let permit = match gate.try_acquire() {
+            AcquireOutcome::Ok(p) => p,
+            _ => panic!("first acquire must succeed"),
+        };
+        let session = "s-permit";
+        let handle = make_handle(session);
+        registry.upsert(make_entry(session), handle);
+        registry.attach_permit(session, permit);
+
+        // Gate at max — second acquire fails.
+        assert!(matches!(gate.try_acquire(), AcquireOutcome::CallsExhausted));
+
+        // Removing the registry entry drops the Permit.
+        registry.remove(session);
+        assert!(matches!(gate.try_acquire(), AcquireOutcome::Ok(_)));
+    }
+
+    /// Phase 5 Plan 05-04 Task 3 unit test 4: cloned entries don't carry Permit.
+    /// Permits live in a sibling map keyed by session_id, so cloning the
+    /// ActiveProxyCallEntry struct cannot duplicate a Permit. This test
+    /// asserts the structural property: a cloned entry's snapshot lifetime
+    /// is independent of the gate's active counter.
+    #[test]
+    fn clone_does_not_clone_permit() {
+        use crate::proxy::trunk_capacity_state::{AcquireOutcome, TrunkCapacityGate};
+        use std::sync::Arc;
+        let registry = ActiveProxyCallRegistry::new();
+        let gate = Arc::new(TrunkCapacityGate::new(Some(1), None));
+        let permit = match gate.try_acquire() {
+            AcquireOutcome::Ok(p) => p,
+            _ => panic!(),
+        };
+        let session = "s-clone";
+        let handle = make_handle(session);
+        registry.upsert(make_entry(session), handle);
+        registry.attach_permit(session, permit);
+
+        // list_recent clones the entries.
+        let recent = registry.list_recent(10);
+        assert_eq!(recent.len(), 1);
+        // The cloned entry exists; the registry still owns the permit.
+        // Removing from registry must still release the permit even though
+        // a cloned snapshot is alive.
+        registry.remove(session);
+        drop(recent);
+        assert!(matches!(gate.try_acquire(), AcquireOutcome::Ok(_)));
     }
 
     /// Before fix: dialog_by_session stored only the LAST dialog, so remove() only

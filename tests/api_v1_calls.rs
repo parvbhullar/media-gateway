@@ -31,6 +31,7 @@ fn make_entry(
         started_at: Utc::now(),
         answered_at: None,
         status,
+        trunk_group_name: None,
     }
 }
 
@@ -47,6 +48,7 @@ fn make_entry_at(
         started_at,
         answered_at: None,
         status,
+        trunk_group_name: None,
     }
 }
 
