@@ -52,7 +52,8 @@ pub struct TrunkView {
     pub members: Vec<TrunkMemberView>,
     // Phase 3 Plan 03-01 (D-02): `credentials` moved to a multi-row
     // sub-resource at /api/v1/trunks/{name}/credentials (Plan 03-02).
-    pub acl: Option<serde_json::Value>,
+    // Phase 5 Plan 05-01 (D-10): `acl` moved to multi-row sub-resource at
+    // /api/v1/trunks/{name}/acl (Plan 05-03).
     pub nofailover_sip_codes: Option<serde_json::Value>,
     pub is_active: bool,
     pub created_at: DateTime<Utc>,
@@ -89,7 +90,6 @@ fn view_from(
         direction: group.direction.as_str().to_string(),
         distribution_mode: group.distribution_mode.as_str().to_string(),
         members: members.into_iter().map(TrunkMemberView::from).collect(),
-        acl: group.acl,
         nofailover_sip_codes: group.nofailover_sip_codes,
         is_active: group.is_active,
         created_at: group.created_at,
@@ -118,8 +118,8 @@ pub struct CreateTrunkRequest {
     pub distribution_mode: Option<String>,
     // Phase 3 Plan 03-01 (D-02): `credentials` removed — POST to
     // /api/v1/trunks/{name}/credentials (Plan 03-02) instead.
-    #[serde(default)]
-    pub acl: Option<serde_json::Value>,
+    // Phase 5 Plan 05-01 (D-10): `acl` removed — POST to
+    // /api/v1/trunks/{name}/acl (Plan 05-03) instead.
     #[serde(default)]
     pub nofailover_sip_codes: Option<serde_json::Value>,
     #[serde(default = "default_true")]
@@ -147,8 +147,7 @@ pub struct UpdateTrunkRequest {
     #[serde(default)]
     pub distribution_mode: Option<String>,
     // Phase 3 Plan 03-01 (D-02): `credentials` removed — sub-resource.
-    #[serde(default)]
-    pub acl: Option<serde_json::Value>,
+    // Phase 5 Plan 05-01 (D-10): `acl` removed — sub-resource.
     #[serde(default)]
     pub nofailover_sip_codes: Option<serde_json::Value>,
     #[serde(default)]
@@ -467,7 +466,6 @@ async fn create_trunk(
         display_name: Set(req.display_name),
         direction: Set(direction),
         distribution_mode: Set(mode),
-        acl: Set(req.acl),
         nofailover_sip_codes: Set(req.nofailover_sip_codes),
         // Phase 3 Plan 03-01: media_config managed via
         // /api/v1/trunks/{name}/media (Plan 03-04).
@@ -572,9 +570,8 @@ async fn update_trunk(
     }
     // Phase 3 Plan 03-01 (D-02): `credentials` is no longer a
     // trunk_group column — managed via the credentials sub-resource.
-    if let Some(v) = req.acl {
-        am.acl = Set(Some(v));
-    }
+    // Phase 5 Plan 05-01 (D-10): `acl` is no longer a trunk_group column —
+    // managed via the acl sub-resource (Plan 05-03).
     if let Some(v) = req.nofailover_sip_codes {
         am.nofailover_sip_codes = Set(Some(v));
     }

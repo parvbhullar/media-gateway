@@ -20,6 +20,7 @@ pub mod call_record_indices;
 pub mod call_record_optimization_indices;
 pub mod department;
 pub mod did;
+pub mod drop_acl_column;
 pub mod drop_credentials_column;
 pub mod extension;
 pub mod extension_department;

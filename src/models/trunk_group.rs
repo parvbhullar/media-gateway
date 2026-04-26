@@ -72,7 +72,6 @@ pub struct Model {
     pub display_name: Option<String>,
     pub direction: SipTrunkDirection,
     pub distribution_mode: TrunkGroupDistributionMode,
-    pub acl: Option<Json>,
     pub nofailover_sip_codes: Option<Json>,
     // Phase 3 Plan 03-01 (TSUB-03): media configuration JSON blob.
     // Additive per D-09. Shape:
@@ -120,7 +119,6 @@ impl MigrationTrait for Migration {
                             .char_len(32)
                             .default(TrunkGroupDistributionMode::default().as_str()),
                     )
-                    .col(json_null(Column::Acl))
                     .col(json_null(Column::NofailoverSipCodes))
                     // Phase 3 Plan 03-01 (TSUB-03, D-09): media config JSON.
                     // Added to fresh-DB CREATE so new installs don't need
