@@ -18,7 +18,7 @@ v2.0 closes the gap between media-gateway's rich data plane (rsipstack proxy, Se
 - [ ] **Phase 2: Trunk Groups Schema & Core CRUD** - `rustpbx_trunk_groups` + `/api/v1/trunks` CRUD
 - [ ] **Phase 3: Trunk Sub-Resources L1 & Routing Resolve** - Credentials, origination URIs, media schema, `/routing/resolve` dry-run
 - [ ] **Phase 4: Active Calls & Mid-Call Control** - List/get/hangup/transfer/mute + play/speak/dtmf/record
-- [ ] **Phase 5: Trunk Enforcement (Capacity, ACL, Codec Filter)** - Proxy hot-path enforcement for per-trunk limits
+- [x] **Phase 5: Trunk Enforcement (Capacity, ACL, Codec Filter)** - Proxy hot-path enforcement for per-trunk limits (completed 2026-04-26)
 - [ ] **Phase 6: Routing Tables, Records & Distribution** - Full routing CRUD + record adapter + distribution modes
 - [ ] **Phase 7: Webhook Pipeline** - CDR delivery with HMAC, retries, disk fallback
 - [ ] **Phase 8: Translations Engine** - Number rewrite before routing
@@ -97,13 +97,13 @@ Plans:
   3. Per-trunk ACL entries are enforced on ingress alongside the global firewall, blocking unauthorized sources
   4. Integration tests exercise capacity exhaustion, codec mismatch, and ACL block paths end-to-end through the dispatch flow
 
-**Plans:** 4 plans
+**Plans:** 4/4 plans complete
 
 Plans:
-- [ ] 05-01-PLAN.md — Schema migrations: supersip_trunk_capacity + supersip_trunk_acl_entries + drop rustpbx_trunk_groups.acl
-- [ ] 05-02-PLAN.md — TSUB-04 + TSUB-07: GET/PUT /api/v1/trunks/{name}/capacity (placeholders for live counts)
-- [ ] 05-03-PLAN.md — TSUB-05: GET/POST/DELETE /api/v1/trunks/{name}/acl + validate_acl_rule
-- [ ] 05-04-PLAN.md — Proxy enforcement: TrunkCapacityState + codec_normalize + per-trunk ACL eval; wire 3 gates into matcher; live observability + IT-03 tests
+- [x] 05-01-PLAN.md — Schema migrations: supersip_trunk_capacity + supersip_trunk_acl_entries + drop rustpbx_trunk_groups.acl
+- [x] 05-02-PLAN.md — TSUB-04 + TSUB-07: GET/PUT /api/v1/trunks/{name}/capacity (placeholders for live counts)
+- [x] 05-03-PLAN.md — TSUB-05: GET/POST/DELETE /api/v1/trunks/{name}/acl + validate_acl_rule
+- [x] 05-04-PLAN.md — Proxy enforcement: TrunkCapacityState + codec_normalize + per-trunk ACL eval; wire 3 gates into matcher; live observability + IT-03 tests
 
 ### Phase 6: Routing Tables, Records & Distribution
 **Goal**: Ship full `/api/v1/routing/*` CRUD including the routing records sub-route adapter for console's embedded-document storage.
@@ -197,7 +197,7 @@ Phases execute in numeric order: 1 → 2 → 3 → ... → 13
 | 2. Trunk Groups Schema & Core CRUD | 0/TBD | Not started | - |
 | 3. Trunk Sub-Resources L1 & Routing Resolve | 0/5 | Planned | - |
 | 4. Active Calls & Mid-Call Control | 0/5 | Planned | - |
-| 5. Trunk Enforcement | 0/TBD | Not started | - |
+| 5. Trunk Enforcement | 4/4 | Complete   | 2026-04-26 |
 | 6. Routing Tables, Records & Distribution | 0/TBD | Not started | - |
 | 7. Webhook Pipeline | 0/TBD | Not started | - |
 | 8. Translations Engine | 0/TBD | Not started | - |

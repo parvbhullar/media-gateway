@@ -77,10 +77,10 @@ Requirement IDs follow `[CATEGORY]-[NUMBER]`. All v2.0 requirements are user/ope
 - [ ] **TSUB-01**: Per-trunk credentials CRUD at `/api/v1/trunks/{name}/credentials` and `/api/v1/trunks/{name}/credentials/{realm}`
 - [ ] **TSUB-02**: Per-trunk origination URIs CRUD at `/api/v1/trunks/{name}/origination_uris` and `/api/v1/trunks/{name}/origination_uris/{uri}`
 - [ ] **TSUB-03**: Per-trunk media config (codec list, dtmf mode, srtp, media mode) GET/PUT at `/api/v1/trunks/{name}/media`
-- [ ] **TSUB-04**: Per-trunk capacity (max_calls, max_cps) GET/PUT at `/api/v1/trunks/{name}/capacity`, enforced by proxy dispatch before gateway selection
-- [ ] **TSUB-05**: Per-trunk ACL CRUD at `/api/v1/trunks/{name}/acl` and `/api/v1/trunks/{name}/acl/{entry}`; enforced in ingress check alongside global firewall
-- [ ] **TSUB-06**: Media config filtering: if a caller SDP codec intersection with the trunk codec list is empty, the call is rejected with 488 Not Acceptable Here
-- [ ] **TSUB-07**: Trunk capacity enforcement is observable via `GET /api/v1/trunks/{name}/capacity` showing current active count
+- [x] **TSUB-04**: Per-trunk capacity (max_calls, max_cps) GET/PUT at `/api/v1/trunks/{name}/capacity`, enforced by proxy dispatch before gateway selection
+- [x] **TSUB-05**: Per-trunk ACL CRUD at `/api/v1/trunks/{name}/acl` and `/api/v1/trunks/{name}/acl/{entry}`; enforced in ingress check alongside global firewall
+- [x] **TSUB-06**: Media config filtering: if a caller SDP codec intersection with the trunk codec list is empty, the call is rejected with 488 Not Acceptable Here
+- [x] **TSUB-07**: Trunk capacity enforcement is observable via `GET /api/v1/trunks/{name}/capacity` showing current active count
 
 ### Routing (RTE)
 
@@ -180,7 +180,7 @@ Requirement IDs follow `[CATEGORY]-[NUMBER]`. All v2.0 requirements are user/ope
 
 - [ ] **IT-01**: Every new api_v1 sub-router has a dedicated test file under `tests/` that asserts 401 without auth, happy path, 404 on missing resource, and 400/409 on bad input
 - [ ] **IT-02**: Translations and Manipulations engines each have pipeline tests that place a simulated call through the dispatch path and assert rewritten numbers and mutated headers
-- [ ] **IT-03**: Trunk capacity enforcement, codec filtering (488 on mismatch), and per-trunk ACL each have a proxy integration test
+- [x] **IT-03**: Trunk capacity enforcement, codec filtering (488 on mismatch), and per-trunk ACL each have a proxy integration test
 - [ ] **IT-04**: Applications XML answer-URL flow has an end-to-end test using a mock HTTP server returning canned XML
 - [ ] **IT-05**: Sub-account isolation has a test asserting that a sub-account Bearer token cannot read or mutate another sub-account's trunk, DID, webhook, or recording
 
@@ -295,10 +295,10 @@ Every v2.0 requirement maps to exactly one phase.
 | TSUB-01 | Phase 3 | Pending |
 | TSUB-02 | Phase 3 | Pending |
 | TSUB-03 | Phase 3 | Pending |
-| TSUB-04 | Phase 5 | Pending |
-| TSUB-05 | Phase 5 | Pending |
-| TSUB-06 | Phase 5 | Pending |
-| TSUB-07 | Phase 5 | Pending |
+| TSUB-04 | Phase 5 | Complete |
+| TSUB-05 | Phase 5 | Complete |
+| TSUB-06 | Phase 5 | Complete |
+| TSUB-07 | Phase 5 | Complete |
 | RTE-01 | Phase 6 | Pending |
 | RTE-02 | Phase 6 | Pending |
 | RTE-03 | Phase 3 | Pending |
@@ -365,7 +365,7 @@ Every v2.0 requirement maps to exactly one phase.
 | TEN-06 | Phase 13 | Pending |
 | IT-01 | Phase 1 | Pending |
 | IT-02 | Phase 9 | Pending |
-| IT-03 | Phase 5 | Pending |
+| IT-03 | Phase 5 | Complete |
 | IT-04 | Phase 13 | Pending |
 | IT-05 | Phase 13 | Pending |
 | MIG-01 | Phase 2 | Complete |
