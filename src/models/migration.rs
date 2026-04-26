@@ -59,6 +59,9 @@ impl MigratorTrait for Migrator {
             Box::new(super::trunk_capacity::Migration),
             Box::new(super::trunk_acl_entries::Migration),
             Box::new(super::drop_acl_column::Migration),
+            // Phase 6 Plan 06-01 — RTE-01/RTE-02 routing tables (records embedded as JSON column per D-01).
+            // Forward-only. Legacy rustpbx_routes is intentionally untouched (D-05).
+            Box::new(super::routing_tables::Migration),
         ]
     }
 }
