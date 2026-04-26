@@ -14,6 +14,8 @@ pub mod error;
 pub mod gateways;
 pub mod reload_steps;
 pub mod routing;                  // Phase 3 Plan 03-01 — RTE-03
+pub mod routing_records;          // Phase 6 — RTE-02 (handlers in Plan 06-03)
+pub mod routing_tables;           // Phase 6 — RTE-01 (handlers in Plan 06-02)
 pub mod system;
 pub mod trunk_acl;                // Phase 5 — TSUB-05 (handlers in Plan 05-03)
 pub mod trunk_capacity;           // Phase 5 — TSUB-04 (handlers in Plan 05-02)
@@ -46,6 +48,8 @@ pub fn api_v1_router(state: AppState) -> Router {
         .merge(trunk_capacity::router())           // Phase 5 — TSUB-04
         .merge(trunk_acl::router())                // Phase 5 — TSUB-05
         .merge(routing::router())                  // Phase 3 — RTE-03
+        .merge(routing_tables::router())           // Phase 6 — RTE-01
+        .merge(routing_records::router())          // Phase 6 — RTE-02
         .merge(calls::router())                    // Phase 4 Plan 04-01 — CALL-01, CALL-02
         ;
 
