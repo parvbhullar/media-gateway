@@ -97,6 +97,14 @@ Plans:
   3. Per-trunk ACL entries are enforced on ingress alongside the global firewall, blocking unauthorized sources
   4. Integration tests exercise capacity exhaustion, codec mismatch, and ACL block paths end-to-end through the dispatch flow
 
+**Plans:** 4 plans
+
+Plans:
+- [ ] 05-01-PLAN.md — Schema migrations: supersip_trunk_capacity + supersip_trunk_acl_entries + drop rustpbx_trunk_groups.acl
+- [ ] 05-02-PLAN.md — TSUB-04 + TSUB-07: GET/PUT /api/v1/trunks/{name}/capacity (placeholders for live counts)
+- [ ] 05-03-PLAN.md — TSUB-05: GET/POST/DELETE /api/v1/trunks/{name}/acl + validate_acl_rule
+- [ ] 05-04-PLAN.md — Proxy enforcement: TrunkCapacityState + codec_normalize + per-trunk ACL eval; wire 3 gates into matcher; live observability + IT-03 tests
+
 ### Phase 6: Routing Tables, Records & Distribution
 **Goal**: Ship full `/api/v1/routing/*` CRUD including the routing records sub-route adapter for console's embedded-document storage.
 **Depends on**: Phase 3
