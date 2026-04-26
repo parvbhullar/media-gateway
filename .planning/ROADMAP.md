@@ -115,6 +115,14 @@ Plans:
   3. All five match types (`Lpm`, `ExactMatch`, `Regex`, `Compare`, `HttpQuery`) resolve correctly against integration tests
   4. A routing table marked `is_default: true` returns its default record when no rule matches
 
+**Plans:** 4 plans
+
+Plans:
+- [ ] 06-01-PLAN.md — Schema migration (supersip_routing_tables) + stub routers + RouteResult/ResolveResponse matched_record_id extension
+- [ ] 06-02-PLAN.md — RTE-01: /api/v1/routing/tables CRUD + IT-01 tests
+- [ ] 06-03-PLAN.md — RTE-02: /api/v1/routing/tables/{name}/records CRUD with all 5 match types + 4 target types + SSRF/regex-DoS validation + IT-01 tests
+- [ ] 06-04-PLAN.md — RTE-04, RTE-05: match_types + table_matcher orchestrator + matcher integration + /resolve wiring + IT-04 tests
+
 ### Phase 7: Webhook Pipeline
 **Goal**: Ship a CRUD webhook registry plus a background processor that delivers CDR completion events with HMAC signing, retries, and disk fallback.
 **Depends on**: Phase 1
@@ -198,7 +206,7 @@ Phases execute in numeric order: 1 → 2 → 3 → ... → 13
 | 3. Trunk Sub-Resources L1 & Routing Resolve | 0/5 | Planned | - |
 | 4. Active Calls & Mid-Call Control | 0/5 | Planned | - |
 | 5. Trunk Enforcement | 4/4 | Complete   | 2026-04-26 |
-| 6. Routing Tables, Records & Distribution | 0/TBD | Not started | - |
+| 6. Routing Tables, Records & Distribution | 0/4 | Planned | - |
 | 7. Webhook Pipeline | 0/TBD | Not started | - |
 | 8. Translations Engine | 0/TBD | Not started | - |
 | 9. Manipulations Engine | 0/TBD | Not started | - |
