@@ -107,6 +107,20 @@ impl AppStateInner {
         &self.sip_server
     }
 
+    /// Phase 7 Plan 07-01 — webhook broadcast sender (D-11).
+    /// Delegates to `SipServer.inner.webhook_sender` so AppStateInner
+    /// stays additive-free (mirrors the active_call_registry pattern).
+    pub fn webhook_sender(&self) -> crate::proxy::webhook::WebhookEventSender {
+        self.sip_server.webhook_sender()
+    }
+
+    /// Phase 7 Plan 07-01 — in-memory cancel registry (D-31).
+    pub fn webhook_cancel_registry(
+        &self,
+    ) -> std::sync::Arc<crate::proxy::webhook::WebhookCancelRegistry> {
+        self.sip_server.webhook_cancel_registry()
+    }
+
     pub fn get_dump_events_file(&self, session_id: &String) -> String {
         let sanitized_id = crate::utils::sanitize_id(session_id);
         let recorder_root = self.config().recorder_path();

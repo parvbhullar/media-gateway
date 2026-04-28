@@ -86,6 +86,13 @@ pub struct SipServerInner {
     pub tls_listener: Option<rsipstack::transport::TlsListenerConnection>,
     pub queue_manager: Arc<crate::call::runtime::QueueManager>,
     pub conference_manager: Arc<crate::call::runtime::ConferenceManager>,
+    /// Phase 7 Plan 07-01 — broadcast channel for webhook events (D-11).
+    /// Capacity 1024 mirrors the locator_webhook precedent. Cloneable;
+    /// emit sites use `state.webhook_sender().send(event)`.
+    pub webhook_sender: crate::proxy::webhook::WebhookEventSender,
+    /// Phase 7 Plan 07-01 — in-memory cancel registry for in-flight
+    /// webhook retries (D-31). Body wired in 07-03.
+    pub webhook_cancel_registry: Arc<crate::proxy::webhook::WebhookCancelRegistry>,
 }
 
 pub type SipServerRef = Arc<SipServerInner>;
@@ -567,6 +574,14 @@ impl SipServerBuilder {
         }
 
         let active_call_registry = Arc::new(ActiveProxyCallRegistry::new());
+        // Phase 7 Plan 07-01 — WebhookEventSender broadcast channel (D-11)
+        // and in-memory cancel registry (D-31). The receiver half is
+        // dropped here; subscribers (07-04 processor) call
+        // `webhook_sender.subscribe()` to attach.
+        let (webhook_sender, _) =
+            tokio::sync::broadcast::channel::<crate::proxy::webhook::WebhookEvent>(1024);
+        let webhook_cancel_registry =
+            Arc::new(crate::proxy::webhook::WebhookCancelRegistry::new());
         // Phase 5 Plan 05-04: capacity-gate state shared between matcher and GET /capacity
         let trunk_capacity_state =
             Arc::new(crate::proxy::trunk_capacity_state::TrunkCapacityState::new());
@@ -606,6 +621,8 @@ impl SipServerBuilder {
             tls_listener: tls_listener_clone,
             queue_manager,
             conference_manager,
+            webhook_sender,
+            webhook_cancel_registry,
         });
 
         let inner_weak = Arc::downgrade(&inner);
@@ -781,6 +798,21 @@ impl SipServer {
 
     pub fn get_cancel_token(&self) -> CancellationToken {
         self.inner.cancel_token.clone()
+    }
+
+    /// Phase 7 Plan 07-01 — accessor for the webhook broadcast sender
+    /// (D-11). Returned by-clone because tokio::sync::broadcast::Sender
+    /// is cheap to clone and emit sites need their own handle.
+    pub fn webhook_sender(&self) -> crate::proxy::webhook::WebhookEventSender {
+        self.inner.webhook_sender.clone()
+    }
+
+    /// Phase 7 Plan 07-01 — accessor for the in-memory cancel registry
+    /// (D-31). Body of insert/cancel/remove lands in 07-03.
+    pub fn webhook_cancel_registry(
+        &self,
+    ) -> Arc<crate::proxy::webhook::WebhookCancelRegistry> {
+        self.inner.webhook_cancel_registry.clone()
     }
 
     async fn handle_incoming(&self, mut incoming: TransactionReceiver) -> Result<()> {

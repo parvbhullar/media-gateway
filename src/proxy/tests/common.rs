@@ -106,6 +106,16 @@ pub async fn create_test_server_with_config(
         tls_listener: None,
         queue_manager: Arc::new(crate::call::runtime::QueueManager::new()),
         conference_manager: Arc::new(crate::call::runtime::ConferenceManager::new()),
+        // Phase 7 Plan 07-01 — webhook channel + cancel registry stubs
+        // for tests. Channel buffer 16 is plenty for unit tests; production
+        // boot uses 1024 (D-11).
+        webhook_sender: tokio::sync::broadcast::channel::<
+            crate::proxy::webhook::WebhookEvent,
+        >(16)
+        .0,
+        webhook_cancel_registry: Arc::new(
+            crate::proxy::webhook::WebhookCancelRegistry::new(),
+        ),
     });
 
     // Add test users

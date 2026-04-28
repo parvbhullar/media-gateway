@@ -477,6 +477,14 @@ async fn test_guest_call_allowed_extension() {
         tls_listener: None,
         queue_manager: Arc::new(crate::call::runtime::QueueManager::new()),
         conference_manager: Arc::new(crate::call::runtime::ConferenceManager::new()),
+        // Phase 7 Plan 07-01 — webhook channel + cancel registry stubs.
+        webhook_sender: tokio::sync::broadcast::channel::<
+            crate::proxy::webhook::WebhookEvent,
+        >(16)
+        .0,
+        webhook_cancel_registry: Arc::new(
+            crate::proxy::webhook::WebhookCancelRegistry::new(),
+        ),
     });
 
     let module = AuthModule::new(server_inner);
