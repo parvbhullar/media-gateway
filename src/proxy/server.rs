@@ -38,6 +38,7 @@ use rsipstack::{
         WebSocketListenerConnection, udp::UdpConnection,
     },
 };
+
 use sea_orm::DatabaseConnection;
 use std::{
     collections::HashMap,
@@ -989,22 +990,59 @@ impl Drop for SipServerInner {
     }
 }
 
+/// Ask the OS which local IP address it would use to send traffic to
+/// `peer`. Uses a scratch UDP socket — `connect()` is non-blocking and
+/// never transmits a packet; it just populates the kernel's routing
+/// decision so `local_addr()` returns the chosen source IP.
+pub fn local_ip_for_peer(peer: IpAddr) -> Option<IpAddr> {
+    let bind: SocketAddr = match peer {
+        IpAddr::V4(_) => "0.0.0.0:0".parse().ok()?,
+        IpAddr::V6(_) => "[::]:0".parse().ok()?,
+    };
+    let sock = std::net::UdpSocket::bind(bind).ok()?;
+    sock.connect(SocketAddr::new(peer, 1)).ok()?;
+    sock.local_addr().ok().map(|a| a.ip())
+}
+
 impl SipServerInner {
     pub fn default_contact_uri(&self) -> Option<rsipstack::sip::Uri> {
+        self.contact_uri_for_peer(None)
+    }
+
+    /// Build a Contact URI whose host is the local IP that the kernel would
+    /// use to reach `peer`. Falls back to the endpoint's first listener when
+    /// the peer is not provided or routing lookup fails. This is critical
+    /// on hosts with multiple interfaces (e.g. a private carrier-facing
+    /// interface plus a public one) — the Contact must be reachable from
+    /// the peer's network, otherwise the peer can't send ACK/BYE back.
+    pub fn contact_uri_for_peer(&self, peer: Option<IpAddr>) -> Option<rsipstack::sip::Uri> {
         let addr = self.endpoint.get_addrs().first()?.clone();
+        let transport = addr.r#type;
+
+        let host_with_port = match peer.and_then(local_ip_for_peer) {
+            Some(local_ip) => {
+                let port = addr.addr.port.clone();
+                rsipstack::sip::HostWithPort {
+                    host: rsipstack::sip::Host::IpAddr(local_ip),
+                    port,
+                }
+            }
+            None => addr.addr,
+        };
+
         let mut params = Vec::new();
-        if let Some(transport) = addr.r#type {
-            if !matches!(transport, Transport::Udp) {
-                params.push(Param::Transport(transport));
+        if let Some(t) = transport {
+            if !matches!(t, Transport::Udp) {
+                params.push(Param::Transport(t));
             }
         }
         Some(rsipstack::sip::Uri {
-            scheme: addr.r#type.map(|t| t.sip_scheme()),
+            scheme: transport.map(|t| t.sip_scheme()),
             auth: Some(Auth {
                 user: "rustpbx".to_string(),
                 password: None,
             }),
-            host_with_port: addr.addr,
+            host_with_port,
             params,
             ..Default::default()
         })

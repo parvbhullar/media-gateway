@@ -1730,6 +1730,24 @@ pub(crate) fn apply_trunk_config(option: &mut InviteOption, trunk: &TrunkConfig)
         option.caller.host_with_port = dest_uri.host_with_port.clone();
     }
 
+    // Stamp the transport onto the callee URI so downstream CANCEL/BYE/ACK
+    // transactions inherit it. rsipstack's send_dialog_request only sets
+    // tx.destination from a Route header — without ;transport=X on the
+    // Request-URI, subsequent requests fall back to UDP via
+    // SipAddr::try_from(uri), even when the original INVITE went over TCP.
+    if let Some(t) = transport {
+        if !matches!(t, rsipstack::sip::transport::Transport::Udp) {
+            let has_transport = option
+                .callee
+                .params
+                .iter()
+                .any(|p| matches!(p, rsipstack::sip::Param::Transport(_)));
+            if !has_transport {
+                option.callee.params.push(rsipstack::sip::Param::Transport(t));
+            }
+        }
+    }
+
     // Set authentication info
     if let (Some(username), Some(password)) = (&trunk.username, &trunk.password) {
         option.credential = Some(Credential {

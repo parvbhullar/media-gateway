@@ -13,7 +13,10 @@ mod tests {
         assert!(!timer.enabled);
         assert!(!timer.active);
         assert!(!timer.refreshing);
-        assert_eq!(timer.session_interval, Duration::from_secs(DEFAULT_SESSION_EXPIRES));
+        assert_eq!(
+            timer.session_interval,
+            Duration::from_secs(DEFAULT_SESSION_EXPIRES)
+        );
         assert_eq!(timer.min_se, Duration::from_secs(MIN_MIN_SE));
         assert_eq!(timer.refresh_count, 0);
         assert_eq!(timer.failed_refreshes, 0);
@@ -24,7 +27,7 @@ mod tests {
         let interval = Duration::from_secs(600);
         let min_se = Duration::from_secs(120);
         let timer = SessionTimerState::new(interval, min_se, SessionRefresher::Uas);
-        
+
         assert!(timer.enabled);
         assert!(timer.active);
         assert!(!timer.refreshing);
@@ -63,7 +66,7 @@ mod tests {
         timer.enabled = true;
         timer.active = false;
         timer.session_interval = Duration::from_secs(100);
-        
+
         assert!(!timer.should_refresh());
     }
 
@@ -73,7 +76,7 @@ mod tests {
         timer.enabled = false;
         timer.active = true;
         timer.session_interval = Duration::from_secs(100);
-        
+
         assert!(!timer.should_refresh());
     }
 
@@ -85,7 +88,7 @@ mod tests {
         timer.refreshing = true;
         timer.session_interval = Duration::from_secs(100);
         timer.last_refresh = Instant::now() - Duration::from_secs(60); // Past half interval
-        
+
         assert!(!timer.should_refresh());
     }
 
@@ -96,7 +99,7 @@ mod tests {
         timer.active = true;
         timer.session_interval = Duration::from_secs(100);
         timer.last_refresh = Instant::now() - Duration::from_secs(40); // Before half (50s)
-        
+
         assert!(!timer.should_refresh());
     }
 
@@ -107,7 +110,7 @@ mod tests {
         timer.active = true;
         timer.session_interval = Duration::from_secs(100);
         timer.last_refresh = Instant::now() - Duration::from_secs(51); // Past half (50s)
-        
+
         assert!(timer.should_refresh());
     }
 
@@ -120,7 +123,7 @@ mod tests {
         timer.active = false;
         timer.session_interval = Duration::from_secs(100);
         timer.last_refresh = Instant::now() - Duration::from_secs(150); // Past interval
-        
+
         assert!(!timer.is_expired());
     }
 
@@ -131,7 +134,7 @@ mod tests {
         timer.active = true;
         timer.session_interval = Duration::from_secs(100);
         timer.last_refresh = Instant::now() - Duration::from_secs(50); // Before 100s
-        
+
         assert!(!timer.is_expired());
     }
 
@@ -142,7 +145,7 @@ mod tests {
         timer.active = true;
         timer.session_interval = Duration::from_secs(100);
         timer.last_refresh = Instant::now() - Duration::from_secs(101); // Past 100s
-        
+
         assert!(timer.is_expired());
     }
 
@@ -792,8 +795,21 @@ mod tests {
 
     #[test]
     fn test_get_header_value_session_expires() {
+        let headers = rsipstack::sip::Headers::from(vec![rsipstack::sip::Header::Other(
+            HEADER_SESSION_EXPIRES.to_string(),
+            "1800;refresher=uac".to_string(),
+        )]);
+
+        let value = get_header_value(&headers, HEADER_SESSION_EXPIRES);
+        assert_eq!(value, Some("1800;refresher=uac".to_string()));
+    }
+
+    #[test]
+    fn test_get_header_value_typed_session_expires() {
         let headers = rsipstack::sip::Headers::from(vec![
-            rsipstack::sip::Header::Other(HEADER_SESSION_EXPIRES.to_string(), "1800;refresher=uac".to_string()),
+            rsipstack::sip::Header::SessionExpires(
+                rsipstack::sip::headers::SessionExpires::new("1800;refresher=uac"),
+            ),
         ]);
 
         let value = get_header_value(&headers, HEADER_SESSION_EXPIRES);
@@ -802,8 +818,19 @@ mod tests {
 
     #[test]
     fn test_get_header_value_min_se() {
+        let headers = rsipstack::sip::Headers::from(vec![rsipstack::sip::Header::Other(
+            HEADER_MIN_SE.to_string(),
+            "90".to_string(),
+        )]);
+
+        let value = get_header_value(&headers, HEADER_MIN_SE);
+        assert_eq!(value, Some("90".to_string()));
+    }
+
+    #[test]
+    fn test_get_header_value_typed_min_se() {
         let headers = rsipstack::sip::Headers::from(vec![
-            rsipstack::sip::Header::Other(HEADER_MIN_SE.to_string(), "90".to_string()),
+            rsipstack::sip::Header::MinSE(rsipstack::sip::headers::MinSE::new("90")),
         ]);
 
         let value = get_header_value(&headers, HEADER_MIN_SE);
@@ -812,9 +839,9 @@ mod tests {
 
     #[test]
     fn test_get_header_value_supported() {
-        let headers = rsipstack::sip::Headers::from(vec![
-            rsipstack::sip::Header::Supported(rsipstack::sip::headers::Supported::from("timer,100rel")),
-        ]);
+        let headers = rsipstack::sip::Headers::from(vec![rsipstack::sip::Header::Supported(
+            rsipstack::sip::headers::Supported::from("timer,100rel"),
+        )]);
 
         let value = get_header_value(&headers, HEADER_SUPPORTED);
         assert!(value.is_some());
@@ -823,9 +850,9 @@ mod tests {
 
     #[test]
     fn test_get_header_value_not_found() {
-        let headers = rsipstack::sip::Headers::from(vec![
-            rsipstack::sip::Header::ContentType("application/sdp".into()),
-        ]);
+        let headers = rsipstack::sip::Headers::from(vec![rsipstack::sip::Header::ContentType(
+            "application/sdp".into(),
+        )]);
 
         let value = get_header_value(&headers, HEADER_SESSION_EXPIRES);
         assert!(value.is_none());
@@ -835,65 +862,172 @@ mod tests {
 
     #[test]
     fn test_has_timer_support_with_supported_header() {
-        let headers = rsipstack::sip::Headers::from(vec![
-            rsipstack::sip::Header::Other(HEADER_SUPPORTED.to_string(), "timer,100rel".to_string()),
-        ]);
+        let headers = rsipstack::sip::Headers::from(vec![rsipstack::sip::Header::Other(
+            HEADER_SUPPORTED.to_string(),
+            "timer,100rel".to_string(),
+        )]);
 
         assert!(has_timer_support(&headers));
     }
 
     #[test]
     fn test_has_timer_support_with_other_header() {
-        let headers = rsipstack::sip::Headers::from(vec![
-            rsipstack::sip::Header::Other(HEADER_SUPPORTED.to_string(), "timer,100rel".to_string()),
-        ]);
+        let headers = rsipstack::sip::Headers::from(vec![rsipstack::sip::Header::Other(
+            HEADER_SUPPORTED.to_string(),
+            "timer,100rel".to_string(),
+        )]);
 
         assert!(has_timer_support(&headers));
     }
 
     #[test]
     fn test_has_timer_support_without_timer() {
-        let headers = rsipstack::sip::Headers::from(vec![
-            rsipstack::sip::Header::Supported(rsipstack::sip::headers::Supported::from("100rel")),
-        ]);
+        let headers = rsipstack::sip::Headers::from(vec![rsipstack::sip::Header::Supported(
+            rsipstack::sip::headers::Supported::from("100rel"),
+        )]);
 
         assert!(!has_timer_support(&headers));
     }
 
     #[test]
     fn test_has_timer_support_no_supported_header() {
-        let headers = rsipstack::sip::Headers::from(vec![
-            rsipstack::sip::Header::ContentType("application/sdp".into()),
-        ]);
+        let headers = rsipstack::sip::Headers::from(vec![rsipstack::sip::Header::ContentType(
+            "application/sdp".into(),
+        )]);
 
         assert!(!has_timer_support(&headers));
     }
 
     #[test]
     fn test_is_timer_required_with_require_header() {
-        let headers = rsipstack::sip::Headers::from(vec![
-            rsipstack::sip::Header::Other(HEADER_REQUIRE.to_string(), "timer".to_string()),
-        ]);
+        let headers = rsipstack::sip::Headers::from(vec![rsipstack::sip::Header::Other(
+            HEADER_REQUIRE.to_string(),
+            "timer".to_string(),
+        )]);
 
         assert!(is_timer_required(&headers));
     }
 
     #[test]
     fn test_is_timer_required_with_other_header() {
-        let headers = rsipstack::sip::Headers::from(vec![
-            rsipstack::sip::Header::Other(HEADER_REQUIRE.to_string(), "timer".to_string()),
-        ]);
+        let headers = rsipstack::sip::Headers::from(vec![rsipstack::sip::Header::Other(
+            HEADER_REQUIRE.to_string(),
+            "timer".to_string(),
+        )]);
 
         assert!(is_timer_required(&headers));
     }
 
     #[test]
     fn test_is_timer_required_without_timer() {
-        let headers = rsipstack::sip::Headers::from(vec![
-            rsipstack::sip::Header::Require(rsipstack::sip::headers::Require::from("100rel")),
-        ]);
+        let headers = rsipstack::sip::Headers::from(vec![rsipstack::sip::Header::Require(
+            rsipstack::sip::headers::Require::from("100rel"),
+        )]);
 
         assert!(!is_timer_required(&headers));
+    }
+
+    #[test]
+    fn test_build_session_timer_response_headers_require_timer_for_uac_refresher() {
+        let mut timer = SessionTimerState::default();
+        timer.enabled = true;
+        timer.active = true;
+        timer.refresher = SessionRefresher::Uac;
+        timer.session_interval = Duration::from_secs(1800);
+
+        let headers = rsipstack::sip::Headers::from(build_session_timer_response_headers(&timer, true));
+
+        assert!(is_timer_required(&headers));
+        assert_eq!(
+            get_header_value(&headers, HEADER_SESSION_EXPIRES),
+            Some("1800;refresher=uac".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_session_timer_response_headers_no_require_for_uas_refresher() {
+        let mut timer = SessionTimerState::default();
+        timer.enabled = true;
+        timer.active = true;
+        timer.refresher = SessionRefresher::Uas;
+        timer.session_interval = Duration::from_secs(1800);
+
+        let headers = rsipstack::sip::Headers::from(build_session_timer_response_headers(&timer, true));
+
+        assert!(!is_timer_required(&headers));
+    }
+
+    #[test]
+    fn test_build_session_timer_response_headers_no_require_without_peer_support() {
+        let mut timer = SessionTimerState::default();
+        timer.enabled = true;
+        timer.active = true;
+        timer.refresher = SessionRefresher::Uac;
+        timer.session_interval = Duration::from_secs(1800);
+
+        let headers = rsipstack::sip::Headers::from(build_session_timer_response_headers(&timer, false));
+
+        assert!(!is_timer_required(&headers));
+    }
+
+    #[test]
+    fn test_select_timer_refresher_defaults_to_uas_without_timer_support() {
+        assert_eq!(select_timer_refresher(false, None), SessionRefresher::Uas);
+        assert_eq!(
+            select_timer_refresher(false, Some(SessionRefresher::Uac)),
+            SessionRefresher::Uas
+        );
+    }
+
+    #[test]
+    fn test_select_timer_refresher_uses_request_when_peer_supports_timer() {
+        assert_eq!(select_timer_refresher(true, None), SessionRefresher::Uac);
+        assert_eq!(
+            select_timer_refresher(true, Some(SessionRefresher::Uas)),
+            SessionRefresher::Uas
+        );
+    }
+
+    #[test]
+    fn test_apply_refresh_response_disables_timer_without_session_expires() {
+        let mut timer = SessionTimerState::default();
+        timer.enabled = true;
+        timer.active = true;
+        timer.refreshing = true;
+        timer.session_interval = Duration::from_secs(1800);
+
+        let headers = rsipstack::sip::Headers::default();
+        let result = apply_refresh_response(&mut timer, &headers);
+
+        assert!(result.is_ok());
+        assert!(!timer.enabled);
+        assert!(!timer.active);
+        assert!(!timer.refreshing);
+        assert_eq!(timer.refresh_count, 1);
+    }
+
+    #[test]
+    fn test_apply_refresh_response_keeps_timer_active_with_session_expires() {
+        let mut timer = SessionTimerState::default();
+        timer.enabled = true;
+        timer.active = true;
+        timer.refreshing = true;
+        timer.session_interval = Duration::from_secs(1800);
+        timer.min_se = Duration::from_secs(90);
+
+        let headers = rsipstack::sip::Headers::from(vec![rsipstack::sip::Header::Other(
+            HEADER_SESSION_EXPIRES.to_string(),
+            "900;refresher=uas".to_string(),
+        )]);
+        let result = apply_refresh_response(&mut timer, &headers);
+
+        assert!(result.is_ok());
+        assert!(timer.enabled);
+        assert!(timer.active);
+        assert!(!timer.refreshing);
+        assert_eq!(timer.session_interval, Duration::from_secs(900));
+        assert_eq!(timer.refresher, SessionRefresher::Uas);
+        assert_eq!(timer.refresh_count, 1);
     }
 
     // ==================== Integration Tests ====================
@@ -962,6 +1096,7 @@ mod tests {
         timer.active = true;
         timer.session_interval = Duration::from_secs(100);
         timer.refresher = SessionRefresher::Uac; // Remote is refresher
+        timer.last_refresh = Instant::now() - Duration::from_millis(100);
 
         let old_refresh_time = timer.last_refresh;
 

@@ -525,6 +525,8 @@ pub struct RouteQueueConfig {
     pub fallback: Option<RouteQueueFallbackConfig>,
     #[serde(default)]
     pub strategy: RouteQueueStrategyConfig,
+    #[serde(skip)]
+    pub origin: ConfigOrigin,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
