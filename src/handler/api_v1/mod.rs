@@ -23,6 +23,7 @@ pub mod trunk_credentials;        // Phase 3 Plan 03-01 — TSUB-01
 pub mod trunk_media;              // Phase 3 Plan 03-01 — TSUB-03
 pub mod trunk_origination_uris;   // Phase 3 Plan 03-01 — TSUB-02
 pub mod trunks;
+pub mod webhooks;                 // Phase 7 — WH-01
 
 use axum::{Router, middleware};
 
@@ -51,6 +52,7 @@ pub fn api_v1_router(state: AppState) -> Router {
         .merge(routing_tables::router())           // Phase 6 — RTE-01
         .merge(routing_records::router())          // Phase 6 — RTE-02
         .merge(calls::router())                    // Phase 4 Plan 04-01 — CALL-01, CALL-02
+        .merge(webhooks::router())                 // Phase 7 — WH-01
         ;
 
     Router::<AppState>::new()
