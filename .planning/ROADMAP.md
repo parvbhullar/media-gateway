@@ -133,6 +133,15 @@ Plans:
   3. A failing webhook target is retried 3 times with exponential backoff and then written to a disk JSON fallback under `ProxyConfig.generated_dir`
   4. Deleting a webhook cancels any in-flight retries for that endpoint
 
+**Plans:** 4/5 plans executed
+
+Plans:
+- [x] 07-01-PLAN.md — Schema migration (supersip_webhooks) + stub router + WebhookEventSender + WebhookCancelRegistry plumbing into AppState (Wave 1 owns mod.rs/migration.rs/server.rs/app.rs)
+- [x] 07-02-PLAN.md — WH-01 + WH-06 PUT/DELETE: full /api/v1/webhooks CRUD with URL/event/range validation + IT-01 tests (15 cases including RFC1918 explicit-allow per D-27)
+- [x] 07-03-PLAN.md — WH-03 HMAC + WH-06 cancel mechanism: signer (Stripe-style HMAC-SHA256, openssl reference vector) + WebhookCancelRegistry (insert/cancel/remove with D-34 PUT-replace)
+- [x] 07-04-PLAN.md — WH-02 + WH-03: webhook processor (subscribe + filter + per-webhook spawn + 3-retry backoff [1s,5s,30s]±25% + Retry-After + pre-flight DB recheck + disk fallback mode 0600); spawn at server boot (final touch of server.rs)
+- [ ] 07-05-PLAN.md — WH-02/04/05/06: 5 emit sites (sip_session call.started/failed, callrecord/storage call.completed, calls.rs recording.completed + transcribe.requested fulfilling Phase 4 D-18) + sync test event on POST + PUT/DELETE cancel triggers + IT-WH 11 end-to-end tests
+
 ### Phase 8: Translations Engine
 **Goal**: Ship the Translations rule engine so inbound calls are normalized (e.g., `02079460123 → +442079460123`) before the router sees them.
 **Depends on**: Phase 6
@@ -207,7 +216,7 @@ Phases execute in numeric order: 1 → 2 → 3 → ... → 13
 | 4. Active Calls & Mid-Call Control | 0/5 | Planned | - |
 | 5. Trunk Enforcement | 4/4 | Complete   | 2026-04-26 |
 | 6. Routing Tables, Records & Distribution | 0/4 | Planned | - |
-| 7. Webhook Pipeline | 0/TBD | Not started | - |
+| 7. Webhook Pipeline | 4/5 | In Progress|  |
 | 8. Translations Engine | 0/TBD | Not started | - |
 | 9. Manipulations Engine | 0/TBD | Not started | - |
 | 10. Security Suite | 0/TBD | Not started | - |

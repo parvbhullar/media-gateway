@@ -134,8 +134,8 @@ Requirement IDs follow `[CATEGORY]-[NUMBER]`. All v2.0 requirements are user/ope
 ### Webhooks (WH)
 
 - [ ] **WH-01**: A new `rustpbx_webhooks` table + CRUD endpoints at `/api/v1/webhooks` exist
-- [ ] **WH-02**: A background processor consumes `callrecord/` completion events and delivers them to registered webhooks
-- [ ] **WH-03**: Webhook delivery posts JSON with HMAC header using the webhook's secret, uses 3 retries with exponential backoff, and falls back to a disk JSON file when all retries fail
+- [x] **WH-02**: A background processor consumes `callrecord/` completion events and delivers them to registered webhooks
+- [x] **WH-03**: Webhook delivery posts JSON with HMAC header using the webhook's secret, uses 3 retries with exponential backoff, and falls back to a disk JSON file when all retries fail
 - [ ] **WH-04**: Webhook events include `X-Webhook-Event`, `X-Webhook-Secret`, and a request id header
 - [ ] **WH-05**: Creating a webhook fires a test event synchronously; failure to deliver the test is non-fatal and logged
 - [ ] **WH-06**: `PUT /api/v1/webhooks/{id}` updates a webhook; `DELETE /api/v1/webhooks/{id}` removes it and cancels any in-flight retries
@@ -334,8 +334,8 @@ Every v2.0 requirement maps to exactly one phase.
 | CALL-09 | Phase 4 | Pending |
 | CALL-10 | Phase 4 | Pending |
 | WH-01 | Phase 7 | Pending |
-| WH-02 | Phase 7 | Pending |
-| WH-03 | Phase 7 | Pending |
+| WH-02 | Phase 7 | Complete |
+| WH-03 | Phase 7 | Complete |
 | WH-04 | Phase 7 | Pending |
 | WH-05 | Phase 7 | Pending |
 | WH-06 | Phase 7 | Pending |
