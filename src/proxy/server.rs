@@ -582,6 +582,24 @@ impl SipServerBuilder {
             tokio::sync::broadcast::channel::<crate::proxy::webhook::WebhookEvent>(1024);
         let webhook_cancel_registry =
             Arc::new(crate::proxy::webhook::WebhookCancelRegistry::new());
+        // Phase 7 Plan 07-04 — webhook delivery processor (D-11..D-13).
+        // Subscribes to `webhook_sender` and dispatches each event to all
+        // active matching webhooks with HMAC signing, retry, jitter,
+        // status policy, Retry-After honoring, pre-flight DB recheck, and
+        // disk fallback. Second and final touch of server.rs in Phase 7.
+        if let Some(db_for_processor) = database.clone() {
+            let sender_for_processor = webhook_sender.clone();
+            let registry_for_processor = webhook_cancel_registry.clone();
+            let generated_dir = self.config.generated_dir.clone();
+            let cancel_for_processor = cancel_token.child_token();
+            tokio::spawn(crate::proxy::webhook::run_webhook_processor(
+                db_for_processor,
+                sender_for_processor,
+                registry_for_processor,
+                generated_dir,
+                cancel_for_processor,
+            ));
+        }
         // Phase 5 Plan 05-04: capacity-gate state shared between matcher and GET /capacity
         let trunk_capacity_state =
             Arc::new(crate::proxy::trunk_capacity_state::TrunkCapacityState::new());
