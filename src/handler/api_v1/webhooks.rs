@@ -91,6 +91,19 @@ pub struct WebhookView {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Phase 7 D-29: POST /webhooks response — WebhookView fields PLUS the
+/// test-event delivery outcome. `test_delivery` is "succeeded" on 2xx,
+/// "failed" otherwise; `test_error` carries the failure message when
+/// applicable. WH-05: test failure does NOT roll back the row insert.
+#[derive(Debug, Serialize)]
+pub struct CreateWebhookResponse {
+    #[serde(flatten)]
+    pub webhook: WebhookView,
+    pub test_delivery: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_error: Option<String>,
+}
+
 impl From<&WhModel> for WebhookView {
     fn from(m: &WhModel) -> Self {
         let events = m
@@ -312,7 +325,7 @@ async fn list_webhooks(
 async fn create_webhook(
     State(state): State<AppState>,
     Json(req): Json<CreateWebhookRequest>,
-) -> ApiResult<(StatusCode, Json<WebhookView>)> {
+) -> ApiResult<(StatusCode, Json<CreateWebhookResponse>)> {
     let db = state.db();
 
     // Field validation (D-04, D-26, D-27, D-09).
@@ -363,9 +376,54 @@ async fn create_webhook(
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    // Test-event firing lands in 07-05 (D-28..D-30); 07-02 returns the
-    // bare WebhookView with no `test_delivery` field.
-    Ok((StatusCode::CREATED, Json(WebhookView::from(inserted))))
+    // Phase 7 D-28..D-30: synchronous webhook.test fire after row commit.
+    // Single-attempt (no retry, no disk fallback). Failure is non-fatal
+    // per WH-05: row persists, response carries test_delivery=failed.
+    let test_event = crate::proxy::webhook::WebhookEvent {
+        event_id: crate::proxy::webhook::new_event_id(),
+        event: "webhook.test".to_string(),
+        timestamp: crate::proxy::webhook::current_unix_timestamp(),
+        data: serde_json::json!({
+            "webhook_id": inserted.id,
+            "message": "Test event from supersip",
+        }),
+    };
+    let envelope = serde_json::json!({
+        "event_id": test_event.event_id,
+        "event": test_event.event,
+        "timestamp": test_event.timestamp,
+        "data": test_event.data,
+    });
+    let envelope_body = serde_json::to_string(&envelope).unwrap_or_default();
+    let client = reqwest::Client::builder()
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    // Cap the inline call by the webhook's own timeout_ms (D-04, T-07-05-03);
+    // perform_attempt also enforces this on the request, but we add an outer
+    // tokio::time::timeout for defense in depth.
+    let timeout = std::time::Duration::from_millis(inserted.timeout_ms.max(1) as u64);
+    let outcome = tokio::time::timeout(
+        timeout,
+        crate::proxy::webhook::deliver_test_event(
+            &inserted,
+            &test_event,
+            &envelope_body,
+            &client,
+        ),
+    )
+    .await;
+    let (test_delivery, test_error) = match outcome {
+        Ok(Ok(())) => ("succeeded".to_string(), None),
+        Ok(Err(e)) => ("failed".to_string(), Some(e)),
+        Err(_) => ("failed".to_string(), Some("timeout".to_string())),
+    };
+
+    let response = CreateWebhookResponse {
+        webhook: WebhookView::from(inserted),
+        test_delivery,
+        test_error,
+    };
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 async fn get_webhook(
@@ -389,6 +447,11 @@ async fn update_webhook(
     Json(req): Json<UpdateWebhookRequest>,
 ) -> ApiResult<Json<WebhookView>> {
     let db = state.db();
+
+    // Phase 7 D-34: cancel any in-flight retries BEFORE applying changes.
+    // URL/secret/events may have changed; we MUST NOT continue retrying the
+    // old delivery against the new row state (T-07-05-06).
+    state.webhook_cancel_registry().cancel(&id);
 
     let existing = WhEntity::find_by_id(id.clone())
         .one(db)
@@ -481,6 +544,12 @@ async fn delete_webhook(
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
     let db = state.db();
+
+    // Phase 7 D-31: cancel any in-flight retries BEFORE deleting the row so
+    // the delivery loop's pre-flight DB recheck doesn't race with the row's
+    // disappearance.
+    state.webhook_cancel_registry().cancel(&id);
+
     let existing = WhEntity::find_by_id(id.clone())
         .one(db)
         .await

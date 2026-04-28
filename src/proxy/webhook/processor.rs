@@ -381,6 +381,31 @@ pub(super) async fn deliver_webhook_with_schedule(
     cancel_registry.remove(&current_webhook.id);
 }
 
+// ─── Test-event helper (07-05 D-28..D-30) ────────────────────────────────
+
+/// Synchronous single-attempt delivery used by POST /api/v1/webhooks to
+/// fire a `webhook.test` event inline so the response can carry a
+/// `test_delivery` field per D-29. NO retry, NO disk fallback (T-07-05-03 +
+/// T-07-05-07): bounded in time by the webhook's `timeout_ms` (max 30s per
+/// D-04). Returns `Ok(())` on 2xx; `Err(message)` on any non-2xx, network
+/// error, or timeout. Reuses `perform_attempt` so signing + headers are
+/// identical to real fires (D-30).
+pub async fn deliver_test_event(
+    webhook: &WhModel,
+    event: &WebhookEvent,
+    envelope_body: &str,
+    client: &reqwest::Client,
+) -> Result<(), String> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let outcome =
+        perform_attempt(client, webhook, event, envelope_body, &request_id).await;
+    match outcome.status {
+        Some(s) if (200..=299).contains(&s) => Ok(()),
+        Some(s) => Err(format!("status {}", s)),
+        None => Err(outcome.error.unwrap_or_else(|| "network error".to_string())),
+    }
+}
+
 // ─── Processor (Task 3) ──────────────────────────────────────────────────
 
 /// Run the webhook processor until `cancel` fires. Spawned at server boot.

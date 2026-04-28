@@ -15,7 +15,7 @@ pub mod processor;
 pub mod signer;
 
 pub use cancel_registry::WebhookCancelRegistry;
-pub use processor::run_webhook_processor;
+pub use processor::{deliver_test_event, run_webhook_processor};
 
 use serde::Serialize;
 
