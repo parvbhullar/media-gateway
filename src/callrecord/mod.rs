@@ -451,6 +451,9 @@ pub struct CallRecordManager {
     saver_fn: FnSaveCallRecord,
     formatter: Arc<dyn CallRecordFormatter>,
     hooks: Arc<Vec<Box<dyn CallRecordHook>>>,
+    /// Phase 7 D-06 — optional broadcast sender for `call.completed` webhook
+    /// emit. None when no SipServer is wired (e.g., standalone CDR tooling).
+    webhook_sender: Option<crate::proxy::webhook::WebhookEventSender>,
 }
 
 pub struct CallRecordManagerBuilder {
@@ -463,6 +466,8 @@ pub struct CallRecordManagerBuilder {
     /// Optional database used to record per-file S3 upload failures into
     /// `pending_uploads` so the upload-retry scheduler can retry them later.
     pending_db: Option<sea_orm::DatabaseConnection>,
+    /// Phase 7 D-06 — webhook broadcast sender for `call.completed`.
+    webhook_sender: Option<crate::proxy::webhook::WebhookEventSender>,
 }
 
 impl CallRecordManagerBuilder {
@@ -475,7 +480,18 @@ impl CallRecordManagerBuilder {
             formatter: None,
             hooks: Vec::new(),
             pending_db: None,
+            webhook_sender: None,
         }
+    }
+
+    /// Phase 7 D-06 — wire the webhook broadcast sender so the recv-loop
+    /// can emit `call.completed` after each successful save.
+    pub fn with_webhook_sender(
+        mut self,
+        sender: crate::proxy::webhook::WebhookEventSender,
+    ) -> Self {
+        self.webhook_sender = Some(sender);
+        self
     }
 
     pub fn with_cancel_token(mut self, cancel_token: CancellationToken) -> Self {
@@ -561,6 +577,7 @@ impl CallRecordManagerBuilder {
             saver_fn,
             formatter,
             hooks: Arc::new(self.hooks),
+            webhook_sender: self.webhook_sender,
         }
     }
 }
@@ -954,15 +971,16 @@ impl CallRecordManager {
                 let config_ref = self.config.clone();
                 let formatter_ref = self.formatter.clone();
                 let hooks_ref = self.hooks.clone();
+                let webhook_sender_ref = self.webhook_sender.clone();
 
                 futures.push(async move {
                     let save_outcome =
                         save_fn_ref(cancel_token_ref, formatter_ref, config_ref, record).await;
-                    let mut record = match save_outcome {
-                        Ok((record, _file_name)) => record,
+                    let (mut record, save_ok) = match save_outcome {
+                        Ok((record, _file_name)) => (record, true),
                         Err((record, err)) => {
                             warn!("Failed to save call record: {}", err);
-                            record
+                            (record, false)
                         }
                     };
 
@@ -970,6 +988,16 @@ impl CallRecordManager {
                         if let Err(e) = hook.on_record_completed(&mut record).await {
                             warn!("CallRecordHook failed: {}", e);
                         }
+                    }
+
+                    // Phase 7 D-06: emit `call.completed` after successful
+                    // finalize (skip on save failure — D-07 contract is the
+                    // record reached durable storage).
+                    if save_ok {
+                        let _ = crate::callrecord::storage::emit_call_completed(
+                            webhook_sender_ref.as_ref(),
+                            &record,
+                        );
                     }
                 });
             }
