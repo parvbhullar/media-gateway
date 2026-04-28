@@ -136,9 +136,9 @@ Requirement IDs follow `[CATEGORY]-[NUMBER]`. All v2.0 requirements are user/ope
 - [ ] **WH-01**: A new `rustpbx_webhooks` table + CRUD endpoints at `/api/v1/webhooks` exist
 - [x] **WH-02**: A background processor consumes `callrecord/` completion events and delivers them to registered webhooks
 - [x] **WH-03**: Webhook delivery posts JSON with HMAC header using the webhook's secret, uses 3 retries with exponential backoff, and falls back to a disk JSON file when all retries fail
-- [ ] **WH-04**: Webhook events include `X-Webhook-Event`, `X-Webhook-Secret`, and a request id header
-- [ ] **WH-05**: Creating a webhook fires a test event synchronously; failure to deliver the test is non-fatal and logged
-- [ ] **WH-06**: `PUT /api/v1/webhooks/{id}` updates a webhook; `DELETE /api/v1/webhooks/{id}` removes it and cancels any in-flight retries
+- [x] **WH-04**: Webhook events include `X-Webhook-Event`, `X-Webhook-Secret`, and a request id header
+- [x] **WH-05**: Creating a webhook fires a test event synchronously; failure to deliver the test is non-fatal and logged
+- [x] **WH-06**: `PUT /api/v1/webhooks/{id}` updates a webhook; `DELETE /api/v1/webhooks/{id}` removes it and cancels any in-flight retries
 
 ### Endpoints — SIP User Agents (EPUA)
 
@@ -336,9 +336,9 @@ Every v2.0 requirement maps to exactly one phase.
 | WH-01 | Phase 7 | Pending |
 | WH-02 | Phase 7 | Complete |
 | WH-03 | Phase 7 | Complete |
-| WH-04 | Phase 7 | Pending |
-| WH-05 | Phase 7 | Pending |
-| WH-06 | Phase 7 | Pending |
+| WH-04 | Phase 7 | Complete |
+| WH-05 | Phase 7 | Complete |
+| WH-06 | Phase 7 | Complete |
 | EPUA-01 | Phase 13 | Pending |
 | EPUA-02 | Phase 13 | Pending |
 | EPUA-03 | Phase 13 | Pending |
