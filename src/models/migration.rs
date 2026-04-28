@@ -62,6 +62,9 @@ impl MigratorTrait for Migrator {
             // Phase 6 Plan 06-01 — RTE-01/RTE-02 routing tables (records embedded as JSON column per D-01).
             // Forward-only. Legacy rustpbx_routes is intentionally untouched (D-05).
             Box::new(super::routing_tables::Migration),
+            // Phase 7 Plan 07-01 — WH-01 webhooks registry.
+            // Forward-only. New table only; no edits to existing tables.
+            Box::new(super::webhooks::Migration),
         ]
     }
 }
