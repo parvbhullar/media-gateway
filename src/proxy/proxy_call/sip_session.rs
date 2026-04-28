@@ -82,6 +82,51 @@ enum TimerAction {
     Expired,
 }
 
+// Phase 7 D-06: webhook event builders for the two emit sites in this file.
+// `call.started` fires from `accept_call` after 200 OK; `call.failed` fires
+// from `cleanup` when no answer was ever observed. Helpers are pure JSON
+// constructors so the emit sites stay short and the shape is unit-testable.
+pub(crate) fn build_call_started_event(
+    session_id: &str,
+    caller_number: Option<&str>,
+    destination_number: Option<&str>,
+    direction: &str,
+) -> crate::proxy::webhook::WebhookEvent {
+    crate::proxy::webhook::WebhookEvent {
+        event_id: crate::proxy::webhook::new_event_id(),
+        event: "call.started".to_string(),
+        timestamp: crate::proxy::webhook::current_unix_timestamp(),
+        data: serde_json::json!({
+            "session_id": session_id,
+            "caller_number": caller_number,
+            "destination_number": destination_number,
+            "started_at": crate::proxy::webhook::current_unix_timestamp(),
+            "direction": direction,
+        }),
+    }
+}
+
+pub(crate) fn build_call_failed_event(
+    session_id: &str,
+    caller_number: Option<&str>,
+    destination_number: Option<&str>,
+    failure_reason: &str,
+    sip_code: Option<u16>,
+) -> crate::proxy::webhook::WebhookEvent {
+    crate::proxy::webhook::WebhookEvent {
+        event_id: crate::proxy::webhook::new_event_id(),
+        event: "call.failed".to_string(),
+        timestamp: crate::proxy::webhook::current_unix_timestamp(),
+        data: serde_json::json!({
+            "session_id": session_id,
+            "caller_number": caller_number,
+            "destination_number": destination_number,
+            "failure_reason": failure_reason,
+            "sip_code": sip_code,
+        }),
+    }
+}
+
 pub struct SipSession {
     pub id: SessionId,
     pub state: SessionState,
@@ -2168,6 +2213,17 @@ impl SipSession {
 
         self.answer_time = Some(Instant::now());
 
+        // Phase 7 D-06: emit call.started after 200 OK accept (D-07 envelope).
+        // Non-fatal: send error (no subscribers) is silently ignored — the
+        // processor task may not yet be subscribed when the first call lands.
+        let event = build_call_started_event(
+            &self.context.session_id,
+            Some(&self.context.original_caller),
+            Some(&self.context.original_callee),
+            "inbound",
+        );
+        let _ = self.server.webhook_sender.send(event);
+
         Ok(())
     }
 
@@ -2356,6 +2412,30 @@ impl SipSession {
 
     async fn cleanup(&mut self) {
         debug!(session_id = %self.context.session_id, "Cleaning up session");
+
+        // Phase 7 D-06: emit call.failed when the call never reached the
+        // answered state (early termination via 3xx/4xx/5xx, dialplan failure,
+        // or timeout). When `answer_time` is set the call DID answer and the
+        // terminal lifecycle event is `call.completed` (emitted by the
+        // callrecord finalize path), so we suppress here to avoid double-fire.
+        if self.answer_time.is_none() {
+            let (failure_reason, sip_code) = match (&self.last_error, &self.hangup_reason) {
+                (Some((code, reason)), _) => (
+                    reason.clone().unwrap_or_else(|| format!("{:?}", code)),
+                    Some(u16::from(code.clone())),
+                ),
+                (None, Some(reason)) => (reason.to_string(), None),
+                (None, None) => ("unknown".to_string(), None),
+            };
+            let event = build_call_failed_event(
+                &self.context.session_id,
+                Some(&self.context.original_caller),
+                Some(&self.context.original_callee),
+                &failure_reason,
+                sip_code,
+            );
+            let _ = self.server.webhook_sender.send(event);
+        }
 
         if self.recording_state.is_some() {
             let _ = self.stop_recording().await;
@@ -4420,5 +4500,41 @@ mod tests {
         assert!(matches!(received, Some(CallCommand::UnmuteTrack { .. })));
 
         drop(handle);
+    }
+
+    // Phase 7 D-06 — webhook event-shape round-trip tests for the two emit
+    // sites in this file. Asserts the JSON envelope matches D-07 fields.
+    #[test]
+    fn build_call_started_event_shape_matches_d07() {
+        let ev = super::build_call_started_event(
+            "sess-abc",
+            Some("+15551234567"),
+            Some("+14155556677"),
+            "inbound",
+        );
+        assert_eq!(ev.event, "call.started");
+        assert!(ev.event_id.starts_with("evt_"));
+        assert!(ev.timestamp > 0);
+        assert_eq!(ev.data["session_id"], "sess-abc");
+        assert_eq!(ev.data["caller_number"], "+15551234567");
+        assert_eq!(ev.data["destination_number"], "+14155556677");
+        assert_eq!(ev.data["direction"], "inbound");
+        assert!(ev.data["started_at"].as_i64().is_some());
+    }
+
+    #[test]
+    fn build_call_failed_event_shape_matches_d07() {
+        let ev = super::build_call_failed_event(
+            "sess-fail",
+            Some("+15551234567"),
+            Some("+14155556677"),
+            "Busy Here",
+            Some(486),
+        );
+        assert_eq!(ev.event, "call.failed");
+        assert!(ev.event_id.starts_with("evt_"));
+        assert_eq!(ev.data["session_id"], "sess-fail");
+        assert_eq!(ev.data["failure_reason"], "Busy Here");
+        assert_eq!(ev.data["sip_code"], 486);
     }
 }
