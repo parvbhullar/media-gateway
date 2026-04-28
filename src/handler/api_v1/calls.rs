@@ -876,18 +876,71 @@ fn resolve_recording_path(
 /// post-processing consumers know to transcribe this recording.
 ///
 /// Failures are logged as warnings — a missing marker is never fatal.
-fn maybe_drop_transcribe_marker(path: &str, transcribe: bool) {
+///
+/// Phase 4 D-18: transcribe marker → Phase 7 transcribe.requested event.
+/// When the marker WRITE succeeds AND a webhook sender is wired, emit a
+/// `transcribe.requested` event (D-07 envelope) so external transcription
+/// consumers can pick up the recording. This consumes the Phase 4 D-18
+/// hand-off contract — the marker file is the source-of-truth artifact;
+/// the webhook is an additional notification rail.
+fn maybe_drop_transcribe_marker(
+    path: &str,
+    transcribe: bool,
+    session_id: &str,
+    webhook_sender: Option<&crate::proxy::webhook::WebhookEventSender>,
+) {
     if !transcribe {
         return;
     }
     let marker = format!("{}.transcribe.marker", path);
     match std::fs::File::create(&marker) {
-        Ok(_) => tracing::info!("dropped transcribe marker: {}", marker),
+        Ok(_) => {
+            tracing::info!("dropped transcribe marker: {}", marker);
+            // Phase 4 D-18: transcribe marker → Phase 7 transcribe.requested event
+            if let Some(sender) = webhook_sender {
+                let event = crate::proxy::webhook::WebhookEvent {
+                    event_id: crate::proxy::webhook::new_event_id(),
+                    event: "transcribe.requested".to_string(),
+                    timestamp: crate::proxy::webhook::current_unix_timestamp(),
+                    data: serde_json::json!({
+                        "session_id": session_id,
+                        "recording_path": path,
+                        "marker_path": marker,
+                    }),
+                };
+                let _ = sender.send(event);
+            }
+        }
         Err(e) => tracing::warn!(
             "failed to drop transcribe marker '{}': {}",
             marker,
             e
         ),
+    }
+}
+
+/// Build the `recording.completed` envelope (D-07). Best-effort metadata —
+/// `size_bytes` reads the file metadata; failure → 0.
+async fn build_recording_completed_event(
+    session_id: &str,
+    recording_path: &str,
+    format: &str,
+) -> crate::proxy::webhook::WebhookEvent {
+    let size_bytes = tokio::fs::metadata(recording_path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+    crate::proxy::webhook::WebhookEvent {
+        event_id: crate::proxy::webhook::new_event_id(),
+        event: "recording.completed".to_string(),
+        timestamp: crate::proxy::webhook::current_unix_timestamp(),
+        data: serde_json::json!({
+            "session_id": session_id,
+            "recording_path": recording_path,
+            "format": format,
+            "duration_secs": 0,
+            "size_bytes": size_bytes,
+        }),
     }
 }
 
@@ -905,7 +958,22 @@ async fn record_call(
     let resolved =
         resolve_recording_path(req.path.as_deref(), &id, &format, &recorder_path)?;
 
-    maybe_drop_transcribe_marker(&resolved, req.transcribe.unwrap_or(false));
+    let webhook_sender = state.webhook_sender();
+    maybe_drop_transcribe_marker(
+        &resolved,
+        req.transcribe.unwrap_or(false),
+        &id,
+        Some(&webhook_sender),
+    );
+
+    // Phase 7 D-06: emit recording.completed after dispatch returns success.
+    // Note: Phase 4 record handler dispatches "start recording" (the file is
+    // not yet final at this point in v2.0). The event is emitted now so
+    // operators are notified the recording was scheduled; v2.1 will move
+    // this to the actual stop-and-flush callback. (See deferred-items.md.)
+    let recording_event =
+        build_recording_completed_event(&id, &resolved, &format).await;
+    let _ = webhook_sender.send(recording_event);
 
     let payload = CallCommandPayload::Record {
         path: Some(resolved.clone()),
@@ -1200,5 +1268,73 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, "/var/recordings/custom.wav");
+    }
+
+    // ── Phase 7 D-06 — transcribe.requested + recording.completed emit ────
+
+    #[test]
+    fn maybe_drop_transcribe_marker_no_event_when_transcribe_false() {
+        let (sender, mut rx) =
+            tokio::sync::broadcast::channel::<crate::proxy::webhook::WebhookEvent>(8);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rec.wav");
+        let _ = std::fs::File::create(&path).unwrap();
+        maybe_drop_transcribe_marker(
+            path.to_str().unwrap(),
+            false,
+            "sess-1",
+            Some(&sender),
+        );
+        assert!(rx.try_recv().is_err(), "no event when transcribe=false");
+    }
+
+    #[test]
+    fn maybe_drop_transcribe_marker_emits_event_on_success() {
+        let (sender, mut rx) =
+            tokio::sync::broadcast::channel::<crate::proxy::webhook::WebhookEvent>(8);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rec.wav");
+        let _ = std::fs::File::create(&path).unwrap();
+        maybe_drop_transcribe_marker(
+            path.to_str().unwrap(),
+            true,
+            "sess-2",
+            Some(&sender),
+        );
+        let ev = rx.try_recv().expect("event delivered");
+        assert_eq!(ev.event, "transcribe.requested");
+        assert_eq!(ev.data["session_id"], "sess-2");
+        assert!(ev.data["marker_path"].as_str().unwrap().ends_with(".transcribe.marker"));
+    }
+
+    #[test]
+    fn maybe_drop_transcribe_marker_no_event_on_io_failure() {
+        let (sender, mut rx) =
+            tokio::sync::broadcast::channel::<crate::proxy::webhook::WebhookEvent>(8);
+        // Path inside a non-existent directory → File::create fails.
+        maybe_drop_transcribe_marker(
+            "/nonexistent-7-05-dir/rec.wav",
+            true,
+            "sess-3",
+            Some(&sender),
+        );
+        assert!(rx.try_recv().is_err(), "no event when marker write fails");
+    }
+
+    #[tokio::test]
+    async fn build_recording_completed_event_uses_d07_envelope() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rec.wav");
+        std::fs::write(&path, b"hello").unwrap();
+        let ev = build_recording_completed_event(
+            "sess-r",
+            path.to_str().unwrap(),
+            "wav",
+        )
+        .await;
+        assert_eq!(ev.event, "recording.completed");
+        assert_eq!(ev.data["session_id"], "sess-r");
+        assert_eq!(ev.data["format"], "wav");
+        assert_eq!(ev.data["size_bytes"], 5);
     }
 }
