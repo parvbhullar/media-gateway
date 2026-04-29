@@ -94,6 +94,11 @@ pub struct SipServerInner {
     /// Phase 7 Plan 07-01 — in-memory cancel registry for in-flight
     /// webhook retries (D-31). Body wired in 07-03.
     pub webhook_cancel_registry: Arc<crate::proxy::webhook::WebhookCancelRegistry>,
+    /// Phase 8 Plan 08-01 — number-translation engine (TRN-01, D-12).
+    /// Stub `translate` body in Wave 1; real DB-backed implementation
+    /// lands in 08-03. Reachable from REST handlers via AppState so 08-02
+    /// CRUD handlers can call `invalidate(rule_id)` on PUT/DELETE.
+    pub translation_engine: Arc<crate::proxy::translation::TranslationEngine>,
 }
 
 pub type SipServerRef = Arc<SipServerInner>;
@@ -583,6 +588,10 @@ impl SipServerBuilder {
             tokio::sync::broadcast::channel::<crate::proxy::webhook::WebhookEvent>(1024);
         let webhook_cancel_registry =
             Arc::new(crate::proxy::webhook::WebhookCancelRegistry::new());
+        // Phase 8 Plan 08-01 — translation engine (TRN-01, D-12). Empty
+        // regex cache; populated lazily on first `translate` call (08-03).
+        let translation_engine =
+            Arc::new(crate::proxy::translation::TranslationEngine::new());
         // Phase 7 Plan 07-04 — webhook delivery processor (D-11..D-13).
         // Subscribes to `webhook_sender` and dispatches each event to all
         // active matching webhooks with HMAC signing, retry, jitter,
@@ -642,6 +651,7 @@ impl SipServerBuilder {
             conference_manager,
             webhook_sender,
             webhook_cancel_registry,
+            translation_engine,
         });
 
         let inner_weak = Arc::downgrade(&inner);
@@ -832,6 +842,15 @@ impl SipServer {
         &self,
     ) -> Arc<crate::proxy::webhook::WebhookCancelRegistry> {
         self.inner.webhook_cancel_registry.clone()
+    }
+
+    /// Phase 8 Plan 08-01 — accessor for the translation engine (D-12).
+    /// Real translate body lands in 08-03; CRUD handlers (08-02) call
+    /// `engine.invalidate(rule_id)` on PUT/DELETE.
+    pub fn translation_engine(
+        &self,
+    ) -> Arc<crate::proxy::translation::TranslationEngine> {
+        self.inner.translation_engine.clone()
     }
 
     async fn handle_incoming(&self, mut incoming: TransactionReceiver) -> Result<()> {

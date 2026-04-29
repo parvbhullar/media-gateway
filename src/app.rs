@@ -121,6 +121,15 @@ impl AppStateInner {
         self.sip_server.webhook_cancel_registry()
     }
 
+    /// Phase 8 Plan 08-01 — translation engine accessor (D-12). Delegates
+    /// to `SipServer.inner.translation_engine` so AppStateInner stays
+    /// additive-free (mirrors webhook_cancel_registry pattern).
+    pub fn translation_engine(
+        &self,
+    ) -> std::sync::Arc<crate::proxy::translation::TranslationEngine> {
+        self.sip_server.translation_engine()
+    }
+
     pub fn get_dump_events_file(&self, session_id: &String) -> String {
         let sanitized_id = crate::utils::sanitize_id(session_id);
         let recorder_root = self.config().recorder_path();
