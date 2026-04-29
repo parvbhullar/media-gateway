@@ -485,6 +485,9 @@ async fn test_guest_call_allowed_extension() {
         webhook_cancel_registry: Arc::new(
             crate::proxy::webhook::WebhookCancelRegistry::new(),
         ),
+        translation_engine: Arc::new(
+            crate::proxy::translation::TranslationEngine::new(),
+        ),
     });
 
     let module = AuthModule::new(server_inner);

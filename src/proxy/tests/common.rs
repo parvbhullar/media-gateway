@@ -116,6 +116,9 @@ pub async fn create_test_server_with_config(
         webhook_cancel_registry: Arc::new(
             crate::proxy::webhook::WebhookCancelRegistry::new(),
         ),
+        translation_engine: Arc::new(
+            crate::proxy::translation::TranslationEngine::new(),
+        ),
     });
 
     // Add test users
