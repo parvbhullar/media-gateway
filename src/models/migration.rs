@@ -65,6 +65,9 @@ impl MigratorTrait for Migrator {
             // Phase 7 Plan 07-01 — WH-01 webhooks registry.
             // Forward-only. New table only; no edits to existing tables.
             Box::new(super::webhooks::Migration),
+            // Phase 8 Plan 08-01 — TRN-01 translations registry.
+            // Forward-only. New table only; no edits to existing tables.
+            Box::new(super::translations::Migration),
         ]
     }
 }
