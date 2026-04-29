@@ -246,6 +246,9 @@ pub struct DefaultRouteInvite {
     pub routing_state: Arc<RoutingState>,
     pub data_context: Arc<ProxyDataContext>,
     pub source_trunk_hint: Option<String>,
+    /// Phase 8 D-11: pre-routing translation engine + DB handle for D-13 fresh read.
+    pub translation_engine: Option<Arc<crate::proxy::translation::TranslationEngine>>,
+    pub db: Option<sea_orm::DatabaseConnection>,
 }
 
 #[async_trait]
@@ -257,6 +260,13 @@ impl RouteInvite for DefaultRouteInvite {
         direction: &DialDirection,
         _cookie: &TransactionCookie,
     ) -> Result<RouteResult> {
+        let mut option = option;
+        // Phase 8 D-11: pre-routing translation pass. TODO(observability): attach trace to CDR.
+        if let (Some(engine), Some(db)) = (self.translation_engine.as_ref(), self.db.as_ref()) {
+            if let Err(e) = engine.translate(&mut option, *direction, db).await {
+                warn!(error = %e, "translation engine failed; continuing without translation");
+            }
+        }
         let (trunks_snapshot, routes_snapshot, source_trunk) =
             self.build_context(origin, direction).await;
         if matches!(direction, DialDirection::Inbound) {
@@ -1085,6 +1095,8 @@ impl CallModule {
                     routing_state: self.inner.routing_state.clone(),
                     data_context: self.inner.server.data_context.clone(),
                     source_trunk_hint,
+                    translation_engine: Some(self.inner.server.translation_engine.clone()),
+                    db: self.inner.server.database.clone(),
                 })
             };
 
