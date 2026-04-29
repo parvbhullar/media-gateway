@@ -2,14 +2,14 @@
 gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: milestone
-status: phase-7-complete
-stopped_at: Phase 7 webhook pipeline complete (WH-01..06)
+status: executing
+stopped_at: Phase 8 complete (TRN-01..06 closed)
 last_updated: "2026-04-26T00:00:00.000Z"
-last_activity: 2026-04-26
+last_activity: 2026-04-26 -- Phase 8 sign-off (08-04 landed: hot-path engine wire-up + IT-TRN-06)
 progress:
   total_phases: 13
-  completed_phases: 7
-  total_plans: 32
+  completed_phases: 8
+  total_plans: 36
   completed_plans: 36
   percent: 100
 ---
@@ -25,12 +25,12 @@ See: .planning/PROJECT.md (updated 2026-04-14)
 
 ## Current Position
 
-Phase: 4 (Active Calls & Mid-Call Control) — COMPLETE
-Plan: 5 of 5 (final wave landed)
-Status: Phase complete — ready for verification
-Last activity: 2026-04-28
+Phase: 8 (Translations Engine) — COMPLETE
+Plan: 4 of 4 (final wave landed)
+Status: Ready to execute Phase 9 (Manipulations Engine)
+Last activity: 2026-04-26 -- Phase 8 sign-off (TRN-01..06 closed)
 
-Progress: [███░░░░░░░] 31%  (4 of 13 phases)
+Progress: [██████░░░░] 62%  (8 of 13 phases)
 
 ## Performance Metrics
 
@@ -48,7 +48,9 @@ Progress: [███░░░░░░░] 31%  (4 of 13 phases)
 | 2. Trunk Groups Schema & Core CRUD | 3 | 3 | Verified (10/10) -- see 02-VERIFICATION.md |
 | 3. Trunk Sub-Resources L1 & Routing Resolve | 3 | 3 | Verified -- see 03-*-SUMMARY.md |
 | 4. Active Calls & Mid-Call Control | 5 | 5 | Done (CALL-01..10) -- see 04-05-SUMMARY.md |
+| 8. Translations Engine | 4 | 4 | Done (TRN-01..06) -- see 08-0{1..4}-SUMMARY.md |
 | Phase 04 P02 | ~8 min | 3 tasks | 3 files |
+| Phase 08 P04 | ~10 min | 3 tasks | 2 files |
 
 ## Phase 2 Verification (2026-04-16)
 

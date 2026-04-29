@@ -92,12 +92,12 @@ Requirement IDs follow `[CATEGORY]-[NUMBER]`. All v2.0 requirements are user/ope
 
 ### Translations Engine (TRN)
 
-- [ ] **TRN-01**: A new `rustpbx_translations` table + `models/translation.rs` entity exists
-- [ ] **TRN-02**: Operator can CRUD translation classes via `/api/v1/translations` with caller/destination regex patterns, replacements, and direction (`inbound`/`outbound`/`both`)
-- [ ] **TRN-03**: `proxy/translation/engine.rs` compiles and caches regex rules keyed on rule id
-- [ ] **TRN-04**: Inbound call pipeline applies matching translation rules to caller and destination numbers BEFORE routing
-- [ ] **TRN-05**: Translation engine honors direction filter — inbound-only rules do not fire on outbound legs
-- [ ] **TRN-06**: An integration test exercises `02079460123 → +442079460123` and `4155551234 → +14155551234` end-to-end through the pipeline
+- [x] **TRN-01**: A new `rustpbx_translations` table + `models/translation.rs` entity exists (Phase 8 / 08-01)
+- [x] **TRN-02**: Operator can CRUD translation classes via `/api/v1/translations` with caller/destination regex patterns, replacements, and direction (`inbound`/`outbound`/`both`) (Phase 8 / 08-02)
+- [x] **TRN-03**: `proxy/translation/engine.rs` compiles and caches regex rules keyed on rule id (Phase 8 / 08-03)
+- [x] **TRN-04**: Inbound call pipeline applies matching translation rules to caller and destination numbers BEFORE routing (Phase 8 / 08-04)
+- [x] **TRN-05**: Translation engine honors direction filter — inbound-only rules do not fire on outbound legs (Phase 8 / 08-04)
+- [x] **TRN-06**: An integration test exercises `02079460123 → +442079460123` and `4155551234 → +14155551234` end-to-end through the pipeline (Phase 8 / 08-04)
 
 ### Manipulations Engine (MAN)
 
@@ -304,12 +304,12 @@ Every v2.0 requirement maps to exactly one phase.
 | RTE-03 | Phase 3 | Pending |
 | RTE-04 | Phase 6 | Pending |
 | RTE-05 | Phase 6 | Pending |
-| TRN-01 | Phase 8 | Pending |
-| TRN-02 | Phase 8 | Pending |
-| TRN-03 | Phase 8 | Pending |
-| TRN-04 | Phase 8 | Pending |
-| TRN-05 | Phase 8 | Pending |
-| TRN-06 | Phase 8 | Pending |
+| TRN-01 | Phase 8 | Complete |
+| TRN-02 | Phase 8 | Complete |
+| TRN-03 | Phase 8 | Complete |
+| TRN-04 | Phase 8 | Complete |
+| TRN-05 | Phase 8 | Complete |
+| TRN-06 | Phase 8 | Complete |
 | MAN-01 | Phase 9 | Pending |
 | MAN-02 | Phase 9 | Pending |
 | MAN-03 | Phase 9 | Pending |
