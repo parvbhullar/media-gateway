@@ -55,12 +55,10 @@ pub fn api_v1_router(state: AppState) -> Router {
         .merge(webhooks::router())                 // Phase 7 — WH-01
         ;
 
-    Router::<AppState>::new()
-        .nest("/api/v1", protected)
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth::api_v1_auth_middleware,
-        ));
+    let protected = protected.layer(middleware::from_fn_with_state(
+        state.clone(),
+        auth::api_v1_auth_middleware,
+    ));
 
     Router::<AppState>::new()
         .nest("/api/v1", protected)

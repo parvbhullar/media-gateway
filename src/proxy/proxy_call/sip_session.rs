@@ -128,6 +128,8 @@ pub(crate) fn build_call_failed_event(
             "sip_code": sip_code,
         }),
     }
+}
+
 enum UpdateRefreshOutcome {
     Refreshed,
     Retry,
@@ -2573,7 +2575,6 @@ impl SipSession {
 
         self.answer_time = Some(Instant::now());
 
-<<<<<<< HEAD
         // Phase 7 D-06: emit call.started after 200 OK accept (D-07 envelope).
         // Non-fatal: send error (no subscribers) is silently ignored — the
         // processor task may not yet be subscribed when the first call lands.
@@ -2584,7 +2585,7 @@ impl SipSession {
             "inbound",
         );
         let _ = self.server.webhook_sender.send(event);
-=======
+
         // Auto-start recording when the call is answered if configured.
         if self.context.dialplan.recording.enabled
             && self.context.dialplan.recording.auto_start
@@ -2603,7 +2604,6 @@ impl SipSession {
                 }
             }
         }
->>>>>>> 28ce2104048aaadd6a229af13a3f92201e60bcfb
 
         Ok(())
     }
