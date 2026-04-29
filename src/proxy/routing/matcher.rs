@@ -1560,7 +1560,7 @@ fn apply_rewrite_pattern(pattern: &str, original: &str, _origin: &rsipstack::sip
 }
 
 /// Update URI user part
-fn update_uri_user(uri: &rsipstack::sip::Uri, new_user: &str) -> Result<rsipstack::sip::Uri> {
+pub(crate) fn update_uri_user(uri: &rsipstack::sip::Uri, new_user: &str) -> Result<rsipstack::sip::Uri> {
     let mut new_uri = uri.clone();
     new_uri.auth = Some(rsipstack::sip::Auth {
         user: new_user.to_string(),
