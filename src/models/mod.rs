@@ -43,6 +43,7 @@ pub mod trunk_group;
 pub mod trunk_group_member;
 pub mod trunk_origination_uris;
 pub mod translations;
+pub mod manipulations;
 pub mod user;
 pub mod webhooks;
 pub mod wholesale_agent;

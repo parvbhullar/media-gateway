@@ -68,6 +68,9 @@ impl MigratorTrait for Migrator {
             // Phase 8 Plan 08-01 — TRN-01 translations registry.
             // Forward-only. New table only; no edits to existing tables.
             Box::new(super::translations::Migration),
+            // Phase 9 Plan 09-01 — MAN-01 manipulations registry.
+            // Forward-only. New table only; no edits to existing tables.
+            Box::new(super::manipulations::Migration),
         ]
     }
 }
