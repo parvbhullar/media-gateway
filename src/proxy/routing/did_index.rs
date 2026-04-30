@@ -53,11 +53,7 @@ impl DidIndex {
     }
 }
 
-#[cfg(any(test, feature = "integration-test"))]
 impl DidIndex {
-    /// Construct a `DidIndex` from a raw map. Exposed for integration tests
-    /// and call-path unit tests that need to synthesize a snapshot without
-    /// touching the database.
     pub fn from_map_for_test(by_number: HashMap<String, DidEntry>) -> Self {
         Self { by_number }
     }
