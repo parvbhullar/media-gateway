@@ -99,6 +99,11 @@ pub struct SipServerInner {
     /// lands in 08-03. Reachable from REST handlers via AppState so 08-02
     /// CRUD handlers can call `invalidate(rule_id)` on PUT/DELETE.
     pub translation_engine: Arc<crate::proxy::translation::TranslationEngine>,
+    /// Phase 9 Plan 09-01 — SIP-manipulation engine (MAN-01, D-23). Stub
+    /// `manipulate` body in Wave 1; real DB-backed implementation lands in
+    /// 09-03. Reachable from REST handlers via AppState so 09-02 CRUD
+    /// handlers can call `invalidate_class(class_id)` on PUT/DELETE.
+    pub manipulation_engine: Arc<crate::proxy::manipulation::ManipulationEngine>,
 }
 
 pub type SipServerRef = Arc<SipServerInner>;
@@ -592,6 +597,11 @@ impl SipServerBuilder {
         // regex cache; populated lazily on first `translate` call (08-03).
         let translation_engine =
             Arc::new(crate::proxy::translation::TranslationEngine::new());
+        // Phase 9 Plan 09-01 — manipulation engine (MAN-01, D-23). Empty
+        // regex_cache + var_scope; populated lazily on first `manipulate`
+        // call (09-03).
+        let manipulation_engine =
+            Arc::new(crate::proxy::manipulation::ManipulationEngine::new());
         // Phase 7 Plan 07-04 — webhook delivery processor (D-11..D-13).
         // Subscribes to `webhook_sender` and dispatches each event to all
         // active matching webhooks with HMAC signing, retry, jitter,
@@ -652,6 +662,7 @@ impl SipServerBuilder {
             webhook_sender,
             webhook_cancel_registry,
             translation_engine,
+            manipulation_engine,
         });
 
         let inner_weak = Arc::downgrade(&inner);
@@ -851,6 +862,15 @@ impl SipServer {
         &self,
     ) -> Arc<crate::proxy::translation::TranslationEngine> {
         self.inner.translation_engine.clone()
+    }
+
+    /// Phase 9 Plan 09-01 — accessor for the manipulation engine (D-23).
+    /// Real `manipulate` body lands in 09-03; CRUD handlers (09-02) call
+    /// `engine.invalidate_class(class_id)` on PUT/DELETE.
+    pub fn manipulation_engine(
+        &self,
+    ) -> Arc<crate::proxy::manipulation::ManipulationEngine> {
+        self.inner.manipulation_engine.clone()
     }
 
     async fn handle_incoming(&self, mut incoming: TransactionReceiver) -> Result<()> {

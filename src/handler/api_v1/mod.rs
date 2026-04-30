@@ -24,6 +24,7 @@ pub mod trunk_media;              // Phase 3 Plan 03-01 — TSUB-03
 pub mod trunk_origination_uris;   // Phase 3 Plan 03-01 — TSUB-02
 pub mod trunks;
 pub mod translations;             // Phase 8 — TRN-01
+pub mod manipulations;            // Phase 9 — MAN-01
 pub mod webhooks;                 // Phase 7 — WH-01
 
 use axum::{Router, middleware};
@@ -55,6 +56,7 @@ pub fn api_v1_router(state: AppState) -> Router {
         .merge(calls::router())                    // Phase 4 Plan 04-01 — CALL-01, CALL-02
         .merge(webhooks::router())                 // Phase 7 — WH-01
         .merge(translations::router())             // Phase 8 — TRN-01
+        .merge(manipulations::router())            // Phase 9 — MAN-01
         ;
 
     let protected = protected.layer(middleware::from_fn_with_state(

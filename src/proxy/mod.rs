@@ -16,6 +16,7 @@ pub mod gateway_health;
 pub mod locator;
 pub mod locator_db;
 pub mod locator_webhook;
+pub mod manipulation;
 pub mod nat;
 pub mod presence;
 pub mod proxy_call;

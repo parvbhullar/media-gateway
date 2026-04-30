@@ -119,6 +119,9 @@ pub async fn create_test_server_with_config(
         translation_engine: Arc::new(
             crate::proxy::translation::TranslationEngine::new(),
         ),
+        manipulation_engine: Arc::new(
+            crate::proxy::manipulation::ManipulationEngine::new(),
+        ),
     });
 
     // Add test users

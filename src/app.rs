@@ -130,6 +130,15 @@ impl AppStateInner {
         self.sip_server.translation_engine()
     }
 
+    /// Phase 9 Plan 09-01 — manipulation engine accessor (D-23). Delegates
+    /// to `SipServer.inner.manipulation_engine` so AppStateInner stays
+    /// additive-free (mirrors translation_engine pattern).
+    pub fn manipulation_engine(
+        &self,
+    ) -> std::sync::Arc<crate::proxy::manipulation::ManipulationEngine> {
+        self.sip_server.manipulation_engine()
+    }
+
     pub fn get_dump_events_file(&self, session_id: &String) -> String {
         let sanitized_id = crate::utils::sanitize_id(session_id);
         let recorder_root = self.config().recorder_path();
