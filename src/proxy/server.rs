@@ -1004,6 +1004,28 @@ pub fn local_ip_for_peer(peer: IpAddr) -> Option<IpAddr> {
     sock.local_addr().ok().map(|a| a.ip())
 }
 
+/// True for RFC1918, link-local, loopback, and the unspecified address —
+/// i.e. peers we can reach without traversing NAT. Used by Contact builder
+/// to decide whether to advertise the operator-configured `external_ip`.
+fn is_private_or_loopback(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                // fc00::/7 unique-local
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                // fe80::/10 link-local
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
 impl SipServerInner {
     pub fn default_contact_uri(&self) -> Option<rsipstack::sip::Uri> {
         self.contact_uri_for_peer(None)
@@ -1019,15 +1041,41 @@ impl SipServerInner {
         let addr = self.endpoint.get_addrs().first()?.clone();
         let transport = addr.r#type;
 
-        let host_with_port = match peer.and_then(local_ip_for_peer) {
-            Some(local_ip) => {
-                let port = addr.addr.port.clone();
-                rsipstack::sip::HostWithPort {
-                    host: rsipstack::sip::Host::IpAddr(local_ip),
-                    port,
+        // When the operator has configured `external_ip` and the peer is on
+        // the public internet (i.e. not in a private/loopback range), advertise
+        // the external IP in Contact. On NAT'd hosts (e.g. AWS EC2) the kernel's
+        // source IP for a public peer is the private VPC interface — putting
+        // that into Contact makes ACK/BYE/in-dialog requests unroutable from
+        // the peer side. For private/LAN peers we keep the kernel-derived
+        // source so same-VPC routing is honored.
+        let external_ip = self
+            .rtp_config
+            .external_ip
+            .as_ref()
+            .and_then(|s| s.parse::<IpAddr>().ok());
+
+        let host_with_port = match peer {
+            Some(p) => {
+                let chosen = if !is_private_or_loopback(p) {
+                    external_ip.or_else(|| local_ip_for_peer(p))
+                } else {
+                    local_ip_for_peer(p)
+                };
+                match chosen {
+                    Some(ip) => rsipstack::sip::HostWithPort {
+                        host: rsipstack::sip::Host::IpAddr(ip),
+                        port: addr.addr.port.clone(),
+                    },
+                    None => addr.addr,
                 }
             }
-            None => addr.addr,
+            None => match external_ip {
+                Some(ip) => rsipstack::sip::HostWithPort {
+                    host: rsipstack::sip::Host::IpAddr(ip),
+                    port: addr.addr.port.clone(),
+                },
+                None => addr.addr,
+            },
         };
 
         let mut params = Vec::new();
