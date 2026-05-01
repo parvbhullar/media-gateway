@@ -32,6 +32,8 @@ pub mod presence;
 pub mod rbac;
 pub mod routing;
 pub mod routing_tables;
+pub mod security_blocks;
+pub mod security_rules;
 pub mod sip_trunk;
 pub mod system_config;
 pub mod system_notification;

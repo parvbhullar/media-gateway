@@ -71,6 +71,10 @@ impl MigratorTrait for Migrator {
             // Phase 9 Plan 09-01 — MAN-01 manipulations registry.
             // Forward-only. New table only; no edits to existing tables.
             Box::new(super::manipulations::Migration),
+            // Phase 10 Plan 10-01 — SEC-01 firewall rules + SEC-03 auto-blocks.
+            // Forward-only. No FK dependencies; standalone global-state tables.
+            Box::new(super::security_rules::Migration),
+            Box::new(super::security_blocks::Migration),
         ]
     }
 }
