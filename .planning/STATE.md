@@ -3,14 +3,14 @@ gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: milestone
 status: executing
-stopped_at: Phase 8 complete (TRN-01..06 closed)
-last_updated: "2026-04-26T00:00:00.000Z"
-last_activity: 2026-04-26 -- Phase 8 sign-off (08-04 landed: hot-path engine wire-up + IT-TRN-06)
+stopped_at: Phase 9 complete (MAN-01..07 + IT-02 closed)
+last_updated: "2026-05-01T00:00:00.000Z"
+last_activity: 2026-05-01 -- Phase 9 sign-off (09-04 landed: hot-path manipulation engine wire-up + IT-02 pipeline tests + cleanup_session hook)
 progress:
   total_phases: 13
-  completed_phases: 8
-  total_plans: 36
-  completed_plans: 36
+  completed_phases: 9
+  total_plans: 40
+  completed_plans: 40
   percent: 100
 ---
 
@@ -25,12 +25,12 @@ See: .planning/PROJECT.md (updated 2026-04-14)
 
 ## Current Position
 
-Phase: 8 (Translations Engine) — COMPLETE
+Phase: 9 (Manipulations Engine) — COMPLETE
 Plan: 4 of 4 (final wave landed)
-Status: Ready to execute Phase 9 (Manipulations Engine)
-Last activity: 2026-04-26 -- Phase 8 sign-off (TRN-01..06 closed)
+Status: Ready to execute Phase 10 (Security Suite)
+Last activity: 2026-05-01 -- Phase 9 sign-off (MAN-01..07 + IT-02 closed; 14/14 pipeline tests GREEN; lib 1297->1369 +72)
 
-Progress: [██████░░░░] 62%  (8 of 13 phases)
+Progress: [███████░░░] 69%  (9 of 13 phases)
 
 ## Performance Metrics
 
@@ -49,6 +49,7 @@ Progress: [██████░░░░] 62%  (8 of 13 phases)
 | 3. Trunk Sub-Resources L1 & Routing Resolve | 3 | 3 | Verified -- see 03-*-SUMMARY.md |
 | 4. Active Calls & Mid-Call Control | 5 | 5 | Done (CALL-01..10) -- see 04-05-SUMMARY.md |
 | 8. Translations Engine | 4 | 4 | Done (TRN-01..06) -- see 08-0{1..4}-SUMMARY.md |
+| 9. Manipulations Engine | 4 | 4 | Done (MAN-01..07 + IT-02) -- see 09-0{1..4}-SUMMARY.md |
 | Phase 04 P02 | ~8 min | 3 tasks | 3 files |
 | Phase 08 P04 | ~10 min | 3 tasks | 2 files |
 

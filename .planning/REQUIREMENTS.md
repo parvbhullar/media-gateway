@@ -101,13 +101,13 @@ Requirement IDs follow `[CATEGORY]-[NUMBER]`. All v2.0 requirements are user/ope
 
 ### Manipulations Engine (MAN)
 
-- [ ] **MAN-01**: A new `rustpbx_manipulations` table + `models/manipulation.rs` entity exists
-- [ ] **MAN-02**: Operator can CRUD manipulation classes via `/api/v1/manipulations` with rules containing conditions (and/or), actions, and anti_actions
-- [ ] **MAN-03**: Condition fields support `caller_number`, `destination_number`, `trunk`, `header:<name>`, `var:<name>`
-- [ ] **MAN-04**: Action types `set_header`, `remove_header`, `set_var`, `log`, `hangup`, `sleep` are implemented
-- [ ] **MAN-05**: Manipulation pipeline runs AFTER routing so rules can depend on the chosen trunk; runs before the outbound INVITE hits the wire
-- [ ] **MAN-06**: `hangup` action short-circuits with a chosen SIP code and integrates cleanly with `proxy_call/session.rs` teardown
-- [ ] **MAN-07**: Anti-actions fire on the else branch when condition_mode evaluates false
+- [x] **MAN-01**: A new `rustpbx_manipulations` table + `models/manipulation.rs` entity exists (Phase 9 / 09-01)
+- [x] **MAN-02**: Operator can CRUD manipulation classes via `/api/v1/manipulations` with rules containing conditions (and/or), actions, and anti_actions (Phase 9 / 09-02)
+- [x] **MAN-03**: Condition fields support `caller_number`, `destination_number`, `trunk`, `header:<name>`, `var:<name>` (Phase 9 / 09-03)
+- [x] **MAN-04**: Action types `set_header`, `remove_header`, `set_var`, `log`, `hangup`, `sleep` are implemented (Phase 9 / 09-03)
+- [x] **MAN-05**: Manipulation pipeline runs AFTER routing so rules can depend on the chosen trunk; runs before the outbound INVITE hits the wire (Phase 9 / 09-04)
+- [x] **MAN-06**: `hangup` action short-circuits with a chosen SIP code and integrates cleanly with `proxy_call/session.rs` teardown (Phase 9 / 09-04)
+- [x] **MAN-07**: Anti-actions fire on the else branch when condition_mode evaluates false (Phase 9 / 09-03)
 
 ### Security Suite (SEC)
 
@@ -179,7 +179,7 @@ Requirement IDs follow `[CATEGORY]-[NUMBER]`. All v2.0 requirements are user/ope
 ### Integration Tests (IT)
 
 - [ ] **IT-01**: Every new api_v1 sub-router has a dedicated test file under `tests/` that asserts 401 without auth, happy path, 404 on missing resource, and 400/409 on bad input
-- [ ] **IT-02**: Translations and Manipulations engines each have pipeline tests that place a simulated call through the dispatch path and assert rewritten numbers and mutated headers
+- [x] **IT-02**: Translations and Manipulations engines each have pipeline tests that place a simulated call through the dispatch path and assert rewritten numbers and mutated headers (Phase 9 / 09-04)
 - [x] **IT-03**: Trunk capacity enforcement, codec filtering (488 on mismatch), and per-trunk ACL each have a proxy integration test
 - [ ] **IT-04**: Applications XML answer-URL flow has an end-to-end test using a mock HTTP server returning canned XML
 - [ ] **IT-05**: Sub-account isolation has a test asserting that a sub-account Bearer token cannot read or mutate another sub-account's trunk, DID, webhook, or recording
@@ -310,13 +310,13 @@ Every v2.0 requirement maps to exactly one phase.
 | TRN-04 | Phase 8 | Complete |
 | TRN-05 | Phase 8 | Complete |
 | TRN-06 | Phase 8 | Complete |
-| MAN-01 | Phase 9 | Pending |
-| MAN-02 | Phase 9 | Pending |
-| MAN-03 | Phase 9 | Pending |
-| MAN-04 | Phase 9 | Pending |
-| MAN-05 | Phase 9 | Pending |
-| MAN-06 | Phase 9 | Pending |
-| MAN-07 | Phase 9 | Pending |
+| MAN-01 | Phase 9 | Satisfied |
+| MAN-02 | Phase 9 | Satisfied |
+| MAN-03 | Phase 9 | Satisfied |
+| MAN-04 | Phase 9 | Satisfied |
+| MAN-05 | Phase 9 | Satisfied |
+| MAN-06 | Phase 9 | Satisfied |
+| MAN-07 | Phase 9 | Satisfied |
 | SEC-01 | Phase 10 | Pending |
 | SEC-02 | Phase 10 | Pending |
 | SEC-03 | Phase 10 | Pending |
@@ -364,7 +364,7 @@ Every v2.0 requirement maps to exactly one phase.
 | TEN-05 | Phase 13 | Pending |
 | TEN-06 | Phase 13 | Pending |
 | IT-01 | Phase 1 | Pending |
-| IT-02 | Phase 9 | Pending |
+| IT-02 | Phase 9 | Satisfied |
 | IT-03 | Phase 5 | Complete |
 | IT-04 | Phase 13 | Pending |
 | IT-05 | Phase 13 | Pending |

@@ -22,7 +22,7 @@ v2.0 closes the gap between media-gateway's rich data plane (rsipstack proxy, Se
 - [ ] **Phase 6: Routing Tables, Records & Distribution** - Full routing CRUD + record adapter + distribution modes
 - [ ] **Phase 7: Webhook Pipeline** - CDR delivery with HMAC, retries, disk fallback
 - [ ] **Phase 8: Translations Engine** - Number rewrite before routing
-- [ ] **Phase 9: Manipulations Engine** - SIP header rewrite after routing
+- [x] **Phase 9: Manipulations Engine** - SIP header rewrite after routing (completed 2026-05-01)
 - [ ] **Phase 10: Security Suite** - Runtime firewall, flood, brute-force, auto-blocks, topology hiding
 - [ ] **Phase 11: System Polish & CDR Export** - `/system/info|config|stats|cluster` + CDR search/recent/export
 - [ ] **Phase 12: Listeners Projection & Recordings First-Class** - Read-only listeners, recordings CRUD/download/export
@@ -218,7 +218,7 @@ Phases execute in numeric order: 1 → 2 → 3 → ... → 13
 | 6. Routing Tables, Records & Distribution | 0/4 | Planned | - |
 | 7. Webhook Pipeline | 4/5 | In Progress|  |
 | 8. Translations Engine | 0/TBD | Not started | - |
-| 9. Manipulations Engine | 0/TBD | Not started | - |
+| 9. Manipulations Engine | 4/4 | Complete   | 2026-05-01 |
 | 10. Security Suite | 0/TBD | Not started | - |
 | 11. System Polish & CDR Export | 0/TBD | Not started | - |
 | 12. Listeners Projection & Recordings First-Class | 0/TBD | Not started | - |
