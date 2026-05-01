@@ -249,6 +249,8 @@ pub struct DefaultRouteInvite {
     /// Phase 8 D-11: pre-routing translation engine + DB handle for D-13 fresh read.
     pub translation_engine: Option<Arc<crate::proxy::translation::TranslationEngine>>,
     pub db: Option<sea_orm::DatabaseConnection>,
+    /// Phase 9 D-22: post-routing manipulation engine (inserted after matcher returns Forward).
+    pub manipulation_engine: Option<Arc<crate::proxy::manipulation::ManipulationEngine>>,
 }
 
 #[async_trait]
@@ -404,6 +406,29 @@ impl RouteInvite for DefaultRouteInvite {
         // (see deferred-items.md). Capacity-gate REJECTION still works
         // correctly — the gate increments and rejects above the limit before
         // the permit drops.
+
+        // Phase 9 D-22: post-routing manipulation pass (runs AFTER matcher, BEFORE dispatch).
+        let mut route_result = route_result;
+        if let (RouteResult::Forward(fwd_opt, _), Some(engine), Some(db)) =
+            (&mut route_result, self.manipulation_engine.as_ref(), self.db.as_ref())
+        {
+            let session_id = origin.call_id_header().map(|h| h.value().to_string()).unwrap_or_default();
+            let ctx = crate::proxy::manipulation::ManipulationContext {
+                caller_number: fwd_opt.caller.user().unwrap_or_default().to_string(),
+                destination_number: fwd_opt.callee.user().unwrap_or_default().to_string(),
+                trunk_name: self.source_trunk_hint.clone().unwrap_or_default(),
+                direction: *direction,
+                session_id,
+            };
+            match engine.manipulate(fwd_opt, ctx, db).await {
+                Ok(crate::proxy::manipulation::ManipulationOutcome::Continue { trace: _ }) => {}
+                Ok(crate::proxy::manipulation::ManipulationOutcome::Hangup { code, reason, trace: _ }) => {
+                    return Ok(RouteResult::Reject { code, reason, retry_after_secs: None });
+                }
+                Err(e) => tracing::warn!(error = %e, "manipulation engine failed; continuing"),
+            }
+        }
+
         Ok(route_result)
     }
 
@@ -1097,6 +1122,7 @@ impl CallModule {
                     source_trunk_hint,
                     translation_engine: Some(self.inner.server.translation_engine.clone()),
                     db: self.inner.server.database.clone(),
+                    manipulation_engine: Some(self.inner.server.manipulation_engine.clone()),
                 })
             };
 

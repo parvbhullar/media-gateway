@@ -3016,6 +3016,9 @@ impl SipSession {
             reporter.report(snapshot);
         }
 
+        // Phase 9 D-26: release per-call manipulation variable scope on hangup.
+        self.server.manipulation_engine.cleanup_session(&self.context.session_id);
+
         debug!(session_id = %self.context.session_id, "Session cleanup complete");
     }
 
