@@ -799,6 +799,16 @@ pub struct ProxyConfig {
     /// When false, a generic error code is sent instead.
     #[serde(default = "default_passthrough_failure")]
     pub passthrough_failure: bool,
+    /// Phase 10 D-17: strip internal Via/Record-Route hops from outbound
+    /// responses. Default false (disabled). Toggle via config edit +
+    /// POST /api/v1/system/reload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topology_hiding: Option<bool>,
+    /// Phase 10 D-03: flush interval for security stats counters (flood
+    /// window state, auth failure counts). Auto-blocks are written
+    /// immediately. Default 30s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub security_flush_interval_secs: Option<u64>,
 }
 
 fn default_passthrough_failure() -> bool {
@@ -1013,6 +1023,8 @@ impl Default for ProxyConfig {
             sip_flow_max_items: None,
             addons: None,
             passthrough_failure: true,
+            topology_hiding: None,
+            security_flush_interval_secs: None,
         }
     }
 }

@@ -491,6 +491,9 @@ async fn test_guest_call_allowed_extension() {
         manipulation_engine: Arc::new(
             crate::proxy::manipulation::ManipulationEngine::new(),
         ),
+        security_state: Arc::new(
+            crate::proxy::security_state::SecurityState::new(),
+        ),
     });
 
     let module = AuthModule::new(server_inner);

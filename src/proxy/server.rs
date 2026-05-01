@@ -104,6 +104,10 @@ pub struct SipServerInner {
     /// 09-03. Reachable from REST handlers via AppState so 09-02 CRUD
     /// handlers can call `invalidate_class(class_id)` on PUT/DELETE.
     pub manipulation_engine: Arc<crate::proxy::manipulation::ManipulationEngine>,
+    /// Phase 10 Plan 10-01 — Security suite shared state (SEC-01..SEC-05).
+    /// Owns the in-memory flood + brute-force counters, firewall cache, and
+    /// active-block cache. Mirrors `trunk_capacity_state` ownership pattern.
+    pub security_state: Arc<crate::proxy::security_state::SecurityState>,
 }
 
 pub type SipServerRef = Arc<SipServerInner>;
@@ -602,6 +606,23 @@ impl SipServerBuilder {
         // call (09-03).
         let manipulation_engine =
             Arc::new(crate::proxy::manipulation::ManipulationEngine::new());
+        // Phase 10 Plan 10-01 — security state + periodic flush task
+        // (SEC-01..SEC-05). DashMap-backed counters; flush task evicts
+        // stale window entries and refreshes the block cache.
+        let security_state =
+            Arc::new(crate::proxy::security_state::SecurityState::new());
+        if let Some(db_for_flush) = database.clone() {
+            let security_for_flush = security_state.clone();
+            let flush_interval =
+                self.config.security_flush_interval_secs.unwrap_or(30);
+            let cancel_for_flush = cancel_token.child_token();
+            tokio::spawn(crate::proxy::security_state::run_flush_task(
+                db_for_flush,
+                security_for_flush,
+                flush_interval,
+                cancel_for_flush,
+            ));
+        }
         // Phase 7 Plan 07-04 — webhook delivery processor (D-11..D-13).
         // Subscribes to `webhook_sender` and dispatches each event to all
         // active matching webhooks with HMAC signing, retry, jitter,
@@ -663,6 +684,7 @@ impl SipServerBuilder {
             webhook_cancel_registry,
             translation_engine,
             manipulation_engine,
+            security_state,
         });
 
         let inner_weak = Arc::downgrade(&inner);
@@ -871,6 +893,13 @@ impl SipServer {
         &self,
     ) -> Arc<crate::proxy::manipulation::ManipulationEngine> {
         self.inner.manipulation_engine.clone()
+    }
+
+    /// Phase 10 Plan 10-01 — accessor for security state (SEC-01..SEC-05).
+    pub fn security_state(
+        &self,
+    ) -> Arc<crate::proxy::security_state::SecurityState> {
+        self.inner.security_state.clone()
     }
 
     async fn handle_incoming(&self, mut incoming: TransactionReceiver) -> Result<()> {

@@ -122,6 +122,9 @@ pub async fn create_test_server_with_config(
         manipulation_engine: Arc::new(
             crate::proxy::manipulation::ManipulationEngine::new(),
         ),
+        security_state: Arc::new(
+            crate::proxy::security_state::SecurityState::new(),
+        ),
     });
 
     // Add test users

@@ -139,6 +139,15 @@ impl AppStateInner {
         self.sip_server.manipulation_engine()
     }
 
+    /// Phase 10 Plan 10-01 — security state accessor (SEC-01..SEC-05).
+    /// Delegates to SipServer.inner.security_state so AppStateInner stays
+    /// additive-free (mirrors manipulation_engine pattern).
+    pub fn security_state(
+        &self,
+    ) -> std::sync::Arc<crate::proxy::security_state::SecurityState> {
+        self.sip_server.security_state()
+    }
+
     pub fn get_dump_events_file(&self, session_id: &String) -> String {
         let sanitized_id = crate::utils::sanitize_id(session_id);
         let recorder_root = self.config().recorder_path();
