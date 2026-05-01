@@ -173,6 +173,14 @@ Plans:
   3. Repeated auth failures from `(ip, realm)` write a row to `rustpbx_security_blocks` and return 403 thereafter; `GET /api/v1/security/blocks` lists them and `DELETE /api/v1/security/blocks/{ip}` unblocks
   4. Topology hiding (internal Via/Record-Route stripping) can be toggled at runtime via the new config flag over existing `proxy_call/session.rs` logic
 
+**Plans:** 4 plans
+
+Plans:
+- [ ] 10-01-PLAN.md — Schema (supersip_security_rules, supersip_security_blocks) + SecurityState struct + AppState wiring + config fields + stub security router (Wave 1 owns shared files)
+- [ ] 10-02-PLAN.md — Full security REST handlers (GET/PATCH firewall, GET flood-tracker, GET/DELETE blocks, GET auth-failures) + SecurityModule ProxyModule hot-path
+- [ ] 10-03-PLAN.md — Auth failure brute-force hook in auth.rs (additive insertion only)
+- [ ] 10-04-PLAN.md — Topology hiding insertion in sip_session.rs + IT-01 integration test suite
+
 ### Phase 11: System Polish & CDR Export
 **Goal**: Finish the `/api/v1/system/*` group and ship CDR search/recent/export surface at Vobiz parity.
 **Depends on**: Phase 1
