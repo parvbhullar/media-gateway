@@ -209,3 +209,18 @@ required-features = ["opus"]
 [[bin]]
 name = "verify-i18n"
 path = "tools/verify_i18n.rs"
+
+# ── Build profiles ────────────────────────────────────────────────────────────
+
+[profile.dev]
+opt-level = 0
+debug = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
