@@ -22,7 +22,11 @@ pub struct HttpCallRouter {
 }
 
 impl HttpCallRouter {
-    pub fn new(config: HttpRouterConfig, rtp_config: RtpConfig, default_media_proxy_mode: MediaProxyMode) -> Self {
+    pub fn new(
+        config: HttpRouterConfig,
+        rtp_config: RtpConfig,
+        default_media_proxy_mode: MediaProxyMode,
+    ) -> Self {
         let mut builder = reqwest::Client::builder();
         if let Some(timeout) = config.timeout_ms {
             builder = builder.timeout(Duration::from_millis(timeout));
@@ -195,12 +199,10 @@ impl CallRouter for HttpCallRouter {
             });
         }
 
-        let result: HttpResponsePayload = response.json().await.map_err(|e| {
-            RouteError {
-                error: anyhow!("Failed to parse HTTP router response: {}", e),
-                status: Some(rsipstack::sip::StatusCode::ServerInternalError),
-                extensions: None,
-            }
+        let result: HttpResponsePayload = response.json().await.map_err(|e| RouteError {
+            error: anyhow!("Failed to parse HTTP router response: {}", e),
+            status: Some(rsipstack::sip::StatusCode::ServerInternalError),
+            extensions: None,
         })?;
 
         info!(
@@ -228,7 +230,7 @@ impl CallRouter for HttpCallRouter {
             HttpRouteAction::Reject | HttpRouteAction::Abort => {
                 let status = result
                     .status
-                    .and_then(|s| rsipstack::sip::StatusCode::try_from(s).ok())
+                    .map(rsipstack::sip::StatusCode::from)
                     .unwrap_or(rsipstack::sip::StatusCode::Forbidden);
                 return Err(RouteError {
                     error: anyhow!(

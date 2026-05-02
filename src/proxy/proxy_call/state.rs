@@ -7,8 +7,8 @@ use crate::proxy::proxy_call::sip_session::SipSessionHandle as NewSipSessionHand
 use crate::rwi::SupervisorMode;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use rsipstack::sip::StatusCode;
 use rsipstack::dialog::DialogId;
+use rsipstack::sip::StatusCode;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, RwLock, Weak};
 use std::time::Instant;
@@ -122,6 +122,9 @@ pub enum SessionAction {
     SupervisorBarge {
         target_session_id: String,
     },
+    SupervisorTakeover {
+        target_session_id: String,
+    },
     SupervisorStop,
     StartSupervisorMode {
         supervisor_session_id: String,
@@ -132,6 +135,17 @@ pub enum SessionAction {
         music_source: Option<String>,
     },
     Unhold,
+    /// Originate a new call leg to the given target and bridge it.
+    OriginateCall {
+        target: String,
+        caller_id: Option<String>,
+        call_id: String,
+    },
+    /// Send a notification event to external systems (WebSocket, RWI, etc.)
+    NotifyEvent {
+        event: String,
+        data: serde_json::Value,
+    },
 }
 
 impl SessionAction {
@@ -154,7 +168,7 @@ pub enum ProxyCallPhase {
 }
 
 #[derive(Clone, Debug, Serialize)]
-pub struct SipSessionSnapshot {
+pub(crate) struct SipSessionSnapshot {
     session_id: String,
     phase: ProxyCallPhase,
     started_at: DateTime<Utc>,
@@ -229,11 +243,10 @@ impl SipSessionShared {
     ///
     /// Returns `true` if the event was delivered (i.e. an app is currently running).
     pub fn send_app_event(&self, event: crate::call::app::ControllerEvent) -> bool {
-        if let Ok(slot) = self.app_event_tx.read() {
-            if let Some(tx) = slot.as_ref() {
+        if let Ok(slot) = self.app_event_tx.read()
+            && let Some(tx) = slot.as_ref() {
                 return tx.send(event).is_ok();
             }
-        }
         false
     }
 
@@ -246,7 +259,8 @@ impl SipSessionShared {
         }
     }
 
-    pub fn snapshot(&self) -> SipSessionSnapshot {
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> SipSessionSnapshot {
         let inner = self.inner.read().unwrap();
         inner.clone()
     }
@@ -305,7 +319,7 @@ impl SipSessionShared {
         }
     }
 
-    pub fn emit_custom_event(&self, event: ProxyCallEvent) {
+    pub(crate) fn emit_custom_event(&self, event: ProxyCallEvent) {
         if let Some(sender) = self.event_sender() {
             let _ = sender.send(event);
         }
@@ -321,24 +335,23 @@ impl SipSessionShared {
     pub fn update_routed_parties(&self, caller: Option<String>, callee: Option<String>) {
         self.update(|inner| {
             let mut changed = false;
-            if let Some(ref caller) = caller {
-                if inner.caller != Some(caller.clone()) {
+            if let Some(ref caller) = caller
+                && inner.caller != Some(caller.clone()) {
                     inner.caller = Some(caller.clone());
                     changed = true;
                 }
-            }
-            if let Some(ref callee) = callee {
-                if inner.callee != Some(callee.clone()) {
+            if let Some(ref callee) = callee
+                && inner.callee != Some(callee.clone()) {
                     inner.callee = Some(callee.clone());
                     changed = true;
                 }
-            }
             changed
         });
     }
 
     pub fn transition_to_ringing(&self, has_early_media: bool) -> bool {
-        let changed = self.update(|inner| match inner.phase {
+        
+        self.update(|inner| match inner.phase {
             ProxyCallPhase::Initializing | ProxyCallPhase::Ringing | ProxyCallPhase::EarlyMedia => {
                 if inner.ring_time.is_none() {
                     inner.ring_time = Some(Utc::now());
@@ -354,8 +367,7 @@ impl SipSessionShared {
             | ProxyCallPhase::Terminating
             | ProxyCallPhase::Failed
             | ProxyCallPhase::Ended => false,
-        });
-        changed
+        })
     }
 
     pub fn transition_to_answered(&self) {
@@ -540,8 +552,8 @@ pub enum ProxyCallEvent {
     },
 }
 
-pub type SessionActionSender = mpsc::UnboundedSender<SessionAction>;
-pub type SessionActionReceiver = mpsc::UnboundedReceiver<SessionAction>;
+pub(crate) type SessionActionSender = mpsc::UnboundedSender<SessionAction>;
+pub(crate) type SessionActionReceiver = mpsc::UnboundedReceiver<SessionAction>;
 pub type ProxyCallEventSender = mpsc::UnboundedSender<ProxyCallEvent>;
 
 #[derive(Clone)]
@@ -573,7 +585,8 @@ impl SipSessionHandle {
         &self.session_id
     }
 
-    pub fn snapshot(&self) -> SipSessionSnapshot {
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> SipSessionSnapshot {
         self.shared.snapshot()
     }
 

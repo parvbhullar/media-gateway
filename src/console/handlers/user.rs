@@ -19,11 +19,10 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 fn is_secure_request(headers: &HeaderMap) -> bool {
-    if let Some(proto) = headers.get("x-forwarded-proto") {
-        if let Ok(proto_str) = proto.to_str() {
+    if let Some(proto) = headers.get("x-forwarded-proto")
+        && let Ok(proto_str) = proto.to_str() {
             return proto_str.eq_ignore_ascii_case("https");
         }
-    }
     false
 }
 
@@ -166,7 +165,11 @@ pub async fn login_post(
         ),
         Err(err) => {
             warn!("login error: {}", err);
-            (StatusCode::INTERNAL_SERVER_ERROR, "Sign-in failed").into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Sign-in failed: {}", err),
+            )
+                .into_response()
         }
     }
 }
@@ -209,7 +212,7 @@ pub async fn register_page(State(state): State<Arc<ConsoleState>>, headers: Head
             warn!("failed to load registration policy: {}", err);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "Unable to load registration page",
+                format!("Unable to load registration page: {}", err),
             )
                 .into_response();
         }
@@ -251,7 +254,11 @@ pub async fn register_post(
         Ok(policy) => policy,
         Err(err) => {
             warn!("failed to load registration policy: {}", err);
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Registration failed").into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Registration failed: {}", err),
+            )
+                .into_response();
         }
     };
 
@@ -295,7 +302,11 @@ pub async fn register_post(
             Ok(false) => {}
             Err(err) => {
                 warn!("failed to check email uniqueness: {}", err);
-                return (StatusCode::INTERNAL_SERVER_ERROR, "Registration failed").into_response();
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Registration failed: {}", err),
+                )
+                    .into_response();
             }
         }
     }
@@ -306,7 +317,11 @@ pub async fn register_post(
             Ok(false) => {}
             Err(err) => {
                 warn!("failed to check username uniqueness: {}", err);
-                return (StatusCode::INTERNAL_SERVER_ERROR, "Registration failed").into_response();
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Registration failed: {}", err),
+                )
+                    .into_response();
             }
         }
     }
@@ -345,7 +360,11 @@ pub async fn register_post(
         }
         Err(err) => {
             warn!("failed to create user: {}", err);
-            (StatusCode::INTERNAL_SERVER_ERROR, "Registration failed").into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Registration failed: {}", err),
+            )
+                .into_response()
         }
     }
 }
@@ -393,7 +412,7 @@ pub async fn forgot_post(
                 warn!("failed to save reset token: {}", err);
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "Unable to process request",
+                    format!("Unable to process request: {}", err),
                 )
                     .into_response();
             }
@@ -403,7 +422,7 @@ pub async fn forgot_post(
             warn!("failed to handle forgot password: {}", err);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "Unable to process request",
+                format!("Unable to process request: {}", err),
             )
                 .into_response();
         }
@@ -465,7 +484,7 @@ pub async fn reset_page(
             warn!("failed to verify reset token: {}", err);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "Unable to process reset request",
+                format!("Unable to process reset request: {}", err),
             )
                 .into_response()
         }
@@ -531,7 +550,7 @@ pub async fn reset_post(
                     warn!("failed to update password: {}", err);
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        "Failed to reset password",
+                        format!("Failed to reset password: {}", err),
                     )
                         .into_response()
                 }
@@ -551,7 +570,7 @@ pub async fn reset_post(
             warn!("failed to reset password: {}", err);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to reset password",
+                format!("Failed to reset password: {}", err),
             )
                 .into_response()
         }

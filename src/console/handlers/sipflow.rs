@@ -247,6 +247,7 @@ async fn update_settings(
         .into_response()
 }
 
+
 async fn query_flow(
     State(state): State<Arc<ConsoleState>>,
     AuthRequired(_user): AuthRequired,
@@ -297,8 +298,8 @@ async fn query_flow(
     let mut start_time = params.start.and_then(|s| parse_datetime(&s));
     let mut end_time = params.end.and_then(|s| parse_datetime(&s));
 
-    if start_time.is_none() || end_time.is_none() {
-        if let Ok(Some(record)) = CallRecordEntity::find()
+    if (start_time.is_none() || end_time.is_none())
+        && let Ok(Some(record)) = CallRecordEntity::find()
             .filter(CallRecordColumn::CallId.eq(&call_id))
             .one(state.db())
             .await
@@ -318,10 +319,9 @@ async fn query_flow(
                 );
             }
         }
-    }
 
     let start_time = start_time.unwrap_or_else(|| now - chrono::Duration::hours(1));
-    let end_time = end_time.unwrap_or_else(|| now);
+    let end_time = end_time.unwrap_or(now);
 
     match backend.query_flow(&call_id, start_time, end_time).await {
         Ok(items) => {
@@ -417,8 +417,8 @@ async fn query_media(
     let mut start_time = params.start.and_then(|s| parse_datetime(&s));
     let mut end_time = params.end.and_then(|s| parse_datetime(&s));
 
-    if start_time.is_none() || end_time.is_none() {
-        if let Ok(Some(record)) = CallRecordEntity::find()
+    if (start_time.is_none() || end_time.is_none())
+        && let Ok(Some(record)) = CallRecordEntity::find()
             .filter(CallRecordColumn::CallId.eq(&call_id))
             .one(state.db())
             .await
@@ -438,10 +438,9 @@ async fn query_media(
                 );
             }
         }
-    }
 
     let start_time = start_time.unwrap_or_else(|| now - chrono::Duration::hours(1));
-    let end_time = end_time.unwrap_or_else(|| now);
+    let end_time = end_time.unwrap_or(now);
 
     match backend.query_media(&call_id, start_time, end_time).await {
         Ok(data) => {
@@ -484,11 +483,10 @@ fn parse_datetime(s: &str) -> Option<DateTime<chrono::Local>> {
     }
 
     // Try Unix timestamp
-    if let Ok(ts) = s.parse::<i64>() {
-        if let Some(dt) = chrono::Local.timestamp_opt(ts, 0).single() {
+    if let Ok(ts) = s.parse::<i64>()
+        && let Some(dt) = chrono::Local.timestamp_opt(ts, 0).single() {
             return Some(dt);
         }
-    }
 
     None
 }

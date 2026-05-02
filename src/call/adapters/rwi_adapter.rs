@@ -3,15 +3,15 @@
 //! Converts `RwiCommandPayload` to unified `CallCommand`.
 
 use crate::call::domain::*;
-use crate::rwi::session::{MediaSource as RwiMediaSource, RwiCommandPayload};
 use crate::callrecord::CallRecordHangupReason;
+use crate::rwi::session::{MediaSource as RwiMediaSource, RwiCommandPayload};
 use anyhow::Result;
 
 use super::AdapterError;
 
 /// Convert RWI MediaSource to domain MediaSource
 fn convert_media_source(source: RwiMediaSource) -> Option<MediaSource> {
-    source.uri.as_ref().map(|uri| MediaSource::file(uri))
+    source.uri.as_ref().map(MediaSource::file)
 }
 
 /// Convert RWI hangup reason string to CallRecordHangupReason
@@ -51,30 +51,44 @@ pub fn rwi_to_call_command(
         | RwiCommandPayload::SipNotify { .. }
         | RwiCommandPayload::SipOptionsPing { .. }
         | RwiCommandPayload::SessionResume { .. }
-        | RwiCommandPayload::CallResume { .. } => {
+        | RwiCommandPayload::CallResume { .. }
+        | RwiCommandPayload::AgentRegister { .. }
+        | RwiCommandPayload::AgentUnregister { .. }
+        | RwiCommandPayload::AgentStatusUpdate { .. }
+        | RwiCommandPayload::QueueStats { .. }
+        | RwiCommandPayload::AgentStats { .. }
+        | RwiCommandPayload::ConsultInitiate { .. }
+        | RwiCommandPayload::ConsultMerge { .. }
+        | RwiCommandPayload::ConsultComplete { .. }
+        | RwiCommandPayload::ConsultCancel { .. }
+        | RwiCommandPayload::LegAdd { .. }
+        | RwiCommandPayload::LegRemove { .. }
+        | RwiCommandPayload::AppStart { .. }
+        | RwiCommandPayload::AppStop { .. } => {
             Err(AdapterError::NotSupported("session management command".to_string()).into())
         }
 
-        RwiCommandPayload::Originate(_) => {
-            Err(AdapterError::NotSupported("originate requires separate handling".to_string()).into())
-        }
+        RwiCommandPayload::Originate(_) => Err(AdapterError::NotSupported(
+            "originate requires separate handling".to_string(),
+        )
+        .into()),
 
         // ========================================================================
         // Basic Call Control
         // ========================================================================
         RwiCommandPayload::Answer { call_id } => {
-            let sid = session_id.or(Some(&call_id)).ok_or_else(|| {
-                AdapterError::MissingField("session_id or call_id")
-            })?;
+            let sid = session_id
+                .or(Some(&call_id))
+                .ok_or(AdapterError::MissingField("session_id or call_id"))?;
             Ok(CallCommand::Answer {
                 leg_id: LegId::new(sid),
             })
         }
 
         RwiCommandPayload::Reject { call_id, reason } => {
-            let sid = session_id.or(Some(&call_id)).ok_or_else(|| {
-                AdapterError::MissingField("session_id or call_id")
-            })?;
+            let sid = session_id
+                .or(Some(&call_id))
+                .ok_or(AdapterError::MissingField("session_id or call_id"))?;
             Ok(CallCommand::Reject {
                 leg_id: LegId::new(sid),
                 reason,
@@ -82,9 +96,9 @@ pub fn rwi_to_call_command(
         }
 
         RwiCommandPayload::Ring { call_id } => {
-            let sid = session_id.or(Some(&call_id)).ok_or_else(|| {
-                AdapterError::MissingField("session_id or call_id")
-            })?;
+            let sid = session_id
+                .or(Some(&call_id))
+                .ok_or(AdapterError::MissingField("session_id or call_id"))?;
             Ok(CallCommand::Ring {
                 leg_id: LegId::new(sid),
                 ringback: None,
@@ -99,8 +113,7 @@ pub fn rwi_to_call_command(
             // Hangup doesn't need session_id validation since it cascades to all legs
             let cdr_reason = parse_hangup_reason(reason.as_deref());
             Ok(CallCommand::Hangup(
-                HangupCommand::local("rwi", cdr_reason, code)
-                    .with_cascade(HangupCascade::All),
+                HangupCommand::local("rwi", cdr_reason, code).with_cascade(HangupCascade::All),
             ))
         }
 
@@ -114,9 +127,9 @@ pub fn rwi_to_call_command(
         }),
 
         RwiCommandPayload::Unbridge { call_id } => {
-            let sid = session_id.or(Some(&call_id)).ok_or_else(|| {
-                AdapterError::MissingField("session_id or call_id")
-            })?;
+            let sid = session_id
+                .or(Some(&call_id))
+                .ok_or(AdapterError::MissingField("session_id or call_id"))?;
             Ok(CallCommand::Unbridge {
                 leg_id: LegId::new(sid),
             })
@@ -126,13 +139,24 @@ pub fn rwi_to_call_command(
         // Transfer
         // ========================================================================
         RwiCommandPayload::Transfer { call_id, target } => {
-            let sid = session_id.or(Some(&call_id)).ok_or_else(|| {
-                AdapterError::MissingField("session_id or call_id")
-            })?;
+            let sid = session_id
+                .or(Some(&call_id))
+                .ok_or(AdapterError::MissingField("session_id or call_id"))?;
             Ok(CallCommand::Transfer {
                 leg_id: LegId::new(sid),
                 target,
                 attended: false,
+            })
+        }
+
+        RwiCommandPayload::TransferReplace { call_id, target } => {
+            let sid = session_id
+                .or(Some(&call_id))
+                .ok_or(AdapterError::MissingField("session_id or call_id"))?;
+            Ok(CallCommand::Transfer {
+                leg_id: LegId::new(sid),
+                target,
+                attended: true,
             })
         }
 
@@ -141,9 +165,9 @@ pub fn rwi_to_call_command(
             target,
             timeout_secs: _,
         } => {
-            let sid = session_id.or(Some(&call_id)).ok_or_else(|| {
-                AdapterError::MissingField("session_id or call_id")
-            })?;
+            let sid = session_id
+                .or(Some(&call_id))
+                .ok_or(AdapterError::MissingField("session_id or call_id"))?;
             Ok(CallCommand::Transfer {
                 leg_id: LegId::new(sid),
                 target,
@@ -168,19 +192,19 @@ pub fn rwi_to_call_command(
         // Hold
         // ========================================================================
         RwiCommandPayload::CallHold { call_id, music } => {
-            let sid = session_id.or(Some(&call_id)).ok_or_else(|| {
-                AdapterError::MissingField("session_id or call_id")
-            })?;
+            let sid = session_id
+                .or(Some(&call_id))
+                .ok_or(AdapterError::MissingField("session_id or call_id"))?;
             Ok(CallCommand::Hold {
                 leg_id: LegId::new(sid),
-                music: music.map(|m| MediaSource::file(m)),
+                music: music.map(MediaSource::file),
             })
         }
 
         RwiCommandPayload::CallUnhold { call_id } => {
-            let sid = session_id.or(Some(&call_id)).ok_or_else(|| {
-                AdapterError::MissingField("session_id or call_id")
-            })?;
+            let sid = session_id
+                .or(Some(&call_id))
+                .ok_or(AdapterError::MissingField("session_id or call_id"))?;
             Ok(CallCommand::Unhold {
                 leg_id: LegId::new(sid),
             })
@@ -190,9 +214,9 @@ pub fn rwi_to_call_command(
         // Media Operations
         // ========================================================================
         RwiCommandPayload::MediaPlay(req) => {
-            let sid = session_id.or(Some(&req.call_id)).ok_or_else(|| {
-                AdapterError::MissingField("session_id or call_id")
-            })?;
+            let sid = session_id
+                .or(Some(&req.call_id))
+                .ok_or(AdapterError::MissingField("session_id or call_id"))?;
             let source = convert_media_source(req.source).unwrap_or(MediaSource::Silence);
             Ok(CallCommand::Play {
                 leg_id: Some(LegId::new(sid)),
@@ -205,9 +229,9 @@ pub fn rwi_to_call_command(
         }
 
         RwiCommandPayload::MediaStop { call_id } => {
-            let sid = session_id.or(Some(&call_id)).ok_or_else(|| {
-                AdapterError::MissingField("session_id or call_id")
-            })?;
+            let sid = session_id
+                .or(Some(&call_id))
+                .ok_or(AdapterError::MissingField("session_id or call_id"))?;
             Ok(CallCommand::StopPlayback {
                 leg_id: Some(LegId::new(sid)),
             })
@@ -248,10 +272,11 @@ pub fn rwi_to_call_command(
         // ========================================================================
         RwiCommandPayload::SupervisorListen {
             supervisor_call_id,
-            target_call_id,
+            target_call_id: _,
         } => Ok(CallCommand::SupervisorListen {
-            supervisor_leg: LegId::new(supervisor_call_id),
-            target_leg: LegId::new(target_call_id),
+            supervisor_leg: LegId::new(supervisor_call_id.clone()),
+            target_leg: LegId::new("callee"),
+            supervisor_session_id: Some(supervisor_call_id),
         }),
 
         RwiCommandPayload::SupervisorWhisper {
@@ -259,8 +284,9 @@ pub fn rwi_to_call_command(
             target_call_id,
             agent_leg: _,
         } => Ok(CallCommand::SupervisorWhisper {
-            supervisor_leg: LegId::new(supervisor_call_id),
+            supervisor_leg: LegId::new(supervisor_call_id.clone()),
             target_leg: LegId::new(target_call_id),
+            supervisor_session_id: Some(supervisor_call_id),
         }),
 
         RwiCommandPayload::SupervisorBarge {
@@ -268,8 +294,18 @@ pub fn rwi_to_call_command(
             target_call_id,
             agent_leg: _,
         } => Ok(CallCommand::SupervisorBarge {
-            supervisor_leg: LegId::new(supervisor_call_id),
+            supervisor_leg: LegId::new(supervisor_call_id.clone()),
             target_leg: LegId::new(target_call_id),
+            supervisor_session_id: Some(supervisor_call_id),
+        }),
+
+        RwiCommandPayload::SupervisorTakeover {
+            supervisor_call_id,
+            target_call_id: _,
+        } => Ok(CallCommand::SupervisorTakeover {
+            supervisor_leg: LegId::new("callee"),
+            target_leg: LegId::new("callee"),
+            supervisor_session_id: Some(supervisor_call_id),
         }),
 
         RwiCommandPayload::SupervisorStop {
@@ -293,9 +329,9 @@ pub fn rwi_to_call_command(
         }),
 
         RwiCommandPayload::QueueHold { call_id } => {
-            let sid = session_id.or(Some(&call_id)).ok_or_else(|| {
-                AdapterError::MissingField("session_id or call_id")
-            })?;
+            let sid = session_id
+                .or(Some(&call_id))
+                .ok_or(AdapterError::MissingField("session_id or call_id"))?;
             Ok(CallCommand::Hold {
                 leg_id: LegId::new(sid),
                 music: None,
@@ -303,9 +339,9 @@ pub fn rwi_to_call_command(
         }
 
         RwiCommandPayload::QueueUnhold { call_id } => {
-            let sid = session_id.or(Some(&call_id)).ok_or_else(|| {
-                AdapterError::MissingField("session_id or call_id")
-            })?;
+            let sid = session_id
+                .or(Some(&call_id))
+                .ok_or(AdapterError::MissingField("session_id or call_id"))?;
             Ok(CallCommand::Unhold {
                 leg_id: LegId::new(sid),
             })
@@ -361,9 +397,11 @@ pub fn rwi_to_call_command(
         // ========================================================================
         // Conference Merge (handled at processor level, not session level)
         // ========================================================================
-        RwiCommandPayload::ConferenceMerge { .. } => {
-            Err(AdapterError::NotSupported("conference merge requires separate handling".to_string()).into())
-        }
+        RwiCommandPayload::ConferenceMerge { .. }
+        | RwiCommandPayload::ConferenceSeatReplace { .. } => Err(AdapterError::NotSupported(
+            "conference/transfer transaction requires separate handling".to_string(),
+        )
+        .into()),
 
         // ========================================================================
         // Media Streaming (not directly convertible to CallCommand)
@@ -371,16 +409,18 @@ pub fn rwi_to_call_command(
         RwiCommandPayload::MediaStreamStart { .. }
         | RwiCommandPayload::MediaStreamStop { .. }
         | RwiCommandPayload::MediaInjectStart { .. }
-        | RwiCommandPayload::MediaInjectStop { .. } => {
-            Err(AdapterError::NotSupported("media streaming requires separate handling".to_string()).into())
-        }
+        | RwiCommandPayload::MediaInjectStop { .. } => Err(AdapterError::NotSupported(
+            "media streaming requires separate handling".to_string(),
+        )
+        .into()),
 
         // ========================================================================
         // Parallel Originate (handled at processor level)
         // ========================================================================
-        RwiCommandPayload::ParallelOriginate { .. } => {
-            Err(AdapterError::NotSupported("parallel originate requires processor-level handling".to_string()).into())
-        }
+        RwiCommandPayload::ParallelOriginate { .. } => Err(AdapterError::NotSupported(
+            "parallel originate requires processor-level handling".to_string(),
+        )
+        .into()),
     }
 }
 
@@ -394,12 +434,7 @@ mod tests {
             call_id: "call-123".to_string(),
         };
         let cmd = rwi_to_call_command(payload, None).unwrap();
-        assert!(matches!(
-            cmd,
-            CallCommand::Answer {
-                leg_id: _
-            }
-        ));
+        assert!(matches!(cmd, CallCommand::Answer { leg_id: _ }));
     }
 
     #[test]
@@ -457,10 +492,12 @@ mod tests {
         if let CallCommand::SupervisorListen {
             supervisor_leg,
             target_leg,
+            supervisor_session_id,
         } = cmd
         {
             assert_eq!(supervisor_leg.as_str(), "sup-1");
-            assert_eq!(target_leg.as_str(), "target-1");
+            assert_eq!(target_leg.as_str(), "callee");
+            assert_eq!(supervisor_session_id.as_deref(), Some("sup-1"));
         } else {
             panic!("Expected SupervisorListen command");
         }

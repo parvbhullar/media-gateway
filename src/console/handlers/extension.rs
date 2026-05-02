@@ -58,12 +58,23 @@ struct QueryExtensionsFilters {
 #[derive(Debug, Clone, Serialize)]
 struct ForwardingCatalog {
     queues: Vec<ForwardingQueue>,
+    ivr_projects: Vec<ForwardingIvr>,
 }
 
 impl ForwardingCatalog {
     fn empty() -> Self {
-        Self { queues: Vec::new() }
+        Self {
+            queues: Vec::new(),
+            ivr_projects: Vec::new(),
+        }
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ForwardingIvr {
+    /// IVR project name (used as file stem and forwarding reference).
+    name: String,
+    description: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -92,6 +103,7 @@ struct ExtensionLocatorRecord {
     contact_params: Option<HashMap<String, String>>,
     age_seconds: Option<u64>,
     user_agent: Option<String>,
+    home_proxy: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
@@ -152,36 +164,59 @@ async fn fetch_extension_locator_summary(
     };
     summary.query_uri = Some(query_uri.clone());
 
-    let uri = match Uri::try_from(query_uri.as_str()) {
-        Ok(uri) => uri,
-        Err(err) => {
-            summary.error = Some(format!("Invalid SIP URI: {}", err));
-            return summary;
-        }
-    };
-
     let Some(server) = server else {
         summary.error = Some("SIP server unavailable".to_string());
         return summary;
     };
 
-    match server.locator.lookup(&uri).await {
-        Ok(locations) => {
-            let records = locations
-                .into_iter()
-                .map(location_to_record)
-                .collect::<Vec<_>>();
-            summary.total = records.len();
-            summary.records = records;
-            summary.available = true;
+    let mut lookup_uris = vec![query_uri.clone()];
+    let localhost_query_uri = format!("sip:{}@localhost", trimmed_ext);
+    if !query_uri.eq_ignore_ascii_case(&localhost_query_uri) {
+        lookup_uris.push(localhost_query_uri);
+    }
+
+    let mut had_success = false;
+    let mut last_error = None;
+
+    for candidate in lookup_uris {
+        let uri = match Uri::try_from(candidate.as_str()) {
+            Ok(uri) => uri,
+            Err(err) => {
+                last_error = Some(format!("Invalid SIP URI: {}", err));
+                continue;
+            }
+        };
+
+        match server.locator.lookup(&uri).await {
+            Ok(locations) => {
+                had_success = true;
+                if locations.is_empty() {
+                    continue;
+                }
+
+                let records = locations
+                    .into_iter()
+                    .map(location_to_record)
+                    .collect::<Vec<_>>();
+                summary.total = records.len();
+                summary.records = records;
+                summary.available = true;
+                summary.query_uri = Some(candidate);
+                return summary;
+            }
+            Err(err) => {
+                warn!(
+                    "locator lookup failed for extension {} ({}): {}",
+                    trimmed_ext, candidate, err
+                );
+                last_error = Some(format!("Locator lookup failed: {}", err));
+            }
         }
-        Err(err) => {
-            warn!(
-                "locator lookup failed for extension {} ({}): {}",
-                trimmed_ext, query_uri, err
-            );
-            summary.error = Some(format!("Locator lookup failed: {}", err));
-        }
+    }
+
+    summary.available = true;
+    if !had_success {
+        summary.error = last_error;
     }
 
     summary
@@ -218,6 +253,7 @@ fn location_to_record(location: Location) -> ExtensionLocatorRecord {
     let age_seconds = location
         .last_modified
         .map(|instant| instant.elapsed().as_secs());
+    let home_proxy = location.home_proxy.map(|h| h.to_string());
 
     ExtensionLocatorRecord {
         binding_key,
@@ -236,6 +272,7 @@ fn location_to_record(location: Location) -> ExtensionLocatorRecord {
         contact_params,
         age_seconds,
         user_agent,
+        home_proxy,
     }
 }
 
@@ -289,10 +326,10 @@ async fn build_filters(state: Arc<ConsoleState>) -> serde_json::Value {
         }
     };
 
-    return json!({
+    json!({
         "departments": departments,
         "statuses": statuses,
-    });
+    })
 }
 
 async fn build_forwarding_catalog(state: Arc<ConsoleState>) -> ForwardingCatalog {
@@ -329,6 +366,35 @@ async fn build_forwarding_catalog(state: Arc<ConsoleState>) -> ForwardingCatalog
             }
         })
         .collect();
+
+    // Load IVR projects if ivr_editor addon is present
+    #[cfg(feature = "addon-ivr-editor")]
+    {
+        use crate::addons::ivr_editor::models::{Column as IvrColumn, Entity as IvrEntity};
+        match IvrEntity::find()
+            .filter(IvrColumn::Status.eq("active"))
+            .order_by_asc(IvrColumn::Name)
+            .all(state.db())
+            .await
+        {
+            Ok(ivr_models) => {
+                catalog.ivr_projects = ivr_models
+                    .into_iter()
+                    .map(|m| ForwardingIvr {
+                        name: m.name,
+                        description: m.description,
+                    })
+                    .collect();
+            }
+            Err(err) => {
+                warn!(
+                    "failed to load IVR projects for forwarding catalog: {}",
+                    err
+                );
+            }
+        }
+    }
+
     catalog
 }
 
@@ -474,21 +540,20 @@ async fn create_extension(
         }
     };
 
-    if let Some(ref dept_ids) = payload.department_ids {
-        if let Err(err) = ExtensionEntity::replace_departments(db, model.id, dept_ids).await {
-            warn!(
-                "failed to set departments for extension {}: {}",
-                model.id, err
-            );
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": err.to_string()})),
-            )
-                .into_response();
-        }
+    if let Some(ref dept_ids) = payload.department_ids
+        && let Err(err) = ExtensionEntity::replace_departments(db, model.id, dept_ids).await
+    {
+        warn!(
+            "failed to set departments for extension {}: {}",
+            model.id, err
+        );
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"message": err.to_string()})),
+        )
+            .into_response();
     }
 
-    state.mark_pending_reload();
     Json(json!({"status": "ok", "id": model.id})).into_response()
 }
 
@@ -562,28 +627,28 @@ async fn query_extensions(
             selector = selector.filter(ExtensionColumn::LoginDisabled.eq(!login_allowed));
         }
 
-        if let Some(ref from_raw) = filters.created_at_from {
-            if let Some(from) = parse_datetime_filter(from_raw) {
-                selector = selector.filter(ExtensionColumn::CreatedAt.gte(from));
-            }
+        if let Some(ref from_raw) = filters.created_at_from
+            && let Some(from) = parse_datetime_filter(from_raw)
+        {
+            selector = selector.filter(ExtensionColumn::CreatedAt.gte(from));
         }
 
-        if let Some(ref to_raw) = filters.created_at_to {
-            if let Some(to) = parse_datetime_filter(to_raw) {
-                selector = selector.filter(ExtensionColumn::CreatedAt.lte(to));
-            }
+        if let Some(ref to_raw) = filters.created_at_to
+            && let Some(to) = parse_datetime_filter(to_raw)
+        {
+            selector = selector.filter(ExtensionColumn::CreatedAt.lte(to));
         }
 
-        if let Some(ref from_raw) = filters.registered_at_from {
-            if let Some(from) = parse_datetime_filter(from_raw) {
-                selector = selector.filter(ExtensionColumn::RegisteredAt.gte(from));
-            }
+        if let Some(ref from_raw) = filters.registered_at_from
+            && let Some(from) = parse_datetime_filter(from_raw)
+        {
+            selector = selector.filter(ExtensionColumn::RegisteredAt.gte(from));
         }
 
-        if let Some(ref to_raw) = filters.registered_at_to {
-            if let Some(to) = parse_datetime_filter(to_raw) {
-                selector = selector.filter(ExtensionColumn::RegisteredAt.lte(to));
-            }
+        if let Some(ref to_raw) = filters.registered_at_to
+            && let Some(to) = parse_datetime_filter(to_raw)
+        {
+            selector = selector.filter(ExtensionColumn::RegisteredAt.lte(to));
         }
     }
     let sort_key = payload.sort.as_deref().unwrap_or("created_at_desc");
@@ -742,17 +807,16 @@ async fn update_extension(
         )
             .into_response();
     }
-    if let Some(ref dept_ids) = payload.department_ids {
-        if let Err(err) = ExtensionEntity::replace_departments(db, id, dept_ids).await {
-            warn!("failed to update departments for extension {}: {}", id, err);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": err.to_string()})),
-            )
-                .into_response();
-        }
+    if let Some(ref dept_ids) = payload.department_ids
+        && let Err(err) = ExtensionEntity::replace_departments(db, id, dept_ids).await
+    {
+        warn!("failed to update departments for extension {}: {}", id, err);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"message": err.to_string()})),
+        )
+            .into_response();
     }
-    state.mark_pending_reload();
     Json(json!({"status": "ok"})).into_response()
 }
 
@@ -826,11 +890,11 @@ async fn delete_extension(
         }
         Err(err) => {
             warn!("failed to delete extension {}: {}", id, err);
-            return (
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"message": err.to_string()})),
             )
-                .into_response();
+                .into_response()
         }
     }
 }

@@ -69,11 +69,10 @@ impl ConferenceRoom {
 
     /// Add a participant to the conference
     pub fn add_participant(&mut self, leg_id: LegId) -> Result<()> {
-        if let Some(max) = self.max_participants {
-            if self.participants.len() >= max {
+        if let Some(max) = self.max_participants
+            && self.participants.len() >= max {
                 return Err(anyhow!("Conference is at maximum capacity"));
             }
-        }
 
         if self.participants.contains_key(&leg_id) {
             warn!(leg_id = %leg_id, "Leg already in conference");
@@ -89,7 +88,7 @@ impl ConferenceRoom {
     /// Remove a participant from the conference
     pub fn remove_participant(&mut self, leg_id: &LegId) -> Result<()> {
         if self.participants.remove(leg_id).is_none() {
-            return Err(anyhow!("Leg {} not found in conference", leg_id));
+            return Err(anyhow!("Leg {} is not in conference", leg_id));
         }
         info!(conf_id = %self.id.0, leg_id = %leg_id, "Participant removed from conference");
         Ok(())
@@ -97,9 +96,10 @@ impl ConferenceRoom {
 
     /// Mute a participant
     pub fn mute_participant(&mut self, leg_id: &LegId) -> Result<()> {
-        let participant = self.participants
+        let participant = self
+            .participants
             .get_mut(leg_id)
-            .ok_or_else(|| anyhow!("Leg {} not found in conference", leg_id))?;
+            .ok_or_else(|| anyhow!("Leg {} is not in conference", leg_id))?;
         participant.muted = true;
         info!(conf_id = %self.id.0, leg_id = %leg_id, "Participant muted");
         Ok(())
@@ -107,9 +107,10 @@ impl ConferenceRoom {
 
     /// Unmute a participant
     pub fn unmute_participant(&mut self, leg_id: &LegId) -> Result<()> {
-        let participant = self.participants
+        let participant = self
+            .participants
             .get_mut(leg_id)
-            .ok_or_else(|| anyhow!("Leg {} not found in conference", leg_id))?;
+            .ok_or_else(|| anyhow!("Leg {} is not in conference", leg_id))?;
         participant.muted = false;
         info!(conf_id = %self.id.0, leg_id = %leg_id, "Participant unmuted");
         Ok(())
@@ -141,24 +142,33 @@ impl ConferenceRoom {
     }
 }
 
-/// Audio channels for a conference participant
-/// Note: This struct should not be cloned for output_rx; use reference instead
-#[derive(Clone)]
-pub struct ParticipantChannels {
-    /// Channel to send audio to the conference (from participant)
-    pub input_tx: mpsc::Sender<AudioFrame>,
-}
+    /// Audio channels for a conference participant
+    /// Note: Only input_tx is cloneable; output_rx must be accessed via get_participant_output_rx
+    #[derive(Clone)]
+    pub struct ParticipantChannels {
+        /// Channel to send audio to the conference (from participant)
+        pub input_tx: mpsc::Sender<AudioFrame>,
+    }
 
-/// Global conference manager with audio mixing
+    impl ParticipantChannels {
+        /// Create a new participant channels pair with only input_tx
+        pub fn new(input_tx: mpsc::Sender<AudioFrame>) -> Self {
+            Self { input_tx }
+        }
+    }
+
+/// Global conference manager with in-server audio mixing
 #[derive(Clone)]
 pub struct ConferenceManager {
     conferences: Arc<RwLock<HashMap<ConferenceId, ConferenceRoom>>>,
     /// Track which conference a leg belongs to
     leg_to_conference: Arc<RwLock<HashMap<LegId, ConferenceId>>>,
-    /// Audio mixers for conferences
+    /// Audio mixers for local conferences
     audio_mixers: Arc<RwLock<HashMap<ConferenceId, Arc<ConferenceAudioMixer>>>>,
-    /// Audio channels for participants
+    /// Audio channels for local participants
     participant_channels: Arc<RwLock<HashMap<LegId, ParticipantChannels>>>,
+    /// Output receivers for local participants (mixed audio from conference)
+    participant_output_rxs: Arc<RwLock<HashMap<LegId, mpsc::Receiver<AudioFrame>>>>,
 }
 
 impl ConferenceManager {
@@ -168,18 +178,18 @@ impl ConferenceManager {
             leg_to_conference: Arc::new(RwLock::new(HashMap::new())),
             audio_mixers: Arc::new(RwLock::new(HashMap::new())),
             participant_channels: Arc::new(RwLock::new(HashMap::new())),
+            participant_output_rxs: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    /// Create a new conference with audio mixing
+    /// Create a new conference with in-server audio mixing
     pub async fn create_conference(
         &self,
         conf_id: ConferenceId,
         max_participants: Option<usize>,
     ) -> Result<ConferenceRoom> {
         let mut conferences = self.conferences.write().await;
-        let mut audio_mixers = self.audio_mixers.write().await;
-        
+
         if conferences.contains_key(&conf_id) {
             return Err(anyhow!("Conference {} already exists", conf_id.0));
         }
@@ -187,12 +197,13 @@ impl ConferenceManager {
         let conference = ConferenceRoom::new(conf_id.clone(), max_participants);
         conferences.insert(conf_id.clone(), conference.clone());
 
-        // Create audio mixer for this conference
+        // Create local audio mixer
+        let mut audio_mixers = self.audio_mixers.write().await;
         let mixer = Arc::new(ConferenceAudioMixer::new(conf_id.0.clone(), 8000));
         mixer.start();
         audio_mixers.insert(conf_id.clone(), mixer);
-        
-        info!(conf_id = %conf_id.0, "Conference created with audio mixing");
+        info!(conf_id = %conf_id.0, "Conference created with local audio mixing");
+
         Ok(conference)
     }
 
@@ -202,37 +213,37 @@ impl ConferenceManager {
         conferences.get(conf_id).cloned()
     }
 
-    /// Destroy a conference and stop audio mixing
+    /// Destroy a conference
     pub async fn destroy_conference(&self, conf_id: &ConferenceId) -> Result<()> {
-        // Stop and remove audio mixer
-        {
-            let mut audio_mixers = self.audio_mixers.write().await;
-            if let Some(mixer) = audio_mixers.remove(conf_id) {
-                mixer.stop().await;
-            }
+        // Stop and remove local audio mixer
+        let mut audio_mixers = self.audio_mixers.write().await;
+        if let Some(mixer) = audio_mixers.remove(conf_id) {
+            mixer.stop().await;
         }
 
         let mut conferences = self.conferences.write().await;
         let mut leg_map = self.leg_to_conference.write().await;
         let mut participant_channels = self.participant_channels.write().await;
-        
+        let mut participant_output_rxs = self.participant_output_rxs.write().await;
+
         if let Some(conf) = conferences.get(conf_id) {
             // Remove all leg mappings and channels
             for leg_id in conf.participant_ids() {
                 leg_map.remove(&leg_id);
                 participant_channels.remove(&leg_id);
+                participant_output_rxs.remove(&leg_id);
             }
         }
-        
+
         conferences
             .remove(conf_id)
             .ok_or_else(|| anyhow!("Conference {} not found", conf_id.0))?;
-        
+
         info!(conf_id = %conf_id.0, "Conference destroyed");
         Ok(())
     }
 
-    /// Add a participant to a conference with audio channels
+    /// Add a participant to a conference
     pub async fn add_participant(
         &self,
         conf_id: &ConferenceId,
@@ -241,15 +252,14 @@ impl ConferenceManager {
         // Check if leg is already in another conference
         {
             let leg_map = self.leg_to_conference.read().await;
-            if let Some(existing_conf) = leg_map.get(&leg_id) {
-                if existing_conf != conf_id {
+            if let Some(existing_conf) = leg_map.get(&leg_id)
+                && existing_conf != conf_id {
                     return Err(anyhow!(
                         "Leg {} is already in conference {}",
                         leg_id,
                         existing_conf.0
                     ));
                 }
-            }
         }
 
         // Add to conference room
@@ -262,21 +272,17 @@ impl ConferenceManager {
             conference.add_participant(leg_id.clone())?;
         }
 
-        // Add to audio mixer
-        let channels = {
+        // Add to local audio mixer
+        let (input_tx, output_rx) = {
             let audio_mixers = self.audio_mixers.read().await;
             let mixer = audio_mixers
                 .get(conf_id)
                 .ok_or_else(|| anyhow!("Audio mixer not found for conference {}", conf_id.0))?;
 
-            let (input_tx, _output_rx) = mixer
-                .add_participant(leg_id.clone(), CodecType::PCMU)
-                .await?;
-
-            ParticipantChannels {
-                input_tx,
-            }
+            mixer.add_participant(leg_id.clone(), CodecType::PCMU).await?
         };
+
+        let channels = ParticipantChannels::new(input_tx);
 
         // Store channels and mapping
         {
@@ -285,6 +291,12 @@ impl ConferenceManager {
 
             let mut leg_map = self.leg_to_conference.write().await;
             leg_map.insert(leg_id.clone(), conf_id.clone());
+        }
+
+        // Store output_rx separately for media path integration
+        {
+            let mut output_rxs = self.participant_output_rxs.write().await;
+            output_rxs.insert(leg_id.clone(), output_rx);
         }
 
         Ok(channels)
@@ -302,18 +314,19 @@ impl ConferenceManager {
             conference.remove_participant(leg_id)?;
         }
 
-        // Remove from audio mixer
-        {
-            let audio_mixers = self.audio_mixers.read().await;
-            if let Some(mixer) = audio_mixers.get(conf_id) {
-                mixer.remove_participant(leg_id).await?;
-            }
+        // Remove from local audio mixer
+        let audio_mixers = self.audio_mixers.read().await;
+        if let Some(mixer) = audio_mixers.get(conf_id) {
+            mixer.remove_participant(leg_id).await?;
         }
 
         // Remove channels and mapping
         {
             let mut participant_channels = self.participant_channels.write().await;
             participant_channels.remove(leg_id);
+
+            let mut participant_output_rxs = self.participant_output_rxs.write().await;
+            participant_output_rxs.remove(leg_id);
 
             let mut leg_map = self.leg_to_conference.write().await;
             leg_map.remove(leg_id);
@@ -334,12 +347,10 @@ impl ConferenceManager {
             conference.mute_participant(leg_id)?;
         }
 
-        // Update audio mixer
-        {
-            let audio_mixers = self.audio_mixers.read().await;
-            if let Some(mixer) = audio_mixers.get(conf_id) {
-                mixer.set_muted(leg_id, true).await?;
-            }
+        // Update local audio mixer
+        let audio_mixers = self.audio_mixers.read().await;
+        if let Some(mixer) = audio_mixers.get(conf_id) {
+            mixer.set_muted(leg_id, true).await?;
         }
 
         Ok(())
@@ -357,12 +368,10 @@ impl ConferenceManager {
             conference.unmute_participant(leg_id)?;
         }
 
-        // Update audio mixer
-        {
-            let audio_mixers = self.audio_mixers.read().await;
-            if let Some(mixer) = audio_mixers.get(conf_id) {
-                mixer.set_muted(leg_id, false).await?;
-            }
+        // Update local audio mixer
+        let audio_mixers = self.audio_mixers.read().await;
+        if let Some(mixer) = audio_mixers.get(conf_id) {
+            mixer.set_muted(leg_id, false).await?;
         }
 
         Ok(())
@@ -374,10 +383,18 @@ impl ConferenceManager {
         leg_map.get(leg_id).cloned()
     }
 
-    /// Get participant channels for audio streaming
+    /// Get participant channels for audio streaming (input only)
     pub async fn get_participant_channels(&self, leg_id: &LegId) -> Option<ParticipantChannels> {
         let participant_channels = self.participant_channels.read().await;
         participant_channels.get(leg_id).cloned()
+    }
+
+    /// Get participant output receiver for mixed audio (to participant)
+    /// Returns the output_rx for a leg, removing it from internal storage.
+    /// Caller is responsible for polling this receiver to receive mixed audio.
+    pub async fn take_participant_output_rx(&self, leg_id: &LegId) -> Option<mpsc::Receiver<AudioFrame>> {
+        let mut participant_output_rxs = self.participant_output_rxs.write().await;
+        participant_output_rxs.remove(leg_id)
     }
 
     /// List all conferences
@@ -537,7 +554,10 @@ mod tests {
 
         // Add third participant (should fail due to limit)
         let result = manager.add_participant(&conf_id, leg3).await;
-        assert!(result.is_err(), "Should fail when exceeding max participants");
+        assert!(
+            result.is_err(),
+            "Should fail when exceeding max participants"
+        );
 
         manager.destroy_conference(&conf_id).await.unwrap();
     }
@@ -555,10 +575,16 @@ mod tests {
         let leg_id = LegId::new("leg1");
 
         // Add participant first time
-        manager.add_participant(&conf_id, leg_id.clone()).await.unwrap();
+        manager
+            .add_participant(&conf_id, leg_id.clone())
+            .await
+            .unwrap();
 
         // Add same participant again (should succeed but be a no-op)
-        manager.add_participant(&conf_id, leg_id.clone()).await.unwrap();
+        manager
+            .add_participant(&conf_id, leg_id.clone())
+            .await
+            .unwrap();
 
         let conf = manager.get_conference(&conf_id).await.unwrap();
         assert_eq!(conf.participant_count(), 1);
@@ -579,8 +605,14 @@ mod tests {
         let leg1 = LegId::new("leg1");
         let leg2 = LegId::new("leg2");
 
-        manager.add_participant(&conf_id, leg1.clone()).await.unwrap();
-        manager.add_participant(&conf_id, leg2.clone()).await.unwrap();
+        manager
+            .add_participant(&conf_id, leg1.clone())
+            .await
+            .unwrap();
+        manager
+            .add_participant(&conf_id, leg2.clone())
+            .await
+            .unwrap();
         manager.mute_participant(&conf_id, &leg1).await.unwrap();
 
         let stats = manager.get_conference_stats(&conf_id).await.unwrap();
@@ -598,8 +630,14 @@ mod tests {
         let conf1 = ConferenceId::from("conf1");
         let conf2 = ConferenceId::from("conf2");
 
-        manager.create_conference(conf1.clone(), None).await.unwrap();
-        manager.create_conference(conf2.clone(), None).await.unwrap();
+        manager
+            .create_conference(conf1.clone(), None)
+            .await
+            .unwrap();
+        manager
+            .create_conference(conf2.clone(), None)
+            .await
+            .unwrap();
 
         let conferences = manager.list_conferences().await;
         assert_eq!(conferences.len(), 2);
@@ -621,7 +659,10 @@ mod tests {
             .unwrap();
 
         let leg_id = LegId::new("leg1");
-        manager.add_participant(&conf_id, leg_id.clone()).await.unwrap();
+        manager
+            .add_participant(&conf_id, leg_id.clone())
+            .await
+            .unwrap();
 
         // Remove from all conferences
         manager.remove_leg_from_all(&leg_id).await.unwrap();
@@ -676,14 +717,19 @@ mod tests {
             .unwrap();
 
         let leg_id = LegId::new("leg1");
-        manager.add_participant(&conf_id, leg_id.clone()).await.unwrap();
+        manager
+            .add_participant(&conf_id, leg_id.clone())
+            .await
+            .unwrap();
 
         let found_conf = manager.get_conference_id_for_leg(&leg_id).await;
         assert!(found_conf.is_some());
         assert_eq!(found_conf.unwrap().0, "test-conf-lookup");
 
         // Non-existent leg
-        let not_found = manager.get_conference_id_for_leg(&LegId::new("nonexistent")).await;
+        let not_found = manager
+            .get_conference_id_for_leg(&LegId::new("nonexistent"))
+            .await;
         assert!(not_found.is_none());
 
         manager.destroy_conference(&conf_id).await.unwrap();
@@ -695,8 +741,14 @@ mod tests {
         let conf1 = ConferenceId::from("conf1");
         let conf2 = ConferenceId::from("conf2");
 
-        manager.create_conference(conf1.clone(), None).await.unwrap();
-        manager.create_conference(conf2.clone(), None).await.unwrap();
+        manager
+            .create_conference(conf1.clone(), None)
+            .await
+            .unwrap();
+        manager
+            .create_conference(conf2.clone(), None)
+            .await
+            .unwrap();
 
         let leg = LegId::new("shared-leg");
 
@@ -705,7 +757,10 @@ mod tests {
 
         // Try to add to second conference (should fail)
         let result = manager.add_participant(&conf2, leg.clone()).await;
-        assert!(result.is_err(), "Leg should not be able to join multiple conferences");
+        assert!(
+            result.is_err(),
+            "Leg should not be able to join multiple conferences"
+        );
 
         manager.destroy_conference(&conf1).await.unwrap();
         manager.destroy_conference(&conf2).await.unwrap();

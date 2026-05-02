@@ -90,7 +90,10 @@ impl CallQueue {
 
     /// Get position of a leg in the queue (1-based)
     pub fn get_position(&self, leg_id: &LegId) -> Option<usize> {
-        self.entries.iter().position(|e| e.leg_id == *leg_id).map(|p| p + 1)
+        self.entries
+            .iter()
+            .position(|e| e.leg_id == *leg_id)
+            .map(|p| p + 1)
     }
 
     /// Get queue length
@@ -216,13 +219,12 @@ impl QueueManager {
     /// Remove a queue if empty
     pub async fn remove_queue_if_empty(&self, queue_id: &QueueId) -> Result<bool> {
         let mut queues = self.queues.write().await;
-        if let Some(queue) = queues.get(queue_id) {
-            if queue.is_empty() {
+        if let Some(queue) = queues.get(queue_id)
+            && queue.is_empty() {
                 queues.remove(queue_id);
                 info!(queue_id = %queue_id.0, "Empty queue removed");
                 return Ok(true);
             }
-        }
         Ok(false)
     }
 
@@ -326,11 +328,21 @@ mod tests {
         let leg2 = LegId::from("leg-2");
 
         manager
-            .enqueue(queue_id.clone(), leg1.clone(), SessionId::from("session-1"), None)
+            .enqueue(
+                queue_id.clone(),
+                leg1.clone(),
+                SessionId::from("session-1"),
+                None,
+            )
             .await
             .unwrap();
         manager
-            .enqueue(queue_id.clone(), leg2.clone(), SessionId::from("session-2"), None)
+            .enqueue(
+                queue_id.clone(),
+                leg2.clone(),
+                SessionId::from("session-2"),
+                None,
+            )
             .await
             .unwrap();
 
@@ -355,7 +367,9 @@ mod tests {
             .unwrap();
 
         // Try to dequeue non-existent leg
-        let result = manager.dequeue(&queue_id, &LegId::from("nonexistent")).await;
+        let result = manager
+            .dequeue(&queue_id, &LegId::from("nonexistent"))
+            .await;
         assert!(result.is_err());
     }
 

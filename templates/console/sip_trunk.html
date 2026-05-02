@@ -5,7 +5,8 @@
 <div class="p-6" x-data='sipTrunkPage({
         basePath: {{ base_url | tojson }},
         filters: {{ filters | default({}) | tojson }},
-        createUrl: {{ create_url | tojson }}
+        createUrl: {{ create_url | tojson }},
+        amiEndpoint: {{ ami_endpoint | default("/ami/v1") | tojson }}
     })' x-init="init()">
     <div class="mx-auto max-w-7xl space-y-6">
         <header class="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
@@ -450,7 +451,7 @@
             basePath: options.basePath || '/console',
             listEndpoint: `${options.basePath || '/console'}/sip-trunk`,
             createUrl: options.createUrl || `${options.basePath || '/console'}/sip-trunk/new`,
-            amiEndpoint: options.amiEndpoint || '/ami/v1',
+            amiEndpoint: options.amiEndpoint || options.ami_path || '/ami/v1',
             filtersRaw: options.filters || {},
             keyword: '',
             statusFilter: 'all',

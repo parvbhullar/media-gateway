@@ -19,20 +19,20 @@ impl IceCredentials {
     pub fn generate() -> Self {
         use rand::RngExt;
         let mut rng = rand::rng();
-        
+
         // Generate random ufrag (4-8 characters as per RFC 5245)
         const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
         let ufrag_len = rng.random_range(4..=8);
         let ufrag: String = (0..ufrag_len)
             .map(|_| CHARS[rng.random_range(0..CHARS.len())] as char)
             .collect();
-        
+
         // Generate random pwd (22-256 characters as per RFC 5245)
         let pwd_len = rng.random_range(22..=32);
         let pwd: String = (0..pwd_len)
             .map(|_| CHARS[rng.random_range(0..CHARS.len())] as char)
             .collect();
-        
+
         Self { ufrag, pwd }
     }
 }
@@ -46,7 +46,7 @@ pub struct DtlsInfo {
 
 impl DtlsInfo {
     /// Generate a placeholder DTLS fingerprint
-    /// 
+    ///
     /// TODO: In production, this should be derived from the actual DTLS certificate
     /// stored in the server's TLS configuration
     pub fn generate_placeholder() -> Self {
@@ -60,7 +60,7 @@ impl DtlsInfo {
             .map(|b| format!("{:02X}", b))
             .collect::<Vec<_>>()
             .join(":");
-        
+
         Self {
             fingerprint,
             setup: "passive".to_string(),
@@ -104,7 +104,7 @@ pub struct SdpBridge;
 
 impl SdpBridge {
     /// Convert WebRTC SDP to RTP SDP
-    /// 
+    ///
     /// Changes:
     /// - Protocol: UDP/TLS/RTP/SAVPF → RTP/AVP
     /// - Remove: fingerprint, ice-ufrag, ice-pwd, setup, rtcp-mux
@@ -118,7 +118,7 @@ impl SdpBridge {
         let mut rtp_sdp = String::new();
 
         // Add session header
-        rtp_sdp.push_str(&format!("v=0\r\n"));
+        rtp_sdp.push_str("v=0\r\n");
         rtp_sdp.push_str(&format!(
             "o=- {} {} IN IP4 {}\r\n",
             parsed.session.origin.session_id,
@@ -126,7 +126,10 @@ impl SdpBridge {
             parsed.session.origin.unicast_address
         ));
         rtp_sdp.push_str("s=RustPBX Bridge\r\n");
-        rtp_sdp.push_str(&format!("c=IN IP4 {}\r\n", parsed.session.origin.unicast_address));
+        rtp_sdp.push_str(&format!(
+            "c=IN IP4 {}\r\n",
+            parsed.session.origin.unicast_address
+        ));
         rtp_sdp.push_str("t=0 0\r\n");
 
         // Transform media sections
@@ -155,7 +158,7 @@ impl SdpBridge {
                         if parts.len() == 2 {
                             let pt_str = parts[0];
                             let codec_info = parts[1];
-                            
+
                             // Keep PCMU, PCMA, telephone-event (skip Opus for RTP)
                             if codec_info.contains("PCMU")
                                 || codec_info.contains("PCMA")
@@ -170,11 +173,10 @@ impl SdpBridge {
                     }
                 } else if attr.key == "fmtp" {
                     // Keep fmtp for telephone-event
-                    if let Some(ref value) = attr.value {
-                        if value.contains("101") || value.contains("telephone-event") {
+                    if let Some(ref value) = attr.value
+                        && (value.contains("101") || value.contains("telephone-event")) {
                             rtp_attrs.push(format!("a=fmtp:{}\r\n", value));
                         }
-                    }
                 } else if attr.key == "sendrecv"
                     || attr.key == "sendonly"
                     || attr.key == "recvonly"
@@ -219,7 +221,12 @@ impl SdpBridge {
     /// - Protocol: RTP/AVP → UDP/TLS/RTP/SAVPF  
     /// - Add: fingerprint, ice-ufrag, ice-pwd, setup, rtcp-mux
     /// - Keep: compatible codecs
-    pub fn rtp_to_webrtc(rtp_sdp: &str, fingerprint: &str, ice_ufrag: &str, ice_pwd: &str) -> Result<String> {
+    pub fn rtp_to_webrtc(
+        rtp_sdp: &str,
+        fingerprint: &str,
+        ice_ufrag: &str,
+        ice_pwd: &str,
+    ) -> Result<String> {
         let parsed = SessionDescription::parse(SdpType::Offer, rtp_sdp)
             .or_else(|_| SessionDescription::parse(SdpType::Answer, rtp_sdp))
             .map_err(|e| anyhow!("Failed to parse RTP SDP: {}", e))?;
@@ -235,7 +242,10 @@ impl SdpBridge {
             parsed.session.origin.unicast_address
         ));
         webrtc_sdp.push_str("s=RustPBX Bridge\r\n");
-        webrtc_sdp.push_str(&format!("c=IN IP4 {}\r\n", parsed.session.origin.unicast_address));
+        webrtc_sdp.push_str(&format!(
+            "c=IN IP4 {}\r\n",
+            parsed.session.origin.unicast_address
+        ));
         webrtc_sdp.push_str("t=0 0\r\n");
 
         // Transform media sections
@@ -350,16 +360,16 @@ a=rtcp-mux\r\n\
 a=sendrecv\r\n";
 
         let rtp_sdp = SdpBridge::webrtc_to_rtp(webrtc_sdp).unwrap();
-        
+
         // Should use RTP/AVP
         assert!(rtp_sdp.contains("RTP/AVP"));
         assert!(!rtp_sdp.contains("SAVPF"));
-        
+
         // Should remove WebRTC-specific attributes
         assert!(!rtp_sdp.contains("fingerprint"));
         assert!(!rtp_sdp.contains("ice-ufrag"));
         assert!(!rtp_sdp.contains("rtcp-mux"));
-        
+
         // Should keep telephone-event
         assert!(rtp_sdp.contains("telephone-event"));
     }
@@ -376,23 +386,19 @@ a=rtpmap:0 PCMU/8000\r\n\
 a=rtpmap:101 telephone-event/8000\r\n\
 a=sendrecv\r\n";
 
-        let webrtc_sdp = SdpBridge::rtp_to_webrtc(
-            rtp_sdp,
-            "AA:BB:CC:DD:EE:FF",
-            "ufrag123",
-            "pwd456"
-        ).unwrap();
-        
+        let webrtc_sdp =
+            SdpBridge::rtp_to_webrtc(rtp_sdp, "AA:BB:CC:DD:EE:FF", "ufrag123", "pwd456").unwrap();
+
         // Should use SAVPF
         assert!(webrtc_sdp.contains("UDP/TLS/RTP/SAVPF"));
-        
+
         // Should add WebRTC-specific attributes
         assert!(webrtc_sdp.contains("fingerprint:sha-256 AA:BB:CC:DD:EE:FF"));
         assert!(webrtc_sdp.contains("ice-ufrag:ufrag123"));
         assert!(webrtc_sdp.contains("ice-pwd:pwd456"));
         assert!(webrtc_sdp.contains("rtcp-mux"));
         assert!(webrtc_sdp.contains("setup:passive"));
-        
+
         // Should keep PCMU
         assert!(webrtc_sdp.contains("PCMU/8000"));
     }

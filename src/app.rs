@@ -3,7 +3,7 @@ use crate::{
         CallRecordFormatter, CallRecordManagerBuilder, CallRecordSender,
         DefaultCallRecordFormatter, noop_saver, sipflow_upload::SipFlowUploadHook,
     },
-    config::{Config, UserBackendConfig},
+    config::{ClusterConfig, Config, UserBackendConfig},
     handler::middleware::clientaddr::ClientAddr,
     models::call_record::DatabaseHook,
     proxy::{
@@ -64,6 +64,7 @@ pub struct CoreContext {
 pub struct AppStateInner {
     pub core: Arc<CoreContext>,
     pub sip_server: SipServer,
+    pub skip_migrate: bool,
     pub total_calls: AtomicU64,
     pub total_failed_calls: AtomicU64,
     pub uptime: DateTime<Utc>,
@@ -73,8 +74,9 @@ pub struct AppStateInner {
     pub addon_registry: Arc<crate::addons::registry::AddonRegistry>,
     #[cfg(feature = "console")]
     pub console: Option<Arc<crate::console::ConsoleState>>,
-    /// TLS certificate reloaders for hot-reload after ACME renewal
     pub tls_reloader: Arc<RwLock<Option<Arc<TlsReloaderRegistry>>>>,
+    /// Cluster config with RwLock for live updates (written on save, read by UI).
+    pub cluster_config: std::sync::RwLock<Option<ClusterConfig>>,
 }
 
 pub type AppState = Arc<AppStateInner>;
@@ -88,9 +90,31 @@ pub struct AppStateBuilder {
     pub config_loaded_at: Option<DateTime<Utc>>,
     pub config_path: Option<String>,
     pub skip_sip_bind: bool,
+    pub skip_migrate: bool,
 }
 
 impl AppStateInner {
+    /// Update the cluster config in-memory (used after save to enable backfill on refresh).
+    pub fn update_cluster_config(&self, config: Option<ClusterConfig>) {
+        *self.cluster_config.write().unwrap() = config;
+    }
+
+    /// Get an addon state by type from the console state.
+    /// Returns None if the console is not configured or the state is not registered.
+    #[cfg(feature = "console")]
+    pub fn get_addon_state<T: crate::console::AddonState>(&self) -> Option<T> {
+        self.console.as_ref().and_then(|c| c.get_addon_state::<T>())
+    }
+
+    /// Insert an addon state into the console state.
+    /// Does nothing if the console is not configured.
+    #[cfg(feature = "console")]
+    pub fn insert_addon_state<T: crate::console::AddonState>(&self, state: T) {
+        if let Some(ref console) = self.console {
+            console.insert_addon_state(state);
+        }
+    }
+
     pub fn config(&self) -> &Arc<Config> {
         &self.core.config
     }
@@ -107,7 +131,11 @@ impl AppStateInner {
         &self.sip_server
     }
 
-    pub fn get_dump_events_file(&self, session_id: &String) -> String {
+    pub fn skip_migrate(&self) -> bool {
+        self.skip_migrate
+    }
+
+    pub fn get_dump_events_file(&self, session_id: &str) -> String {
         let sanitized_id = crate::utils::sanitize_id(session_id);
         let recorder_root = self.config().recorder_path();
         let root = Path::new(&recorder_root);
@@ -130,7 +158,7 @@ impl AppStateInner {
             .to_string()
     }
 
-    pub fn get_recorder_file(&self, session_id: &String) -> String {
+    pub fn get_recorder_file(&self, session_id: &str) -> String {
         let sanitized_id = crate::utils::sanitize_id(session_id);
         let recorder_root = self.config().recorder_path();
         let root = Path::new(&recorder_root);
@@ -154,6 +182,12 @@ impl AppStateInner {
     }
 }
 
+impl Default for AppStateBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AppStateBuilder {
     pub fn new() -> Self {
         Self {
@@ -165,11 +199,17 @@ impl AppStateBuilder {
             config_loaded_at: None,
             config_path: None,
             skip_sip_bind: false,
+            skip_migrate: false,
         }
     }
 
     pub fn with_skip_sip_bind(mut self) -> Self {
         self.skip_sip_bind = true;
+        self
+    }
+
+    pub fn with_skip_migrate(mut self) -> Self {
+        self.skip_migrate = true;
         self
     }
 
@@ -210,12 +250,22 @@ impl AppStateBuilder {
 
         let token = self
             .cancel_token
-            .unwrap_or_else(|| CancellationToken::new());
-        let config_loaded_at = self.config_loaded_at.unwrap_or_else(|| Utc::now());
+            .unwrap_or_default();
+        let config_loaded_at = self.config_loaded_at.unwrap_or_else(Utc::now);
         let config_path = self.config_path.clone();
-        let db_conn = crate::models::create_db(&config.database_url).await?;
+        let db_conn = if self.skip_migrate {
+            crate::models::connect_db(&config.database_url).await?
+        } else {
+            crate::models::create_db(&config.database_url).await?
+        };
 
         let addon_registry = Arc::new(crate::addons::registry::AddonRegistry::new());
+
+        // Run addon migrations if not skipped
+        if !self.skip_migrate
+            && let Err(e) = addon_registry.run_migrations(&db_conn).await {
+                tracing::error!("Failed to run addon migrations: {}", e);
+            }
 
         // Pre-build the SipFlow backend so it can be shared between the SipServer
         // (for recording RTP packets) and the SipFlowUploadHook (for post-call upload).
@@ -328,11 +378,10 @@ impl AppStateBuilder {
             None => {
                 let mut proxy_config = config.proxy.clone();
                 for backend in proxy_config.user_backends.iter_mut() {
-                    if let UserBackendConfig::Extension { database_url, .. } = backend {
-                        if database_url.is_none() {
+                    if let UserBackendConfig::Extension { database_url, .. } = backend
+                        && database_url.is_none() {
                             *database_url = Some(config.database_url.clone());
                         }
-                    }
                 }
                 if proxy_config.recording.is_none() {
                     proxy_config.recording = config.recording.clone();
@@ -342,8 +391,19 @@ impl AppStateBuilder {
                 let proxy_config = Arc::new(proxy_config);
                 let call_record_hooks = addon_registry.get_call_record_hooks(&config, &db_conn);
 
+                // Derive cluster peer SocketAddrs from Config.cluster peers
+                let cluster_peers: Vec<SocketAddr> = config
+                    .cluster
+                    .as_ref()
+                    .map(|c| c.peers.as_slice())
+                    .unwrap_or(&[])
+                    .iter()
+                    .filter_map(|p| format!("{}:{}", p.addr, p.sip_port).parse().ok())
+                    .collect();
+
                 #[allow(unused_mut)]
                 let mut builder = SipServerBuilder::new(proxy_config.clone())
+                    .with_cluster_peers(cluster_peers)
                     .with_cancel_token(core.token.child_token())
                     .with_callrecord_sender(core.callrecord_sender.clone())
                     .with_rtp_config(config.rtp_config())
@@ -353,6 +413,7 @@ impl AppStateBuilder {
                     .with_sipflow_config(config.sipflow.clone())
                     .with_sipflow_backend(sipflow_backend_arc.clone())
                     .with_no_bind(self.skip_sip_bind)
+                    .with_skip_migrate(self.skip_migrate)
                     .with_addon_registry(Some(addon_registry.clone()))
                     .register_module("acl", AclModule::create)
                     .register_module("auth", AuthModule::create)
@@ -360,10 +421,14 @@ impl AppStateBuilder {
                     .register_module("registrar", RegistrarModule::create)
                     .register_module("call", CallModule::create);
 
+                // Apply addon proxy server hooks (including CC addon's AgentRegistry registration)
                 builder = addon_registry.apply_proxy_server_hooks(builder, core.clone());
                 builder.build().await
             }
         }?;
+
+        // Note: CC addon state is created and managed by the addon itself during initialize()
+        // The proxy_server_hook registers the AgentRegistry adapter with the SIP server
 
         // Update rwi_call_registry with the active call registry from sip_server
         if config.rwi.is_some() {
@@ -384,6 +449,7 @@ impl AppStateBuilder {
         let app_state = Arc::new(AppStateInner {
             core: core.clone(),
             sip_server,
+            skip_migrate: self.skip_migrate,
             total_calls: AtomicU64::new(0),
             total_failed_calls: AtomicU64::new(0),
             uptime: chrono::Utc::now(),
@@ -394,6 +460,7 @@ impl AppStateBuilder {
             #[cfg(feature = "console")]
             console: console_state,
             tls_reloader: Arc::new(RwLock::new(Some(Arc::new(TlsReloaderRegistry::new())))),
+            cluster_config: std::sync::RwLock::new(config.cluster.clone()),
         });
 
         // Register SIP TLS reloader if TLS is enabled
@@ -511,8 +578,8 @@ pub async fn run(state: AppState, mut router: Router) -> Result<()> {
     } else {
         // Auto-detect from config/certs
         let cert_dir = std::path::Path::new("config/certs");
-        if cert_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(cert_dir) {
+        if cert_dir.exists()
+            && let Ok(entries) = std::fs::read_dir(cert_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if path.extension().and_then(|s| s.to_str()) == Some("crt") {
@@ -527,7 +594,6 @@ pub async fn run(state: AppState, mut router: Router) -> Result<()> {
                     }
                 }
             }
-        }
     }
 
     let https_config = if let Some((cert, key)) = ssl_config {
@@ -637,6 +703,18 @@ async fn iceservers_handler(State(state): State<AppState>) -> impl IntoResponse 
     Json(ice_servers).into_response()
 }
 
+// Phone config handler (exposes proxy paths for static HTML clients)
+async fn phone_config_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let proxy_cfg = &state.config().proxy;
+    let config = serde_json::json!({
+        "wsPath": proxy_cfg.ws_handler.clone().unwrap_or_else(|| "/ws".to_string()),
+        "iceServersPath": proxy_cfg.ice_servers_path.clone().unwrap_or_else(|| "/iceservers".to_string()),
+        "amiPath": proxy_cfg.ami_path.clone().unwrap_or_else(|| "/ami/v1".to_string()),
+        "staticPath": state.config().static_path(),
+    });
+    Json(config).into_response()
+}
+
 pub fn create_router(state: AppState) -> Router {
     let mut router = Router::new();
 
@@ -673,17 +751,23 @@ pub fn create_router(state: AppState) -> Router {
             axum::http::header::ORIGIN,
         ]);
 
+    // Read paths from proxy config (fallback to hardcoded defaults)
+    let proxy_cfg = &state.config().proxy;
+    let ice_servers_path = proxy_cfg.ice_servers_path.clone().unwrap_or_else(|| "/iceservers".to_string());
+    let static_path = state.config().static_path();
+
     // Merge call and WebSocket handlers with static file serving
     let call_routes = crate::handler::ami_router(state.clone()).with_state(state.clone());
     let api_v1 = crate::handler::api_v1::api_v1_router(state.clone());
     #[allow(unused_mut)]
     let mut router = router
+        .route("/api/config/phone", get(phone_config_handler).with_state(state.clone()))
         .route(
-            "/iceservers",
+            &ice_servers_path,
             get(iceservers_handler).with_state(state.clone()),
         )
         .merge(state.addon_registry.get_routers(state.clone()))
-        .nest_service("/static", static_files_service)
+        .nest_service(&static_path, static_files_service)
         .merge(call_routes)
         .merge(api_v1)
         .layer(cors);
@@ -695,8 +779,8 @@ pub fn create_router(state: AppState) -> Router {
         state.core.rwi_call_registry.clone(),
     ) {
         let rwi_auth = auth;
-        let rwi_gateway = gateway;
-        let rwi_call_registry = call_registry;
+        let rwi_gateway = gateway.clone();
+        let rwi_call_registry = call_registry.clone();
         let rwi_sip_server: Option<crate::proxy::server::SipServerRef> =
             Some(state.sip_server().get_inner());
         router = router.route(

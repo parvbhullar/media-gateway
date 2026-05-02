@@ -38,9 +38,7 @@ fn trunk_test_proxy_config() -> ProxyConfig {
         },
     );
 
-    let mut routes = Vec::new();
-
-    routes.push(RouteRule {
+    let mut routes = vec![RouteRule {
         name: "route_national_via_provider_a".to_string(),
         description: Some("Route national calls via provider_a".to_string()),
         priority: 1,
@@ -54,7 +52,7 @@ fn trunk_test_proxy_config() -> ProxyConfig {
             ..Default::default()
         },
         ..Default::default()
-    });
+    }];
 
     routes.push(RouteRule {
         name: "route_international_via_provider_b".to_string(),
@@ -96,16 +94,30 @@ mod tests {
 
         // Verify trunk data is loaded
         let trunks = server.server_ref.data_context.trunks_snapshot();
-        assert!(trunks.contains_key("provider_a"), "Should have provider_a trunk");
-        assert!(trunks.contains_key("provider_b"), "Should have provider_b trunk");
+        assert!(
+            trunks.contains_key("provider_a"),
+            "Should have provider_a trunk"
+        );
+        assert!(
+            trunks.contains_key("provider_b"),
+            "Should have provider_b trunk"
+        );
 
         let provider_a = &trunks["provider_a"];
         assert_eq!(provider_a.dest, "sip:carrier.example.com:5060");
-        assert!(provider_a.inbound_hosts.contains(&"203.0.113.10".to_string()));
+        assert!(
+            provider_a
+                .inbound_hosts
+                .contains(&"203.0.113.10".to_string())
+        );
 
         let provider_b = &trunks["provider_b"];
         assert_eq!(provider_b.dest, "sip:backup.example.com:5060");
-        assert!(provider_b.inbound_hosts.contains(&"203.0.113.20".to_string()));
+        assert!(
+            provider_b
+                .inbound_hosts
+                .contains(&"203.0.113.20".to_string())
+        );
 
         server.stop();
         Ok(())
@@ -156,7 +168,13 @@ mod tests {
         let trunks = server.server_ref.data_context.trunks_snapshot();
         assert_eq!(trunks.len(), 5, "Should have 5 trunks configured");
 
-        for name in &["provider_a", "provider_b", "provider_3", "provider_4", "provider_5"] {
+        for name in &[
+            "provider_a",
+            "provider_b",
+            "provider_3",
+            "provider_4",
+            "provider_5",
+        ] {
             assert!(trunks.contains_key(*name), "Missing trunk: {}", name);
         }
 
@@ -217,7 +235,10 @@ mod tests {
         let routes = server.server_ref.data_context.routes_snapshot();
         assert_eq!(routes.len(), 3, "Should have 3 routes");
 
-        let premium_route = routes.iter().find(|r| r.name == "route_premium_load_balanced").unwrap();
+        let premium_route = routes
+            .iter()
+            .find(|r| r.name == "route_premium_load_balanced")
+            .unwrap();
         match &premium_route.action.dest {
             Some(DestConfig::Multiple(dests)) => {
                 assert_eq!(dests.len(), 2);
@@ -249,15 +270,12 @@ mod tests {
         let _sdp = super::super::rtp_utils::RtpPacket::create_sequence(
             50, 1000, 50000, 0xA1A1A1A1, 0, 160, 160,
         );
-        let _caller_sdp = format!(
-            "v=0\r\no=- 1234 1234 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 12345 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\n"
-        );
+        let _caller_sdp = "v=0\r\no=- 1234 1234 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 12345 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\n".to_string();
 
         let alice_clone = alice.clone();
         let caller_sdp = _caller_sdp.clone();
-        let caller_handle = tokio::spawn(async move {
-            alice_clone.make_call("bob", Some(caller_sdp)).await
-        });
+        let caller_handle =
+            tokio::spawn(async move { alice_clone.make_call("bob", Some(caller_sdp)).await });
 
         // Bob answers
         let mut bob_dialog_id = None;

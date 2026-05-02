@@ -23,17 +23,17 @@ use tokio_util::sync::CancellationToken;
 #[tokio::test]
 async fn test_proxy_full_flow() {
     // 1. Set up proxy server configuration
-    let mut config = ProxyConfig::default();
-    config.addr = "127.0.0.1".to_string();
-    config.udp_port = Some(6061);
-
-    // Add the required modules
-    config.modules = Some(vec![
-        "acl".to_string(),
-        "auth".to_string(),
-        "registrar".to_string(),
-        "call".to_string(),
-    ]);
+    let config = ProxyConfig {
+        addr: "127.0.0.1".to_string(),
+        udp_port: Some(6061),
+        modules: Some(vec![
+            "acl".to_string(),
+            "auth".to_string(),
+            "registrar".to_string(),
+            "call".to_string(),
+        ]),
+        ..Default::default()
+    };
 
     // Create a user backend with a test user
     let user_backend = Box::new(MemoryUserBackend::new(None));
@@ -157,7 +157,12 @@ async fn test_ban_module(username: &str, realm: &str, tx: mpsc::Sender<String>) 
 
     // Try registration with wrong password multiple times to trigger ban
     for i in 0..3 {
-        let request = create_auth_request(rsipstack::sip::Method::Register, username, realm, "wrongpassword");
+        let request = create_auth_request(
+            rsipstack::sip::Method::Register,
+            username,
+            realm,
+            "wrongpassword",
+        );
         let (mut tx1, _endpoint_inner) = create_transaction(request).await;
 
         // Process the transaction (this won't actually send over network, just record the response locally)
@@ -168,7 +173,12 @@ async fn test_ban_module(username: &str, realm: &str, tx: mpsc::Sender<String>) 
     }
 
     // Try one more time - in a real server this would be banned
-    let request = create_auth_request(rsipstack::sip::Method::Register, username, realm, "wrongpassword");
+    let request = create_auth_request(
+        rsipstack::sip::Method::Register,
+        username,
+        realm,
+        "wrongpassword",
+    );
     let (mut tx1, _endpoint_inner) = create_transaction(request).await;
     let _ = process_transaction_locally(&mut tx1).await;
 
@@ -194,7 +204,8 @@ async fn test_registration_module(
     let _ = process_transaction_locally(&mut tx1).await;
 
     // Create an authenticated request
-    let auth_request = create_auth_request(rsipstack::sip::Method::Register, username, realm, password);
+    let auth_request =
+        create_auth_request(rsipstack::sip::Method::Register, username, realm, password);
     let (mut tx2, _endpoint_inner) = create_transaction(auth_request).await;
     let _ = process_transaction_locally(&mut tx2).await;
 
@@ -273,7 +284,8 @@ async fn process_transaction_locally(tx: &mut Transaction) -> Result<(), String>
 
 // Helper function to create an INVITE request with SDP body
 fn create_invite_request(from_user: &str, to_user: &str, realm: &str) -> rsipstack::sip::Request {
-    let mut request = create_test_request(rsipstack::sip::Method::Invite, from_user, None, realm, None);
+    let mut request =
+        create_test_request(rsipstack::sip::Method::Invite, from_user, None, realm, None);
 
     // Update the request URI to target the callee
     let to_uri = rsipstack::sip::Uri {

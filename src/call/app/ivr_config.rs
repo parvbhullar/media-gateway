@@ -85,13 +85,19 @@ fn default_timezone() -> String {
 }
 
 /// Complete IVR definition: metadata + root menu + sub-menus.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct IvrDefinition {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
     pub lang: Option<String>,
+    /// Default TTS voice for the entire IVR (overridable per menu).
+    #[serde(default)]
+    pub default_voice: Option<String>,
+    /// When true, TTS is generated at runtime instead of pre-cached on publish.
+    #[serde(default)]
+    pub dynamic_build: bool,
     /// Business hours configuration. When enabled, calls outside business
     /// hours are routed to `closed_action` instead of the normal IVR menu.
     #[serde(default)]
@@ -184,7 +190,13 @@ pub enum EntryAction {
     /// Transfer the call to a SIP extension or URI.
     Transfer { target: String },
     /// Send the call to a queue.
-    Queue { target: String },
+    Queue {
+        target: String,
+        /// If true, when the queue ends (all agents exhausted / timeout),
+        /// the call returns to the current IVR instead of hanging up.
+        #[serde(default)]
+        return_to_ivr: Option<bool>,
+    },
     /// Navigate to a sub-menu (or "root" for top level).
     Menu { menu: String },
     /// Transfer to voicemail for the given extension.
@@ -284,7 +296,12 @@ pub enum WebhookResponse {
     /// Transfer the call to a SIP extension or URI.
     Transfer { target: String },
     /// Send the call to a queue.
-    Queue { target: String },
+    Queue {
+        target: String,
+        /// If true, when the queue ends, call returns to the current IVR.
+        #[serde(default)]
+        return_to_ivr: Option<bool>,
+    },
     /// Navigate to a sub-menu.
     Menu { menu: String },
     /// Transfer to voicemail.
@@ -341,7 +358,13 @@ impl WebhookResponse {
     pub fn into_entry_action(self) -> EntryAction {
         match self {
             WebhookResponse::Transfer { target } => EntryAction::Transfer { target },
-            WebhookResponse::Queue { target } => EntryAction::Queue { target },
+            WebhookResponse::Queue {
+                target,
+                return_to_ivr,
+            } => EntryAction::Queue {
+                target,
+                return_to_ivr,
+            },
             WebhookResponse::Menu { menu } => EntryAction::Menu { menu },
             WebhookResponse::Voicemail { target } => EntryAction::Voicemail { target },
             WebhookResponse::Play { prompt, .. } => EntryAction::Play {
@@ -387,14 +410,12 @@ impl WebhookResponse {
                 inter_digit_timeout_ms: inter_digit_timeout_ms
                     .unwrap_or_else(default_inter_digit_timeout_ms),
             },
-            WebhookResponse::PlayAndHangup { prompt, code } => {
-                EntryAction::PlayAndHangup {
-                    prompt,
-                    prompt_text: None,
-                    prompt_voice: None,
-                    code,
-                }
-            }
+            WebhookResponse::PlayAndHangup { prompt, code } => EntryAction::PlayAndHangup {
+                prompt,
+                prompt_text: None,
+                prompt_voice: None,
+                code,
+            },
         }
     }
 }
@@ -450,32 +471,29 @@ impl IvrDefinition {
         menus: &HashMap<String, MenuNode>,
     ) -> Result<(), String> {
         for entry in &menu.entries {
-            if let EntryAction::Menu { menu: ref target } = entry.action {
-                if target != "root" && !menus.contains_key(target) {
+            if let EntryAction::Menu { menu: ref target } = entry.action
+                && target != "root" && !menus.contains_key(target) {
                     return Err(format!(
                         "menu '{}' entry key '{}' references unknown menu '{}'",
                         menu_key, entry.key, target
                     ));
                 }
-            }
         }
         // Also check timeout_action and max_retries_action
-        if let Some(EntryAction::Menu { menu: ref target }) = menu.timeout_action {
-            if target != "root" && !menus.contains_key(target) {
+        if let Some(EntryAction::Menu { menu: ref target }) = menu.timeout_action
+            && target != "root" && !menus.contains_key(target) {
                 return Err(format!(
                     "menu '{}' timeout_action references unknown menu '{}'",
                     menu_key, target
                 ));
             }
-        }
-        if let Some(EntryAction::Menu { menu: ref target }) = menu.max_retries_action {
-            if target != "root" && !menus.contains_key(target) {
+        if let Some(EntryAction::Menu { menu: ref target }) = menu.max_retries_action
+            && target != "root" && !menus.contains_key(target) {
                 return Err(format!(
                     "menu '{}' max_retries_action references unknown menu '{}'",
                     menu_key, target
                 ));
             }
-        }
         Ok(())
     }
 }

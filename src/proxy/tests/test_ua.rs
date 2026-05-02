@@ -1,11 +1,11 @@
 use anyhow::{Result, anyhow};
-use rsipstack::sip::prelude::HeadersExt;
 use rsipstack::dialog::DialogId;
 use rsipstack::dialog::authenticate::Credential;
 use rsipstack::dialog::dialog::{Dialog, DialogState, DialogStateReceiver, DialogStateSender};
 use rsipstack::dialog::dialog_layer::DialogLayer;
 use rsipstack::dialog::invitation::InviteOption;
 use rsipstack::dialog::registration::Registration;
+use rsipstack::sip::prelude::HeadersExt;
 use rsipstack::transaction::{EndpointBuilder, TransactionReceiver};
 use rsipstack::transport::TransportLayer;
 use rsipstack::transport::udp::UdpConnection;
@@ -85,6 +85,11 @@ impl TestUa {
             received_offer_sdps: Arc::new(Mutex::new(HashMap::new())),
             negotiated_answer_sdps: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Return the local SIP port this UA is bound to.
+    pub fn local_port(&self) -> u16 {
+        self.config.local_port
     }
 
     /// Start the UA with simplified initialization
@@ -234,9 +239,8 @@ impl TestUa {
         )
         .try_into()
         .map_err(|e| anyhow!("Invalid proxy URI: {:?}", e))?;
-        let route_header = rsipstack::sip::Header::from(
-            rsipstack::sip::typed::Route::from(proxy_uri),
-        );
+        let route_header =
+            rsipstack::sip::Header::from(rsipstack::sip::typed::Route::from(proxy_uri));
 
         let (content_type, offer) = if let Some(sdp) = sdp_offer {
             (Some("application/sdp".to_string()), Some(sdp.into_bytes()))
@@ -255,13 +259,10 @@ impl TestUa {
             ..Default::default()
         };
 
-        let state_sender = self
-            .state_sender
-            .clone()
-            .unwrap_or_else(|| {
-                let (sender, _) = unbounded_channel();
-                sender
-            });
+        let state_sender = self.state_sender.clone().unwrap_or_else(|| {
+            let (sender, _) = unbounded_channel();
+            sender
+        });
         let (dialog, resp) = dialog_layer
             .do_invite(invite_option, state_sender)
             .await
@@ -286,6 +287,12 @@ impl TestUa {
         sdps.get(dialog_id).cloned()
     }
 
+    /// Set answer SDP for a dialog, used for re-INVITE responses.
+    pub async fn set_answer_sdp(&self, dialog_id: &DialogId, sdp: &str) {
+        let mut sdps = self.answer_sdps.lock().await;
+        sdps.insert(dialog_id.clone(), sdp.to_string());
+    }
+
     /// Answer an incoming call with optional SDP
     pub async fn answer_call(
         &self,
@@ -308,7 +315,9 @@ impl TestUa {
 
                     let body = sdp_answer.map(|sdp| sdp.into_bytes());
                     let headers = if body.is_some() {
-                        vec![rsipstack::sip::Header::ContentType("application/sdp".into())]
+                        vec![rsipstack::sip::Header::ContentType(
+                            "application/sdp".into(),
+                        )]
                     } else {
                         vec![]
                     };
@@ -343,7 +352,7 @@ impl TestUa {
         if let Some(dialog) = dialog_layer.get_dialog(dialog_id) {
             match dialog {
                 Dialog::ServerInvite(d) => {
-                    let code = status_code.map(|c| StatusCode::from(c));
+                    let code = status_code.map(StatusCode::from);
                     d.reject(code, reason).map_err(|e| e.into_anyhow())?;
                     Ok(())
                 }
@@ -371,12 +380,14 @@ impl TestUa {
                     let contact = rsipstack::sip::typed::Contact {
                         display_name: None,
                         uri: self.contact_uri.clone().unwrap(),
-                        params: vec![].into(),
+                        params: vec![],
                     };
 
                     let mut headers = vec![contact.into()];
                     let body = if let Some(sdp) = early_media_sdp {
-                        headers.push(rsipstack::sip::Header::ContentType("application/sdp".into()));
+                        headers.push(rsipstack::sip::Header::ContentType(
+                            "application/sdp".into(),
+                        ));
                         Some(sdp.into_bytes())
                     } else {
                         None
@@ -433,6 +444,35 @@ impl TestUa {
             .await
     }
 
+    /// Send SIP REFER request on an established dialog.
+    /// Returns the status code of the REFER response (typically 202 Accepted).
+    pub async fn send_refer(&self, dialog_id: &DialogId, refer_to: &str) -> Result<u16> {
+        let dialog_layer = self
+            .dialog_layer
+            .as_ref()
+            .ok_or_else(|| anyhow!("TestUa not started"))?;
+
+        let refer_to_uri = rsipstack::sip::Uri::try_from(refer_to)
+            .map_err(|e| anyhow!("Invalid Refer-To URI: {:?}", e))?;
+
+        if let Some(dialog) = dialog_layer.get_dialog(dialog_id) {
+            let resp = match dialog {
+                Dialog::ClientInvite(d) => d
+                    .refer(refer_to_uri, None, None)
+                    .await
+                    .map_err(|e| e.into_anyhow())?,
+                Dialog::ServerInvite(d) => d
+                    .refer(refer_to_uri, None, None)
+                    .await
+                    .map_err(|e| e.into_anyhow())?,
+                _ => return Err(anyhow!("Dialog does not support REFER request")),
+            };
+            Ok(resp.map(|r| r.status_code().code()).unwrap_or(408))
+        } else {
+            Err(anyhow!("Dialog not found: {}", dialog_id))
+        }
+    }
+
     /// Send SIP INFO with DTMF signal
     pub async fn send_dtmf_info(&self, dialog_id: &DialogId, digit: &str) -> Result<()> {
         let dialog_layer = self
@@ -441,17 +481,21 @@ impl TestUa {
             .ok_or_else(|| anyhow!("TestUa not started"))?;
 
         let body = format!("Signal={}\n", digit).into_bytes();
-        let headers = vec![
-            rsipstack::sip::Header::ContentType("application/dtmf-relay".into()),
-        ];
+        let headers = vec![rsipstack::sip::Header::ContentType(
+            "application/dtmf-relay".into(),
+        )];
 
         if let Some(dialog) = dialog_layer.get_dialog(dialog_id) {
             match dialog {
                 Dialog::ClientInvite(d) => {
-                    d.info(Some(headers), Some(body)).await.map_err(|e| e.into_anyhow())?;
+                    d.info(Some(headers), Some(body))
+                        .await
+                        .map_err(|e| e.into_anyhow())?;
                 }
                 Dialog::ServerInvite(d) => {
-                    d.info(Some(headers), Some(body)).await.map_err(|e| e.into_anyhow())?;
+                    d.info(Some(headers), Some(body))
+                        .await
+                        .map_err(|e| e.into_anyhow())?;
                 }
                 _ => return Err(anyhow!("Dialog does not support INFO request")),
             }
@@ -473,7 +517,9 @@ impl TestUa {
         if let Some(mut dialog) = dialog_layer.get_dialog(dialog_id) {
             let body = sdp.map(|s| s.into_bytes());
             let headers = if body.is_some() {
-                vec![rsipstack::sip::Header::ContentType("application/sdp".into())]
+                vec![rsipstack::sip::Header::ContentType(
+                    "application/sdp".into(),
+                )]
             } else {
                 vec![]
             };
@@ -582,15 +628,16 @@ impl TestUa {
                         };
                         events.push(TestUaEvent::CallUpdated(
                             id.clone(),
-                            request.method.clone(),
+                            request.method,
                             sdp,
                         ));
                         // Reply with saved answer SDP if available (for re-INVITE responses)
                         let sdps = self.answer_sdps.lock().await;
                         if let Some(answer_sdp) = sdps.get(&id) {
                             let body = answer_sdp.clone().into_bytes();
-                            let headers =
-                                vec![rsipstack::sip::Header::ContentType("application/sdp".into())];
+                            let headers = vec![rsipstack::sip::Header::ContentType(
+                                "application/sdp".into(),
+                            )];
                             tx_handle
                                 .respond(rsipstack::sip::StatusCode::OK, Some(headers), Some(body))
                                 .await
@@ -598,6 +645,11 @@ impl TestUa {
                         } else {
                             tx_handle.reply(rsipstack::sip::StatusCode::OK).await.ok();
                         }
+                    }
+                    DialogState::Notify(id, _request, tx_handle) => {
+                        debug!("TestUa: Received Notify state for {}", id);
+                        // Reply 200 OK to NOTIFY so the sender can proceed
+                        tx_handle.reply(rsipstack::sip::StatusCode::OK).await.ok();
                     }
                     DialogState::Refer(id, request, tx_handle) => {
                         debug!("TestUa: Received Refer state for {}", id);
@@ -617,11 +669,7 @@ impl TestUa {
                             events.push(TestUaEvent::Referred(id.clone(), target));
                         } else {
                             tx_handle
-                                .respond(
-                                    rsipstack::sip::StatusCode::BadRequest,
-                                    None,
-                                    None,
-                                )
+                                .respond(rsipstack::sip::StatusCode::BadRequest, None, None)
                                 .await
                                 .ok();
                         }
@@ -650,17 +698,18 @@ impl TestUa {
             select! {
                 tx_opt = incoming.recv() => {
                     if let Some(mut tx) = tx_opt {
+                        debug!(method=%tx.original.method, "TestUa process_incoming_request received request");
                         // Handle existing dialog
-                        match tx.original.to_header()?.tag()?.as_ref() {
-                            Some(_) => {
-                                if let Some(mut d) = dialog_layer.match_dialog(&tx) {
-                                    tokio::spawn(async move {
-                                        d.handle(&mut tx).await.ok();
-                                    });
-                                    continue;
-                                }
+                        if tx.original.to_header()?.tag()?.as_ref().is_some() {
+                            if let Some(mut d) = dialog_layer.match_dialog(&tx) {
+                                debug!(method=%tx.original.method, "TestUa matched dialog for request");
+                                tokio::spawn(async move {
+                                    d.handle(&mut tx).await.ok();
+                                });
+                                continue;
+                            } else {
+                                debug!(method=%tx.original.method, "TestUa no matching dialog found");
                             }
-                            None => {}
                         }
 
                         // Handle new dialog
@@ -854,7 +903,7 @@ mod tests {
                     Ok(Box::new(RegistrarModule::new(inner, config)))
                 })
                 .register_module("auth", |inner, _config| {
-                    Ok(Box::new(AuthModule::new(inner)))
+                    Ok(Box::new(AuthModule::new(inner.clone(), inner.proxy_config.clone())))
                 })
                 .register_module("call", |inner, config| {
                     Ok(Box::new(CallModule::new(config, inner)))
@@ -1313,11 +1362,9 @@ mod tests {
             let _ = tokio::time::timeout(Duration::from_secs(10), callee_fut).await;
 
             if let Ok(join_res) = tokio::time::timeout(Duration::from_secs(5), caller_handle).await
-            {
-                if let Ok(Ok(dialog_id)) = join_res {
+                && let Ok(Ok(dialog_id)) = join_res {
                     alice.hangup(&dialog_id).await.ok();
                 }
-            }
 
             alice.stop();
             bob.stop();
@@ -1378,11 +1425,10 @@ mod tests {
                             _ => {}
                         }
                     }
-                    if i == 10 {
-                        if let Some(id) = &established_id {
+                    if i == 10
+                        && let Some(id) = &established_id {
                             let _ = bob.hangup(id).await; // drive termination
                         }
-                    }
                     if states_observed.contains(&"Terminated".to_string()) {
                         println!("States observed: {:?}", states_observed);
                         assert!(
@@ -1584,14 +1630,12 @@ mod tests {
             }
 
             if let Ok(join_res) = tokio::time::timeout(Duration::from_secs(3), caller_handle).await
-            {
-                if let Ok(Ok(dialog_id)) = join_res {
+                && let Ok(Ok(dialog_id)) = join_res {
                     // Very short call duration simulating network flakiness
                     sleep(Duration::from_millis(20)).await;
                     alice.hangup(&dialog_id).await.ok();
                     println!("Quick call cycle #{} completed", i + 1);
                 }
-            }
 
             sleep(Duration::from_millis(20)).await;
         }
@@ -1665,11 +1709,9 @@ mod tests {
 
                 if let Ok(join_res) =
                     tokio::time::timeout(Duration::from_secs(5), caller_handle).await
-                {
-                    if let Ok(Ok(id)) = join_res {
+                    && let Ok(Ok(id)) = join_res {
                         alice_arc.hangup(&id).await.ok();
                     }
-                }
             }
         }
 
@@ -1733,11 +1775,9 @@ mod tests {
                         // Transfer completed - original call should be replaced
                         if let Ok(join_res) =
                             tokio::time::timeout(Duration::from_secs(5), caller_handle).await
-                        {
-                            if let Ok(Ok(id)) = join_res {
+                            && let Ok(Ok(id)) = join_res {
                                 alice_arc.hangup(&id).await.ok();
                             }
-                        }
                         println!("Blind transfer scenario completed");
                         break;
                     }
@@ -1825,11 +1865,9 @@ mod tests {
                 sleep(Duration::from_millis(100)).await;
                 if let Ok(join_res) =
                     tokio::time::timeout(Duration::from_secs(5), caller_handle).await
-                {
-                    if let Ok(Ok(id)) = join_res {
+                    && let Ok(Ok(id)) = join_res {
                         alice_arc.hangup(&id).await.ok();
                     }
-                }
             }
 
             sleep(Duration::from_millis(50)).await;
@@ -1902,11 +1940,9 @@ mod tests {
                         sleep(Duration::from_millis(300)).await;
                         if let Ok(join_res) =
                             tokio::time::timeout(Duration::from_secs(5), caller_handle).await
-                        {
-                            if let Ok(Ok(id)) = join_res {
+                            && let Ok(Ok(id)) = join_res {
                                 alice_arc.hangup(&id).await.ok();
                             }
-                        }
                         break;
                     }
                 }
@@ -2030,11 +2066,10 @@ a=rtpmap:0 PCMU/8000"#;
         }
 
         sleep(Duration::from_millis(100)).await;
-        if let Ok(join_res) = tokio::time::timeout(Duration::from_secs(5), caller_handle).await {
-            if let Ok(Ok(id)) = join_res {
+        if let Ok(join_res) = tokio::time::timeout(Duration::from_secs(5), caller_handle).await
+            && let Ok(Ok(id)) = join_res {
                 alice_arc.hangup(&id).await.ok();
             }
-        }
 
         // Test dual-stack SDP scenario
         let dual_stack_sdp = r#"v=0
@@ -2069,13 +2104,12 @@ a=candidate:2 1 udp 2130706430 2001:db8::1 54401 typ host"#;
                 }
             }
         }
-        if let Ok(join_res) = tokio::time::timeout(Duration::from_secs(5), caller_handle).await {
-            if let Ok(Ok(id)) = join_res {
+        if let Ok(join_res) = tokio::time::timeout(Duration::from_secs(5), caller_handle).await
+            && let Ok(Ok(id)) = join_res {
                 sleep(Duration::from_millis(100)).await;
                 alice_arc.hangup(&id).await.ok();
                 println!("Dual-stack SDP scenario completed");
             }
-        }
 
         alice.stop();
         bob.stop();
@@ -2130,13 +2164,11 @@ a=candidate:2 1 udp 2130706430 2001:db8::1 54401 typ host"#;
                 }
             }
             if let Ok(join_res) = tokio::time::timeout(Duration::from_secs(3), caller_handle).await
-            {
-                if let Ok(Ok(dialog_id)) = join_res {
+                && let Ok(Ok(dialog_id)) = join_res {
                     // Caller terminates immediately after answer
                     assert!(alice.hangup(&dialog_id).await.is_ok());
                     println!("Caller terminated call immediately after answer");
                 }
-            }
         }
 
         // Scenario 2: Ringing then early termination by caller (still requires established dialog in this simplified UA)
@@ -2167,13 +2199,11 @@ a=candidate:2 1 udp 2130706430 2001:db8::1 54401 typ host"#;
                 }
             }
             if let Ok(join_res) = tokio::time::timeout(Duration::from_secs(3), caller_handle).await
-            {
-                if let Ok(Ok(dialog_id)) = join_res {
+                && let Ok(Ok(dialog_id)) = join_res {
                     // Caller terminates immediately after answer
                     assert!(alice.hangup(&dialog_id).await.is_ok());
                     println!("Caller terminated during/after ringing phase");
                 }
-            }
         }
 
         alice.stop();
@@ -2327,11 +2357,9 @@ a=rtpmap:0 PCMU/8000"#;
                 sleep(Duration::from_millis(200)).await;
                 if let Ok(join_res) =
                     tokio::time::timeout(Duration::from_secs(5), caller_handle).await
-                {
-                    if let Ok(Ok(id)) = join_res {
+                    && let Ok(Ok(id)) = join_res {
                         alice_arc.hangup(&id).await.ok();
                     }
-                }
             }
 
             // Test 2: RTP offer to WebRTC callee (simulated by different SDP patterns)
@@ -2385,11 +2413,9 @@ a=rtpmap:111 opus/48000/2"#;
                 sleep(Duration::from_millis(200)).await;
                 if let Ok(join_res) =
                     tokio::time::timeout(Duration::from_secs(5), caller_handle).await
-                {
-                    if let Ok(Ok(id)) = join_res {
+                    && let Ok(Ok(id)) = join_res {
                         alice_arc.hangup(&id).await.ok();
                     }
-                }
             }
             alice.stop();
             bob.stop();
@@ -2466,11 +2492,10 @@ a=rtpmap:0 PCMU/8000"#;
         }
 
         sleep(Duration::from_millis(200)).await;
-        if let Ok(join_res) = tokio::time::timeout(Duration::from_secs(5), caller_handle).await {
-            if let Ok(Ok(id)) = join_res {
+        if let Ok(join_res) = tokio::time::timeout(Duration::from_secs(5), caller_handle).await
+            && let Ok(Ok(id)) = join_res {
                 alice_arc.hangup(&id).await.ok();
             }
-        }
 
         // Test with public IP (should NOT trigger NAT mode proxy)
         let public_ip_sdp = r#"v=0
@@ -2513,13 +2538,12 @@ a=rtpmap:0 PCMU/8000"#;
                 }
             }
         }
-        if let Ok(join_res) = tokio::time::timeout(Duration::from_secs(5), caller_handle).await {
-            if let Ok(Ok(id)) = join_res {
+        if let Ok(join_res) = tokio::time::timeout(Duration::from_secs(5), caller_handle).await
+            && let Ok(Ok(id)) = join_res {
                 sleep(Duration::from_millis(200)).await;
                 alice_arc.hangup(&id).await.ok();
                 println!("Public IP test completed (should bypass NAT proxy)");
             }
-        }
 
         alice.stop();
         bob.stop();
@@ -2601,12 +2625,11 @@ a=rtpmap:0 PCMU/8000"#;
                 }
             }
         }
-        if let Ok(join_res) = tokio::time::timeout(Duration::from_secs(5), caller_handle).await {
-            if let Ok(Ok(id)) = join_res {
+        if let Ok(join_res) = tokio::time::timeout(Duration::from_secs(5), caller_handle).await
+            && let Ok(Ok(id)) = join_res {
                 alice.hangup(&id).await.ok();
                 println!("Ringtone functionality test - call flow with ringing simulation works");
             }
-        }
 
         alice.stop();
         bob.stop();

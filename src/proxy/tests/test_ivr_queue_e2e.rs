@@ -30,6 +30,8 @@ fn create_ivr_queue_proxy_config(port: u16, ivr_toml_path: &str) -> ProxyConfig 
             "registrar".to_string(),
             "call".to_string(),
         ]),
+        // This test verifies the REFER-based transfer flow explicitly.
+        blind_transfer_use_refer: true,
         ..Default::default()
     };
 
@@ -134,7 +136,10 @@ impl TestIvrQueueServer {
                 Ok(Box::new(RegistrarModule::new(inner, config)))
             })
             .register_module("auth", |inner, _config| {
-                Ok(Box::new(AuthModule::new(inner)))
+                Ok(Box::new(AuthModule::new(
+                    inner.clone(),
+                    inner.proxy_config.clone(),
+                )))
             })
             .register_module("call", |inner, config| {
                 Ok(Box::new(CallModule::new(config, inner)))
@@ -296,14 +301,14 @@ action = {{ type = "transfer", target = "support" }}
         // Inject AudioComplete to simulate greeting finishing
         let registry = &server.server.active_call_registry;
         let sessions = registry.list_recent(1);
-        if let Some(entry) = sessions.first() {
-            if let Some(handle) = registry.get_handle(&entry.session_id) {
-                let _ = handle.send_app_event(crate::call::app::ControllerEvent::AudioComplete {
-                    track_id: "greeting".to_string(),
-                    interrupted: false,
-                });
-                info!("Injected AudioComplete for session {}", entry.session_id);
-            }
+        if let Some(entry) = sessions.first()
+            && let Some(handle) = registry.get_handle(&entry.session_id)
+        {
+            let _ = handle.send_app_event(crate::call::app::ControllerEvent::AudioComplete {
+                track_id: "greeting".to_string(),
+                interrupted: false,
+            });
+            info!("Injected AudioComplete for session {}", entry.session_id);
         }
 
         sleep(Duration::from_millis(200)).await;
@@ -320,10 +325,8 @@ action = {{ type = "transfer", target = "support" }}
                 if let TestUaEvent::Referred(_, ref target) = event {
                     info!("Caller received REFER to {}", target);
                     // Parse Refer-To which may be `<sip:support>` or `sip:support`
-                    let target_trimmed = target
-                        .trim()
-                        .trim_start_matches('<')
-                        .trim_end_matches('>');
+                    let target_trimmed =
+                        target.trim().trim_start_matches('<').trim_end_matches('>');
                     let target_user = target_trimmed
                         .trim_start_matches("sip:")
                         .split('@')
@@ -332,10 +335,10 @@ action = {{ type = "transfer", target = "support" }}
                     new_dialog = Some(caller.make_call(target_user, None).await?);
                     info!("Caller re-invited to {}", target_user);
                 }
-                if let TestUaEvent::CallEstablished(ref id) = event {
-                    if Some(id) == new_dialog.as_ref() {
-                        info!("Caller established queue call");
-                    }
+                if let TestUaEvent::CallEstablished(ref id) = event
+                    && Some(id) == new_dialog.as_ref()
+                {
+                    info!("Caller established queue call");
                 }
             }
             if new_dialog.is_some() {
@@ -378,7 +381,10 @@ action = {{ type = "transfer", target = "support" }}
                             .as_secs(),
                         agent_port + 100
                     );
-                    agent.answer_call(&dialog_id, Some(sdp_answer)).await.unwrap();
+                    agent
+                        .answer_call(&dialog_id, Some(sdp_answer))
+                        .await
+                        .unwrap();
                     sleep(Duration::from_millis(1500)).await;
                     return Ok(());
                 }
@@ -420,6 +426,6 @@ fn create_minimal_wav(path: &std::path::Path) {
     wav.extend_from_slice(&16u16.to_le_bytes()); // BitsPerSample
     wav.extend_from_slice(b"data");
     wav.extend_from_slice(&data_size.to_le_bytes());
-    wav.extend(std::iter::repeat(0u8).take(data_size as usize));
+    wav.extend(std::iter::repeat_n(0u8, data_size as usize));
     std::fs::write(path, wav).expect("failed to write wav");
 }

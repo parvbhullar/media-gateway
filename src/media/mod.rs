@@ -4,6 +4,7 @@ use audio_codec::CodecType;
 use rustrtc::{
     Attribute, IceServer, IceTransportPolicy, MediaKind, PeerConnection, RtcConfiguration,
     RtpCodecParameters, SdpType, SessionDescription, TransceiverDirection, TransportMode,
+    media::{AudioFrame, MediaSample, SampleStreamSource},
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -15,6 +16,8 @@ use tracing::{debug, warn};
 pub use transcoder::Transcoder;
 
 use crate::media::recorder::RecorderOption;
+
+pub type TrackMap = HashMap<String, Arc<AsyncMutex<Box<dyn Track>>>>;
 
 pub mod audio_source;
 pub mod bridge;
@@ -30,6 +33,7 @@ pub mod mixer_registry;
 pub mod negotiate;
 pub mod sdp_bridge;
 pub mod transcoder;
+pub mod transcoding_pipeline;
 #[cfg(test)]
 mod unified_pc_tests;
 pub mod wav_writer;
@@ -116,12 +120,24 @@ pub trait Track: Send + Sync {
         // Default implementation returns false
         false
     }
+
+    /// Get the media sample sender for this track, if available.
+    /// This allows external code to inject audio into the track's PeerConnection.
+    fn get_sender(&self) -> Option<SampleStreamSource> {
+        None
+    }
 }
 
 pub struct MediaStreamBuilder {
     id: Option<String>,
     cancel_token: Option<CancellationToken>,
     recorder_option: Option<RecorderOption>,
+}
+
+impl Default for MediaStreamBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MediaStreamBuilder {
@@ -151,7 +167,7 @@ impl MediaStreamBuilder {
     pub fn build(self) -> MediaStream {
         MediaStream {
             id: self.id.unwrap_or_else(|| "media-stream".to_string()),
-            cancel_token: self.cancel_token.unwrap_or_else(CancellationToken::new),
+            cancel_token: self.cancel_token.unwrap_or_default(),
             tracks: Mutex::new(HashMap::new()),
             recorder_option: self.recorder_option,
         }
@@ -161,7 +177,7 @@ impl MediaStreamBuilder {
 pub struct MediaStream {
     pub id: String,
     pub cancel_token: CancellationToken,
-    tracks: Mutex<HashMap<String, Arc<AsyncMutex<Box<dyn Track>>>>>,
+    tracks: Mutex<TrackMap>,
     pub recorder_option: Option<RecorderOption>,
 }
 
@@ -249,6 +265,8 @@ pub struct RtcTrack {
     pub recorder_option: Option<RecorderOption>,
     rtp_map: Vec<negotiate::CodecInfo>,
     muted: std::sync::atomic::AtomicBool,
+    /// Sender for injecting audio samples into the PeerConnection
+    sender: Option<SampleStreamSource>,
 }
 
 impl RtcTrack {
@@ -259,8 +277,8 @@ impl RtcTrack {
     ) -> Self {
         let pc = PeerConnection::new(config);
 
-        // Add a dummy track to ensure a sender is created and SSRC is signaled in SDP
-        let (_, track, _) =
+        // Add a sample track to ensure a sender is created and SSRC is signaled in SDP
+        let (tx, track, _) =
             rustrtc::media::track::sample_track(rustrtc::media::MediaKind::Audio, 100);
         let mut params = RtpCodecParameters::default();
         if let Some(info) = rtp_map.first() {
@@ -276,6 +294,7 @@ impl RtcTrack {
             recorder_option: None,
             rtp_map,
             muted: std::sync::atomic::AtomicBool::new(false),
+            sender: Some(tx),
         }
     }
 
@@ -288,7 +307,7 @@ impl RtcTrack {
         let pc = PeerConnection::new(config);
 
         // Add audio track
-        let (_, audio_track, _) =
+        let (tx, audio_track, _) =
             rustrtc::media::track::sample_track(rustrtc::media::MediaKind::Audio, 100);
         let mut audio_params = RtpCodecParameters::default();
         if let Some(info) = rtp_map.first() {
@@ -299,13 +318,14 @@ impl RtcTrack {
         let _ = pc.add_track(audio_track, audio_params);
 
         // Add video track for each video capability
-        for (_idx, video_cap) in video_capabilities.iter().enumerate() {
+        for video_cap in video_capabilities.iter() {
             let (_, video_track, _) =
                 rustrtc::media::track::sample_track(rustrtc::media::MediaKind::Video, 100);
-            let mut video_params = RtpCodecParameters::default();
-            video_params.payload_type = video_cap.payload_type;
-            video_params.clock_rate = video_cap.clock_rate;
-            video_params.channels = 0;
+            let video_params = RtpCodecParameters {
+                payload_type: video_cap.payload_type,
+                clock_rate: video_cap.clock_rate,
+                channels: 0,
+            };
             let _ = pc.add_track(video_track, video_params);
         }
 
@@ -315,6 +335,7 @@ impl RtcTrack {
             recorder_option: None,
             rtp_map,
             muted: std::sync::atomic::AtomicBool::new(false),
+            sender: Some(tx),
         }
     }
 
@@ -324,8 +345,8 @@ impl RtcTrack {
     }
 
     async fn set_local(&self, pc: &PeerConnection, mut desc: SessionDescription) -> Result<String> {
-        if !self.rtp_map.is_empty() {
-            if let Some(section) = desc
+        if !self.rtp_map.is_empty()
+            && let Some(section) = desc
                 .media_sections
                 .iter_mut()
                 .find(|m| m.kind == MediaKind::Audio)
@@ -356,7 +377,6 @@ impl RtcTrack {
                     }
                 }
             }
-        }
         pc.set_local_description(desc)?;
         let desc = pc
             .local_description()
@@ -405,11 +425,10 @@ impl Track for RtcTrack {
             }
             Err(e) => {
                 let err_str = e.to_string();
-                if err_str.contains("HaveLocalOffer") {
-                    if let Some(desc) = self.pc.local_description() {
+                if err_str.contains("HaveLocalOffer")
+                    && let Some(desc) = self.pc.local_description() {
                         return Ok(desc.to_sdp_string());
                     }
-                }
                 Err(anyhow!(e))
             }
         }
@@ -443,6 +462,10 @@ impl Track for RtcTrack {
     fn is_muted(&self) -> bool {
         self.muted.load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    fn get_sender(&self) -> Option<SampleStreamSource> {
+        self.sender.clone()
+    }
 }
 
 impl Drop for RtcTrack {
@@ -461,6 +484,7 @@ pub struct RtpTrackBuilder {
     track_id: String,
     cancel_token: Option<CancellationToken>,
     external_ip: Option<String>,
+    bind_ip: Option<String>,
     rtp_start_port: Option<u16>,
     rtp_end_port: Option<u16>,
     mode: TransportMode,
@@ -476,6 +500,7 @@ impl RtpTrackBuilder {
             track_id,
             cancel_token: None,
             external_ip: None,
+            bind_ip: None,
             rtp_start_port: None,
             rtp_end_port: None,
             mode: TransportMode::Rtp,
@@ -494,7 +519,7 @@ impl RtpTrackBuilder {
             .map(|c| negotiate::CodecInfo {
                 payload_type: c.payload_type(),
                 clock_rate: c.clock_rate(),
-                channels: c.channels() as u16,
+                channels: c.channels(),
                 codec: c,
             })
             .collect(),
@@ -522,13 +547,18 @@ impl RtpTrackBuilder {
         self
     }
 
+    pub fn with_bind_ip(mut self, addr: String) -> Self {
+        self.bind_ip = Some(addr);
+        self
+    }
+
     pub fn with_codec_preference(mut self, codecs: Vec<CodecType>) -> Self {
         self.rtp_map = codecs
             .into_iter()
             .map(|c| negotiate::CodecInfo {
                 payload_type: c.payload_type(),
                 clock_rate: c.clock_rate(),
-                channels: c.channels() as u16,
+                channels: c.channels(),
                 codec: c,
             })
             .collect();
@@ -585,12 +615,18 @@ impl RtpTrackBuilder {
             negotiate::CodecInfo {
                 payload_type: codec.payload_type(),
                 clock_rate: codec.clock_rate(),
-                channels: codec.channels() as u16,
+                channels: codec.channels(),
                 codec,
             }
             .to_audio_capability()
         })
         .collect();
+
+        let bind_ip = if matches!(self.mode, TransportMode::Rtp | TransportMode::Srtp) {
+            self.bind_ip
+        } else {
+            None
+        };
 
         let config = RtcConfiguration {
             ice_servers: self.ice_servers,
@@ -603,6 +639,7 @@ impl RtpTrackBuilder {
             rtp_start_port: self.rtp_start_port,
             rtp_end_port: self.rtp_end_port,
             external_ip: self.external_ip,
+            bind_ip,
             enable_latching: self.enable_latching,
             media_capabilities: Some(rustrtc::config::MediaCapabilities {
                 audio: audio_capabilities,
@@ -638,8 +675,10 @@ pub struct FileTrack {
     rtp_start_port: Option<u16>,
     rtp_end_port: Option<u16>,
     external_ip: Option<String>,
+    bind_ip: Option<String>,
     audio_source_manager: Option<Arc<audio_source::AudioSourceManager>>,
     muted: std::sync::atomic::AtomicBool,
+    lifetime_guard: Arc<()>,
 }
 
 impl Clone for FileTrack {
@@ -657,11 +696,60 @@ impl Clone for FileTrack {
             rtp_start_port: self.rtp_start_port,
             rtp_end_port: self.rtp_end_port,
             external_ip: self.external_ip.clone(),
+            bind_ip: self.bind_ip.clone(),
             audio_source_manager: self.audio_source_manager.clone(),
             muted: std::sync::atomic::AtomicBool::new(
                 self.muted.load(std::sync::atomic::Ordering::Relaxed),
             ),
+            lifetime_guard: self.lifetime_guard.clone(),
         }
+    }
+}
+
+pub(crate) struct FileTrackPlaybackSource {
+    audio_source_manager: Arc<audio_source::AudioSourceManager>,
+    encoder: Box<dyn audio_codec::Encoder>,
+    codec_info: negotiate::CodecInfo,
+    samples_per_frame: usize,
+    rtp_ticks_per_frame: u32,
+    rtp_timestamp: u32,
+    sequence_number: u16,
+    completion_notify: Arc<tokio::sync::Notify>,
+    loop_playback: bool,
+}
+
+impl FileTrackPlaybackSource {
+    pub(crate) fn next_audio_sample(&mut self) -> Option<MediaSample> {
+        let mut pcm_buf = vec![0i16; self.samples_per_frame];
+        let mut read = self.audio_source_manager.read_samples(&mut pcm_buf);
+
+        if read == 0 && self.loop_playback {
+            read = self.audio_source_manager.read_samples(&mut pcm_buf);
+        }
+
+        if read == 0 {
+            debug!("FileTrack playback completed (source exhausted)");
+            self.completion_notify.notify_waiters();
+            return None;
+        }
+
+        let encoded = self.encoder.encode(&pcm_buf[..read]);
+        let frame = AudioFrame {
+            rtp_timestamp: self.rtp_timestamp,
+            clock_rate: self.codec_info.clock_rate,
+            data: encoded.into(),
+            sequence_number: Some(self.sequence_number),
+            payload_type: Some(self.codec_info.payload_type),
+            marker: false,
+            header_extension: None,
+            raw_packet: None,
+            source_addr: None,
+        };
+
+        self.rtp_timestamp = self.rtp_timestamp.wrapping_add(self.rtp_ticks_per_frame);
+        self.sequence_number = self.sequence_number.wrapping_add(1);
+
+        Some(MediaSample::Audio(frame))
     }
 }
 
@@ -688,8 +776,10 @@ impl FileTrack {
             rtp_start_port: None,
             rtp_end_port: None,
             external_ip: None,
+            bind_ip: None,
             audio_source_manager: None,
             muted: std::sync::atomic::AtomicBool::new(false),
+            lifetime_guard: Arc::new(()),
         }
     }
 
@@ -737,12 +827,25 @@ impl FileTrack {
         self
     }
 
+    pub fn with_bind_ip(mut self, ip: String) -> Self {
+        self.bind_ip = Some(ip);
+        self.recreate_pc();
+        self
+    }
+
     fn recreate_pc(&mut self) {
+        let bind_ip = if matches!(self.mode, TransportMode::Rtp | TransportMode::Srtp) {
+            self.bind_ip.clone()
+        } else {
+            None
+        };
+
         let config = RtcConfiguration {
             transport_mode: self.mode.clone(),
             rtp_start_port: self.rtp_start_port,
             rtp_end_port: self.rtp_end_port,
             external_ip: self.external_ip.clone(),
+            bind_ip,
             ssrc_start: rand::random::<u32>(),
             ..Default::default()
         };
@@ -791,6 +894,70 @@ impl FileTrack {
     pub async fn start_playback(&self) -> Result<()> {
         self.start_playback_on(None).await
     }
+
+    pub(crate) fn create_playback_source(&self) -> Result<FileTrackPlaybackSource> {
+        let file_path = self.file_path.as_deref();
+
+        if let Some(file_path) = file_path {
+            let is_remote = file_path.starts_with("http://") || file_path.starts_with("https://");
+            if !is_remote && !std::path::Path::new(file_path).exists() {
+                return Err(anyhow!("Audio file not found: {}", file_path));
+            }
+        }
+
+        let selected = self.codec_info.clone().unwrap_or_else(|| {
+            let codec = self
+                .codec_preference
+                .first()
+                .copied()
+                .unwrap_or(CodecType::PCMU);
+            negotiate::CodecInfo {
+                payload_type: codec.payload_type(),
+                codec,
+                clock_rate: codec.clock_rate(),
+                channels: codec.channels(),
+            }
+        });
+        let frame_timing = audio_frame_timing(selected.codec, selected.clock_rate);
+        let audio_source_manager = {
+            if let Some(ref mgr) = self.audio_source_manager {
+                mgr.clone()
+            } else {
+                let mgr = Arc::new(audio_source::AudioSourceManager::new(
+                    frame_timing.pcm_sample_rate,
+                ));
+                if let Some(file_path) = file_path {
+                    mgr.switch_to_file(file_path.to_string(), self.loop_playback)?;
+                } else {
+                    mgr.switch_to_silence();
+                }
+                mgr
+            }
+        };
+
+        debug!(
+            file = %file_path.unwrap_or("<silence>"),
+            loop_playback = self.loop_playback,
+            codec = ?selected.codec,
+            samples_per_frame = frame_timing.pcm_samples_per_frame,
+            pcm_sample_rate = frame_timing.pcm_sample_rate,
+            rtp_ticks_per_frame = frame_timing.rtp_ticks_per_frame,
+            "FileTrack playback source created"
+        );
+
+        Ok(FileTrackPlaybackSource {
+            audio_source_manager,
+            encoder: audio_codec::create_encoder(selected.codec),
+            codec_info: selected,
+            samples_per_frame: frame_timing.pcm_samples_per_frame,
+            rtp_ticks_per_frame: frame_timing.rtp_ticks_per_frame,
+            rtp_timestamp: rand::random(),
+            sequence_number: rand::random(),
+            completion_notify: self.completion_notify.clone(),
+            loop_playback: self.loop_playback,
+        })
+    }
+
     pub async fn start_playback_on(&self, target_pc: Option<PeerConnection>) -> Result<()> {
         use audio_codec::create_encoder;
         use rustrtc::media::{AudioFrame, MediaSample};
@@ -817,7 +984,7 @@ impl FileTrack {
                 payload_type: codec.payload_type(),
                 codec,
                 clock_rate: codec.clock_rate(),
-                channels: codec.channels() as u16,
+                channels: codec.channels(),
             }
         });
         let codec = selected.codec;
@@ -868,10 +1035,11 @@ impl FileTrack {
         let existing = transceivers.iter().find(|t| t.kind() == MediaKind::Audio);
 
         let ssrc = rand::random::<u32>();
-        let mut params = RtpCodecParameters::default();
-        params.payload_type = payload_type;
-        params.clock_rate = selected.clock_rate;
-        params.channels = selected.channels as u8;
+        let params = RtpCodecParameters {
+            payload_type,
+            clock_rate: selected.clock_rate,
+            channels: selected.channels as u8,
+        };
 
         if let Some(transceiver) = existing {
             let track_arc: Arc<dyn rustrtc::media::MediaStreamTrack> = track_target;
@@ -996,8 +1164,8 @@ impl Track for FileTrack {
 
         let mut offer = self.pc.create_offer().await?;
 
-        if !self.codec_preference.is_empty() {
-            if let Some(section) = offer
+        if !self.codec_preference.is_empty()
+            && let Some(section) = offer
                 .media_sections
                 .iter_mut()
                 .find(|m| m.kind == MediaKind::Audio)
@@ -1028,7 +1196,6 @@ impl Track for FileTrack {
                     }
                 }
             }
-        }
 
         self.pc.set_local_description(offer.clone())?;
         Ok(offer.to_sdp_string())
@@ -1043,6 +1210,7 @@ impl Track for FileTrack {
 
     async fn stop(&self) {
         self.cancel_token.cancel();
+        self.completion_notify.notify_waiters();
     }
 
     async fn get_peer_connection(&self) -> Option<PeerConnection> {
@@ -1066,9 +1234,11 @@ impl Track for FileTrack {
 
 impl Drop for FileTrack {
     fn drop(&mut self) {
-        debug!(track_id = %self.track_id, "FileTrack dropping, closing PeerConnection");
-        self.cancel_token.cancel();
-        self.pc.close();
+        if Arc::strong_count(&self.lifetime_guard) == 1 {
+            debug!(track_id = %self.track_id, "FileTrack dropping, closing PeerConnection");
+            self.cancel_token.cancel();
+            self.pc.close();
+        }
     }
 }
 

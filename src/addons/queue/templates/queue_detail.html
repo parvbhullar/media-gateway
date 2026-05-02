@@ -8,6 +8,7 @@ endblock %}
 {% set base_url = base_path | safe %}
 <div class="p-6" x-data='queueDetailPage({
         basePath: {{ base_url | tojson }},
+        apiPrefix: {{ api_prefix | default('/api') | tojson }},
         mode: {{ page_mode | tojson }},
         model: {{ model_data | tojson }},
         createUrl: {{ create_url | tojson }},
@@ -76,6 +77,9 @@ endblock %}
                     </button>
                     <button type="button" @click="activeTab = 'fallback'" :class="tabButtonClasses('fallback')"
                         x-text="tt('queue.tab_fallback')">
+                    </button>
+                    <button type="button" @click="activeTab = 'voice_prompts'" :class="tabButtonClasses('voice_prompts')"
+                        x-text="tt('queue.tab_voice_prompts')">
                     </button>
                 </div>
             </div>
@@ -196,15 +200,40 @@ endblock %}
                             <span class="text-xs font-normal text-slate-400"
                                 x-text="tt('queue.field_ring_timeout_hint')"></span>
                         </label>
+                        <label class="md:col-span-2 flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            <span x-text="tt('queue.field_acd_policy')"></span>
+                            <template x-if="acdPolicies.length">
+                                <select x-model="form.spec.acd_policy"
+                                    class="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                    <option value="" x-text="tt('queue.field_acd_policy_placeholder')"></option>
+                                    <template x-for="policy in acdPolicies" :key="policy.name">
+                                        <option :value="policy.name" x-text="policy.name"></option>
+                                    </template>
+                                </select>
+                            </template>
+                            <template x-if="!acdPolicies.length">
+                                <input type="text" x-model.trim="form.spec.acd_policy"
+                                    class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                    :placeholder="tt('queue.field_acd_policy_placeholder')">
+                            </template>
+                            <span class="text-xs font-normal text-slate-400" x-text="tt('queue.field_acd_policy_hint')"></span>
+                        </label>
                     </div>
                     <div class="space-y-3">
                         <div class="flex items-center justify-between">
                             <h3 class="text-sm font-semibold text-slate-800" x-text="tt('queue.dial_targets_title')">
                             </h3>
-                            <button type="button" @click="addStrategyTarget()"
-                                class="inline-flex items-center gap-2 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-600 hover:bg-slate-50"
-                                x-text="tt('queue.add_target')">
-                            </button>
+                            <div class="flex items-center gap-2">
+                                <button type="button" @click="addStrategyTarget('sip')"
+                                    class="inline-flex items-center gap-2 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-600 hover:bg-slate-50"
+                                    x-text="tt('queue.add_target')">
+                                </button>
+                                <button type="button" @click="addStrategyTarget('skill_group')"
+                                    x-show="skillGroups.length"
+                                    class="inline-flex items-center gap-2 rounded-lg border border-indigo-200 px-3 py-1.5 text-xs font-semibold text-indigo-600 hover:bg-indigo-50"
+                                    x-text="tt('queue.add_skill_group_target')">
+                                </button>
+                            </div>
                         </div>
                         <template x-if="!form.spec.strategy.targets.length">
                             <p class="text-xs text-slate-400" x-text="tt('queue.no_targets')"></p>
@@ -212,14 +241,33 @@ endblock %}
                         <div class="space-y-3">
                             <template x-for="(target, index) in form.spec.strategy.targets" :key="index">
                                 <div
-                                    class="grid gap-3 rounded-lg border border-slate-200 p-3 md:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_auto]">
-                                    <label
-                                        class="flex flex-col gap-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
-                                        <span x-text="tt('queue.target_uri')"></span>
-                                        <input type="text" x-model.trim="target.uri"
-                                            class="rounded-lg border border-slate-200 px-3 py-2 text-sm font-normal text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
-                                            :placeholder="tt('queue.target_uri_placeholder')">
-                                    </label>
+                                    class="grid gap-3 rounded-lg border border-slate-200 p-3"
+                                    :class="target.uri && target.uri.startsWith('skill-group:') ? 'md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]' : 'md:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_auto]'">
+                                    <!-- SIP Target -->
+                                    <template x-if="!target.uri || !target.uri.startsWith('skill-group:')">
+                                        <label
+                                            class="flex flex-col gap-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                                            <span x-text="tt('queue.target_uri')"></span>
+                                            <input type="text" x-model.trim="target.uri"
+                                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm font-normal text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                                :placeholder="tt('queue.target_uri_placeholder')">
+                                        </label>
+                                    </template>
+                                    <!-- Skill Group Target -->
+                                    <template x-if="target.uri && target.uri.startsWith('skill-group:')">
+                                        <label class="flex flex-col gap-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                                            <span x-text="tt('queue.target_skill_group')"></span>
+                                            <select x-model="target.skill_group_id"
+                                                x-effect="target.skill_group_id && skillGroups.length ? $el.value = target.skill_group_id : ''"
+                                                @change="target.uri = 'skill-group:' + target.skill_group_id"
+                                                class="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                                <option value="" x-text="tt('queue.skill_group_select_placeholder')"></option>
+                                                <template x-for="group in skillGroups" :key="group.skill_group_id">
+                                                    <option :value="group.skill_group_id" x-text="group.display_name || group.skill_group_id"></option>
+                                                </template>
+                                            </select>
+                                        </label>
+                                    </template>
                                     <label
                                         class="flex flex-col gap-1 text-xs font-semibold uppercase tracking-wide text-slate-500">
                                         <span x-text="tt('queue.target_label')"></span>
@@ -262,6 +310,11 @@ endblock %}
                             <input type="radio" name="queue-fallback" value="queue" x-model="fallbackMode"
                                 class="h-4 w-4 text-sky-600 focus:ring-sky-400">
                             <span x-text="tt('queue.fallback_queue_opt')"></span>
+                        </label>
+                        <label class="inline-flex items-center gap-2 text-sm font-medium text-slate-700" x-show="skillGroups.length" x-cloak>
+                            <input type="radio" name="queue-fallback" value="skill_group" x-model="fallbackMode"
+                                class="h-4 w-4 text-sky-600 focus:ring-sky-400">
+                            <span x-text="tt('queue.fallback_skill_group_opt')"></span>
                         </label>
                         <label class="inline-flex items-center gap-2 text-sm font-medium text-slate-700">
                             <input type="radio" name="queue-fallback" value="failure" x-model="fallbackMode"
@@ -309,6 +362,171 @@ endblock %}
                                 x-text="tt('queue.fallback_queue_hint')"></span>
                         </label>
                     </div>
+                    <div class="grid gap-4 md:grid-cols-2" x-show="fallbackMode === 'skill_group'" x-cloak>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            <span x-text="tt('queue.fallback_skill_group_label')"></span>
+                            <template x-if="skillGroups.length">
+                                                <select x-model="form.spec.fallback.skill_group_ref"
+                                                    x-effect="form.spec.fallback.skill_group_ref && skillGroups.length ? $el.value = form.spec.fallback.skill_group_ref : ''"
+                                                    class="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                                    <option value="" x-text="tt('queue.fallback_skill_group_placeholder')"></option>
+                                                    <template x-for="group in skillGroups" :key="group.skill_group_id">
+                                                        <option :value="group.skill_group_id" x-text="group.display_name || group.skill_group_id"></option>
+                                                    </template>
+                                                </select>
+                            </template>
+                            <template x-if="!skillGroups.length">
+                                <input type="text" x-model.trim="form.spec.fallback.skill_group_ref"
+                                    class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                    :placeholder="tt('queue.fallback_skill_group_placeholder')">
+                            </template>
+                            <span class="text-xs font-normal text-slate-400" x-text="tt('queue.fallback_skill_group_hint')"></span>
+                        </label>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Voice Prompts tab -->
+            <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5" x-show="activeTab === 'voice_prompts'" x-cloak>
+                <div class="flex flex-col gap-1">
+                    <h2 class="text-sm font-semibold text-slate-900" x-text="tt('queue.section_voice_prompts')"></h2>
+                    <p class="text-sm text-slate-500" x-text="tt('queue.section_voice_prompts_desc')"></p>
+                </div>
+                <div class="mt-6 space-y-6">
+                    <!-- Transfer prompt -->
+                    <div class="rounded-lg border border-slate-200 p-4">
+                        <h3 class="text-sm font-semibold text-slate-800" x-text="tt('queue.vp_transfer')"></h3>
+                        <p class="mt-1 text-xs text-slate-500" x-text="tt('queue.vp_transfer_desc')"></p>
+                        <div class="mt-3 grid gap-3 md:grid-cols-3">
+                            <select x-model="vpTransferType"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <option value="none" x-text="tt('queue.vp_none')"></option>
+                                <option value="zh" x-text="tt('queue.vp_chinese')"></option>
+                                <option value="en" x-text="tt('queue.vp_english')"></option>
+                                <option value="custom" x-text="tt('queue.vp_custom')"></option>
+                            </select>
+                            <div class="flex items-center gap-2 md:col-span-2">
+                                <input type="text" x-show="vpTransferType === 'custom'" x-model.trim="vpTransferCustom"
+                                    class="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                    :placeholder="tt('queue.vp_url_placeholder')">
+                                <button type="button" x-show="vpTransferType === 'custom' && vpTransferCustom.startsWith('http')"
+                                    @click="downloadAudio(vpTransferCustom, 'transfer')"
+                                    :disabled="downloadingTransfer"
+                                    class="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 hover:border-sky-300 hover:text-sky-700"
+                                    x-text="downloadingTransfer ? tt('queue.vp_downloading') : tt('queue.vp_download')">
+                                </button>
+                            </div>
+                        </div>
+                        <div class="mt-2 flex items-center gap-2">
+                            <button type="button" @click="previewAudio('transfer')"
+                                class="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-600 hover:border-indigo-300 hover:text-indigo-700"
+                                x-text="tt('queue.vp_preview')">
+                            </button>
+                            <span class="text-xs text-slate-400" x-text="vpTransferPath || ''"></span>
+                        </div>
+                    </div>
+
+                    <!-- Busy prompt -->
+                    <div class="rounded-lg border border-slate-200 p-4">
+                        <h3 class="text-sm font-semibold text-slate-800" x-text="tt('queue.vp_busy')"></h3>
+                        <p class="mt-1 text-xs text-slate-500" x-text="tt('queue.vp_busy_desc')"></p>
+                        <div class="mt-3 grid gap-3 md:grid-cols-3">
+                            <select x-model="vpBusyType"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <option value="none" x-text="tt('queue.vp_none')"></option>
+                                <option value="zh" x-text="tt('queue.vp_chinese')"></option>
+                                <option value="en" x-text="tt('queue.vp_english')"></option>
+                                <option value="custom" x-text="tt('queue.vp_custom')"></option>
+                            </select>
+                            <div class="flex items-center gap-2 md:col-span-2">
+                                <input type="text" x-show="vpBusyType === 'custom'" x-model.trim="vpBusyCustom"
+                                    class="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                    :placeholder="tt('queue.vp_url_placeholder')">
+                                <button type="button" x-show="vpBusyType === 'custom' && vpBusyCustom.startsWith('http')"
+                                    @click="downloadAudio(vpBusyCustom, 'busy')"
+                                    :disabled="downloadingBusy"
+                                    class="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 hover:border-sky-300 hover:text-sky-700"
+                                    x-text="downloadingBusy ? tt('queue.vp_downloading') : tt('queue.vp_download')">
+                                </button>
+                            </div>
+                        </div>
+                        <div class="mt-2 flex items-center gap-2">
+                            <button type="button" @click="previewAudio('busy')"
+                                class="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-600 hover:border-indigo-300 hover:text-indigo-700"
+                                x-text="tt('queue.vp_preview')">
+                            </button>
+                            <span class="text-xs text-slate-400" x-text="vpBusyPath || ''"></span>
+                        </div>
+                    </div>
+
+                    <!-- Off-hours prompt -->
+                    <div class="rounded-lg border border-slate-200 p-4">
+                        <h3 class="text-sm font-semibold text-slate-800" x-text="tt('queue.vp_off_hours')"></h3>
+                        <p class="mt-1 text-xs text-slate-500" x-text="tt('queue.vp_off_hours_desc')"></p>
+                        <div class="mt-3 grid gap-3 md:grid-cols-3">
+                            <select x-model="vpOffHoursType"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <option value="none" x-text="tt('queue.vp_none')"></option>
+                                <option value="zh" x-text="tt('queue.vp_chinese')"></option>
+                                <option value="en" x-text="tt('queue.vp_english')"></option>
+                                <option value="custom" x-text="tt('queue.vp_custom')"></option>
+                            </select>
+                            <div class="flex items-center gap-2 md:col-span-2">
+                                <input type="text" x-show="vpOffHoursType === 'custom'" x-model.trim="vpOffHoursCustom"
+                                    class="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                    :placeholder="tt('queue.vp_url_placeholder')">
+                                <button type="button" x-show="vpOffHoursType === 'custom' && vpOffHoursCustom.startsWith('http')"
+                                    @click="downloadAudio(vpOffHoursCustom, 'offhours')"
+                                    :disabled="downloadingOffHours"
+                                    class="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 hover:border-sky-300 hover:text-sky-700"
+                                    x-text="downloadingOffHours ? tt('queue.vp_downloading') : tt('queue.vp_download')">
+                                </button>
+                            </div>
+                        </div>
+                        <div class="mt-2 flex items-center gap-2">
+                            <button type="button" @click="previewAudio('offhours')"
+                                class="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-600 hover:border-indigo-300 hover:text-indigo-700"
+                                x-text="tt('queue.vp_preview')">
+                            </button>
+                            <span class="text-xs text-slate-400" x-text="vpOffHoursPath || ''"></span>
+                        </div>
+                    </div>
+
+                    <!-- No-answer prompt -->
+                    <div class="rounded-lg border border-slate-200 p-4">
+                        <h3 class="text-sm font-semibold text-slate-800" x-text="tt('queue.vp_no_answer')"></h3>
+                        <p class="mt-1 text-xs text-slate-500" x-text="tt('queue.vp_no_answer_desc')"></p>
+                        <div class="mt-3 grid gap-3 md:grid-cols-3">
+                            <select x-model="vpNoAnswerType"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <option value="none" x-text="tt('queue.vp_none')"></option>
+                                <option value="zh" x-text="tt('queue.vp_chinese')"></option>
+                                <option value="en" x-text="tt('queue.vp_english')"></option>
+                                <option value="custom" x-text="tt('queue.vp_custom')"></option>
+                            </select>
+                            <div class="flex items-center gap-2 md:col-span-2">
+                                <input type="text" x-show="vpNoAnswerType === 'custom'" x-model.trim="vpNoAnswerCustom"
+                                    class="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                    :placeholder="tt('queue.vp_url_placeholder')">
+                                <button type="button" x-show="vpNoAnswerType === 'custom' && vpNoAnswerCustom.startsWith('http')"
+                                    @click="downloadAudio(vpNoAnswerCustom, 'noanswer')"
+                                    :disabled="downloadingNoAnswer"
+                                    class="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 hover:border-sky-300 hover:text-sky-700"
+                                    x-text="downloadingNoAnswer ? tt('queue.vp_downloading') : tt('queue.vp_download')">
+                                </button>
+                            </div>
+                        </div>
+                        <div class="mt-2 flex items-center gap-2">
+                            <button type="button" @click="previewAudio('noanswer')"
+                                class="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-600 hover:border-indigo-300 hover:text-indigo-700"
+                                x-text="tt('queue.vp_preview')">
+                            </button>
+                            <span class="text-xs text-slate-400" x-text="vpNoAnswerPath || ''"></span>
+                        </div>
+                    </div>
+
+                    <!-- Preview audio element (hidden) -->
+                    <audio x-ref="audioPreview" controls class="hidden"></audio>
                 </div>
             </section>
 
@@ -336,10 +554,12 @@ endblock %}
 </div>
 
 <script>
+    window.__consoleApiPrefix = {{ api_prefix | default('/api') | tojson }};
     window._queueTranslations = {{ t | json | safe }};
     document.addEventListener('alpine:init', () => {
         Alpine.data('queueDetailPage', (options) => ({
             basePath: options.basePath || '/console',
+            apiPrefix: options.apiPrefix || '/api',
             mode: options.mode || 'create',
             model: options.model || null,
             createUrl: options.createUrl || `${options.basePath || '/console'}/queues`,
@@ -348,6 +568,9 @@ endblock %}
             t: window._queueTranslations,
             pageTitle: options.mode === 'edit' ? (window._queueTranslations?.queue?.detail_subtitle_edit || 'Edit queue') : (window._queueTranslations?.queue?.new_queue || 'New queue'),
             activeTab: 'overview',
+            skillGroups: [],
+            acdPolicies: [],
+            pendingSkillGroup: '',
             form: {
                 name: '',
                 description: '',
@@ -366,21 +589,147 @@ endblock %}
                         failure_reason: '',
                         failure_prompt: '',
                         queue_ref: '',
+                        skill_group_ref: '',
                     },
                     strategy: {
                         mode: 'sequential',
                         wait_timeout_secs: null,
                         targets: [],
+                        skill_groups: [],
                     },
+                    acd_policy: '',
                 },
             },
             holdEnabled: false,
             fallbackMode: 'none',
+            // Voice prompts
+            vpTransferType: 'none',
+            vpBusyType: 'none',
+            vpOffHoursType: 'none',
+            vpNoAnswerType: 'none',
+            vpTransferCustom: '',
+            vpBusyCustom: '',
+            vpOffHoursCustom: '',
+            vpNoAnswerCustom: '',
+            vpTransferPath: '',
+            vpBusyPath: '',
+            vpOffHoursPath: '',
+            vpNoAnswerPath: '',
+            downloadingTransfer: false,
+            downloadingBusy: false,
+            downloadingOffHours: false,
+            downloadingNoAnswer: false,
             saving: false,
             success: null,
             error: null,
+            normalizeApiPrefix(value) {
+                const raw = String(value || '/api').trim();
+                if (!raw) {
+                    return '/api';
+                }
+                const normalized = raw.replace(/\/+$/, '');
+                if (/\/api(?:\/|$)/.test(normalized)) {
+                    return normalized;
+                }
+                return `${normalized}/api`;
+            },
             init() {
+                this.apiPrefix = this.normalizeApiPrefix(this.apiPrefix || window.__consoleApiPrefix || '/api');
                 this.applyModel(this.model || {});
+                this.loadSkillGroups();
+                this.loadAcdPolicies();
+            },
+            extractSkillGroupId(value) {
+                const raw = String(value || '').trim();
+                if (!raw) {
+                    return '';
+                }
+                const match = raw.match(/^skill(?:-|_)?group:(.+)$/i);
+                if (match && match[1]) {
+                    return match[1].trim();
+                }
+                return raw;
+            },
+            toSkillGroupUri(value) {
+                const id = this.extractSkillGroupId(value);
+                return id ? `skill-group:${id}` : '';
+            },
+            reconcileSkillGroupTargets() {
+                const targets = this.form?.spec?.strategy?.targets;
+                if (!Array.isArray(targets)) {
+                    return;
+                }
+                targets.forEach((target) => {
+                    if (!target || typeof target !== 'object') {
+                        return;
+                    }
+                    const groupId = this.extractSkillGroupId(target.skill_group_id || target.uri);
+                    if (!groupId) {
+                        return;
+                    }
+                    target.skill_group_id = groupId;
+                    target.uri = this.toSkillGroupUri(groupId);
+                });
+                const fallbackRef = this.extractSkillGroupId(this.form?.spec?.fallback?.skill_group_ref);
+                if (fallbackRef && this.form?.spec?.fallback) {
+                    this.form.spec.fallback.skill_group_ref = fallbackRef;
+                }
+            },
+            hasSkillGroupOption(value) {
+                const target = this.extractSkillGroupId(value);
+                if (!target) {
+                    return false;
+                }
+                return (this.skillGroups || []).some((group) => {
+                    const id = this.extractSkillGroupId(group?.skill_group_id);
+                    return id === target;
+                });
+            },
+            loadSkillGroups() {
+                // Try to load skill groups from CC addon API
+                const loader = window.__ccSkillGroupsLoader;
+                if (typeof loader === 'function') {
+                    loader()
+                        .then((groups) => {
+                            this.skillGroups = Array.isArray(groups) ? groups : [];
+                            this.reconcileSkillGroupTargets();
+                        })
+                        .catch(() => {
+                            this.skillGroups = [];
+                        });
+                } else {
+                    fetch(this.apiPrefix + '/cc/skill-groups', { credentials: 'same-origin' })
+                        .then(res => res.ok ? res.json() : null)
+                        .then(payload => {
+                            const arr = Array.isArray(payload) ? payload : (payload && Array.isArray(payload.data) ? payload.data : []);
+                            this.skillGroups = arr;
+                            this.reconcileSkillGroupTargets();
+                        })
+                        .catch(() => {
+                            this.skillGroups = [];
+                        });
+                }
+            },
+            loadAcdPolicies() {
+                const loader = window.__ccAcdPoliciesLoader;
+                if (typeof loader === 'function') {
+                    loader()
+                        .then((policies) => {
+                            this.acdPolicies = Array.isArray(policies) ? policies : [];
+                        })
+                        .catch(() => {
+                            this.acdPolicies = [];
+                        });
+                    return;
+                }
+                fetch(this.apiPrefix + '/cc/acd/policies', { credentials: 'same-origin' })
+                    .then(res => res.ok ? res.json() : { data: [] })
+                    .then(payload => {
+                        this.acdPolicies = Array.isArray(payload?.data) ? payload.data : [];
+                    })
+                    .catch(() => {
+                        this.acdPolicies = [];
+                    });
             },
             tt(key) {
                 const parts = key.split('.');
@@ -390,6 +739,99 @@ endblock %}
                     val = val[part];
                 }
                 return val != null ? String(val) : key;
+            },
+            VP_PATHS: {
+                transfer: { zh: 'sounds/queue-transfer-zh.wav', en: 'sounds/queue-transfer-en.wav' },
+                busy: { zh: 'sounds/queue-busy-zh.wav', en: 'sounds/queue-busy-en.wav' },
+                offhours: { zh: 'sounds/queue-off-hours-zh.wav', en: 'sounds/queue-off-hours-en.wav' },
+                noanswer: { zh: 'sounds/queue-no-answer-zh.wav', en: 'sounds/queue-no-answer-en.wav' },
+            },
+            vpTypeFor(path) {
+                if (!path) return 'none';
+                for (const [type, langs] of Object.entries(this.VP_PATHS)) {
+                    for (const [lang, p] of Object.entries(langs)) {
+                        if (path === p) return lang;
+                    }
+                }
+                return 'custom';
+            },
+            loadVoicePrompts(vp) {
+                if (!vp || typeof vp !== 'object') return;
+                this.vpTransferType = this.vpTypeFor(vp.transfer_prompt);
+                this.vpBusyType = this.vpTypeFor(vp.busy_prompt);
+                this.vpOffHoursType = this.vpTypeFor(vp.off_hours_prompt);
+                this.vpNoAnswerType = this.vpTypeFor(vp.no_answer_prompt);
+                this.vpTransferPath = vp.transfer_prompt || '';
+                this.vpBusyPath = vp.busy_prompt || '';
+                this.vpOffHoursPath = vp.off_hours_prompt || '';
+                this.vpNoAnswerPath = vp.no_answer_prompt || '';
+                if (this.vpTransferType === 'custom') this.vpTransferCustom = vp.transfer_prompt;
+                if (this.vpBusyType === 'custom') this.vpBusyCustom = vp.busy_prompt;
+                if (this.vpOffHoursType === 'custom') this.vpOffHoursCustom = vp.off_hours_prompt;
+                if (this.vpNoAnswerType === 'custom') this.vpNoAnswerCustom = vp.no_answer_prompt;
+            },
+            buildVoicePrompts() {
+                const result = {};
+                const transfer = this.resolvePrompt('transfer', this.vpTransferType, this.vpTransferCustom);
+                const busy = this.resolvePrompt('busy', this.vpBusyType, this.vpBusyCustom);
+                const offhours = this.resolvePrompt('offhours', this.vpOffHoursType, this.vpOffHoursCustom);
+                const noanswer = this.resolvePrompt('noanswer', this.vpNoAnswerType, this.vpNoAnswerCustom);
+                if (transfer) result.transfer_prompt = transfer;
+                if (busy) result.busy_prompt = busy;
+                if (offhours) result.off_hours_prompt = offhours;
+                if (noanswer) result.no_answer_prompt = noanswer;
+                return Object.keys(result).length ? result : null;
+            },
+            resolvePrompt(type, lang, custom) {
+                if (lang === 'none' || !lang) return null;
+                if (lang === 'custom') return custom || null;
+                return this.VP_PATHS[type]?.[lang] || null;
+            },
+            async downloadAudio(url, type) {
+                const loadingKey = type === 'transfer' ? 'downloadingTransfer'
+                    : type === 'busy' ? 'downloadingBusy'
+                    : type === 'noanswer' ? 'downloadingNoAnswer' : 'downloadingOffHours';
+                this[loadingKey] = true;
+                try {
+                    const resp = await fetch(`${this.basePath}/queues/download-audio`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                        body: JSON.stringify({ url }),
+                    });
+                    const data = await resp.json().catch(() => ({}));
+                    if (!resp.ok) throw new Error(data?.message || 'Download failed');
+                    const path = data.path;
+                    if (type === 'transfer') { this.vpTransferCustom = path; this.vpTransferPath = path; }
+                    else if (type === 'busy') { this.vpBusyCustom = path; this.vpBusyPath = path; }
+                    else if (type === 'noanswer') { this.vpNoAnswerCustom = path; this.vpNoAnswerPath = path; }
+                    else { this.vpOffHoursCustom = path; this.vpOffHoursPath = path; }
+                } catch (err) {
+                    console.error(err);
+                    alert(err.message || 'Download failed');
+                } finally {
+                    this[loadingKey] = false;
+                }
+            },
+            previewAudio(type) {
+                let path = type === 'transfer' ? this.vpTransferPath
+                    : type === 'busy' ? this.vpBusyPath
+                    : type === 'noanswer' ? this.vpNoAnswerPath : this.vpOffHoursPath;
+                if (!path) {
+                    const lang = type === 'transfer' ? this.vpTransferType
+                        : type === 'busy' ? this.vpBusyType
+                        : type === 'noanswer' ? this.vpNoAnswerType : this.vpOffHoursType;
+                    if (lang && lang !== 'none' && lang !== 'custom') {
+                        path = this.VP_PATHS[type]?.[lang];
+                    }
+                }
+                if (!path) return;
+                const url = `${this.basePath}/queues/sound/${path.replace(/^sounds\//, '')}`;
+                const audio = this.$refs.audioPreview;
+                if (audio) {
+                    audio.src = url;
+                    audio.classList.remove('hidden');
+                    audio.play().catch(() => {});
+                }
             },
             tabButtonClasses(tab) {
                 return this.activeTab === tab
@@ -412,6 +854,8 @@ endblock %}
                 this.form.spec = spec;
                 this.holdEnabled = Boolean(spec.hold && (spec.hold.audio_file || spec.hold.loop_playback === false));
                 this.fallbackMode = this.detectFallbackMode(spec.fallback);
+                // Parse voice prompts from spec
+                this.loadVoicePrompts(spec.voice_prompts);
                 this.pageTitle = this.mode === 'edit'
                     ? (model.name ? `${this.tt('queue.detail_subtitle_edit')} - ${model.name}` : this.tt('queue.detail_subtitle_edit'))
                     : this.tt('queue.new_queue');
@@ -430,25 +874,76 @@ endblock %}
                         failure_reason: raw?.fallback?.failure_reason || '',
                         failure_prompt: raw?.fallback?.failure_prompt || '',
                         queue_ref: raw?.fallback?.queue_ref || '',
+                        skill_group_ref: this.extractSkillGroupId(raw?.fallback?.skill_group_ref || ''),
                     },
                     strategy: {
                         mode: raw?.strategy?.mode === 'parallel' ? 'parallel' : 'sequential',
                         wait_timeout_secs: Number.isFinite(Number(raw?.strategy?.wait_timeout_secs))
                             ? Number(raw.strategy.wait_timeout_secs)
                             : null,
-                        targets: Array.isArray(raw?.strategy?.targets)
-                            ? raw.strategy.targets
-                                .map((target) => ({
-                                    uri: (target?.uri || '').trim(),
-                                    label: (target?.label || '').trim(),
-                                }))
-                                .filter((target) => target.uri)
-                            : [],
+                        targets: (() => {
+                            const list = [];
+                            if (Array.isArray(raw?.strategy?.targets)) {
+                                raw.strategy.targets.forEach((target) => {
+                                    const uriText = (target?.uri || '').trim();
+                                    const legacySkillId = this.extractSkillGroupId(target?.skill_group_id || uriText);
+                                    if (legacySkillId && (/^skill(?:-|_)?group:/i.test(uriText) || target?.skill_group_id)) {
+                                        list.push({
+                                            uri: this.toSkillGroupUri(legacySkillId),
+                                            label: (target?.label || '').trim(),
+                                            skill_group_id: legacySkillId,
+                                        });
+                                        return;
+                                    }
+                                    if (uriText) {
+                                        list.push({
+                                            uri: uriText,
+                                            label: (target?.label || '').trim(),
+                                        });
+                                    }
+                                });
+                            }
+                            if (Array.isArray(raw?.strategy?.skill_groups)) {
+                                raw.strategy.skill_groups.forEach((entry) => {
+                                    const skillId = this.extractSkillGroupId(entry);
+                                    if (!skillId) {
+                                        return;
+                                    }
+                                    list.push({
+                                        uri: this.toSkillGroupUri(skillId),
+                                        label: '',
+                                        skill_group_id: skillId,
+                                    });
+                                });
+                            }
+                            const seen = new Set();
+                            return list.filter((target) => {
+                                const key = `${target.uri}|${target.label || ''}`;
+                                if (!target.uri || seen.has(key)) {
+                                    return false;
+                                }
+                                seen.add(key);
+                                return true;
+                            });
+                        })(),
                     },
+                    acd_policy: raw?.acd_policy || '',
+                    voice_prompts: raw?.voice_prompts || null,
                 };
                 return spec;
             },
             detectFallbackMode(fallback) {
+                if ((fallback?.skill_group_ref || '').trim()) {
+                    return 'skill_group';
+                }
+                if ((fallback?.queue_ref || '').trim().toLowerCase().startsWith('skill-group:')) {
+                    const ref = this.extractSkillGroupId(fallback.queue_ref);
+                    if (this.form?.spec?.fallback) {
+                        this.form.spec.fallback.skill_group_ref = ref;
+                        this.form.spec.fallback.queue_ref = '';
+                    }
+                    return 'skill_group';
+                }
                 if ((fallback?.queue_ref || '').trim()) {
                     return 'queue';
                 }
@@ -476,11 +971,19 @@ endblock %}
                 });
                 return unique;
             },
-            addStrategyTarget() {
+            addStrategyTarget(type) {
                 if (!Array.isArray(this.form.spec.strategy.targets)) {
                     this.form.spec.strategy.targets = [];
                 }
-                this.form.spec.strategy.targets.push({ uri: '', label: '' });
+                if (type === 'skill_group') {
+                    this.form.spec.strategy.targets.push({ 
+                        uri: 'skill-group:', 
+                        label: '',
+                        skill_group_id: ''
+                    });
+                } else {
+                    this.form.spec.strategy.targets.push({ uri: '', label: '' });
+                }
             },
             removeStrategyTarget(index) {
                 if (!Array.isArray(this.form.spec.strategy.targets)) {
@@ -512,6 +1015,11 @@ endblock %}
                     if (queueRef) {
                         spec.fallback = { queue_ref: queueRef };
                     }
+                } else if (this.fallbackMode === 'skill_group') {
+                    const skillGroupRef = (this.form.spec.fallback?.skill_group_ref || '').trim();
+                    if (skillGroupRef) {
+                        spec.fallback = { skill_group_ref: skillGroupRef };
+                    }
                 } else if (this.fallbackMode === 'failure') {
                     const code = Number(this.form.spec.fallback?.failure_code);
                     const payload = {
@@ -526,10 +1034,25 @@ endblock %}
 
                 const strategyMode = this.form.spec.strategy?.mode === 'parallel' ? 'parallel' : 'sequential';
                 const targets = (this.form.spec.strategy?.targets || [])
-                    .map((target) => ({
-                        uri: (target.uri || '').trim(),
-                        label: (target.label || '').trim() || null,
-                    }))
+                    .map((target) => {
+                        const uri = (target.uri || '').trim();
+                        // Handle skill-group targets
+                        if (/^skill(?:-|_)?group:/i.test(uri) || target?.skill_group_id) {
+                            const skillGroupId = this.extractSkillGroupId(target.skill_group_id || uri);
+                            if (skillGroupId) {
+                                return {
+                                    uri: this.toSkillGroupUri(skillGroupId),
+                                    label: (target.label || '').trim() || null,
+                                };
+                            }
+                            return null;
+                        }
+                        return {
+                            uri: uri,
+                            label: (target.label || '').trim() || null,
+                        };
+                    })
+                    .filter(Boolean)
                     .filter((target) => target.uri);
                 const waitTimeoutRaw = Number(this.form.spec.strategy?.wait_timeout_secs);
                 const waitTimeout = Number.isFinite(waitTimeoutRaw) && waitTimeoutRaw > 0
@@ -542,6 +1065,12 @@ endblock %}
                         targets,
                     };
                 }
+                const acdPolicy = (this.form.spec.acd_policy || '').trim();
+                if (acdPolicy) {
+                    spec.acd_policy = acdPolicy;
+                }
+                // Voice prompts
+                spec.voice_prompts = this.buildVoicePrompts();
                 return spec;
             },
             buildPayload() {

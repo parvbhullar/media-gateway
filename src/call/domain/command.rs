@@ -13,8 +13,14 @@
 //! 3. Media commands include capability-aware options
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 
 use super::{HangupCommand, LegId, MediaSource, RingbackPolicy};
+
+/// Type alias for CallCommand sender.
+pub type CallCommandTx = mpsc::UnboundedSender<CallCommand>;
+/// Type alias for CallCommand receiver.
+pub type CallCommandRx = mpsc::UnboundedReceiver<CallCommand>;
 
 /// Unified command for session control
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -23,7 +29,6 @@ pub enum CallCommand {
     // ============================================================================
     // Basic Call Control
     // ============================================================================
-
     /// Answer an incoming call leg
     Answer {
         /// The leg to answer
@@ -65,6 +70,19 @@ pub enum CallCommand {
         leg_id: LegId,
     },
 
+    /// Bridge two legs from different sessions (cross-session P2P).
+    /// Used when downgrading from a conference to P2P after transfer completion.
+    BridgeCrossSession {
+        /// First session ID
+        session_a: String,
+        /// First leg ID within session_a
+        leg_a: LegId,
+        /// Second session ID
+        session_b: String,
+        /// Second leg ID within session_b
+        leg_b: LegId,
+    },
+
     /// Transfer a leg to a target (blind transfer)
     Transfer {
         /// The leg to transfer
@@ -85,6 +103,18 @@ pub enum CallCommand {
     TransferCancel {
         /// The consultation leg to hangup
         consult_leg: LegId,
+    },
+
+    /// Complete a cross-session attended transfer by migrating a leg into a conference.
+    /// This is used in the BC -> ABC conference flow where leg_c from session2
+    /// needs to be migrated into a conference that also includes legs from session1.
+    TransferCompleteCrossSession {
+        /// The session ID containing the leg to migrate
+        from_session: String,
+        /// The leg ID within from_session to migrate
+        leg_id: LegId,
+        /// The target conference ID to migrate the leg into
+        into_conference: String,
     },
 
     /// Place a leg on hold
@@ -140,29 +170,44 @@ pub enum CallCommand {
     /// Stop recording
     StopRecording,
 
-
     /// Supervisor listen mode (monitoring only)
     SupervisorListen {
-        /// Supervisor's leg
+        /// Supervisor's leg (or supervisor session ID for cross-session monitoring)
         supervisor_leg: LegId,
         /// Target leg to monitor
         target_leg: LegId,
+        /// Optional supervisor session ID when monitoring from a different session
+        supervisor_session_id: Option<String>,
     },
 
     /// Supervisor whisper mode (can talk to agent only)
     SupervisorWhisper {
-        /// Supervisor's leg
+        /// Supervisor's leg (or supervisor session ID for cross-session monitoring)
         supervisor_leg: LegId,
         /// Target leg (agent)
         target_leg: LegId,
+        /// Optional supervisor session ID when monitoring from a different session
+        supervisor_session_id: Option<String>,
     },
 
     /// Supervisor barge mode (join conversation)
     SupervisorBarge {
-        /// Supervisor's leg
+        /// Supervisor's leg (or supervisor session ID for cross-session monitoring)
         supervisor_leg: LegId,
         /// Target leg (agent)
         target_leg: LegId,
+        /// Optional supervisor session ID when monitoring from a different session
+        supervisor_session_id: Option<String>,
+    },
+
+    /// Supervisor takeover mode (replace agent)
+    SupervisorTakeover {
+        /// Supervisor's leg (or supervisor session ID for cross-session monitoring)
+        supervisor_leg: LegId,
+        /// Target leg (agent to be replaced)
+        target_leg: LegId,
+        /// Optional supervisor session ID when monitoring from a different session
+        supervisor_session_id: Option<String>,
     },
 
     /// Stop supervisor mode
@@ -170,7 +215,6 @@ pub enum CallCommand {
         /// Supervisor's leg
         supervisor_leg: LegId,
     },
-
 
     /// Create a conference
     ConferenceCreate {
@@ -297,26 +341,59 @@ pub enum CallCommand {
         body: String,
     },
 
+    /// Join a conference mixer (for attended-transfer or 3-way calling)
+    JoinMixer {
+        /// Mixer ID / conference room ID
+        mixer_id: String,
+    },
+
+    /// Leave the current conference mixer
+    LeaveMixer,
+
     /// Send a SIP OPTIONS ping
     SendSipOptionsPing,
+
+    /// Add a new SIP leg to the session
+    LegAdd {
+        /// SIP URI target
+        target: String,
+        /// Optional leg ID (auto-generated if not provided)
+        leg_id: Option<LegId>,
+    },
+
+    /// Remove a leg from the session
+    LegRemove {
+        /// Leg ID to remove
+        leg_id: LegId,
+    },
+
+    /// Leg dial completed successfully (async notification)
+    LegConnected {
+        /// Leg ID that connected
+        leg_id: LegId,
+    },
+
+    /// Leg dial failed (async notification)
+    LegFailed {
+        /// Leg ID that failed
+        leg_id: LegId,
+        /// Failure reason
+        reason: String,
+    },
 }
 
 /// Point-to-point bridge mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum P2PMode {
     /// Standard audio bridge
+    #[default]
     Audio,
     /// Video bridge
     Video,
     /// Audio and video
     AudioVideo,
-}
-
-impl Default for P2PMode {
-    fn default() -> Self {
-        Self::Audio
-    }
 }
 
 /// Audio playback options
@@ -381,7 +458,10 @@ pub enum AppEvent {
     /// Recording completed
     RecordingComplete { recording_id: String, path: String },
     /// Custom event
-    Custom { name: String, data: serde_json::Value },
+    Custom {
+        name: String,
+        data: serde_json::Value,
+    },
     /// Timeout event
     Timeout { timer_id: String },
 }
@@ -396,6 +476,7 @@ impl CallCommand {
                 | CallCommand::SupervisorListen { .. }
                 | CallCommand::SupervisorWhisper { .. }
                 | CallCommand::SupervisorBarge { .. }
+                | CallCommand::SupervisorTakeover { .. }
                 | CallCommand::Hold { music: Some(_), .. }
         )
     }
@@ -425,12 +506,18 @@ impl CallCommand {
             CallCommand::Transfer { leg_id, .. } => Some(leg_id),
             CallCommand::Hold { leg_id, .. } => Some(leg_id),
             CallCommand::Unhold { leg_id } => Some(leg_id),
-            CallCommand::Play { leg_id: Some(leg_id), .. } => Some(leg_id),
-            CallCommand::StopPlayback { leg_id: Some(leg_id) } => Some(leg_id),
+            CallCommand::Play {
+                leg_id: Some(leg_id),
+                ..
+            } => Some(leg_id),
+            CallCommand::StopPlayback {
+                leg_id: Some(leg_id),
+            } => Some(leg_id),
             CallCommand::SendDtmf { leg_id, .. } => Some(leg_id),
             CallCommand::SupervisorListen { supervisor_leg, .. } => Some(supervisor_leg),
             CallCommand::SupervisorWhisper { supervisor_leg, .. } => Some(supervisor_leg),
             CallCommand::SupervisorBarge { supervisor_leg, .. } => Some(supervisor_leg),
+            CallCommand::SupervisorTakeover { supervisor_leg, .. } => Some(supervisor_leg),
             CallCommand::SupervisorStop { supervisor_leg } => Some(supervisor_leg),
             CallCommand::ConferenceAdd { leg_id, .. } => Some(leg_id),
             CallCommand::ConferenceRemove { leg_id, .. } => Some(leg_id),

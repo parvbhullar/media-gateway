@@ -8,8 +8,10 @@ use super::LegId;
 /// How hangup cascades to other legs in the session
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum HangupCascade {
     /// Hangup all legs in the session
+    #[default]
     All,
     /// Only hangup the specified leg, leave others intact
     None,
@@ -19,11 +21,6 @@ pub enum HangupCascade {
     Other,
 }
 
-impl Default for HangupCascade {
-    fn default() -> Self {
-        Self::All
-    }
-}
 
 /// Who initiated the hangup
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,10 +201,7 @@ mod tests {
 
     #[test]
     fn hangup_command_all() {
-        let cmd = HangupCommand::all(
-            Some(CallRecordHangupReason::BySystem),
-            Some(200),
-        );
+        let cmd = HangupCommand::all(Some(CallRecordHangupReason::BySystem), Some(200));
         assert_eq!(cmd.cascade, HangupCascade::All);
         assert!(cmd.leg_id.is_none());
     }
@@ -232,9 +226,6 @@ mod tests {
 
     #[test]
     fn system_hangup_reason_display() {
-        assert_eq!(
-            SystemHangupReason::NoAnswer.to_string(),
-            "no_answer"
-        );
+        assert_eq!(SystemHangupReason::NoAnswer.to_string(), "no_answer");
     }
 }

@@ -1,27 +1,170 @@
 use crate::call::domain::{CallCommand, LegId};
 
+use crate::call::runtime::ConferenceManager;
+use crate::call::runtime::conference_media_bridge::{
+    AudioReceiver, ConferenceBridgeHandle, PcmAudioFrame,
+};
 use crate::media;
-use crate::media::mixer_registry::MixerParticipantRole;
 use crate::media::Track as MediaTrackTrait;
 use crate::proxy::active_call_registry::ActiveProxyCallRegistry;
 use crate::proxy::proxy_call::media_peer::VoiceEnginePeer;
-use crate::proxy::proxy_call::sip_session::SipSessionHandle;
+use crate::proxy::proxy_call::sip_session::{PeerConnectionAudioReceiver, SipSessionHandle};
 use crate::proxy::server::SipServerRef;
 use crate::rwi::gateway::RwiGateway;
 use crate::rwi::proto::RwiEvent;
 use crate::rwi::session::{
-    ConferenceCreateRequest, OriginateRequest, ParallelOriginateRequest,
-    QueueEnqueueRequest, RecordStartRequest, RwiCommandPayload, SupervisorMode,
+    ConferenceCreateRequest, OriginateRequest, ParallelOriginateRequest, QueueEnqueueRequest,
+    RecordStartRequest, RwiCommandPayload, SupervisorMode,
 };
-use crate::rwi::transfer::{TransferConfig, TransferController};
+use crate::rwi::transfer::TransferController;
 use futures::FutureExt;
 use std::collections::HashMap;
 
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 use uuid::Uuid;
+
+/// Audio receiver for originated calls to bridge into conference.
+///
+/// For now this provides paced silence (20 ms frames). The pacing is important:
+/// an unpaced source can flood the conference input channel and starve the mixer
+/// loop that drains participant inputs.
+struct OriginateAudioReceiver;
+
+impl AudioReceiver for OriginateAudioReceiver {
+    fn recv(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<PcmAudioFrame>> + Send + '_>>
+    {
+        Box::pin(async move {
+            // For now, return paced silence. In a full implementation, we'd decode
+            // RTP from the originated peer for whisper/barge capable monitoring.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            Some(PcmAudioFrame::new(vec![0i16; 160], 8000))
+        })
+    }
+}
+
+/// Start a full-duplex conference media bridge for a peer.
+///
+/// Gets the PeerConnection from the peer, adds a sample_track for output (conference → peer),
+/// creates a `PeerConnectionAudioReceiver` for input (peer → conference), and starts the bridge.
+///
+/// Returns the `ConferenceBridgeHandle` on success, or `None` on failure.
+async fn start_peer_conference_bridge(
+    conf_manager: &Arc<ConferenceManager>,
+    conf_id: &str,
+    leg_id: &LegId,
+    peer: &Arc<dyn crate::proxy::proxy_call::media_peer::MediaPeer>,
+    cancel_token: tokio_util::sync::CancellationToken,
+) -> Option<ConferenceBridgeHandle> {
+    use rustrtc::RtpCodecParameters;
+    use rustrtc::media::track::sample_track;
+
+    // Wait for a PeerConnection to become available (SDP exchange may be in progress)
+    let mut pc = None;
+    for _ in 0..150 {
+        let tracks = peer.get_tracks().await;
+        for t in &tracks {
+            let guard = t.lock().await;
+            if let Some(found_pc) = guard.get_peer_connection().await {
+                pc = Some(found_pc);
+                break;
+            }
+        }
+        if pc.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let pc = match pc {
+        Some(pc) => pc,
+        None => {
+            tracing::warn!(%leg_id, "auto-bridge: no PeerConnection found for peer, skipping");
+            return None;
+        }
+    };
+
+    // Wire conference output → peer RTP sender using the EXISTING negotiated transceiver.
+    // We must NOT call pc.add_track() on an already-negotiated PC: that would create a second
+    // transceiver with no remote-address binding, causing start_playback_on() to pick it up
+    // (finding it first in the list) and send RTP into a void.  Instead we do exactly what
+    // FileTrack::start_playback_on does: find the existing audio transceiver and replace its
+    // sender with a new one backed by our sample_track.
+    let (audio_sender, sample_track_arc, _) = sample_track(rustrtc::media::MediaKind::Audio, 100);
+    let params = RtpCodecParameters {
+        payload_type: 0, // PCMU
+        clock_rate: 8000,
+        channels: 1,
+    };
+    let ssrc = rand::random::<u32>();
+
+    let transceivers = pc.get_transceivers();
+    let existing = transceivers
+        .iter()
+        .find(|t| t.kind() == rustrtc::MediaKind::Audio);
+
+    if let Some(transceiver) = existing {
+        let track_arc: std::sync::Arc<dyn rustrtc::media::MediaStreamTrack> = sample_track_arc;
+        let new_sender = rustrtc::RtpSender::builder(track_arc, ssrc)
+            .params(params)
+            .build();
+        transceiver.set_sender(Some(new_sender));
+        tracing::debug!(%leg_id, "auto-bridge: set_sender on existing transceiver");
+    } else {
+        // No existing transceiver yet (pre-negotiation race) — fall back to add_track.
+        if let Err(e) = pc.add_track(sample_track_arc, params) {
+            tracing::warn!(%leg_id, error = %e, "auto-bridge: add_track failed, skipping");
+            return None;
+        }
+        tracing::debug!(%leg_id, "auto-bridge: added new track via add_track");
+    }
+
+    // Channel: conference forward loop → audio_sender (→ sample_track → peer PC sender)
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<rustrtc::media::MediaSample>(100);
+    let cancel = cancel_token.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                sample = rx.recv() => match sample {
+                    Some(s) => {
+                        if audio_sender.send(s).await.is_err() {
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+    });
+
+    // PeerConnectionAudioReceiver reads incoming RTP from the peer and decodes to PCM
+    let decoder = audio_codec::create_decoder(audio_codec::CodecType::PCMU);
+    let audio_receiver = Box::new(PeerConnectionAudioReceiver::new(pc, decoder));
+
+    // Start the full-duplex bridge
+    let bridge = crate::call::runtime::ConferenceMediaBridge::new(conf_manager.clone());
+    match bridge
+        .start_bridge_full_duplex(conf_id, leg_id, tx, audio_receiver)
+        .await
+    {
+        Ok(handle) => {
+            tracing::info!(%conf_id, %leg_id, "auto-bridge: conference media bridge started");
+            Some(handle)
+        }
+        Err(e) => {
+            tracing::warn!(%conf_id, %leg_id, error = %e, "auto-bridge: start_bridge_full_duplex failed");
+            None
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
@@ -52,11 +195,10 @@ impl CommandDeduplicationCache {
 
     async fn is_duplicate(&self, action_id: &str) -> bool {
         let entries = self.entries.read().await;
-        if let Some(entry) = entries.get(action_id) {
-
-            if entry.received_at.elapsed() < self.ttl {
-                return true;
-            }
+        if let Some(entry) = entries.get(action_id)
+            && entry.received_at.elapsed() < self.ttl
+        {
+            return true;
         }
         false
     }
@@ -165,17 +307,6 @@ struct MediaStreamState;
 #[allow(dead_code)]
 struct MediaInjectState;
 
-#[derive(Clone)]
-#[allow(unused)]
-struct ConferenceState {
-    conf_id: String,
-    backend: String,
-    max_members: Option<u32>,
-    record: bool,
-    mcu_uri: Option<String>,
-    members: Vec<String>,
-}
-
 pub struct RwiCommandProcessor {
     call_registry: Arc<ActiveProxyCallRegistry>,
     gateway: Arc<RwLock<RwiGateway>>,
@@ -187,12 +318,14 @@ pub struct RwiCommandProcessor {
     media_stream_states: Arc<RwLock<HashMap<String, MediaStreamState>>>,
     media_inject_states: Arc<RwLock<HashMap<String, MediaInjectState>>>,
     mixer_registry: Arc<media::mixer_registry::MixerRegistry>,
-    conference_states: Arc<RwLock<HashMap<String, ConferenceState>>>,
+    conference_manager: Arc<ConferenceManager>,
     transfer_controller: Arc<RwLock<TransferController>>,
     command_dedup_cache: CommandDeduplicationCache,
-    
-    agent_skills: Arc<RwLock<HashMap<String, AgentSkill>>>, 
-    queue_overflow_configs: Arc<RwLock<HashMap<String, QueueOverflowConfig>>>, 
+
+    agent_skills: Arc<RwLock<HashMap<String, AgentSkill>>>,
+    queue_overflow_configs: Arc<RwLock<HashMap<String, QueueOverflowConfig>>>,
+    #[cfg(test)]
+    force_seat_replace_rollback_failure: Arc<AtomicBool>,
 }
 
 #[allow(dead_code)]
@@ -200,6 +333,7 @@ impl RwiCommandProcessor {
     pub fn new(
         call_registry: Arc<ActiveProxyCallRegistry>,
         gateway: Arc<RwLock<RwiGateway>>,
+        conference_manager: Arc<ConferenceManager>,
     ) -> Self {
         let transfer_controller = Arc::new(RwLock::new(TransferController::with_default_config(
             call_registry.clone(),
@@ -216,25 +350,28 @@ impl RwiCommandProcessor {
             media_stream_states: Arc::new(RwLock::new(HashMap::new())),
             media_inject_states: Arc::new(RwLock::new(HashMap::new())),
             mixer_registry: Arc::new(media::mixer_registry::MixerRegistry::new()),
-            conference_states: Arc::new(RwLock::new(HashMap::new())),
+            conference_manager,
             transfer_controller,
             command_dedup_cache: CommandDeduplicationCache::with_default_ttl(),
-            
+
             agent_skills: Arc::new(RwLock::new(HashMap::new())),
             queue_overflow_configs: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(test)]
+            force_seat_replace_rollback_failure: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn with_sip_server(mut self, server: SipServerRef) -> Self {
         self.sip_server = Some(server.clone());
-        
-        
+        self.conference_manager = server.conference_manager.clone();
+
         let new_controller = TransferController::with_default_config(
             self.call_registry.clone(),
             self.gateway.clone(),
-        ).with_sip_server(server);
+        )
+        .with_sip_server(server);
         self.transfer_controller = Arc::new(RwLock::new(new_controller));
-        
+
         self
     }
 
@@ -252,29 +389,46 @@ impl RwiCommandProcessor {
         self.command_dedup_cache.record(action_id, result).await;
     }
 
-    pub fn update_transfer_config(&self, config: &crate::config::TransferConfig) {
-        let transfer_config = TransferConfig {
-            refer_enabled: config.refer_enabled,
-            attended_enabled: config.attended_enabled,
-            three_pcc_fallback_enabled: config.three_pcc_fallback_enabled,
-            refer_timeout_secs: config.refer_timeout_secs,
-            three_pcc_timeout_secs: config.three_pcc_timeout_secs,
-            max_concurrent_transfers: config.max_concurrent,
+    #[cfg(test)]
+    fn force_next_seat_replace_rollback_failure(&self) {
+        self.force_seat_replace_rollback_failure
+            .store(true, Ordering::SeqCst);
+    }
+
+    fn conference_manager(&self) -> Arc<ConferenceManager> {
+        self.conference_manager.clone()
+    }
+
+    /// Register this processor as a subscriber for REFER NOTIFY events from
+    /// `SipSession` and spawn a background task to feed them into the
+    /// `TransferController`.
+    pub async fn register_transfer_notify_listener(&self) {
+        let Some(ref server) = self.sip_server else {
+            return;
         };
-        
-        
-        let _new_controller = TransferController::new(
-            transfer_config,
-            self.call_registry.clone(),
-            self.gateway.clone(),
-        );
-        
-        
-        if let Ok(_controller) = self.transfer_controller.try_write() {
-            
-            
-            tracing::info!("Transfer configuration updated");
+        let (tx, mut rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::call::domain::ReferNotifyEvent>();
+        {
+            let mut subscribers = server.transfer_notify_subscribers.lock().await;
+            subscribers.push(tx);
         }
+
+        let controller = self.transfer_controller.clone();
+        tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                let c = controller.read().await;
+                match event.event_type {
+                    crate::call::domain::ReferNotifyEventType::ReferResponse => {
+                        c.handle_refer_response_by_call_id(&event.call_id, event.sip_status)
+                            .await;
+                    }
+                    crate::call::domain::ReferNotifyEventType::Notify => {
+                        c.handle_notify_by_call_id(&event.call_id, event.sip_status)
+                            .await;
+                    }
+                }
+            }
+        });
     }
 
     fn dispatch_unified_command(
@@ -292,11 +446,11 @@ impl RwiCommandProcessor {
                     let msg = result
                         .message
                         .unwrap_or_else(|| "command failed".to_string());
-                    
+
                     if msg.contains("not supported") || msg.contains("not implemented") {
                         return None;
                     }
-                    
+
                     if msg.to_lowercase().contains("not found") {
                         Some(Err(CommandError::CallNotFound(call_id.to_string())))
                     } else {
@@ -319,9 +473,7 @@ impl RwiCommandProcessor {
         &self,
         command: RwiCommandPayload,
     ) -> Result<CommandResult, CommandError> {
-        
         if let RwiCommandPayload::Bridge { leg_a, leg_b } = &command {
-            
             if self.call_registry.get_handle(leg_a).is_none() {
                 return Err(CommandError::CallNotFound(leg_a.clone()));
             }
@@ -330,12 +482,10 @@ impl RwiCommandProcessor {
             }
         }
 
-        
         if let RwiCommandPayload::Originate(req) = &command {
             return self.originate_call(req.clone()).await;
         }
 
-        
         match &command {
             RwiCommandPayload::QueueEnqueue(req) => {
                 return self.queue_enqueue(req.clone()).await;
@@ -365,7 +515,6 @@ impl RwiCommandProcessor {
             _ => {}
         }
 
-        
         match &command {
             RwiCommandPayload::RecordStart(req) => {
                 return self.record_start(req.clone()).await;
@@ -382,7 +531,6 @@ impl RwiCommandProcessor {
             _ => {}
         }
 
-        
         match &command {
             RwiCommandPayload::SetRingbackSource {
                 target_call_id,
@@ -396,36 +544,37 @@ impl RwiCommandProcessor {
                 supervisor_call_id,
                 target_call_id,
             } => {
-                
                 self.get_handle(supervisor_call_id).await?;
                 self.get_handle(target_call_id).await?;
-                
             }
             RwiCommandPayload::SupervisorWhisper {
                 supervisor_call_id,
                 target_call_id,
                 agent_leg,
             } => {
-                
                 self.get_handle(supervisor_call_id).await?;
                 self.get_handle(target_call_id).await?;
                 if !agent_leg.is_empty() {
                     self.get_handle(agent_leg).await?;
                 }
-                
             }
             RwiCommandPayload::SupervisorBarge {
                 supervisor_call_id,
                 target_call_id,
                 agent_leg,
             } => {
-                
                 self.get_handle(supervisor_call_id).await?;
                 self.get_handle(target_call_id).await?;
                 if !agent_leg.is_empty() {
                     self.get_handle(agent_leg).await?;
                 }
-                
+            }
+            RwiCommandPayload::SupervisorTakeover {
+                supervisor_call_id,
+                target_call_id,
+            } => {
+                self.get_handle(supervisor_call_id).await?;
+                self.get_handle(target_call_id).await?;
             }
             RwiCommandPayload::SupervisorStop {
                 supervisor_call_id,
@@ -441,56 +590,75 @@ impl RwiCommandProcessor {
             _ => {}
         }
 
-        
         // Handle transfer commands via TransferController for proper 3PCC fallback coordination
         match &command {
             RwiCommandPayload::Transfer { call_id, target } => {
-                return self.handle_transfer(call_id.clone(), target.clone(), false).await;
+                return self
+                    .handle_transfer(call_id.clone(), target.clone(), false)
+                    .await;
             }
-            RwiCommandPayload::TransferAttended { call_id, target, timeout_secs } => {
-                return self.handle_attended_transfer(call_id.clone(), target.clone(), *timeout_secs).await;
+            RwiCommandPayload::TransferReplace { call_id, target } => {
+                return self
+                    .handle_transfer_replace(call_id.clone(), target.clone())
+                    .await;
             }
-            RwiCommandPayload::TransferComplete { call_id, consultation_call_id } => {
-                return self.handle_transfer_complete(call_id.clone(), consultation_call_id.clone()).await;
+            RwiCommandPayload::TransferAttended {
+                call_id,
+                target,
+                timeout_secs,
+            } => {
+                return self
+                    .handle_attended_transfer(call_id.clone(), target.clone(), *timeout_secs)
+                    .await;
             }
-            RwiCommandPayload::TransferCancel { consultation_call_id } => {
-                return self.handle_transfer_cancel(consultation_call_id.clone()).await;
+            RwiCommandPayload::TransferComplete {
+                call_id,
+                consultation_call_id,
+            } => {
+                return self
+                    .handle_transfer_complete(call_id.clone(), consultation_call_id.clone())
+                    .await;
+            }
+            RwiCommandPayload::TransferCancel {
+                consultation_call_id,
+            } => {
+                return self
+                    .handle_transfer_cancel(consultation_call_id.clone())
+                    .await;
             }
             _ => {}
         }
 
-        if let Some(call_id) = self.extract_call_id(&command) {
-            if let Some(result) = self.dispatch_unified_command(&call_id, command.clone()) {
-                tracing::debug!(
-                    call_id = %call_id,
-                    "Command handled via unified session runtime"
-                );
-                
-                
-                match &command {
-                    RwiCommandPayload::Bridge { leg_a, leg_b } => {
-                        let gw = self.gateway.read().await;
-                        let event = RwiEvent::CallBridged {
-                            leg_a: leg_a.clone(),
-                            leg_b: leg_b.clone(),
-                        };
-                        gw.send_event_to_call_owner(leg_a, &event);
-                        gw.send_event_to_call_owner(leg_b, &event);
-                    }
-                    RwiCommandPayload::Unbridge { call_id } => {
-                        let gw = self.gateway.read().await;
-                        let event = RwiEvent::CallUnbridged {
-                            call_id: call_id.clone(),
-                        };
-                        gw.send_event_to_call_owner(call_id, &event);
-                    }
-                    _ => {}
+        if let Some(call_id) = self.extract_call_id(&command)
+            && let Some(result) = self.dispatch_unified_command(&call_id, command.clone())
+        {
+            tracing::debug!(
+                call_id = %call_id,
+                "Command handled via unified session runtime"
+            );
+
+            match &command {
+                RwiCommandPayload::Bridge { leg_a, leg_b } => {
+                    let gw = self.gateway.read().await;
+                    let event = RwiEvent::CallBridged {
+                        leg_a: leg_a.clone(),
+                        leg_b: leg_b.clone(),
+                    };
+                    gw.send_event_to_call_owner(leg_a, &event);
+                    gw.send_event_to_call_owner(leg_b, &event);
                 }
-                return result;
+                RwiCommandPayload::Unbridge { call_id } => {
+                    let gw = self.gateway.read().await;
+                    let event = RwiEvent::CallUnbridged {
+                        call_id: call_id.clone(),
+                    };
+                    gw.send_event_to_call_owner(call_id, &event);
+                }
+                _ => {}
             }
+            return result;
         }
 
-        
         match &command {
             RwiCommandPayload::ListCalls => {
                 let calls = self.list_calls().await;
@@ -506,7 +674,6 @@ impl RwiCommandProcessor {
                 }
             }
             RwiCommandPayload::DetachCall { call_id } => {
-                
                 if self.call_registry.get_handle(call_id).is_some() {
                     return Ok(CommandResult::Success);
                 } else {
@@ -540,15 +707,23 @@ impl RwiCommandProcessor {
                     .conference_merge(conf_id, call_id, consultation_call_id)
                     .await;
             }
-            
-            
+            RwiCommandPayload::ConferenceSeatReplace {
+                conf_id,
+                old_call_id,
+                new_call_id,
+            } => {
+                return self
+                    .conference_seat_replace(conf_id, old_call_id, new_call_id)
+                    .await;
+            }
+
             RwiCommandPayload::Subscribe { .. } => {
                 return Ok(CommandResult::Success);
             }
             RwiCommandPayload::Unsubscribe { .. } => {
                 return Ok(CommandResult::Success);
             }
-            
+
             RwiCommandPayload::SipMessage {
                 call_id,
                 content_type,
@@ -564,10 +739,37 @@ impl RwiCommandProcessor {
             } => {
                 return self.sip_notify(call_id, event, content_type, body).await;
             }
+            RwiCommandPayload::LegAdd {
+                call_id,
+                target,
+                leg_id,
+            } => {
+                return self.leg_add(call_id, target, leg_id.as_deref()).await;
+            }
+            RwiCommandPayload::LegRemove { call_id, leg_id } => {
+                return self.leg_remove(call_id, leg_id).await;
+            }
+            RwiCommandPayload::AppStart {
+                call_id,
+                app_name,
+                params,
+            } => {
+                return self.app_start(call_id, app_name, params.clone()).await;
+            }
+            RwiCommandPayload::AppStop { call_id, reason } => {
+                return self.app_stop(call_id, reason.clone()).await;
+            }
             RwiCommandPayload::SipOptionsPing { call_id } => {
                 return self.sip_options_ping(call_id).await;
             }
-            
+            RwiCommandPayload::MediaPlay(req) => {
+                return self
+                    .media_play(&req.call_id, req.source.clone(), req.interrupt_on_dtmf)
+                    .await;
+            }
+            RwiCommandPayload::MediaStop { call_id } => {
+                return self.media_stop(call_id).await;
+            }
             RwiCommandPayload::MediaStreamStart(req) => {
                 return self
                     .media_stream_start(&req.call_id, &req.call_id, &req.direction)
@@ -584,7 +786,7 @@ impl RwiCommandProcessor {
             RwiCommandPayload::MediaInjectStop { call_id } => {
                 return self.media_inject_stop(call_id).await;
             }
-            
+
             RwiCommandPayload::QueueEnqueue(req) => {
                 return self.queue_enqueue(req.clone()).await;
             }
@@ -610,7 +812,7 @@ impl RwiCommandProcessor {
             } => {
                 return self.queue_requeue(call_id, queue_id, *priority).await;
             }
-            
+
             RwiCommandPayload::RecordStart(req) => {
                 return self.record_start(req.clone()).await;
             }
@@ -623,7 +825,7 @@ impl RwiCommandProcessor {
             RwiCommandPayload::RecordStop { call_id } => {
                 return self.record_stop(call_id).await;
             }
-            
+
             RwiCommandPayload::SetRingbackSource {
                 target_call_id,
                 source_call_id,
@@ -666,7 +868,10 @@ impl RwiCommandProcessor {
                     events,
                 });
             }
-            RwiCommandPayload::CallResume { call_id, last_sequence } => {
+            RwiCommandPayload::CallResume {
+                call_id,
+                last_sequence,
+            } => {
                 let gw = self.gateway.read().await;
                 let (entries, current_seq) = gw.resume_call(call_id, *last_sequence);
                 let replayed_count = entries.len() as u64;
@@ -693,7 +898,6 @@ impl RwiCommandProcessor {
 
         if let Some(call_id) = self.extract_call_id(&command) {
             if self.call_registry.get_handle(&call_id).is_some() {
-
                 return Err(CommandError::CommandFailed(
                     "command not implemented in unified runtime".to_string(),
                 ));
@@ -718,6 +922,7 @@ impl RwiCommandProcessor {
             RwiCommandPayload::Bridge { leg_a, .. } => Some(leg_a.clone()),
             RwiCommandPayload::Unbridge { call_id } => Some(call_id.clone()),
             RwiCommandPayload::Transfer { call_id, .. } => Some(call_id.clone()),
+            RwiCommandPayload::TransferReplace { call_id, .. } => Some(call_id.clone()),
             RwiCommandPayload::TransferAttended { call_id, .. } => Some(call_id.clone()),
             RwiCommandPayload::TransferComplete { call_id, .. } => Some(call_id.clone()),
             RwiCommandPayload::TransferCancel {
@@ -746,24 +951,30 @@ impl RwiCommandProcessor {
             RwiCommandPayload::QueueSetPriority { call_id, .. } => Some(call_id.clone()),
             RwiCommandPayload::QueueAssignAgent { call_id, .. } => Some(call_id.clone()),
             RwiCommandPayload::QueueRequeue { call_id, .. } => Some(call_id.clone()),
-            RwiCommandPayload::SupervisorListen {
-                target_call_id, ..
-            } => Some(target_call_id.clone()),
-            RwiCommandPayload::SupervisorWhisper {
-                target_call_id, ..
-            } => Some(target_call_id.clone()),
-            RwiCommandPayload::SupervisorBarge {
-                target_call_id, ..
-            } => Some(target_call_id.clone()),
-            RwiCommandPayload::SupervisorStop {
-                target_call_id, ..
-            } => Some(target_call_id.clone()),
+            RwiCommandPayload::SupervisorListen { target_call_id, .. } => {
+                Some(target_call_id.clone())
+            }
+            RwiCommandPayload::SupervisorWhisper { target_call_id, .. } => {
+                Some(target_call_id.clone())
+            }
+            RwiCommandPayload::SupervisorBarge { target_call_id, .. } => {
+                Some(target_call_id.clone())
+            }
+            RwiCommandPayload::SupervisorTakeover { target_call_id, .. } => {
+                Some(target_call_id.clone())
+            }
+            RwiCommandPayload::SupervisorStop { target_call_id, .. } => {
+                Some(target_call_id.clone())
+            }
             RwiCommandPayload::SipMessage { call_id, .. } => Some(call_id.clone()),
             RwiCommandPayload::SipNotify { call_id, .. } => Some(call_id.clone()),
             RwiCommandPayload::SipOptionsPing { call_id } => Some(call_id.clone()),
-            
+            RwiCommandPayload::LegAdd { call_id, .. } => Some(call_id.clone()),
+            RwiCommandPayload::LegRemove { call_id, .. } => Some(call_id.clone()),
+
             RwiCommandPayload::ConferenceCreate(_) => None,
             RwiCommandPayload::ConferenceDestroy { .. } => None,
+            RwiCommandPayload::ConferenceSeatReplace { .. } => None,
             _ => None,
         }
     }
@@ -778,13 +989,11 @@ impl RwiCommandProcessor {
             .ok_or_else(|| CommandError::CommandFailed("SIP server not available".into()))?
             .clone();
 
-        
         let destination_uri: rsipstack::sip::Uri =
             rsipstack::sip::Uri::try_from(req.destination.as_str()).map_err(|_| {
                 CommandError::CommandFailed(format!("invalid destination: {}", req.destination))
             })?;
 
-        
         let realm = server
             .proxy_config
             .realms
@@ -798,43 +1007,51 @@ impl RwiCommandProcessor {
         let caller_uri: rsipstack::sip::Uri = rsipstack::sip::Uri::try_from(caller_str.as_str())
             .map_err(|_| CommandError::CommandFailed("invalid caller_id".into()))?;
 
-        
-        let mut headers: Vec<rsipstack::sip::Header> = vec![rsipstack::sip::headers::MaxForwards::from(70u32).into()];
+        let mut headers: Vec<rsipstack::sip::Header> =
+            vec![rsipstack::sip::headers::MaxForwards::from(70u32).into()];
         for (k, v) in &req.extra_headers {
-            headers.push(rsipstack::sip::Header::Other(k.clone().into(), v.clone()));
+            headers.push(rsipstack::sip::Header::Other(k.clone(), v.clone()));
         }
 
-        
-        let external_ip = server.rtp_config.external_ip.clone()
+        let external_ip = server
+            .rtp_config
+            .external_ip
+            .clone()
             .unwrap_or_else(|| "127.0.0.1".to_string());
 
-        
-        let media_track = crate::media::RtpTrackBuilder::new(format!("rwi-originate-{}", req.call_id))
-            .with_cancel_token(tokio_util::sync::CancellationToken::new())
-            .with_external_ip(external_ip.clone())
-            .build();
+        let media_track =
+            crate::media::RtpTrackBuilder::new(format!("rwi-originate-{}", req.call_id))
+                .with_cancel_token(tokio_util::sync::CancellationToken::new())
+                .with_external_ip(external_ip.clone());
+        let media_track = if let Some(bind_ip) = server.rtp_config.bind_ip.clone() {
+            media_track.with_bind_ip(bind_ip)
+        } else {
+            media_track
+        }
+        .build();
 
         tracing::info!(call_id = %req.call_id, external_ip = %external_ip, "Created media track for originate");
 
-        
         let sdp_offer = match media_track.local_description().await {
             Ok(sdp) => {
                 tracing::info!(call_id = %req.call_id, sdp_len = %sdp.len(), "Generated SDP offer");
                 if sdp.is_empty() {
                     return Err(CommandError::CommandFailed("SDP offer is empty".into()));
                 }
-                
+
                 let preview: String = sdp.lines().take(5).collect::<Vec<_>>().join("\n");
                 tracing::debug!(call_id = %req.call_id, "SDP preview:\n{}", preview);
                 sdp
             }
             Err(e) => {
                 tracing::error!(call_id = %req.call_id, error = %e, "Failed to generate SDP offer");
-                return Err(CommandError::CommandFailed(format!("failed to create SDP offer: {}", e)));
+                return Err(CommandError::CommandFailed(format!(
+                    "failed to create SDP offer: {}",
+                    e
+                )));
             }
         };
 
-        
         let invite_option = rsipstack::dialog::invitation::InviteOption {
             callee: destination_uri.clone(),
             caller: caller_uri.clone(),
@@ -856,24 +1073,22 @@ impl RwiCommandProcessor {
         let caller_display = req.caller_id.unwrap_or_else(|| caller_str.clone());
         let callee_display = req.destination.clone();
 
-        
         let cancel_token = tokio_util::sync::CancellationToken::new();
-        
+        let conference_manager = self.conference_manager.clone();
+
         tokio::spawn(async move {
             let (state_tx, mut state_rx) = tokio::sync::mpsc::unbounded_channel();
 
-            
             let mut invitation = dialog_layer.do_invite(invite_option, state_tx).boxed();
 
-            
-            
             let caller_media_builder = crate::media::MediaStreamBuilder::new()
                 .with_id(format!("{}-caller", call_id))
                 .with_cancel_token(cancel_token.clone());
             let caller_peer: std::sync::Arc<dyn crate::proxy::proxy_call::media_peer::MediaPeer> =
-                std::sync::Arc::new(VoiceEnginePeer::new(std::sync::Arc::new(caller_media_builder.build())));
+                std::sync::Arc::new(VoiceEnginePeer::new(std::sync::Arc::new(
+                    caller_media_builder.build(),
+                )));
 
-            
             caller_peer.update_track(Box::new(media_track), None).await;
 
             let (_handle, mut cmd_rx) = {
@@ -899,35 +1114,435 @@ impl RwiCommandProcessor {
                 (handle, cmd_rx)
             };
 
-            
-            
+            // Snapshot the queue configs (hold music paths) for use in cmd_task.
+            let cmd_queue_configs: Arc<HashMap<String, crate::proxy::routing::RouteQueueConfig>> = {
+                let snapshot = server.proxy_config.queues.clone();
+                Arc::new(snapshot)
+            };
+
             let cmd_cancel = cancel_token.clone();
+            let cmd_call_id = call_id.clone();
+            let cmd_caller_peer = caller_peer.clone();
+            let cmd_conference_manager = conference_manager.clone();
+            let cmd_dialog_layer = dialog_layer.clone();
             let cmd_task = tokio::spawn(async move {
+                use crate::media::FileTrack;
+                use audio_codec::CodecType;
+                use std::collections::HashMap;
+                let mut leg_peers: HashMap<
+                    LegId,
+                    Arc<dyn crate::proxy::proxy_call::media_peer::MediaPeer>,
+                > = HashMap::new();
+                let mut leg_tasks: HashMap<LegId, Vec<tokio::task::JoinHandle<()>>> =
+                    HashMap::new();
+                let mut playback_tracks: HashMap<String, FileTrack> = HashMap::new();
+                let mut app_cancel: Option<tokio_util::sync::CancellationToken> = None;
+                // Channel for leg-connected notifications from spawned INVITE tasks
+                let (leg_connected_tx, mut leg_connected_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<LegId>();
+                // Per-leg conference bridge handles (auto-bridge caller ↔ agent)
+                let mut leg_bridge_handles: HashMap<LegId, Vec<ConferenceBridgeHandle>> =
+                    HashMap::new();
+
                 loop {
                     tokio::select! {
                         _ = cmd_cancel.cancelled() => {
                             tracing::debug!("Command task cancelled, exiting");
                             break;
                         }
+                        // Auto-bridge: after agent answers, set up bidirectional conference bridge
+                        Some(leg_id) = leg_connected_rx.recv() => {
+                            tracing::info!(%cmd_call_id, %leg_id, "Auto-bridging caller ↔ agent via conference");
+                            let conf_id = format!("call-bridge-{}", cmd_call_id);
+                            let conf_id_obj = crate::call::runtime::ConferenceId::from(conf_id.as_str());
+
+                            if let Err(e) = cmd_conference_manager
+                                .create_conference(conf_id_obj.clone(), None)
+                                .await
+                            {
+                                tracing::warn!(%cmd_call_id, %leg_id, error = %e, "Auto-bridge: failed to create conference");
+                            } else {
+                                let mut handles = Vec::new();
+
+                                // Bridge the caller peer into the conference
+                                let caller_leg = LegId::new(format!("{}-caller", cmd_call_id));
+                                let _ = cmd_conference_manager
+                                    .add_participant(&conf_id_obj, caller_leg.clone())
+                                    .await;
+                                if let Some(h) = start_peer_conference_bridge(
+                                    &cmd_conference_manager,
+                                    &conf_id,
+                                    &caller_leg,
+                                    &cmd_caller_peer,
+                                    cmd_cancel.child_token(),
+                                )
+                                .await
+                                {
+                                    handles.push(h);
+                                }
+
+                                // Bridge the agent peer into the conference
+                                if let Some(agent_peer) = leg_peers.get(&leg_id) {
+                                    let agent_leg = leg_id.clone();
+                                    let _ = cmd_conference_manager
+                                        .add_participant(&conf_id_obj, agent_leg.clone())
+                                        .await;
+                                    if let Some(h) = start_peer_conference_bridge(
+                                        &cmd_conference_manager,
+                                        &conf_id,
+                                        &agent_leg,
+                                        agent_peer,
+                                        cmd_cancel.child_token(),
+                                    )
+                                    .await
+                                    {
+                                        handles.push(h);
+                                    }
+                                }
+
+                                if !handles.is_empty() {
+                                    leg_bridge_handles.insert(leg_id, handles);
+                                    tracing::info!(%cmd_call_id, conf_id = %conf_id, "Caller ↔ agent conference bridge active");
+                                }
+                            }
+                        }
                         Some(cmd) = cmd_rx.recv() => {
                             tracing::debug!(?cmd, "RWI originate command received");
+                            match cmd {
+                                CallCommand::JoinMixer { mixer_id } => {
+                                    tracing::info!(%cmd_call_id, %mixer_id, "Joining conference from originate task");
+                                    // Bridge the caller_peer to the conference
+                                    let conf_id_obj = crate::call::runtime::ConferenceId::from(mixer_id.as_str());
+                                    let participant_leg = LegId::new(format!("{}-callee", cmd_call_id));
+
+                                    // Add participant to conference
+                                    if let Err(e) = cmd_conference_manager.add_participant(&conf_id_obj, participant_leg.clone()).await {
+                                        tracing::warn!(%cmd_call_id, %mixer_id, error = %e, "Failed to add participant to conference");
+                                        continue;
+                                    }
+
+                                    // Start conference media bridge
+                                    let bridge = crate::call::runtime::ConferenceMediaBridge::new(cmd_conference_manager.clone());
+
+                                    // Get audio sender from caller_peer's existing track
+                                    let mut audio_sender = None;
+                                    let tracks = cmd_caller_peer.get_tracks().await;
+                                    for t in &tracks {
+                                        let guard = t.lock().await;
+                                        if let Some(sender) = guard.get_sender() {
+                                            audio_sender = Some(sender);
+                                            break;
+                                        }
+                                    }
+
+                                    let (tx, mut rx) = tokio::sync::mpsc::channel::<rustrtc::media::MediaSample>(100);
+
+                                    if let Some(sender) = audio_sender {
+                                        tokio::spawn(async move {
+                                            while let Some(sample) = rx.recv().await {
+                                                if sender.send(sample).await.is_err() {
+                                                    break;
+                                                }
+                                            }
+                                        });
+                                        tracing::info!(%cmd_call_id, %mixer_id, "Using existing track sender for conference bridge");
+                                    } else {
+                                        tracing::warn!(%cmd_call_id, %mixer_id, "No track sender found, conference audio will not be sent");
+                                    }
+
+                                    // Create audio receiver from caller_peer
+                                    let audio_receiver = Box::new(OriginateAudioReceiver);
+
+                                    if let Err(e) = bridge.start_bridge_full_duplex(&mixer_id, &participant_leg, tx, audio_receiver).await {
+                                        tracing::warn!(%cmd_call_id, %mixer_id, error = %e, "Failed to start conference bridge");
+                                    } else {
+                                        tracing::info!(%cmd_call_id, %mixer_id, "Successfully joined conference from originate");
+                                    }
+                                }
+                                CallCommand::LegAdd { target, leg_id } => {
+                                    let leg_id = leg_id.unwrap_or_else(|| LegId::new(format!("leg-{}", uuid::Uuid::new_v4())));
+                                    let callee_uri = match rsipstack::sip::Uri::try_from(target.as_str()) {
+                                                Ok(uri) => uri,
+                                                Err(e) => {
+                                                    tracing::warn!(%cmd_call_id, error = %e, "Invalid SIP URI for leg add");
+                                                    continue;
+                                                }
+                                            };
+
+                                            // Create peer for this leg
+                                            let track_id = format!("orig-{}-{}", cmd_call_id, leg_id);
+                                            let media_stream_builder = crate::media::MediaStreamBuilder::new()
+                                                .with_id(track_id.clone())
+                                                .with_cancel_token(cmd_cancel.child_token());
+                                            let media_stream = media_stream_builder.build();
+                                            let peer: Arc<dyn crate::proxy::proxy_call::media_peer::MediaPeer> = Arc::new(
+                                                VoiceEnginePeer::new(Arc::new(media_stream))
+                                            );
+
+                                            // Create RTP track
+                                            let track_builder = crate::media::RtpTrackBuilder::new(track_id.clone())
+                                                .with_cancel_token(cmd_cancel.child_token());
+                                            let track = track_builder.build();
+
+                                            // Get SDP offer
+                                            let sdp_offer = match track.local_description().await {
+                                                Ok(sdp) => sdp,
+                                                Err(e) => {
+                                                    tracing::warn!(%cmd_call_id, error = %e, "Failed to get local description for leg");
+                                                    continue;
+                                                }
+                                            };
+
+                                            peer.update_track(Box::new(track), None).await;
+                                            leg_peers.insert(leg_id.clone(), peer.clone());
+
+                                            // Build INVITE option
+                                            let invite_option = rsipstack::dialog::invitation::InviteOption {
+                                                callee: callee_uri.clone(),
+                                                caller: callee_uri.clone(),
+                                                contact: callee_uri.clone(),
+                                                content_type: Some("application/sdp".to_string()),
+                                                offer: Some(sdp_offer.into_bytes()),
+                                                destination: None,
+                                                credential: None,
+                                                headers: None,
+                                                call_id: Some(format!("{}-{}", cmd_call_id, leg_id)),
+                                                ..Default::default()
+                                            };
+
+                                            let leg_id_clone = leg_id.clone();
+                                            let peer_clone = peer.clone();
+                                            let dialog_layer_clone = cmd_dialog_layer.clone();
+                                            let cancel_token_clone = cmd_cancel.child_token();
+                                            let call_id_for_spawn = cmd_call_id.clone();
+                                            // Notifier: signals the main loop after agent answers
+                                            let connected_notifier = leg_connected_tx.clone();
+
+                                            let handle = tokio::spawn(async move {
+                                                let (state_tx, mut state_rx) = tokio::sync::mpsc::unbounded_channel();
+                                                let invitation = dialog_layer_clone.do_invite(invite_option, state_tx).boxed();
+
+                                                match invitation.await {
+                                                    Ok((dialog, response)) => {
+                                                        if let Some(ref resp) = response {
+                                                            let status_code = resp.status_code.code();
+                                                            if (200..300).contains(&status_code) {
+                                                                tracing::info!(%call_id_for_spawn, %leg_id_clone, status = %status_code, "SIP leg answered successfully in originate task");
+                                                                if !resp.body().is_empty() {
+                                                                    let answer_sdp = String::from_utf8_lossy(resp.body()).to_string();
+                                                                    if let Err(e) = peer_clone.update_remote_description(&format!("orig-{}-{}", call_id_for_spawn, leg_id_clone), &answer_sdp).await {
+                                                                        tracing::warn!(%call_id_for_spawn, %leg_id_clone, error = %e, "Failed to set remote description on leg peer");
+                                                                    } else {
+                                                                        // Notify main loop: agent answered, trigger auto-bridge
+                                                                        let _ = connected_notifier.send(leg_id_clone.clone());
+                                                                    }
+                                                                }
+                                                            } else {
+                                                                tracing::warn!(%call_id_for_spawn, %leg_id_clone, status = %status_code, "SIP leg rejected in originate task");
+                                                            }
+                                                        } else {
+                                                            tracing::warn!(%call_id_for_spawn, %leg_id_clone, "SIP leg timeout in originate task");
+                                                        }
+
+                                                        // Monitor dialog state
+                                                        let dialog_cancel = cancel_token_clone.child_token();
+                                                        tokio::spawn(async move {
+                                                            loop {
+                                                                tokio::select! {
+                                                                    biased;
+                                                                    _ = dialog_cancel.cancelled() => break,
+                                                                    state = state_rx.recv() => {
+                                                                        match state {
+                                                                            Some(rsipstack::dialog::dialog::DialogState::Terminated(..)) => break,
+                                                                            Some(_) => {},
+                                                                            None => break,
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                            let _ = dialog;
+                                                        });
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!(%call_id_for_spawn, %leg_id_clone, error = %e, "SIP leg failed in originate task");
+                                                    }
+                                                }
+                                            });
+
+                                            leg_tasks.entry(leg_id).or_default().push(handle);
+                                            tracing::info!(%cmd_call_id, "SIP leg added in originate task");
+                                }
+                                CallCommand::LegRemove { leg_id } => {
+                                    if let Some(handles) = leg_tasks.remove(&leg_id) {
+                                        for handle in handles {
+                                            handle.abort();
+                                        }
+                                    }
+                                    // Stop auto-bridge handles for this leg
+                                    if let Some(bridge_handles) = leg_bridge_handles.remove(&leg_id) {
+                                        for h in bridge_handles {
+                                            h.stop();
+                                        }
+                                    }
+                                    leg_peers.remove(&leg_id);
+                                    tracing::info!(%cmd_call_id, %leg_id, "Leg removed in originate task");
+                                }
+                                CallCommand::Play { leg_id, source, options } => {
+                                    let file_path = match source {
+                                        crate::call::domain::MediaSource::File { path } => path,
+                                        _ => {
+                                            tracing::warn!(%cmd_call_id, "Only file playback supported in originate task");
+                                            continue;
+                                        }
+                                    };
+                                    let track_id = options
+                                        .as_ref()
+                                        .and_then(|o| o.track_id.clone())
+                                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                                    let loop_pb = options
+                                        .as_ref()
+                                        .map(|o| o.loop_playback)
+                                        .unwrap_or(false);
+
+                                    // Resolve target peer: leg_id → leg_peers, None → caller_peer
+                                    let target_peer: Arc<dyn crate::proxy::proxy_call::media_peer::MediaPeer> =
+                                        if let Some(ref lid) = leg_id {
+                                            match leg_peers.get(lid) {
+                                                Some(p) => p.clone(),
+                                                None => {
+                                                    tracing::warn!(%cmd_call_id, %lid, "Play: leg not found, using caller");
+                                                    cmd_caller_peer.clone()
+                                                }
+                                            }
+                                        } else {
+                                            cmd_caller_peer.clone()
+                                        };
+
+                                    // Wait up to 2 s for the PC to be ready (set_remote_description may lag)
+                                    let mut target_pc = None;
+                                    for _ in 0..40 {
+                                        let tracks = target_peer.get_tracks().await;
+                                        for t in &tracks {
+                                            let g = t.lock().await;
+                                            if let Some(pc) = g.get_peer_connection().await {
+                                                target_pc = Some(pc);
+                                                break;
+                                            }
+                                        }
+                                        if target_pc.is_some() {
+                                            break;
+                                        }
+                                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                    }
+
+                                    let track = FileTrack::new(track_id.clone())
+                                        .with_path(file_path.clone())
+                                        .with_codec_preference(vec![CodecType::PCMU])
+                                        .with_loop(loop_pb);
+
+                                    if let Err(e) = track.start_playback_on(target_pc).await {
+                                        tracing::warn!(%cmd_call_id, error = %e, "Originate play failed");
+                                    }
+                                    target_peer.update_track(Box::new(track.clone()), None).await;
+                                    playback_tracks.insert(track_id.clone(), track);
+                                    tracing::info!(%cmd_call_id, track_id, file = %file_path, "Playback started in originate task");
+                                }
+                                CallCommand::StopPlayback { leg_id } => {
+                                    let track_id = leg_id
+                                        .as_ref()
+                                        .map(|l| l.to_string())
+                                        .unwrap_or_else(|| "playback".to_string());
+                                    if playback_tracks.remove(&track_id).is_some() {
+                                        cmd_caller_peer.remove_track(&track_id, true).await;
+                                        tracing::info!(%cmd_call_id, %track_id, "Playback stopped in originate task");
+                                    }
+                                }
+                                CallCommand::StartApp { app_name, params, .. } => {
+                                    // Cancel any previously running app and clear playback.
+                                    if let Some(tok) = app_cancel.take() {
+                                        tok.cancel();
+                                    }
+                                    for (id, _) in playback_tracks.drain() {
+                                        cmd_caller_peer.remove_track(&id, true).await;
+                                    }
+                                    let app_tok = tokio_util::sync::CancellationToken::new();
+                                    app_cancel = Some(app_tok);
+                                    tracing::info!(%cmd_call_id, app = ?app_name, "StartApp acknowledged in originate task");
+
+                                    // For "queue" app: look up hold music from route config and start playback.
+                                    if app_name == "queue" {
+                                        let queue_name = params
+                                            .as_ref()
+                                            .and_then(|p| p.get("name"))
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        if let Some(qcfg) = cmd_queue_configs.get(&queue_name) {
+                                            if let Some(hold) = &qcfg.hold {
+                                                if let Some(audio_file) = &hold.audio_file {
+                                                    let track_id = format!("queue-hold-{}", uuid::Uuid::new_v4());
+                                                    let loop_pb = hold.loop_playback;
+                                                    let file_path = audio_file.clone();
+                                                    let target_peer = cmd_caller_peer.clone();
+
+                                                    let mut target_pc = None;
+                                                    for _ in 0..40 {
+                                                        let tracks = target_peer.get_tracks().await;
+                                                        for t in &tracks {
+                                                            let g = t.lock().await;
+                                                            if let Some(pc) = g.get_peer_connection().await {
+                                                                target_pc = Some(pc);
+                                                                break;
+                                                            }
+                                                        }
+                                                        if target_pc.is_some() { break; }
+                                                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                                    }
+
+                                                    let track = FileTrack::new(track_id.clone())
+                                                        .with_path(file_path.clone())
+                                                        .with_codec_preference(vec![CodecType::PCMU])
+                                                        .with_loop(loop_pb);
+                                                    if let Err(e) = track.start_playback_on(target_pc).await {
+                                                        tracing::warn!(%cmd_call_id, error = %e, "Queue hold music playback failed");
+                                                    } else {
+                                                        target_peer.update_track(Box::new(track.clone()), None).await;
+                                                        playback_tracks.insert(track_id.clone(), track);
+                                                        tracing::info!(%cmd_call_id, queue = %queue_name, track_id, file = %file_path, "Queue hold music started");
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                CallCommand::StopApp { .. } => {
+                                    if let Some(tok) = app_cancel.take() {
+                                        tok.cancel();
+                                    }
+                                    for (id, _) in playback_tracks.drain() {
+                                        cmd_caller_peer.remove_track(&id, true).await;
+                                    }
+                                    tracing::info!(%cmd_call_id, "App stopped in originate task");
+                                }
+                                _ => {
+                                    tracing::debug!(?cmd, "Unhandled command in originate task");
+                                }
+                            }
                         }
                         else => {
-                            
+
                             break;
                         }
                     }
                 }
             });
 
-            
             let cleanup = || async {
                 cancel_token.cancel();
-                
+
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(5), cmd_task).await;
             };
 
-            
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs as u64)) => {
                     let gw = gateway.read().await;
@@ -951,7 +1566,7 @@ impl RwiCommandProcessor {
                                         );
                                     }
                                     Some(rsipstack::dialog::dialog::DialogState::Early(_, ref response)) => {
-                                        
+
                                         let body = response.body();
                                         if !body.is_empty() {
                                             let sdp = String::from_utf8_lossy(body).to_string();
@@ -966,7 +1581,7 @@ impl RwiCommandProcessor {
                                         );
                                     }
                                     Some(rsipstack::dialog::dialog::DialogState::Terminated(_, _)) => {
-                                        
+
                                     }
                                     _ => {}
                                 }
@@ -976,7 +1591,7 @@ impl RwiCommandProcessor {
                 } => {
                     match result {
                         Ok((dialog_id, Some(resp))) if resp.status_code.kind() == rsipstack::sip::StatusCodeKind::Successful => {
-                            
+
                             let sdp_answer = if resp.body().is_empty() {
                                 None
                             } else {
@@ -988,12 +1603,12 @@ impl RwiCommandProcessor {
                                 }
                             };
 
-                            
+
                             if let Some(answer) = sdp_answer {
                                 tracing::info!(%call_id, "Received SDP answer, completing media handshake");
 
-                                
-                                
+
+
                                 let tracks = caller_peer.get_tracks().await;
                                 if let Some(first_track) = tracks.first() {
                                     if let Err(e) = first_track.lock().await.set_remote_description(&answer).await {
@@ -1006,11 +1621,11 @@ impl RwiCommandProcessor {
                                 tracing::warn!(%call_id, "200 OK received without SDP answer");
                             }
 
-                            
+
                             let _ = caller_peer;
                             let _ = dialog_id;
 
-                            
+
                             use crate::proxy::active_call_registry::ActiveProxyCallStatus;
                             registry.update(&call_id, |entry| {
                                 entry.answered_at = Some(chrono::Utc::now());
@@ -1022,9 +1637,9 @@ impl RwiCommandProcessor {
                                     &call_id,
                                     &RwiEvent::CallAnswered { call_id: call_id.clone() },
                                 );
-                            } 
-                            
-                            
+                            }
+
+
                             tokio::select! {
                                 _ = cancel_token.cancelled() => {
                                     tracing::info!(%call_id, "Originate task cancelled");
@@ -1033,7 +1648,7 @@ impl RwiCommandProcessor {
                                     tracing::info!(%call_id, "Call timeout after 1 hour");
                                 }
                                 _ = async {
-                                    
+
                                     loop {
                                         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                                         if registry.get_handle(&call_id).is_none() {
@@ -1109,14 +1724,13 @@ impl RwiCommandProcessor {
         let operation_id = req.operation_id.clone();
         let targets = req.targets.clone();
         let leg_count = targets.len() as u32;
-        
+
         info!(
             %operation_id,
             leg_count,
             "Starting parallel originate"
         );
 
-        
         {
             let gw = self.gateway.read().await;
             gw.send_event_to_call_owner(
@@ -1132,11 +1746,11 @@ impl RwiCommandProcessor {
         let gateway = self.gateway.clone();
         let registry = self.call_registry.clone();
 
-        
         let cancel_token = tokio_util::sync::CancellationToken::new();
 
-        
-        let mut futures: Vec<Pin<Box<dyn Future<Output = Result<(usize, String), (usize, String)>> + Send>>> = Vec::new();
+        type OriginateFuture =
+            Pin<Box<dyn Future<Output = Result<(usize, String), (usize, String)>> + Send>>;
+        let mut futures: Vec<OriginateFuture> = Vec::new();
 
         for (idx, target) in targets.iter().enumerate() {
             let server = server.clone();
@@ -1149,12 +1763,10 @@ impl RwiCommandProcessor {
             let cancel_token = cancel_token.clone();
 
             let fut = async move {
-                
                 if cancel_token.is_cancelled() {
                     return Err((idx, "Cancelled".to_string()));
                 }
 
-                
                 match Self::do_single_originate(
                     server,
                     &target,
@@ -1163,7 +1775,9 @@ impl RwiCommandProcessor {
                     gateway,
                     registry,
                     &operation_id,
-                ).await {
+                )
+                .await
+                {
                     Ok(call_id) => Ok((idx, call_id)),
                     Err(e) => Err((idx, e)),
                 }
@@ -1171,86 +1785,76 @@ impl RwiCommandProcessor {
             futures.push(Box::pin(fut));
         }
 
-        
-        let result = tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
-            async {
-                let mut remaining = futures;
-                
-                loop {
-                    if remaining.is_empty() {
-                        return Err("All legs failed".to_string());
-                    }
+        let result = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
+            let mut remaining = futures;
 
-                    
-                    let (result, _idx, rest) = futures::future::select_all(remaining).await;
-                    remaining = rest;
+            loop {
+                if remaining.is_empty() {
+                    return Err("All legs failed".to_string());
+                }
 
-                    match result {
-                        Ok((leg_idx, call_id)) => {
-                            
-                            cancel_token.cancel();
-                            
-                            info!(
-                                operation_id = %operation_id,
-                                leg_idx = leg_idx,
-                                call_id = %call_id,
-                                "Parallel originate leg answered"
-                            );
+                let (result, _idx, rest) = futures::future::select_all(remaining).await;
+                remaining = rest;
 
-                            
-                            let gw = self.gateway.read().await;
-                            gw.send_event_to_call_owner(
-                                &operation_id,
-                                &RwiEvent::ParallelOriginateWinner {
-                                    operation_id: operation_id.clone(),
-                                    call_id: call_id.clone(),
-                                    destination: targets[leg_idx].destination.clone(),
-                                },
-                            );
+                match result {
+                    Ok((leg_idx, call_id)) => {
+                        cancel_token.cancel();
 
-                            
-                            for (i, _) in remaining.iter().enumerate() {
-                                let actual_idx = i; 
-                                if let Some(target) = targets.get(actual_idx) {
-                                    gw.send_event_to_call_owner(
-                                        &operation_id,
-                                        &RwiEvent::ParallelOriginateLegCancelled {
-                                            operation_id: operation_id.clone(),
-                                            call_id: target.call_id.clone(),
-                                            reason: "Cancelled - another leg won".to_string(),
-                                        },
-                                    );
-                                }
+                        info!(
+                            operation_id = %operation_id,
+                            leg_idx = leg_idx,
+                            call_id = %call_id,
+                            "Parallel originate leg answered"
+                        );
+
+                        let gw = self.gateway.read().await;
+                        gw.send_event_to_call_owner(
+                            &operation_id,
+                            &RwiEvent::ParallelOriginateWinner {
+                                operation_id: operation_id.clone(),
+                                call_id: call_id.clone(),
+                                destination: targets[leg_idx].destination.clone(),
+                            },
+                        );
+
+                        for (i, _) in remaining.iter().enumerate() {
+                            let actual_idx = i;
+                            if let Some(target) = targets.get(actual_idx) {
+                                gw.send_event_to_call_owner(
+                                    &operation_id,
+                                    &RwiEvent::ParallelOriginateLegCancelled {
+                                        operation_id: operation_id.clone(),
+                                        call_id: target.call_id.clone(),
+                                        reason: "Cancelled - another leg won".to_string(),
+                                    },
+                                );
                             }
-
-                            return Ok(call_id);
                         }
-                        Err((leg_idx, reason)) => {
-                            
-                            info!(
-                                operation_id = %operation_id,
-                                leg_idx = leg_idx,
-                                reason = %reason,
-                                "Parallel originate leg failed"
-                            );
 
-                            let gw = self.gateway.read().await;
-                            gw.send_event_to_call_owner(
-                                &operation_id,
-                                &RwiEvent::ParallelOriginateLegCancelled {
-                                    operation_id: operation_id.clone(),
-                                    call_id: targets[leg_idx].call_id.clone(),
-                                    reason,
-                                },
-                            );
-                            
-                            
-                        }
+                        return Ok(call_id);
+                    }
+                    Err((leg_idx, reason)) => {
+                        info!(
+                            operation_id = %operation_id,
+                            leg_idx = leg_idx,
+                            reason = %reason,
+                            "Parallel originate leg failed"
+                        );
+
+                        let gw = self.gateway.read().await;
+                        gw.send_event_to_call_owner(
+                            &operation_id,
+                            &RwiEvent::ParallelOriginateLegCancelled {
+                                operation_id: operation_id.clone(),
+                                call_id: targets[leg_idx].call_id.clone(),
+                                reason,
+                            },
+                        );
                     }
                 }
             }
-        ).await;
+        })
+        .await;
 
         match result {
             Ok(Ok(winning_call_id)) => {
@@ -1307,27 +1911,31 @@ impl RwiCommandProcessor {
     ) -> Result<String, String> {
         let call_id = target.call_id.clone();
         let target_uri_str = target.destination.clone();
-        
-        
+
         let destination_uri = rsipstack::sip::Uri::try_from(target_uri_str.clone())
             .map_err(|e| format!("Invalid target URI: {}", e))?;
 
         let caller_str = caller_id.clone().unwrap_or_else(|| "RustPBX".to_string());
-        
-        
+
         let dialog_layer = server.dialog_layer.clone();
-        
-        
-        let external_ip = server.rtp_config.external_ip.clone()
+
+        let external_ip = server
+            .rtp_config
+            .external_ip
+            .clone()
             .unwrap_or_else(|| "127.0.0.1".to_string());
 
-        
-        let media_track = crate::media::RtpTrackBuilder::new(format!("parallel-{}-{}", operation_id, call_id))
-            .with_cancel_token(tokio_util::sync::CancellationToken::new())
-            .with_external_ip(external_ip.clone())
-            .build();
+        let media_track =
+            crate::media::RtpTrackBuilder::new(format!("parallel-{}-{}", operation_id, call_id))
+                .with_cancel_token(tokio_util::sync::CancellationToken::new())
+                .with_external_ip(external_ip.clone());
+        let media_track = if let Some(bind_ip) = server.rtp_config.bind_ip.clone() {
+            media_track.with_bind_ip(bind_ip)
+        } else {
+            media_track
+        }
+        .build();
 
-        
         let sdp_offer = match media_track.local_description().await {
             Ok(sdp) => {
                 if sdp.is_empty() {
@@ -1338,17 +1946,16 @@ impl RwiCommandProcessor {
             Err(e) => return Err(format!("Failed to generate SDP: {}", e)),
         };
 
-        
-        let caller_uri: rsipstack::sip::Uri = rsipstack::sip::Uri::try_from(format!("sip:{}@{}", caller_str, external_ip).as_str())
-            .map_err(|e| format!("Invalid caller URI: {:?}", e))?;
+        let caller_uri: rsipstack::sip::Uri =
+            rsipstack::sip::Uri::try_from(format!("sip:{}@{}", caller_str, external_ip).as_str())
+                .map_err(|e| format!("Invalid caller URI: {:?}", e))?;
 
-        
-        let mut headers: Vec<rsipstack::sip::Header> = vec![rsipstack::sip::headers::MaxForwards::from(70u32).into()];
+        let mut headers: Vec<rsipstack::sip::Header> =
+            vec![rsipstack::sip::headers::MaxForwards::from(70u32).into()];
         for (k, v) in extra_headers {
-            headers.push(rsipstack::sip::Header::Other(k.into(), v));
+            headers.push(rsipstack::sip::Header::Other(k, v));
         }
 
-        
         let invite_option = rsipstack::dialog::invitation::InviteOption {
             callee: destination_uri.clone(),
             caller: caller_uri.clone(),
@@ -1362,20 +1969,19 @@ impl RwiCommandProcessor {
             ..Default::default()
         };
 
-        
         let (state_tx, mut state_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut invitation = dialog_layer.do_invite(invite_option, state_tx).boxed();
 
-        
         let cancel_token = tokio_util::sync::CancellationToken::new();
         let caller_media_builder = crate::media::MediaStreamBuilder::new()
             .with_id(format!("{}-caller", call_id))
             .with_cancel_token(cancel_token.clone());
         let caller_peer: std::sync::Arc<dyn crate::proxy::proxy_call::media_peer::MediaPeer> =
-            std::sync::Arc::new(VoiceEnginePeer::new(std::sync::Arc::new(caller_media_builder.build())));
+            std::sync::Arc::new(VoiceEnginePeer::new(std::sync::Arc::new(
+                caller_media_builder.build(),
+            )));
         caller_peer.update_track(Box::new(media_track), None).await;
 
-        
         {
             use crate::call::runtime::SessionId;
             use crate::proxy::active_call_registry::{ActiveProxyCallEntry, ActiveProxyCallStatus};
@@ -1396,7 +2002,6 @@ impl RwiCommandProcessor {
             registry.upsert(entry, handle);
         }
 
-        
         let result = tokio::time::timeout(
             Duration::from_secs(60),
             async {
@@ -1406,15 +2011,12 @@ impl RwiCommandProcessor {
                             return res;
                         }
                         state = state_rx.recv() => {
-                            match state {
-                                Some(rsipstack::dialog::dialog::DialogState::Calling(_)) => {
-                                    let gw = gateway.read().await;
-                                    gw.send_event_to_call_owner(
-                                        &call_id,
-                                        &crate::rwi::proto::RwiEvent::CallRinging { call_id: call_id.clone() },
-                                    );
-                                }
-                                _ => {}
+                            if let Some(rsipstack::dialog::dialog::DialogState::Calling(_)) = state {
+                                let gw = gateway.read().await;
+                                gw.send_event_to_call_owner(
+                                    &call_id,
+                                    &crate::rwi::proto::RwiEvent::CallRinging { call_id: call_id.clone() },
+                                );
                             }
                         }
                     }
@@ -1423,39 +2025,45 @@ impl RwiCommandProcessor {
         ).await;
 
         match result {
-            Ok(Ok((dialog_id, Some(resp)))) 
-                if resp.status_code.kind() == rsipstack::sip::StatusCodeKind::Successful => {
-                
-                
+            Ok(Ok((dialog_id, Some(resp))))
+                if resp.status_code.kind() == rsipstack::sip::StatusCodeKind::Successful =>
+            {
                 let sdp_answer = if resp.body().is_empty() {
                     None
                 } else {
                     let body_str = String::from_utf8_lossy(resp.body()).to_string();
-                    if body_str.contains("v=0") { Some(body_str) } else { None }
+                    if body_str.contains("v=0") {
+                        Some(body_str)
+                    } else {
+                        None
+                    }
                 };
 
                 if let Some(answer) = sdp_answer {
                     let tracks = caller_peer.get_tracks().await;
                     if let Some(first_track) = tracks.first() {
-                        let _ = first_track.lock().await.set_remote_description(&answer).await;
+                        let _ = first_track
+                            .lock()
+                            .await
+                            .set_remote_description(&answer)
+                            .await;
                     }
                 }
 
-                
                 use crate::proxy::active_call_registry::ActiveProxyCallStatus;
                 registry.update(&call_id, |entry| {
                     entry.answered_at = Some(chrono::Utc::now());
                     entry.status = ActiveProxyCallStatus::Talking;
                 });
 
-                
                 let gw = gateway.read().await;
                 gw.send_event_to_call_owner(
                     &call_id,
-                    &crate::rwi::proto::RwiEvent::CallAnswered { call_id: call_id.clone() },
+                    &crate::rwi::proto::RwiEvent::CallAnswered {
+                        call_id: call_id.clone(),
+                    },
                 );
 
-                
                 let _ = caller_peer;
                 let _ = dialog_id;
 
@@ -1482,7 +2090,6 @@ impl RwiCommandProcessor {
                 status: entry.status.to_string(),
                 started_at: entry.started_at.to_rfc3339(),
                 answered_at: entry.answered_at.map(|t| t.to_rfc3339()),
-                state: None,
             })
             .collect()
     }
@@ -1493,24 +2100,127 @@ impl RwiCommandProcessor {
             .ok_or_else(|| CommandError::CallNotFound(call_id.to_string()))
     }
 
+    async fn leg_add(
+        &self,
+        call_id: &str,
+        target: &str,
+        leg_id: Option<&str>,
+    ) -> Result<CommandResult, CommandError> {
+        let handle = self.get_handle(call_id).await?;
+
+        let leg_id_opt = leg_id.map(|id| crate::call::domain::LegId::new(id));
+
+        handle
+            .send_command(CallCommand::LegAdd {
+                target: target.to_string(),
+                leg_id: leg_id_opt,
+            })
+            .map_err(|e| CommandError::CommandFailed(e.to_string()))?;
+
+        Ok(CommandResult::Success)
+    }
+
+    async fn leg_remove(&self, call_id: &str, leg_id: &str) -> Result<CommandResult, CommandError> {
+        let handle = self.get_handle(call_id).await?;
+
+        handle
+            .send_command(CallCommand::LegRemove {
+                leg_id: crate::call::domain::LegId::new(leg_id),
+            })
+            .map_err(|e| CommandError::CommandFailed(e.to_string()))?;
+
+        Ok(CommandResult::Success)
+    }
+
+    async fn app_start(
+        &self,
+        call_id: &str,
+        app_name: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<CommandResult, CommandError> {
+        let handle = self.get_handle(call_id).await?;
+
+        handle
+            .send_command(CallCommand::StartApp {
+                app_name: app_name.to_string(),
+                params,
+                auto_answer: false,
+            })
+            .map_err(|e| CommandError::CommandFailed(e.to_string()))?;
+
+        Ok(CommandResult::Success)
+    }
+
+    async fn app_stop(
+        &self,
+        call_id: &str,
+        reason: Option<String>,
+    ) -> Result<CommandResult, CommandError> {
+        let handle = self.get_handle(call_id).await?;
+
+        handle
+            .send_command(CallCommand::StopApp { reason })
+            .map_err(|e| CommandError::CommandFailed(e.to_string()))?;
+
+        Ok(CommandResult::Success)
+    }
+
+    async fn media_play(
+        &self,
+        call_id: &str,
+        source: crate::rwi::session::MediaSource,
+        _interrupt_on_dtmf: bool,
+    ) -> Result<CommandResult, CommandError> {
+        use crate::call::domain::{MediaSource as DomainMediaSource, PlayOptions};
+
+        let handle = self.get_handle(call_id).await?;
+
+        let domain_source = if source.source_type == "file" {
+            DomainMediaSource::File {
+                path: source.uri.unwrap_or_default(),
+            }
+        } else {
+            DomainMediaSource::Silence
+        };
+
+        let track_id = uuid::Uuid::new_v4().to_string();
+        handle
+            .send_command(CallCommand::Play {
+                leg_id: None,
+                source: domain_source,
+                options: Some(PlayOptions {
+                    loop_playback: false,
+                    await_completion: false,
+                    interrupt_on_dtmf: _interrupt_on_dtmf,
+                    track_id: Some(track_id.clone()),
+                    send_progress: false,
+                }),
+            })
+            .map_err(|e| CommandError::CommandFailed(e.to_string()))?;
+
+        Ok(CommandResult::MediaPlay { track_id })
+    }
+
+    async fn media_stop(&self, call_id: &str) -> Result<CommandResult, CommandError> {
+        let handle = self.get_handle(call_id).await?;
+        handle
+            .send_command(CallCommand::StopPlayback { leg_id: None })
+            .map_err(|e| CommandError::CommandFailed(e.to_string()))?;
+        Ok(CommandResult::Success)
+    }
+
     async fn bridge_calls(&self, leg_a: &str, leg_b: &str) -> Result<CommandResult, CommandError> {
         use crate::call::domain::P2PMode;
 
         let handle_a = self.get_handle(leg_a).await?;
         let _handle_b = self.get_handle(leg_b).await?;
 
-        
-        
-        
-        
         let send_result = handle_a.send_command(CallCommand::Bridge {
             leg_a: LegId::new(leg_a),
             leg_b: LegId::new(leg_b),
             mode: P2PMode::Audio,
         });
 
-        
-        
         let event = RwiEvent::CallBridged {
             leg_a: leg_a.to_string(),
             leg_b: leg_b.to_string(),
@@ -1519,8 +2229,6 @@ impl RwiCommandProcessor {
         gw.send_event_to_call_owner(&leg_a.to_string(), &event);
         gw.send_event_to_call_owner(&leg_b.to_string(), &event);
 
-        
-        
         if let Err(e) = &send_result {
             tracing::warn!("bridge_calls: send_command error (may be expected): {}", e);
         }
@@ -1530,20 +2238,18 @@ impl RwiCommandProcessor {
 
     async fn queue_enqueue(&self, req: QueueEnqueueRequest) -> Result<CommandResult, CommandError> {
         let _handle = self.get_handle(&req.call_id).await?;
-        
-        
+
         let overflow_check = self.check_queue_overflow(&req.queue_id).await;
         if let Some(overflow_action) = overflow_check {
             return self.handle_queue_overflow(req, overflow_action).await;
         }
-        
-        
+
         let matched_agent = if let Some(ref skills) = req.skills {
             self.find_matching_agent(skills).await
         } else {
             None
         };
-        
+
         let queue_state = QueueState {
             queue_id: req.queue_id.clone(),
             priority: req.priority,
@@ -1554,20 +2260,18 @@ impl RwiCommandProcessor {
             agent_id: matched_agent.clone(),
             overflow_count: 0,
         };
-        
+
         let mut states = self.queue_states.write().await;
         states.insert(req.call_id.clone(), queue_state);
-        drop(states); 
-        
-        
+        drop(states);
+
         let event = RwiEvent::QueueJoined {
             call_id: req.call_id.clone(),
             queue_id: req.queue_id.clone(),
         };
         let gw = self.gateway.read().await;
         gw.send_event_to_call_owner(&req.call_id, &event);
-        
-        
+
         if let Some(agent_id) = matched_agent {
             let agent_event = RwiEvent::QueueAgentOffered {
                 call_id: req.call_id.clone(),
@@ -1575,7 +2279,7 @@ impl RwiCommandProcessor {
                 agent_id: agent_id.clone(),
             };
             gw.broadcast_event(&agent_event);
-            
+
             info!(
                 call_id = %req.call_id,
                 queue_id = %req.queue_id,
@@ -1591,19 +2295,17 @@ impl RwiCommandProcessor {
                 "Call enqueued"
             );
         }
-        
+
         Ok(CommandResult::Success)
     }
-    
+
     async fn check_queue_overflow(&self, queue_id: &str) -> Option<QueueOverflowAction> {
         let configs = self.queue_overflow_configs.read().await;
         let config = configs.get(queue_id)?;
-        
-        
+
         let states = self.queue_states.read().await;
         let queue_count = states.values().filter(|s| s.queue_id == queue_id).count() as u32;
-        
-        
+
         if queue_count >= config.max_calls {
             return Some(QueueOverflowAction {
                 action: config.overflow_action.clone(),
@@ -1611,10 +2313,10 @@ impl RwiCommandProcessor {
                 reason: "queue_full".to_string(),
             });
         }
-        
+
         None
     }
-    
+
     async fn handle_queue_overflow(
         &self,
         req: QueueEnqueueRequest,
@@ -1626,10 +2328,9 @@ impl RwiCommandProcessor {
             overflow_action = ?overflow.action,
             "Queue overflow - redirecting call"
         );
-        
+
         match overflow.action.as_deref() {
             Some("transfer") if overflow.target_queue.is_some() => {
-                
                 let target_queue = overflow.target_queue.unwrap();
                 info!(
                     call_id = %req.call_id,
@@ -1637,8 +2338,7 @@ impl RwiCommandProcessor {
                     to_queue = %target_queue,
                     "Transferring call to overflow queue"
                 );
-                
-                
+
                 let queue_state = QueueState {
                     queue_id: target_queue.clone(),
                     priority: req.priority,
@@ -1649,12 +2349,11 @@ impl RwiCommandProcessor {
                     agent_id: None,
                     overflow_count: 1,
                 };
-                
+
                 let mut states = self.queue_states.write().await;
                 states.insert(req.call_id.clone(), queue_state);
                 drop(states);
-                
-                
+
                 let overflow_event = RwiEvent::QueueOverflowed {
                     call_id: req.call_id.clone(),
                     original_queue_id: req.queue_id,
@@ -1663,18 +2362,16 @@ impl RwiCommandProcessor {
                 };
                 let gw = self.gateway.read().await;
                 gw.send_event_to_call_owner(&req.call_id, &overflow_event);
-                
-                
+
                 let joined_event = RwiEvent::QueueJoined {
                     call_id: req.call_id.clone(),
                     queue_id: target_queue,
                 };
                 gw.send_event_to_call_owner(&req.call_id, &joined_event);
-                
+
                 Ok(CommandResult::Success)
             }
             Some("voicemail") => {
-                
                 info!(call_id = %req.call_id, "Redirecting to voicemail due to overflow");
                 let event = RwiEvent::QueueVoicemailRedirected {
                     call_id: req.call_id.clone(),
@@ -1686,51 +2383,46 @@ impl RwiCommandProcessor {
                 Ok(CommandResult::Success)
             }
             Some("hangup") => {
-                
                 warn!(call_id = %req.call_id, "Hanging up call due to queue overflow");
                 if let Ok(handle) = self.get_handle(&req.call_id).await {
                     use crate::callrecord::CallRecordHangupReason;
                     let hangup_cmd = crate::call::domain::HangupCommand::all(
                         Some(CallRecordHangupReason::BySystem),
-                        Some(480u16), 
+                        Some(480u16),
                     );
                     let _ = handle.send_command(CallCommand::Hangup(hangup_cmd));
                 }
                 Ok(CommandResult::Success)
             }
-            _ => {
-                
-                Err(CommandError::CommandFailed(
-                    format!("Queue {} is full", req.queue_id)
-                ))
-            }
+            _ => Err(CommandError::CommandFailed(format!(
+                "Queue {} is full",
+                req.queue_id
+            ))),
         }
     }
-    
+
     async fn find_matching_agent(&self, required_skills: &[String]) -> Option<String> {
         let agents = self.agent_skills.read().await;
-        
-        let mut best_match: Option<(String, usize, f32)> = None; 
-        
+
+        let mut best_match: Option<(String, usize, f32)> = None;
+
         for (agent_id, agent) in agents.iter() {
-            
             if agent.current_calls >= agent.max_concurrent_calls {
                 continue;
             }
-            
-            
+
             let match_count = required_skills
                 .iter()
                 .filter(|skill| agent.skills.contains(skill))
                 .count();
-            
+
             if match_count == 0 {
                 continue;
             }
-            
+
             // Calculate load ratio for tie-breaking (lower is better)
             let load_ratio = agent.current_calls as f32 / agent.max_concurrent_calls as f32;
-            
+
             // Determine if this agent is better than current best
             let is_better = match &best_match {
                 None => true,
@@ -1748,17 +2440,17 @@ impl RwiCommandProcessor {
                     }
                 }
             };
-            
+
             if is_better {
                 best_match = Some((agent_id.clone(), match_count, load_ratio));
             }
         }
-        
+
         best_match.map(|(agent_id, _, _)| agent_id)
     }
 
     async fn queue_dequeue(&self, call_id: &str) -> Result<CommandResult, CommandError> {
-        let _handle = self.get_handle(call_id).await?; 
+        let _handle = self.get_handle(call_id).await?;
         let queue_id = {
             let states = self.queue_states.read().await;
             states.get(call_id).map(|s| s.queue_id.clone())
@@ -1838,10 +2530,8 @@ impl RwiCommandProcessor {
         call_id: &str,
         priority: u32,
     ) -> Result<CommandResult, CommandError> {
-        
         self.get_handle(call_id).await?;
 
-        
         {
             let states = self.queue_states.read().await;
             if !states.contains_key(call_id) {
@@ -1849,7 +2539,6 @@ impl RwiCommandProcessor {
             }
         }
 
-        
         {
             let mut states = self.queue_states.write().await;
             if let Some(state) = states.get_mut(call_id) {
@@ -1866,10 +2555,8 @@ impl RwiCommandProcessor {
         call_id: &str,
         agent_id: &str,
     ) -> Result<CommandResult, CommandError> {
-        
         self.get_handle(call_id).await?;
 
-        
         let queue_id = {
             let states = self.queue_states.read().await;
             if let Some(state) = states.get(call_id) {
@@ -1879,7 +2566,6 @@ impl RwiCommandProcessor {
             }
         };
 
-        
         let event = RwiEvent::QueueAgentOffered {
             call_id: call_id.to_string(),
             queue_id: queue_id.clone(),
@@ -1898,10 +2584,8 @@ impl RwiCommandProcessor {
         queue_id: &str,
         priority: Option<u32>,
     ) -> Result<CommandResult, CommandError> {
-        
         self.get_handle(call_id).await?;
 
-        
         let old_queue_id = {
             let mut states = self.queue_states.write().await;
             if let Some(state) = states.get_mut(call_id) {
@@ -1916,7 +2600,6 @@ impl RwiCommandProcessor {
             }
         };
 
-        
         let event = RwiEvent::QueueLeft {
             call_id: call_id.to_string(),
             queue_id: old_queue_id,
@@ -1935,10 +2618,6 @@ impl RwiCommandProcessor {
         Ok(CommandResult::Success)
     }
 
-    
-    
-    
-
     pub async fn register_agent_skill(
         &self,
         agent_id: String,
@@ -1951,10 +2630,10 @@ impl RwiCommandProcessor {
             max_concurrent_calls,
             current_calls: 0,
         };
-        
+
         let mut agents = self.agent_skills.write().await;
         agents.insert(agent_id.clone(), agent);
-        
+
         info!(
             agent_id = %agent_id,
             max_calls = %max_concurrent_calls,
@@ -1965,7 +2644,7 @@ impl RwiCommandProcessor {
     pub async fn unregister_agent(&self, agent_id: &str) {
         let mut agents = self.agent_skills.write().await;
         agents.remove(agent_id);
-        
+
         info!(agent_id = %agent_id, "Agent unregistered");
     }
 
@@ -1994,10 +2673,10 @@ impl RwiCommandProcessor {
             overflow_queue_id,
             overflow_action,
         };
-        
+
         let mut configs = self.queue_overflow_configs.write().await;
         configs.insert(queue_id.clone(), config);
-        
+
         info!(
             queue_id = %queue_id,
             max_calls = %max_calls,
@@ -2009,29 +2688,28 @@ impl RwiCommandProcessor {
     pub async fn remove_queue_overflow_config(&self, queue_id: &str) {
         let mut configs = self.queue_overflow_configs.write().await;
         configs.remove(queue_id);
-        
+
         info!(queue_id = %queue_id, "Queue overflow configuration removed");
     }
 
     pub async fn get_queue_stats(&self, queue_id: &str) -> Option<QueueStats> {
         let states = self.queue_states.read().await;
-        
-        let queue_calls: Vec<&QueueState> = states
-            .values()
-            .filter(|s| s.queue_id == queue_id)
-            .collect();
-        
+
+        let queue_calls: Vec<&QueueState> =
+            states.values().filter(|s| s.queue_id == queue_id).collect();
+
         if queue_calls.is_empty() {
             return None;
         }
-        
+
         let total_calls = queue_calls.len() as u32;
         let calls_on_hold = queue_calls.iter().filter(|s| s.is_hold).count() as u32;
         let avg_wait_time_secs = queue_calls
             .iter()
             .map(|s| s.enqueued_at.elapsed().as_secs())
-            .sum::<u64>() / queue_calls.len() as u64;
-        
+            .sum::<u64>()
+            / queue_calls.len() as u64;
+
         Some(QueueStats {
             queue_id: queue_id.to_string(),
             total_calls,
@@ -2170,10 +2848,12 @@ impl RwiCommandProcessor {
             ));
         }
         let handle = self.get_handle(call_id).await?;
-        handle.send_command(CallCommand::SendSipMessage {
-            content_type: content_type.to_string(),
-            body: body.to_string(),
-        }).map_err(|e| CommandError::CommandFailed(e.to_string()))?;
+        handle
+            .send_command(CallCommand::SendSipMessage {
+                content_type: content_type.to_string(),
+                body: body.to_string(),
+            })
+            .map_err(|e| CommandError::CommandFailed(e.to_string()))?;
         let event = RwiEvent::SipMessageReceived {
             call_id: call_id.to_string(),
             content_type: content_type.to_string(),
@@ -2197,11 +2877,13 @@ impl RwiCommandProcessor {
             ));
         }
         let handle = self.get_handle(call_id).await?;
-        handle.send_command(CallCommand::SendSipNotify {
-            event: event.to_string(),
-            content_type: content_type.to_string(),
-            body: body.to_string(),
-        }).map_err(|e| CommandError::CommandFailed(e.to_string()))?;
+        handle
+            .send_command(CallCommand::SendSipNotify {
+                event: event.to_string(),
+                content_type: content_type.to_string(),
+                body: body.to_string(),
+            })
+            .map_err(|e| CommandError::CommandFailed(e.to_string()))?;
         let event = RwiEvent::SipNotifyReceived {
             call_id: call_id.to_string(),
             event: event.to_string(),
@@ -2220,7 +2902,8 @@ impl RwiCommandProcessor {
             ));
         }
         let handle = self.get_handle(call_id).await?;
-        handle.send_command(CallCommand::SendSipOptionsPing)
+        handle
+            .send_command(CallCommand::SendSipOptionsPing)
             .map_err(|e| CommandError::CommandFailed(e.to_string()))?;
         Ok(CommandResult::Success)
     }
@@ -2231,47 +2914,19 @@ impl RwiCommandProcessor {
     ) -> Result<CommandResult, CommandError> {
         let conf_id = req.conf_id.clone();
 
-        
-        {
-            let states = self.conference_states.read().await;
-            if states.contains_key(&conf_id) {
-                return Err(CommandError::CommandFailed(format!(
-                    "conference {} already exists",
-                    conf_id
-                )));
-            }
+        if req.backend == "external" && req.mcu_uri.is_none() {
+            return Err(CommandError::CommandFailed(
+                "external backend requires mcu_uri".to_string(),
+            ));
         }
 
-        
-        if req.backend == "external" {
-            if req.mcu_uri.is_none() {
-                return Err(CommandError::CommandFailed(
-                    "external backend requires mcu_uri".to_string(),
-                ));
-            }
-        }
+        let manager = self.conference_manager();
+        let max_participants = req.max_members.map(|m| m as usize);
+        manager
+            .create_conference(conf_id.clone().into(), max_participants)
+            .await
+            .map_err(|e| CommandError::CommandFailed(e.to_string()))?;
 
-        
-        let state = ConferenceState {
-            conf_id: conf_id.clone(),
-            backend: req.backend,
-            max_members: req.max_members,
-            record: req.record,
-            mcu_uri: req.mcu_uri,
-            members: vec![],
-        };
-
-        
-        self.mixer_registry
-            .create_conference_mixer(conf_id.clone(), 8000);
-
-        
-        {
-            let mut states = self.conference_states.write().await;
-            states.insert(conf_id.clone(), state);
-        }
-
-        
         let event = RwiEvent::ConferenceCreated {
             conf_id: conf_id.clone(),
         };
@@ -2287,52 +2942,14 @@ impl RwiCommandProcessor {
         conf_id: &str,
         call_id: &str,
     ) -> Result<CommandResult, CommandError> {
-        
         self.get_handle(call_id).await?;
 
-        
-        let mut state = {
-            let mut states = self.conference_states.write().await;
-            let state = states.get_mut(conf_id).ok_or_else(|| {
-                CommandError::CommandFailed(format!("conference {} not found", conf_id))
-            })?;
+        let manager = self.conference_manager();
+        manager
+            .add_participant(&conf_id.into(), LegId::new(call_id))
+            .await
+            .map_err(|e| CommandError::CommandFailed(e.to_string()))?;
 
-            
-            if let Some(max) = state.max_members {
-                if state.members.len() >= max as usize {
-                    return Err(CommandError::CommandFailed(format!(
-                        "conference {} is full",
-                        conf_id
-                    )));
-                }
-            }
-
-            state.clone()
-        };
-
-        
-        let added = self.mixer_registry.add_participant(
-            conf_id,
-            call_id.to_string(),
-            MixerParticipantRole::ConferenceParticipant,
-        );
-
-        if !added {
-            return Err(CommandError::CommandFailed(format!(
-                "failed to add participant to mixer"
-            )));
-        }
-
-        
-        state.members.push(call_id.to_string());
-        {
-            let mut states = self.conference_states.write().await;
-            if let Some(s) = states.get_mut(conf_id) {
-                s.members.push(call_id.to_string());
-            }
-        }
-
-        
         let event = RwiEvent::ConferenceMemberJoined {
             conf_id: conf_id.to_string(),
             call_id: call_id.to_string(),
@@ -2352,33 +2969,12 @@ impl RwiCommandProcessor {
         conf_id: &str,
         call_id: &str,
     ) -> Result<CommandResult, CommandError> {
-        
-        {
-            let states = self.conference_states.read().await;
-            let state = states.get(conf_id).ok_or_else(|| {
-                CommandError::CommandFailed(format!("conference {} not found", conf_id))
-            })?;
+        let manager = self.conference_manager();
+        manager
+            .remove_participant(&conf_id.into(), &LegId::new(call_id))
+            .await
+            .map_err(|e| CommandError::CommandFailed(e.to_string()))?;
 
-            if !state.members.contains(&call_id.to_string()) {
-                return Err(CommandError::CommandFailed(format!(
-                    "call {} is not in conference {}",
-                    call_id, conf_id
-                )));
-            }
-        }
-
-        
-        self.mixer_registry.remove_participant(call_id);
-
-        
-        {
-            let mut states = self.conference_states.write().await;
-            if let Some(s) = states.get_mut(conf_id) {
-                s.members.retain(|c| c != call_id);
-            }
-        }
-
-        
         let event = RwiEvent::ConferenceMemberLeft {
             conf_id: conf_id.to_string(),
             call_id: call_id.to_string(),
@@ -2398,32 +2994,12 @@ impl RwiCommandProcessor {
         conf_id: &str,
         call_id: &str,
     ) -> Result<CommandResult, CommandError> {
-        
-        {
-            let states = self.conference_states.read().await;
-            let state = states.get(conf_id).ok_or_else(|| {
-                CommandError::CommandFailed(format!("conference {} not found", conf_id))
-            })?;
+        let manager = self.conference_manager();
+        manager
+            .mute_participant(&conf_id.into(), &LegId::new(call_id))
+            .await
+            .map_err(|e| CommandError::CommandFailed(e.to_string()))?;
 
-            if !state.members.contains(&call_id.to_string()) {
-                return Err(CommandError::CommandFailed(format!(
-                    "call {} is not in conference {}",
-                    call_id, conf_id
-                )));
-            }
-        }
-
-        
-        let muted = self.mixer_registry.set_participant_muted(call_id, true);
-        if !muted {
-            warn!(
-                conf_id = %conf_id,
-                call_id = %call_id,
-                "Failed to mute participant in mixer (participant not found)"
-            );
-        }
-
-        
         let event = RwiEvent::ConferenceMemberMuted {
             conf_id: conf_id.to_string(),
             call_id: call_id.to_string(),
@@ -2431,7 +3007,7 @@ impl RwiCommandProcessor {
         let gw = self.gateway.read().await;
         gw.broadcast_event(&event);
 
-        info!(conf_id = %conf_id, call_id = %call_id, muted = muted, "Conference member muted");
+        info!(conf_id = %conf_id, call_id = %call_id, "Conference member muted");
         Ok(CommandResult::ConferenceMemberMuted {
             conf_id: conf_id.to_string(),
             call_id: call_id.to_string(),
@@ -2443,32 +3019,12 @@ impl RwiCommandProcessor {
         conf_id: &str,
         call_id: &str,
     ) -> Result<CommandResult, CommandError> {
-        
-        {
-            let states = self.conference_states.read().await;
-            let state = states.get(conf_id).ok_or_else(|| {
-                CommandError::CommandFailed(format!("conference {} not found", conf_id))
-            })?;
+        let manager = self.conference_manager();
+        manager
+            .unmute_participant(&conf_id.into(), &LegId::new(call_id))
+            .await
+            .map_err(|e| CommandError::CommandFailed(e.to_string()))?;
 
-            if !state.members.contains(&call_id.to_string()) {
-                return Err(CommandError::CommandFailed(format!(
-                    "call {} is not in conference {}",
-                    call_id, conf_id
-                )));
-            }
-        }
-
-        
-        let unmuted = self.mixer_registry.set_participant_muted(call_id, false);
-        if !unmuted {
-            warn!(
-                conf_id = %conf_id,
-                call_id = %call_id,
-                "Failed to unmute participant in mixer (participant not found)"
-            );
-        }
-
-        
         let event = RwiEvent::ConferenceMemberUnmuted {
             conf_id: conf_id.to_string(),
             call_id: call_id.to_string(),
@@ -2476,7 +3032,7 @@ impl RwiCommandProcessor {
         let gw = self.gateway.read().await;
         gw.broadcast_event(&event);
 
-        info!(conf_id = %conf_id, call_id = %call_id, unmuted = unmuted, "Conference member unmuted");
+        info!(conf_id = %conf_id, call_id = %call_id, "Conference member unmuted");
         Ok(CommandResult::ConferenceMemberUnmuted {
             conf_id: conf_id.to_string(),
             call_id: call_id.to_string(),
@@ -2484,30 +3040,12 @@ impl RwiCommandProcessor {
     }
 
     async fn conference_destroy(&self, conf_id: &str) -> Result<CommandResult, CommandError> {
-        
-        let members = {
-            let states = self.conference_states.read().await;
-            let state = states.get(conf_id).ok_or_else(|| {
-                CommandError::CommandFailed(format!("conference {} not found", conf_id))
-            })?;
-            state.members.clone()
-        };
+        let manager = self.conference_manager();
+        manager
+            .destroy_conference(&conf_id.into())
+            .await
+            .map_err(|e| CommandError::CommandFailed(e.to_string()))?;
 
-        
-        for call_id in &members {
-            self.mixer_registry.remove_participant(call_id);
-        }
-
-        
-        self.mixer_registry.remove_mixer(conf_id);
-
-        
-        {
-            let mut states = self.conference_states.write().await;
-            states.remove(conf_id);
-        }
-
-        
         let event = RwiEvent::ConferenceDestroyed {
             conf_id: conf_id.to_string(),
         };
@@ -2526,22 +3064,17 @@ impl RwiCommandProcessor {
         call_id: &str,
         consultation_call_id: &str,
     ) -> Result<CommandResult, CommandError> {
-        
-        {
-            let states = self.conference_states.read().await;
-            if !states.contains_key(conf_id) {
-                return Err(CommandError::CommandFailed(format!(
-                    "conference {} not found",
-                    conf_id
-                )));
-            }
+        let manager = self.conference_manager();
+        if manager.get_conference(&conf_id.into()).await.is_none() {
+            return Err(CommandError::CommandFailed(format!(
+                "conference {} not found",
+                conf_id
+            )));
         }
 
-        
         self.get_handle(call_id).await?;
         self.get_handle(consultation_call_id).await?;
 
-        
         let event = RwiEvent::ConferenceMergeRequested {
             call_id: call_id.to_string(),
             consultation_call_id: consultation_call_id.to_string(),
@@ -2557,20 +3090,28 @@ impl RwiCommandProcessor {
             "Conference merge requested"
         );
 
-        
+        if manager
+            .get_conference_id_for_leg(&LegId::new(call_id))
+            .await
+            .is_none()
         {
-            let states = self.conference_states.read().await;
-            let state = states.get(conf_id).unwrap();
-            if !state.members.contains(&call_id.to_string()) {
-                drop(states);
-                let _ = self.conference_add(conf_id, call_id).await;
-            }
+            let _ = self.conference_add(conf_id, call_id).await;
         }
 
-        
         match self.conference_add(conf_id, consultation_call_id).await {
             Ok(_) => {
-                
+                // Ensure both legs are unheld after merge so media flows correctly
+                if let Some(handle) = self.call_registry.get_handle(call_id) {
+                    let _ = handle.send_command(CallCommand::Unhold {
+                        leg_id: LegId::new(call_id),
+                    });
+                }
+                if let Some(handle) = self.call_registry.get_handle(consultation_call_id) {
+                    let _ = handle.send_command(CallCommand::Unhold {
+                        leg_id: LegId::new(consultation_call_id),
+                    });
+                }
+
                 let event = RwiEvent::ConferenceMerged {
                     conf_id: conf_id.to_string(),
                     call_id: call_id.to_string(),
@@ -2582,7 +3123,6 @@ impl RwiCommandProcessor {
                 Ok(CommandResult::Success)
             }
             Err(e) => {
-                
                 let event = RwiEvent::ConferenceMergeFailed {
                     conf_id: conf_id.to_string(),
                     call_id: call_id.to_string(),
@@ -2595,6 +3135,144 @@ impl RwiCommandProcessor {
                 Err(CommandError::CommandFailed(format!(
                     "Failed to merge consultation call: {}",
                     e
+                )))
+            }
+        }
+    }
+
+    async fn conference_seat_replace(
+        &self,
+        conf_id: &str,
+        old_call_id: &str,
+        new_call_id: &str,
+    ) -> Result<CommandResult, CommandError> {
+        let manager = self.conference_manager();
+        if manager.get_conference(&conf_id.into()).await.is_none() {
+            return Err(CommandError::CommandFailed(format!(
+                "conference {} not found",
+                conf_id
+            )));
+        }
+
+        self.get_handle(old_call_id).await?;
+        self.get_handle(new_call_id).await?;
+
+        let started_event = RwiEvent::ConferenceSeatReplaceStarted {
+            conf_id: conf_id.to_string(),
+            old_call_id: old_call_id.to_string(),
+            new_call_id: new_call_id.to_string(),
+        };
+        let gw = self.gateway.read().await;
+        gw.broadcast_event(&started_event);
+        drop(gw);
+
+        let old_leg = LegId::new(old_call_id);
+        let new_leg = LegId::new(new_call_id);
+        let old_was_member = manager.get_conference_id_for_leg(&old_leg).await.is_some();
+
+        if old_was_member {
+            manager
+                .remove_participant(&conf_id.into(), &old_leg)
+                .await
+                .map_err(|e| CommandError::CommandFailed(e.to_string()))?;
+
+            let left_event = RwiEvent::ConferenceMemberLeft {
+                conf_id: conf_id.to_string(),
+                call_id: old_call_id.to_string(),
+            };
+            let gw = self.gateway.read().await;
+            gw.broadcast_event(&left_event);
+            drop(gw);
+        }
+
+        match manager
+            .add_participant(&conf_id.into(), new_leg.clone())
+            .await
+        {
+            Ok(_) => {
+                let joined_event = RwiEvent::ConferenceMemberJoined {
+                    conf_id: conf_id.to_string(),
+                    call_id: new_call_id.to_string(),
+                };
+                let gw = self.gateway.read().await;
+                gw.broadcast_event(&joined_event);
+                drop(gw);
+
+                if old_was_member && let Ok(handle) = self.get_handle(old_call_id).await {
+                    let _ = handle.send_command(CallCommand::Hangup(
+                        crate::call::domain::HangupCommand::local(
+                            "conference_seat_replace",
+                            Some(crate::callrecord::CallRecordHangupReason::BySystem),
+                            Some(200),
+                        ),
+                    ));
+                }
+
+                let success_event = RwiEvent::ConferenceSeatReplaceSucceeded {
+                    conf_id: conf_id.to_string(),
+                    old_call_id: old_call_id.to_string(),
+                    new_call_id: new_call_id.to_string(),
+                };
+                let gw = self.gateway.read().await;
+                gw.broadcast_event(&success_event);
+
+                Ok(CommandResult::Success)
+            }
+            Err(e) => {
+                let reason = e.to_string();
+                if old_was_member {
+                    #[cfg(test)]
+                    let forced_rollback_failure = self
+                        .force_seat_replace_rollback_failure
+                        .swap(false, Ordering::SeqCst);
+                    #[cfg(not(test))]
+                    let forced_rollback_failure = false;
+
+                    if forced_rollback_failure {
+                        let rollback_failed = RwiEvent::ConferenceSeatReplaceRollbackFailed {
+                            conf_id: conf_id.to_string(),
+                            old_call_id: old_call_id.to_string(),
+                            new_call_id: new_call_id.to_string(),
+                            reason: "forced rollback failure".to_string(),
+                        };
+                        let gw = self.gateway.read().await;
+                        gw.broadcast_event(&rollback_failed);
+                    } else {
+                        let rollback = manager
+                            .add_participant(&conf_id.into(), old_leg.clone())
+                            .await;
+                        if rollback.is_ok() {
+                            let rollback_event = RwiEvent::ConferenceMemberJoined {
+                                conf_id: conf_id.to_string(),
+                                call_id: old_call_id.to_string(),
+                            };
+                            let gw = self.gateway.read().await;
+                            gw.broadcast_event(&rollback_event);
+                        } else if let Err(rollback_err) = rollback {
+                            let rollback_failed = RwiEvent::ConferenceSeatReplaceRollbackFailed {
+                                conf_id: conf_id.to_string(),
+                                old_call_id: old_call_id.to_string(),
+                                new_call_id: new_call_id.to_string(),
+                                reason: rollback_err.to_string(),
+                            };
+                            let gw = self.gateway.read().await;
+                            gw.broadcast_event(&rollback_failed);
+                        }
+                    }
+                }
+
+                let failed_event = RwiEvent::ConferenceSeatReplaceFailed {
+                    conf_id: conf_id.to_string(),
+                    old_call_id: old_call_id.to_string(),
+                    new_call_id: new_call_id.to_string(),
+                    reason: reason.clone(),
+                };
+                let gw = self.gateway.read().await;
+                gw.broadcast_event(&failed_event);
+
+                Err(CommandError::CommandFailed(format!(
+                    "seat replacement failed: {}",
+                    reason
                 )))
             }
         }
@@ -2628,11 +3306,9 @@ impl RwiCommandProcessor {
         supervisor_call_id: &str,
         target_call_id: &str,
     ) -> Result<CommandResult, CommandError> {
-        
         let mixer_id = format!("supervisor-{}-{}", supervisor_call_id, target_call_id);
         tracing::info!("supervisor_stop: removing mixer with id={}", mixer_id);
 
-        
         let removed = self.mixer_registry.remove_mixer(&mixer_id);
         if removed {
             tracing::info!("supervisor_stop: mixer stopped and removed");
@@ -2640,14 +3316,12 @@ impl RwiCommandProcessor {
             tracing::warn!("supervisor_stop: mixer not found (may have already been removed)");
         }
 
-        
         if let Ok(handle) = self.get_handle(target_call_id).await {
             let _ = handle.send_command(CallCommand::SupervisorStop {
                 supervisor_leg: LegId::new(supervisor_call_id),
             });
         }
 
-        
         info!(
             audit_event = "supervisor_action",
             action = "stop",
@@ -2791,15 +3465,6 @@ pub struct CallInfo {
     pub status: String,
     pub started_at: String,
     pub answered_at: Option<String>,
-    pub state: Option<CallStateInfo>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct CallStateInfo {
-    pub phase: String,
-    pub caller: Option<String>,
-    pub callee: Option<String>,
-    pub hangup_reason: Option<String>,
 }
 
 #[derive(Debug)]
@@ -2844,8 +3509,11 @@ impl RwiCommandProcessor {
 
         // Use TransferController to execute transfer with 3PCC fallback
         let controller = self.transfer_controller.read().await;
-        
-        match controller.execute_blind_transfer(call_id.clone(), target.clone()).await {
+
+        match controller
+            .execute_blind_transfer(call_id.clone(), target.clone())
+            .await
+        {
             Ok(_tx) => {
                 // Transfer initiated successfully (REFER accepted or 3PCC started)
                 Ok(CommandResult::Success)
@@ -2873,11 +3541,46 @@ impl RwiCommandProcessor {
         }
 
         let controller = self.transfer_controller.read().await;
-        
-        match controller.initiate_attended_transfer(call_id, target, timeout_secs).await {
-            Ok(_tx) => Ok(CommandResult::Success),
+
+        match controller
+            .initiate_attended_transfer(call_id.clone(), target, timeout_secs)
+            .await
+        {
+            Ok(tx) => {
+                let consultation_call_id = tx
+                    .consultation_call_id
+                    .clone()
+                    .unwrap_or_else(|| tx.transfer_id.clone());
+                Ok(CommandResult::TransferAttended {
+                    original_call_id: call_id,
+                    consultation_call_id,
+                })
+            }
             Err(e) => Err(CommandError::CommandFailed(format!(
                 "Attended transfer failed: {}",
+                e.as_str()
+            ))),
+        }
+    }
+
+    async fn handle_transfer_replace(
+        &self,
+        call_id: String,
+        target: String,
+    ) -> Result<CommandResult, CommandError> {
+        if self.call_registry.get_handle(&call_id).is_none() {
+            return Err(CommandError::CallNotFound(call_id));
+        }
+
+        let controller = self.transfer_controller.read().await;
+
+        match controller
+            .execute_replace_transfer(call_id.clone(), target)
+            .await
+        {
+            Ok(_) => Ok(CommandResult::Success),
+            Err(e) => Err(CommandError::CommandFailed(format!(
+                "Replace transfer failed: {}",
                 e.as_str()
             ))),
         }
@@ -2890,8 +3593,11 @@ impl RwiCommandProcessor {
         consultation_call_id: String,
     ) -> Result<CommandResult, CommandError> {
         let controller = self.transfer_controller.read().await;
-        
-        match controller.complete_attended_transfer(call_id, consultation_call_id).await {
+
+        match controller
+            .complete_attended_transfer(call_id, consultation_call_id)
+            .await
+        {
             Ok(_tx) => Ok(CommandResult::Success),
             Err(e) => Err(CommandError::CommandFailed(format!(
                 "Transfer complete failed: {}",
@@ -2906,8 +3612,11 @@ impl RwiCommandProcessor {
         consultation_call_id: String,
     ) -> Result<CommandResult, CommandError> {
         let controller = self.transfer_controller.read().await;
-        
-        match controller.cancel_attended_transfer(consultation_call_id).await {
+
+        match controller
+            .cancel_attended_transfer(consultation_call_id)
+            .await
+        {
             Ok(_tx) => Ok(CommandResult::Success),
             Err(e) => Err(CommandError::CommandFailed(format!(
                 "Transfer cancel failed: {}",
@@ -2927,17 +3636,21 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
-    fn create_test_processor() -> Arc<RwiCommandProcessor> {
+    fn create_test_processor() -> (Arc<RwiCommandProcessor>, Arc<ConferenceManager>) {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        Arc::new(RwiCommandProcessor::new(registry, gateway))
+        let cm = Arc::new(ConferenceManager::new());
+        let processor = Arc::new(RwiCommandProcessor::new(registry, gateway, cm.clone()));
+        (processor, cm)
     }
 
     fn create_test_processor_with_registry(
         registry: Arc<ActiveProxyCallRegistry>,
-    ) -> Arc<RwiCommandProcessor> {
+    ) -> (Arc<RwiCommandProcessor>, Arc<ConferenceManager>) {
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        Arc::new(RwiCommandProcessor::new(registry, gateway))
+        let cm = Arc::new(ConferenceManager::new());
+        let processor = Arc::new(RwiCommandProcessor::new(registry, gateway, cm.clone()));
+        (processor, cm)
     }
 
     fn create_test_call(
@@ -2947,14 +3660,52 @@ mod tests {
         callee: &str,
         direction: DialDirection,
     ) -> crate::proxy::proxy_call::sip_session::SipSessionHandle {
+        create_test_call_with_conference_manager(
+            registry, session_id, caller, callee, direction, None,
+        )
+    }
+
+    fn create_test_call_with_conference_manager(
+        registry: &Arc<ActiveProxyCallRegistry>,
+        session_id: &str,
+        caller: &str,
+        callee: &str,
+        direction: DialDirection,
+        conference_manager: Option<Arc<ConferenceManager>>,
+    ) -> crate::proxy::proxy_call::sip_session::SipSessionHandle {
         use crate::call::runtime::SessionId;
         use crate::proxy::proxy_call::sip_session::SipSession;
 
         let id = SessionId::from(session_id);
         let (handle, mut cmd_rx) = SipSession::with_handle(id);
 
-        
-        tokio::spawn(async move { while let Some(_cmd) = cmd_rx.recv().await {} });
+        if let Some(cm) = conference_manager {
+            tokio::spawn(async move {
+                while let Some(cmd) = cmd_rx.recv().await {
+                    match cmd {
+                        crate::call::domain::CallCommand::ConferenceAdd { conf_id, leg_id } => {
+                            let conf: crate::call::runtime::ConferenceId = conf_id.into();
+                            let _ = cm.add_participant(&conf, leg_id).await;
+                        }
+                        crate::call::domain::CallCommand::ConferenceRemove { conf_id, leg_id } => {
+                            let conf: crate::call::runtime::ConferenceId = conf_id.into();
+                            let _ = cm.remove_participant(&conf, &leg_id).await;
+                        }
+                        crate::call::domain::CallCommand::ConferenceMute { conf_id, leg_id } => {
+                            let conf: crate::call::runtime::ConferenceId = conf_id.into();
+                            let _ = cm.mute_participant(&conf, &leg_id).await;
+                        }
+                        crate::call::domain::CallCommand::ConferenceUnmute { conf_id, leg_id } => {
+                            let conf: crate::call::runtime::ConferenceId = conf_id.into();
+                            let _ = cm.unmute_participant(&conf, &leg_id).await;
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        } else {
+            tokio::spawn(async move { while let Some(_cmd) = cmd_rx.recv().await {} });
+        }
 
         let entry = crate::proxy::active_call_registry::ActiveProxyCallEntry {
             session_id: session_id.to_string(),
@@ -2982,7 +3733,7 @@ mod tests {
         direction: DialDirection,
     ) -> (
         crate::proxy::proxy_call::sip_session::SipSessionHandle,
-        tokio::sync::mpsc::UnboundedReceiver<crate::call::domain::CallCommand>,
+        crate::call::domain::CallCommandRx,
     ) {
         use crate::call::runtime::SessionId;
         use crate::proxy::proxy_call::sip_session::SipSession;
@@ -3010,7 +3761,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_calls_empty() {
-        let processor = create_test_processor();
+        let (processor, _cm) = create_test_processor();
         let result = processor
             .process_command(RwiCommandPayload::ListCalls)
             .await;
@@ -3022,7 +3773,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_answer_call_not_found() {
-        let processor = create_test_processor();
+        let (processor, _cm) = create_test_processor();
         let result = processor
             .process_command(RwiCommandPayload::Answer {
                 call_id: "nonexistent".into(),
@@ -3034,7 +3785,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_ring_call_not_found() {
-        let processor = create_test_processor();
+        let (processor, _cm) = create_test_processor();
         let result = processor
             .process_command(RwiCommandPayload::Ring {
                 call_id: "nonexistent".into(),
@@ -3046,7 +3797,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reject_call_not_found() {
-        let processor = create_test_processor();
+        let (processor, _cm) = create_test_processor();
         let result = processor
             .process_command(RwiCommandPayload::Reject {
                 call_id: "nonexistent".into(),
@@ -3059,7 +3810,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_attach_call_not_found() {
-        let processor = create_test_processor();
+        let (processor, _cm) = create_test_processor();
         let result = processor
             .process_command(RwiCommandPayload::AttachCall {
                 call_id: "nonexistent".into(),
@@ -3072,7 +3823,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_detach_call_not_found() {
-        let processor = create_test_processor();
+        let (processor, _cm) = create_test_processor();
         let result = processor
             .process_command(RwiCommandPayload::DetachCall {
                 call_id: "nonexistent".into(),
@@ -3092,9 +3843,8 @@ mod tests {
             "callee1",
             DialDirection::Inbound,
         );
-        let processor = create_test_processor_with_registry(registry.clone());
+        let (processor, _cm) = create_test_processor_with_registry(registry.clone());
 
-        
         let result = processor
             .process_command(RwiCommandPayload::DetachCall {
                 call_id: "call-to-detach".into(),
@@ -3104,13 +3854,12 @@ mod tests {
         assert!(result.is_ok());
         assert!(matches!(result.unwrap(), CommandResult::Success));
 
-        
         assert!(registry.get_handle("call-to-detach").is_some());
     }
 
     #[tokio::test]
     async fn test_hangup_call_not_found() {
-        let processor = create_test_processor();
+        let (processor, _cm) = create_test_processor();
         let result = processor
             .process_command(RwiCommandPayload::Hangup {
                 call_id: "nonexistent".into(),
@@ -3124,7 +3873,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_transfer_call_not_found() {
-        let processor = create_test_processor();
+        let (processor, _cm) = create_test_processor();
         let result = processor
             .process_command(RwiCommandPayload::Transfer {
                 call_id: "nonexistent".into(),
@@ -3136,7 +3885,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_bridge_not_found_leg_a() {
-        let processor = create_test_processor();
+        let (processor, _cm) = create_test_processor();
         let result = processor
             .process_command(RwiCommandPayload::Bridge {
                 leg_a: "missing-a".into(),
@@ -3150,7 +3899,7 @@ mod tests {
     #[tokio::test]
     async fn test_bridge_not_found_leg_b() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
-        let processor = create_test_processor_with_registry(registry.clone());
+        let (processor, _cm) = create_test_processor_with_registry(registry.clone());
         create_test_call(&registry, "leg-a", "1001", "2001", DialDirection::Outbound);
 
         let result = processor
@@ -3166,29 +3915,27 @@ mod tests {
     #[tokio::test]
     async fn test_bridge_both_legs_exist_sends_bridgeto() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
-        let processor = create_test_processor_with_registry(registry.clone());
+        let (processor, _cm) = create_test_processor_with_registry(registry.clone());
         let _ha = create_test_call(&registry, "leg-a", "1001", "2001", DialDirection::Outbound);
         let _hb = create_test_call(&registry, "leg-b", "1001", "2002", DialDirection::Outbound);
 
-        
-        
         let result = processor
             .process_command(RwiCommandPayload::Bridge {
                 leg_a: "leg-a".into(),
                 leg_b: "leg-b".into(),
             })
             .await;
-        
+
         match &result {
             Ok(_) => {}
-            Err(CommandError::CommandFailed(_)) => {} 
+            Err(CommandError::CommandFailed(_)) => {}
             Err(e) => panic!("Unexpected error: {}", e),
         }
     }
 
     #[tokio::test]
     async fn test_unbridge_not_found() {
-        let processor = create_test_processor();
+        let (processor, _cm) = create_test_processor();
         let result = processor
             .process_command(RwiCommandPayload::Unbridge {
                 call_id: "nope".into(),
@@ -3200,7 +3947,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_subscribe_success() {
-        let processor = create_test_processor();
+        let (processor, _cm) = create_test_processor();
         let result = processor
             .process_command(RwiCommandPayload::Subscribe {
                 contexts: vec!["ctx1".into()],
@@ -3211,7 +3958,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_unsubscribe_success() {
-        let processor = create_test_processor();
+        let (processor, _cm) = create_test_processor();
         let result = processor
             .process_command(RwiCommandPayload::Unsubscribe {
                 contexts: vec!["ctx1".into()],
@@ -3222,7 +3969,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_media_play_not_found() {
-        let processor = create_test_processor();
+        let (processor, _cm) = create_test_processor();
         let result = processor
             .process_command(RwiCommandPayload::MediaPlay(
                 crate::rwi::session::MediaPlayRequest {
@@ -3242,8 +3989,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_originate_no_server_returns_error() {
-        
-        let processor = create_test_processor();
+        let (processor, _cm) = create_test_processor();
         let result = processor
             .process_command(RwiCommandPayload::Originate(
                 crate::rwi::session::OriginateRequest {
@@ -3270,10 +4016,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_originate_invalid_destination_returns_error() {
-        
-        
-        
-        let processor = create_test_processor();
+        let (processor, _cm) = create_test_processor();
         let result = processor
             .process_command(RwiCommandPayload::Originate(
                 crate::rwi::session::OriginateRequest {
@@ -3290,7 +4033,7 @@ mod tests {
             ))
             .await;
         assert!(result.is_err());
-        
+
         assert!(
             result
                 .unwrap_err()
@@ -3299,12 +4042,10 @@ mod tests {
         );
     }
 
-    
-
     #[tokio::test]
     async fn test_answer_existing_call() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
-        let processor = create_test_processor_with_registry(registry.clone());
+        let (processor, _cm) = create_test_processor_with_registry(registry.clone());
         let _handle = create_test_call(
             &registry,
             "call-001",
@@ -3329,7 +4070,7 @@ mod tests {
     #[tokio::test]
     async fn test_hangup_existing_call() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
-        let processor = create_test_processor_with_registry(registry.clone());
+        let (processor, _cm) = create_test_processor_with_registry(registry.clone());
         let _handle = create_test_call(
             &registry,
             "call-001",
@@ -3355,7 +4096,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_calls_with_multiple_calls() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
-        let processor = create_test_processor_with_registry(registry.clone());
+        let (processor, _cm) = create_test_processor_with_registry(registry.clone());
 
         create_test_call(&registry, "call-1", "1001", "2000", DialDirection::Inbound);
         create_test_call(&registry, "call-2", "1002", "2001", DialDirection::Outbound);
@@ -3377,7 +4118,7 @@ mod tests {
     #[tokio::test]
     async fn test_call_direction_filtering() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
-        let processor = create_test_processor_with_registry(registry.clone());
+        let (processor, _cm) = create_test_processor_with_registry(registry.clone());
 
         create_test_call(
             &registry,
@@ -3416,13 +4157,16 @@ mod tests {
     async fn test_bridge_emits_event_to_gateway() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let processor = Arc::new(RwiCommandProcessor::new(registry.clone(), gateway.clone()));
+        let cm = Arc::new(ConferenceManager::new());
+        let processor = Arc::new(RwiCommandProcessor::new(
+            registry.clone(),
+            gateway.clone(),
+            cm.clone(),
+        ));
 
-        
         let _ha = create_test_call(&registry, "leg-a", "1001", "2001", DialDirection::Outbound);
         let _hb = create_test_call(&registry, "leg-b", "1001", "2002", DialDirection::Outbound);
 
-        
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         {
             let mut gw = gateway.write().await;
@@ -3442,7 +4186,6 @@ mod tests {
             .unwrap();
         }
 
-        
         let result = processor
             .process_command(RwiCommandPayload::Bridge {
                 leg_a: "leg-a".into(),
@@ -3450,15 +4193,11 @@ mod tests {
             })
             .await;
 
-        
         match result {
             Ok(_) | Err(CommandError::CommandFailed(_)) => {
-                
-                
                 match tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv()).await
                 {
                     Ok(Some(ev)) => {
-                        
                         let s = serde_json::to_string(&ev).unwrap();
                         assert!(
                             s.contains("call_bridged"),
@@ -3476,11 +4215,9 @@ mod tests {
         }
     }
 
-    
-
     #[tokio::test]
     async fn test_media_stop_not_found() {
-        let processor = create_test_processor();
+        let (processor, _cm) = create_test_processor();
         let result = processor
             .process_command(RwiCommandPayload::MediaStop {
                 call_id: "ghost".into(),
@@ -3493,7 +4230,7 @@ mod tests {
     #[tokio::test]
     async fn test_media_stop_existing_call_sends_stop_playback() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
-        let processor = create_test_processor_with_registry(registry.clone());
+        let (processor, _cm) = create_test_processor_with_registry(registry.clone());
         let (_handle, mut rx) = create_test_call_with_rx(
             &registry,
             "call-stop",
@@ -3507,7 +4244,7 @@ mod tests {
                 call_id: "call-stop".into(),
             })
             .await;
-        
+
         match result {
             Ok(_) | Err(CommandError::CommandFailed(_)) => {}
             Err(e) => panic!("Unexpected error: {}", e),
@@ -3520,7 +4257,7 @@ mod tests {
     #[tokio::test]
     async fn test_unbridge_existing_call_sends_unbridge() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
-        let processor = create_test_processor_with_registry(registry.clone());
+        let (processor, _cm) = create_test_processor_with_registry(registry.clone());
         let (_handle, mut rx) = create_test_call_with_rx(
             &registry,
             "call-unb",
@@ -3546,7 +4283,7 @@ mod tests {
     #[tokio::test]
     async fn test_bridge_sends_bridge_to_to_leg_a() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
-        let processor = create_test_processor_with_registry(registry.clone());
+        let (processor, _cm) = create_test_processor_with_registry(registry.clone());
         let (_ha, mut rx_a) =
             create_test_call_with_rx(&registry, "leg-a2", "1001", "2001", DialDirection::Outbound);
         let _hb = create_test_call(&registry, "leg-b2", "1001", "2002", DialDirection::Outbound);
@@ -3562,7 +4299,6 @@ mod tests {
             Err(e) => panic!("Unexpected error: {}", e),
         }
 
-        
         let cmd = rx_a.try_recv().expect("Bridge should be queued on leg_a");
         assert!(
             matches!(cmd, CallCommand::Bridge { leg_a: _, ref leg_b, .. } if leg_b.as_str() == "leg-b2"),
@@ -3575,12 +4311,16 @@ mod tests {
     async fn test_unbridge_emits_call_unbridged_event_to_gateway() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let processor = Arc::new(RwiCommandProcessor::new(registry.clone(), gateway.clone()));
+        let cm = Arc::new(ConferenceManager::new());
+        let processor = Arc::new(RwiCommandProcessor::new(
+            registry.clone(),
+            gateway.clone(),
+            cm.clone(),
+        ));
 
         let (_handle, _rx) =
             create_test_call_with_rx(&registry, "call-ev", "1001", "2000", DialDirection::Inbound);
 
-        
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         {
             let mut gw = gateway.write().await;
@@ -3607,11 +4347,9 @@ mod tests {
             .await;
         match result {
             Ok(_) | Err(CommandError::CommandFailed(_)) => {
-                
                 match tokio::time::timeout(std::time::Duration::from_secs(2), event_rx.recv()).await
                 {
                     Ok(Some(ev)) => {
-                        
                         let s = serde_json::to_string(&ev).unwrap();
                         assert!(s.contains("call-ev"), "Event should reference call-ev");
                     }
@@ -3642,7 +4380,7 @@ mod tests {
             "2001",
             DialDirection::Inbound,
         );
-        let processor = create_test_processor_with_registry(registry);
+        let (processor, _cm) = create_test_processor_with_registry(registry);
 
         let result = processor
             .process_command(RwiCommandPayload::SetRingbackSource {
@@ -3663,7 +4401,7 @@ mod tests {
             "2000",
             DialDirection::Inbound,
         );
-        let processor = create_test_processor_with_registry(registry);
+        let (processor, _cm) = create_test_processor_with_registry(registry);
 
         let result = processor
             .process_command(RwiCommandPayload::SetRingbackSource {
@@ -3685,7 +4423,7 @@ mod tests {
             "2000",
             DialDirection::Inbound,
         );
-        let processor = create_test_processor_with_registry(registry);
+        let (processor, _cm) = create_test_processor_with_registry(registry);
 
         let result = processor
             .process_command(RwiCommandPayload::SetRingbackSource {
@@ -3707,7 +4445,7 @@ mod tests {
             "2000",
             DialDirection::Inbound,
         );
-        let processor = create_test_processor_with_registry(registry);
+        let (processor, _cm) = create_test_processor_with_registry(registry);
 
         let result = processor
             .process_command(RwiCommandPayload::RecordStart(
@@ -3734,7 +4472,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_record_start_not_found() {
-        let processor = create_test_processor();
+        let (processor, _cm) = create_test_processor();
         let result = processor
             .process_command(RwiCommandPayload::RecordStart(
                 crate::rwi::session::RecordStartRequest {
@@ -3763,7 +4501,7 @@ mod tests {
             "2000",
             DialDirection::Inbound,
         );
-        let processor = create_test_processor_with_registry(registry);
+        let (processor, _cm) = create_test_processor_with_registry(registry);
 
         processor
             .process_command(RwiCommandPayload::RecordStart(
@@ -3802,7 +4540,7 @@ mod tests {
             "2000",
             DialDirection::Inbound,
         );
-        let processor = create_test_processor_with_registry(registry);
+        let (processor, _cm) = create_test_processor_with_registry(registry);
 
         let result = processor
             .process_command(RwiCommandPayload::RecordPause {
@@ -3823,7 +4561,7 @@ mod tests {
             "2000",
             DialDirection::Inbound,
         );
-        let processor = create_test_processor_with_registry(registry);
+        let (processor, _cm) = create_test_processor_with_registry(registry);
 
         processor
             .process_command(RwiCommandPayload::RecordStart(
@@ -3869,7 +4607,7 @@ mod tests {
             "2000",
             DialDirection::Inbound,
         );
-        let processor = create_test_processor_with_registry(registry);
+        let (processor, _cm) = create_test_processor_with_registry(registry);
 
         let result = processor
             .process_command(RwiCommandPayload::RecordResume {
@@ -3890,7 +4628,7 @@ mod tests {
             "2000",
             DialDirection::Inbound,
         );
-        let processor = create_test_processor_with_registry(registry);
+        let (processor, _cm) = create_test_processor_with_registry(registry);
 
         processor
             .process_command(RwiCommandPayload::RecordStart(
@@ -3935,7 +4673,7 @@ mod tests {
             "2000",
             DialDirection::Inbound,
         );
-        let processor = create_test_processor_with_registry(registry);
+        let (processor, _cm) = create_test_processor_with_registry(registry);
 
         let result = processor
             .process_command(RwiCommandPayload::RecordStop {
@@ -3960,7 +4698,7 @@ mod tests {
             "support",
             DialDirection::Inbound,
         );
-        let processor = create_test_processor_with_registry(registry);
+        let (processor, _cm) = create_test_processor_with_registry(registry);
 
         let result = processor
             .process_command(RwiCommandPayload::QueueEnqueue(
@@ -3974,14 +4712,11 @@ mod tests {
             ))
             .await;
         assert!(result.is_ok());
-
-        
-        
     }
 
     #[tokio::test]
     async fn test_queue_enqueue_not_found() {
-        let processor = create_test_processor();
+        let (processor, _cm) = create_test_processor();
         let result = processor
             .process_command(RwiCommandPayload::QueueEnqueue(
                 crate::rwi::session::QueueEnqueueRequest {
@@ -4007,7 +4742,7 @@ mod tests {
             "support",
             DialDirection::Inbound,
         );
-        let processor = create_test_processor_with_registry(registry);
+        let (processor, _cm) = create_test_processor_with_registry(registry);
 
         processor
             .process_command(RwiCommandPayload::QueueEnqueue(
@@ -4028,14 +4763,11 @@ mod tests {
             })
             .await;
         assert!(result.is_ok());
-
-        
-        
     }
 
     #[tokio::test]
     async fn test_queue_dequeue_not_found() {
-        let processor = create_test_processor();
+        let (processor, _cm) = create_test_processor();
         let result = processor
             .process_command(RwiCommandPayload::QueueDequeue {
                 call_id: "nonexistent".into(),
@@ -4055,7 +4787,7 @@ mod tests {
             "support",
             DialDirection::Inbound,
         );
-        let processor = create_test_processor_with_registry(registry);
+        let (processor, _cm) = create_test_processor_with_registry(registry);
 
         processor
             .process_command(RwiCommandPayload::QueueEnqueue(
@@ -4091,7 +4823,7 @@ mod tests {
             "2000",
             DialDirection::Inbound,
         );
-        let processor = create_test_processor_with_registry(registry);
+        let (processor, _cm) = create_test_processor_with_registry(registry);
 
         let result = processor
             .process_command(RwiCommandPayload::QueueHold {
@@ -4117,7 +4849,7 @@ mod tests {
             "support",
             DialDirection::Inbound,
         );
-        let processor = create_test_processor_with_registry(registry);
+        let (processor, _cm) = create_test_processor_with_registry(registry);
 
         processor
             .process_command(RwiCommandPayload::QueueEnqueue(
@@ -4160,7 +4892,7 @@ mod tests {
             "2000",
             DialDirection::Inbound,
         );
-        let processor = create_test_processor_with_registry(registry);
+        let (processor, _cm) = create_test_processor_with_registry(registry);
 
         let result = processor
             .process_command(RwiCommandPayload::QueueUnhold {
@@ -4188,7 +4920,7 @@ mod tests {
         );
         let _handle2 =
             create_test_call(&registry, "call-1", "1002", "2001", DialDirection::Inbound);
-        let processor = create_test_processor_with_registry(registry);
+        let (processor, _cm) = create_test_processor_with_registry(registry);
 
         let result = processor
             .process_command(RwiCommandPayload::SupervisorListen {
@@ -4196,7 +4928,7 @@ mod tests {
                 target_call_id: "call-1".into(),
             })
             .await;
-        
+
         match &result {
             Ok(_) | Err(CommandError::CommandFailed(_)) => {}
             Err(e) => panic!("Unexpected error: {}", e),
@@ -4207,7 +4939,7 @@ mod tests {
     async fn test_supervisor_listen_not_found() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let _handle = create_test_call(&registry, "call-1", "1001", "2000", DialDirection::Inbound);
-        let processor = create_test_processor_with_registry(registry);
+        let (processor, _cm) = create_test_processor_with_registry(registry);
 
         let result = processor
             .process_command(RwiCommandPayload::SupervisorListen {
@@ -4231,16 +4963,16 @@ mod tests {
         );
         let _handle2 =
             create_test_call(&registry, "call-1", "1002", "2001", DialDirection::Inbound);
-        let processor = create_test_processor_with_registry(registry);
+        let (processor, _cm) = create_test_processor_with_registry(registry);
 
         let result = processor
             .process_command(RwiCommandPayload::SupervisorWhisper {
                 supervisor_call_id: "supervisor-1".into(),
                 target_call_id: "call-1".into(),
-                agent_leg: "call-1".into(), 
+                agent_leg: "call-1".into(),
             })
             .await;
-        
+
         match &result {
             Ok(_) | Err(CommandError::CommandFailed(_)) => {}
             Err(e) => panic!("Unexpected error: {}", e),
@@ -4259,16 +4991,16 @@ mod tests {
         );
         let _handle2 =
             create_test_call(&registry, "call-1", "1002", "2001", DialDirection::Inbound);
-        let processor = create_test_processor_with_registry(registry);
+        let (processor, _cm) = create_test_processor_with_registry(registry);
 
         let result = processor
             .process_command(RwiCommandPayload::SupervisorBarge {
                 supervisor_call_id: "supervisor-1".into(),
                 target_call_id: "call-1".into(),
-                agent_leg: "call-1".into(), 
+                agent_leg: "call-1".into(),
             })
             .await;
-        
+
         match &result {
             Ok(_) | Err(CommandError::CommandFailed(_)) => {}
             Err(e) => panic!("Unexpected error: {}", e),
@@ -4279,7 +5011,7 @@ mod tests {
     async fn test_supervisor_stop_success() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let _handle = create_test_call(&registry, "call-1", "1001", "2000", DialDirection::Inbound);
-        let processor = create_test_processor_with_registry(registry);
+        let (processor, _cm) = create_test_processor_with_registry(registry);
 
         let result = processor
             .process_command(RwiCommandPayload::SupervisorStop {
@@ -4294,7 +5026,7 @@ mod tests {
     async fn test_media_stream_start_success() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let _handle = create_test_call(&registry, "call-1", "1001", "2000", DialDirection::Inbound);
-        let processor = create_test_processor_with_registry(registry);
+        let (processor, _cm) = create_test_processor_with_registry(registry);
 
         let result = processor
             .process_command(RwiCommandPayload::MediaStreamStart(
@@ -4315,7 +5047,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_media_stream_start_not_found() {
-        let processor = create_test_processor();
+        let (processor, _cm) = create_test_processor();
         let result = processor
             .process_command(RwiCommandPayload::MediaStreamStart(
                 crate::rwi::session::MediaStreamRequest {
@@ -4338,7 +5070,7 @@ mod tests {
     async fn test_media_stream_stop_success() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let _handle = create_test_call(&registry, "call-1", "1001", "2000", DialDirection::Inbound);
-        let processor = create_test_processor_with_registry(registry);
+        let (processor, _cm) = create_test_processor_with_registry(registry);
 
         processor
             .process_command(RwiCommandPayload::MediaStreamStart(
@@ -4368,7 +5100,7 @@ mod tests {
     async fn test_media_inject_start_success() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let _handle = create_test_call(&registry, "call-1", "1001", "2000", DialDirection::Inbound);
-        let processor = create_test_processor_with_registry(registry);
+        let (processor, _cm) = create_test_processor_with_registry(registry);
 
         let result = processor
             .process_command(RwiCommandPayload::MediaInjectStart(
@@ -4390,7 +5122,7 @@ mod tests {
     async fn test_media_inject_stop_success() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let _handle = create_test_call(&registry, "call-1", "1001", "2000", DialDirection::Inbound);
-        let processor = create_test_processor_with_registry(registry);
+        let (processor, _cm) = create_test_processor_with_registry(registry);
 
         processor
             .process_command(RwiCommandPayload::MediaInjectStart(
@@ -4417,7 +5149,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sip_message_no_server() {
-        let processor = create_test_processor();
+        let (processor, _cm) = create_test_processor();
         let result = processor
             .process_command(RwiCommandPayload::SipMessage {
                 call_id: "call-1".into(),
@@ -4436,7 +5168,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sip_notify_no_server() {
-        let processor = create_test_processor();
+        let (processor, _cm) = create_test_processor();
         let result = processor
             .process_command(RwiCommandPayload::SipNotify {
                 call_id: "call-1".into(),
@@ -4456,7 +5188,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sip_options_ping_no_server() {
-        let processor = create_test_processor();
+        let (processor, _cm) = create_test_processor();
         let result = processor
             .process_command(RwiCommandPayload::SipOptionsPing {
                 call_id: "call-1".into(),
@@ -4471,12 +5203,15 @@ mod tests {
         );
     }
 
-    
     #[tokio::test]
     async fn test_conference_create_success() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let processor = Arc::new(RwiCommandProcessor::new(registry, gateway));
+        let processor = Arc::new(RwiCommandProcessor::new(
+            registry,
+            gateway,
+            Arc::new(ConferenceManager::new()),
+        ));
 
         let result = processor
             .process_command(RwiCommandPayload::ConferenceCreate(
@@ -4502,9 +5237,12 @@ mod tests {
     async fn test_conference_create_duplicate_fails() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let processor = Arc::new(RwiCommandProcessor::new(registry, gateway));
+        let processor = Arc::new(RwiCommandProcessor::new(
+            registry,
+            gateway,
+            Arc::new(ConferenceManager::new()),
+        ));
 
-        
         processor
             .process_command(RwiCommandPayload::ConferenceCreate(
                 ConferenceCreateRequest {
@@ -4518,7 +5256,6 @@ mod tests {
             .await
             .unwrap();
 
-        
         let result = processor
             .process_command(RwiCommandPayload::ConferenceCreate(
                 ConferenceCreateRequest {
@@ -4538,7 +5275,11 @@ mod tests {
     async fn test_conference_create_external_requires_mcu_uri() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let processor = Arc::new(RwiCommandProcessor::new(registry, gateway));
+        let processor = Arc::new(RwiCommandProcessor::new(
+            registry,
+            gateway,
+            Arc::new(ConferenceManager::new()),
+        ));
 
         let result = processor
             .process_command(RwiCommandPayload::ConferenceCreate(
@@ -4564,7 +5305,11 @@ mod tests {
     async fn test_conference_add_not_found_fails() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let processor = Arc::new(RwiCommandProcessor::new(registry, gateway));
+        let processor = Arc::new(RwiCommandProcessor::new(
+            registry,
+            gateway,
+            Arc::new(ConferenceManager::new()),
+        ));
 
         let result = processor
             .process_command(RwiCommandPayload::ConferenceAdd {
@@ -4581,9 +5326,12 @@ mod tests {
     async fn test_conference_destroy_success() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let processor = Arc::new(RwiCommandProcessor::new(registry, gateway));
+        let processor = Arc::new(RwiCommandProcessor::new(
+            registry,
+            gateway,
+            Arc::new(ConferenceManager::new()),
+        ));
 
-        
         processor
             .process_command(RwiCommandPayload::ConferenceCreate(
                 ConferenceCreateRequest {
@@ -4597,7 +5345,6 @@ mod tests {
             .await
             .unwrap();
 
-        
         let result = processor
             .process_command(RwiCommandPayload::ConferenceDestroy {
                 conf_id: "room-1".into(),
@@ -4616,7 +5363,11 @@ mod tests {
     async fn test_conference_destroy_not_found_fails() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let processor = Arc::new(RwiCommandProcessor::new(registry, gateway));
+        let processor = Arc::new(RwiCommandProcessor::new(
+            registry,
+            gateway,
+            Arc::new(ConferenceManager::new()),
+        ));
 
         let result = processor
             .process_command(RwiCommandPayload::ConferenceDestroy {
@@ -4631,9 +5382,13 @@ mod tests {
     async fn test_conference_mute_not_in_conference_fails() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let processor = Arc::new(RwiCommandProcessor::new(registry, gateway));
+        let cm = Arc::new(ConferenceManager::new());
+        let processor = Arc::new(RwiCommandProcessor::new(
+            registry.clone(),
+            gateway,
+            cm.clone(),
+        ));
 
-        
         processor
             .process_command(RwiCommandPayload::ConferenceCreate(
                 ConferenceCreateRequest {
@@ -4647,7 +5402,15 @@ mod tests {
             .await
             .unwrap();
 
-        
+        let _handle = create_test_call_with_conference_manager(
+            &registry,
+            "call-1",
+            "1001",
+            "2000",
+            DialDirection::Inbound,
+            Some(cm.clone()),
+        );
+
         let result = processor
             .process_command(RwiCommandPayload::ConferenceMute {
                 conf_id: "room-1".into(),
@@ -4655,11 +5418,9 @@ mod tests {
             })
             .await;
         assert!(result.is_err());
+        let error = result.unwrap_err().to_string();
         assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("is not in conference")
+            error.contains("not found in conference") || error.contains("is not in conference")
         );
     }
 
@@ -4667,9 +5428,13 @@ mod tests {
     async fn test_conference_add_with_max_members() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let processor = Arc::new(RwiCommandProcessor::new(registry.clone(), gateway));
+        let cm = Arc::new(ConferenceManager::new());
+        let processor = Arc::new(RwiCommandProcessor::new(
+            registry.clone(),
+            gateway,
+            cm.clone(),
+        ));
 
-        
         processor
             .process_command(RwiCommandPayload::ConferenceCreate(
                 ConferenceCreateRequest {
@@ -4683,9 +5448,14 @@ mod tests {
             .await
             .unwrap();
 
-        
-        let _handle1 =
-            create_test_call(&registry, "call-1", "1001", "2000", DialDirection::Inbound);
+        let _handle1 = create_test_call_with_conference_manager(
+            &registry,
+            "call-1",
+            "1001",
+            "2000",
+            DialDirection::Inbound,
+            Some(cm.clone()),
+        );
         let result = processor
             .process_command(RwiCommandPayload::ConferenceAdd {
                 conf_id: "room-1".into(),
@@ -4694,9 +5464,14 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        
-        let _handle2 =
-            create_test_call(&registry, "call-2", "1002", "2001", DialDirection::Inbound);
+        let _handle2 = create_test_call_with_conference_manager(
+            &registry,
+            "call-2",
+            "1002",
+            "2001",
+            DialDirection::Inbound,
+            Some(cm.clone()),
+        );
         let result = processor
             .process_command(RwiCommandPayload::ConferenceAdd {
                 conf_id: "room-1".into(),
@@ -4705,9 +5480,14 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        
-        let _handle3 =
-            create_test_call(&registry, "call-3", "1003", "2002", DialDirection::Inbound);
+        let _handle3 = create_test_call_with_conference_manager(
+            &registry,
+            "call-3",
+            "1003",
+            "2002",
+            DialDirection::Inbound,
+            Some(cm.clone()),
+        );
         let result = processor
             .process_command(RwiCommandPayload::ConferenceAdd {
                 conf_id: "room-1".into(),
@@ -4715,17 +5495,347 @@ mod tests {
             })
             .await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("is full"));
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("maximum capacity") || error.contains("is full"));
     }
 
-    
+    #[tokio::test]
+    async fn test_transfer_attended_returns_consultation_call_id() {
+        let registry = Arc::new(ActiveProxyCallRegistry::new());
+        let gateway = Arc::new(RwLock::new(RwiGateway::new()));
+        let cm = Arc::new(ConferenceManager::new());
+        let processor = Arc::new(RwiCommandProcessor::new(
+            registry.clone(),
+            gateway,
+            cm.clone(),
+        ));
+
+        let _handle = create_test_call(
+            &registry,
+            "call-attended-1",
+            "1001",
+            "2000",
+            DialDirection::Inbound,
+        );
+        registry.update("call-attended-1", |entry| {
+            entry.answered_at = Some(chrono::Utc::now());
+            entry.status = crate::proxy::active_call_registry::ActiveProxyCallStatus::Talking;
+        });
+
+        let result = processor
+            .process_command(RwiCommandPayload::TransferAttended {
+                call_id: "call-attended-1".into(),
+                target: "sip:consult@local".into(),
+                timeout_secs: Some(30),
+            })
+            .await;
+
+        assert!(result.is_ok());
+        match result.unwrap() {
+            CommandResult::TransferAttended {
+                original_call_id,
+                consultation_call_id,
+            } => {
+                assert_eq!(original_call_id, "call-attended-1");
+                assert!(!consultation_call_id.is_empty());
+            }
+            other => panic!("unexpected result: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_conference_seat_replace_success() {
+        let registry = Arc::new(ActiveProxyCallRegistry::new());
+        let gateway = Arc::new(RwLock::new(RwiGateway::new()));
+        let cm = Arc::new(ConferenceManager::new());
+        let processor = Arc::new(RwiCommandProcessor::new(
+            registry.clone(),
+            gateway,
+            cm.clone(),
+        ));
+
+        processor
+            .process_command(RwiCommandPayload::ConferenceCreate(
+                ConferenceCreateRequest {
+                    conf_id: "room-seat-1".into(),
+                    backend: "internal".to_string(),
+                    max_members: Some(2),
+                    record: false,
+                    mcu_uri: None,
+                },
+            ))
+            .await
+            .unwrap();
+
+        let _handle_a = create_test_call_with_conference_manager(
+            &registry,
+            "call-a",
+            "1001",
+            "2000",
+            DialDirection::Inbound,
+            Some(cm.clone()),
+        );
+        let _handle_a1 = create_test_call_with_conference_manager(
+            &registry,
+            "call-a1",
+            "1002",
+            "2001",
+            DialDirection::Inbound,
+            Some(cm.clone()),
+        );
+
+        processor
+            .process_command(RwiCommandPayload::ConferenceAdd {
+                conf_id: "room-seat-1".into(),
+                call_id: "call-a".into(),
+            })
+            .await
+            .unwrap();
+
+        let result = processor
+            .process_command(RwiCommandPayload::ConferenceSeatReplace {
+                conf_id: "room-seat-1".into(),
+                old_call_id: "call-a".into(),
+                new_call_id: "call-a1".into(),
+            })
+            .await;
+        assert!(result.is_ok());
+
+        let manager = processor.conference_manager();
+        let conf = manager
+            .get_conference(&"room-seat-1".into())
+            .await
+            .expect("conference should exist");
+        assert!(!conf.participants.contains_key(&LegId::new("call-a")));
+        assert!(conf.participants.contains_key(&LegId::new("call-a1")));
+    }
+
+    #[tokio::test]
+    async fn test_conference_seat_replace_failure_rolls_back_old_member() {
+        let registry = Arc::new(ActiveProxyCallRegistry::new());
+        let gateway = Arc::new(RwLock::new(RwiGateway::new()));
+        let cm = Arc::new(ConferenceManager::new());
+        let processor = Arc::new(RwiCommandProcessor::new(
+            registry.clone(),
+            gateway,
+            cm.clone(),
+        ));
+
+        processor
+            .process_command(RwiCommandPayload::ConferenceCreate(
+                ConferenceCreateRequest {
+                    conf_id: "room-seat-2".into(),
+                    backend: "internal".to_string(),
+                    max_members: Some(3),
+                    record: false,
+                    mcu_uri: None,
+                },
+            ))
+            .await
+            .unwrap();
+
+        processor
+            .process_command(RwiCommandPayload::ConferenceCreate(
+                ConferenceCreateRequest {
+                    conf_id: "room-seat-3".into(),
+                    backend: "internal".to_string(),
+                    max_members: Some(2),
+                    record: false,
+                    mcu_uri: None,
+                },
+            ))
+            .await
+            .unwrap();
+
+        let _handle_a = create_test_call_with_conference_manager(
+            &registry,
+            "call-a",
+            "1001",
+            "2000",
+            DialDirection::Inbound,
+            Some(cm.clone()),
+        );
+        let _handle_b = create_test_call_with_conference_manager(
+            &registry,
+            "call-b",
+            "1003",
+            "2002",
+            DialDirection::Inbound,
+            Some(cm.clone()),
+        );
+        let _handle_a1 = create_test_call_with_conference_manager(
+            &registry,
+            "call-a1",
+            "1002",
+            "2001",
+            DialDirection::Inbound,
+            Some(cm.clone()),
+        );
+
+        processor
+            .process_command(RwiCommandPayload::ConferenceAdd {
+                conf_id: "room-seat-2".into(),
+                call_id: "call-a".into(),
+            })
+            .await
+            .unwrap();
+        processor
+            .process_command(RwiCommandPayload::ConferenceAdd {
+                conf_id: "room-seat-2".into(),
+                call_id: "call-b".into(),
+            })
+            .await
+            .unwrap();
+        processor
+            .process_command(RwiCommandPayload::ConferenceAdd {
+                conf_id: "room-seat-3".into(),
+                call_id: "call-a1".into(),
+            })
+            .await
+            .unwrap();
+
+        let result = processor
+            .process_command(RwiCommandPayload::ConferenceSeatReplace {
+                conf_id: "room-seat-2".into(),
+                old_call_id: "call-a".into(),
+                new_call_id: "call-a1".into(),
+            })
+            .await;
+        assert!(result.is_err());
+
+        let manager = processor.conference_manager();
+        let conf = manager
+            .get_conference(&"room-seat-2".into())
+            .await
+            .expect("conference should exist");
+        assert!(conf.participants.contains_key(&LegId::new("call-a")));
+        assert!(conf.participants.contains_key(&LegId::new("call-b")));
+        assert!(!conf.participants.contains_key(&LegId::new("call-a1")));
+    }
+
+    #[tokio::test]
+    async fn test_conference_seat_replace_rollback_failed_event_emitted() {
+        let registry = Arc::new(ActiveProxyCallRegistry::new());
+
+        let mut gateway_impl = RwiGateway::new();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        gateway_impl.set_session_event_sender(&"test-session".to_string(), event_tx);
+        let gateway = Arc::new(RwLock::new(gateway_impl));
+
+        let cm = Arc::new(ConferenceManager::new());
+        let processor = Arc::new(RwiCommandProcessor::new(
+            registry.clone(),
+            gateway,
+            cm.clone(),
+        ));
+        processor.force_next_seat_replace_rollback_failure();
+
+        processor
+            .process_command(RwiCommandPayload::ConferenceCreate(
+                ConferenceCreateRequest {
+                    conf_id: "room-seat-4".into(),
+                    backend: "internal".to_string(),
+                    max_members: Some(3),
+                    record: false,
+                    mcu_uri: None,
+                },
+            ))
+            .await
+            .unwrap();
+
+        processor
+            .process_command(RwiCommandPayload::ConferenceCreate(
+                ConferenceCreateRequest {
+                    conf_id: "room-seat-5".into(),
+                    backend: "internal".to_string(),
+                    max_members: Some(2),
+                    record: false,
+                    mcu_uri: None,
+                },
+            ))
+            .await
+            .unwrap();
+
+        let _handle_a = create_test_call_with_conference_manager(
+            &registry,
+            "call-a",
+            "1001",
+            "2000",
+            DialDirection::Inbound,
+            Some(cm.clone()),
+        );
+        let _handle_b = create_test_call_with_conference_manager(
+            &registry,
+            "call-b",
+            "1003",
+            "2002",
+            DialDirection::Inbound,
+            Some(cm.clone()),
+        );
+        let _handle_a1 = create_test_call_with_conference_manager(
+            &registry,
+            "call-a1",
+            "1002",
+            "2001",
+            DialDirection::Inbound,
+            Some(cm.clone()),
+        );
+
+        processor
+            .process_command(RwiCommandPayload::ConferenceAdd {
+                conf_id: "room-seat-4".into(),
+                call_id: "call-a".into(),
+            })
+            .await
+            .unwrap();
+        processor
+            .process_command(RwiCommandPayload::ConferenceAdd {
+                conf_id: "room-seat-4".into(),
+                call_id: "call-b".into(),
+            })
+            .await
+            .unwrap();
+        processor
+            .process_command(RwiCommandPayload::ConferenceAdd {
+                conf_id: "room-seat-5".into(),
+                call_id: "call-a1".into(),
+            })
+            .await
+            .unwrap();
+
+        let result = processor
+            .process_command(RwiCommandPayload::ConferenceSeatReplace {
+                conf_id: "room-seat-4".into(),
+                old_call_id: "call-a".into(),
+                new_call_id: "call-a1".into(),
+            })
+            .await;
+        assert!(result.is_err());
+
+        let mut found = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if event
+                .get("conference_seat_replace_rollback_failed")
+                .is_some()
+            {
+                found = true;
+                break;
+            }
+        }
+        assert!(found);
+    }
+
     #[tokio::test]
     async fn test_queue_set_priority_success() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let processor = Arc::new(RwiCommandProcessor::new(registry.clone(), gateway));
+        let cm = Arc::new(ConferenceManager::new());
+        let processor = Arc::new(RwiCommandProcessor::new(
+            registry.clone(),
+            gateway,
+            cm.clone(),
+        ));
 
-        
         let _handle = create_test_call(&registry, "call-1", "1001", "2000", DialDirection::Inbound);
         processor
             .process_command(RwiCommandPayload::QueueEnqueue(QueueEnqueueRequest {
@@ -4738,7 +5848,6 @@ mod tests {
             .await
             .unwrap();
 
-        
         let result = processor
             .process_command(RwiCommandPayload::QueueSetPriority {
                 call_id: "call-1".into(),
@@ -4752,12 +5861,15 @@ mod tests {
     async fn test_queue_set_priority_not_in_queue_fails() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let processor = Arc::new(RwiCommandProcessor::new(registry.clone(), gateway));
+        let cm = Arc::new(ConferenceManager::new());
+        let processor = Arc::new(RwiCommandProcessor::new(
+            registry.clone(),
+            gateway,
+            cm.clone(),
+        ));
 
-        
         let _handle = create_test_call(&registry, "call-1", "1001", "2000", DialDirection::Inbound);
 
-        
         let result = processor
             .process_command(RwiCommandPayload::QueueSetPriority {
                 call_id: "call-1".into(),
@@ -4772,9 +5884,13 @@ mod tests {
     async fn test_queue_assign_agent_success() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let processor = Arc::new(RwiCommandProcessor::new(registry.clone(), gateway));
+        let cm = Arc::new(ConferenceManager::new());
+        let processor = Arc::new(RwiCommandProcessor::new(
+            registry.clone(),
+            gateway,
+            cm.clone(),
+        ));
 
-        
         let _handle = create_test_call(&registry, "call-1", "1001", "2000", DialDirection::Inbound);
         processor
             .process_command(RwiCommandPayload::QueueEnqueue(QueueEnqueueRequest {
@@ -4787,7 +5903,6 @@ mod tests {
             .await
             .unwrap();
 
-        
         let result = processor
             .process_command(RwiCommandPayload::QueueAssignAgent {
                 call_id: "call-1".into(),
@@ -4801,9 +5916,13 @@ mod tests {
     async fn test_queue_requeue_success() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let processor = Arc::new(RwiCommandProcessor::new(registry.clone(), gateway));
+        let cm = Arc::new(ConferenceManager::new());
+        let processor = Arc::new(RwiCommandProcessor::new(
+            registry.clone(),
+            gateway,
+            cm.clone(),
+        ));
 
-        
         let _handle = create_test_call(&registry, "call-1", "1001", "2000", DialDirection::Inbound);
         processor
             .process_command(RwiCommandPayload::QueueEnqueue(QueueEnqueueRequest {
@@ -4816,7 +5935,6 @@ mod tests {
             .await
             .unwrap();
 
-        
         let result = processor
             .process_command(RwiCommandPayload::QueueRequeue {
                 call_id: "call-1".into(),
@@ -4827,24 +5945,25 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    
-    
-    
-
     #[tokio::test]
     async fn test_skill_based_routing() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let processor = Arc::new(RwiCommandProcessor::new(registry.clone(), gateway));
+        let cm = Arc::new(ConferenceManager::new());
+        let processor = Arc::new(RwiCommandProcessor::new(
+            registry.clone(),
+            gateway,
+            cm.clone(),
+        ));
 
-        
-        processor.register_agent_skill(
-            "agent-1".to_string(),
-            vec!["support".to_string(), "technical".to_string()],
-            5, 
-        ).await;
+        processor
+            .register_agent_skill(
+                "agent-1".to_string(),
+                vec!["support".to_string(), "technical".to_string()],
+                5,
+            )
+            .await;
 
-        
         let _handle = create_test_call(&registry, "call-1", "1001", "2000", DialDirection::Inbound);
         let result = processor
             .process_command(RwiCommandPayload::QueueEnqueue(QueueEnqueueRequest {
@@ -4855,10 +5974,9 @@ mod tests {
                 max_wait_secs: None,
             }))
             .await;
-        
+
         assert!(result.is_ok());
 
-        
         let states = processor.queue_states.read().await;
         let state = states.get("call-1").unwrap();
         assert_eq!(state.agent_id, Some("agent-1".to_string()));
@@ -4868,21 +5986,27 @@ mod tests {
     async fn test_queue_overflow_transfer() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let processor = Arc::new(RwiCommandProcessor::new(registry.clone(), gateway));
+        let cm = Arc::new(ConferenceManager::new());
+        let processor = Arc::new(RwiCommandProcessor::new(
+            registry.clone(),
+            gateway,
+            cm.clone(),
+        ));
 
-        
-        processor.set_queue_overflow_config(
-            "busy-queue".to_string(),
-            2, 
-            300, 
-            Some("overflow-queue".to_string()),
-            Some("transfer".to_string()),
-        ).await;
+        processor
+            .set_queue_overflow_config(
+                "busy-queue".to_string(),
+                2,
+                300,
+                Some("overflow-queue".to_string()),
+                Some("transfer".to_string()),
+            )
+            .await;
 
-        
         for i in 1..=2 {
             let call_id = format!("call-{}", i);
-            let _handle = create_test_call(&registry, &call_id, "1001", "2000", DialDirection::Inbound);
+            let _handle =
+                create_test_call(&registry, &call_id, "1001", "2000", DialDirection::Inbound);
             processor
                 .process_command(RwiCommandPayload::QueueEnqueue(QueueEnqueueRequest {
                     call_id: call_id.clone(),
@@ -4895,7 +6019,6 @@ mod tests {
                 .unwrap();
         }
 
-        
         let _handle = create_test_call(&registry, "call-3", "1001", "2000", DialDirection::Inbound);
         let result = processor
             .process_command(RwiCommandPayload::QueueEnqueue(QueueEnqueueRequest {
@@ -4906,10 +6029,9 @@ mod tests {
                 max_wait_secs: None,
             }))
             .await;
-        
+
         assert!(result.is_ok());
 
-        
         let states = processor.queue_states.read().await;
         let state = states.get("call-3").unwrap();
         assert_eq!(state.queue_id, "overflow-queue");
@@ -4920,40 +6042,41 @@ mod tests {
     async fn test_find_matching_agent_with_capacity() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let processor = Arc::new(RwiCommandProcessor::new(registry, gateway));
+        let processor = Arc::new(RwiCommandProcessor::new(
+            registry,
+            gateway,
+            Arc::new(ConferenceManager::new()),
+        ));
 
-        
-        processor.register_agent_skill(
-            "agent-1".to_string(),
-            vec!["support".to_string()],
-            1, 
-        ).await;
+        processor
+            .register_agent_skill("agent-1".to_string(), vec!["support".to_string()], 1)
+            .await;
 
-        processor.register_agent_skill(
-            "agent-2".to_string(),
-            vec!["support".to_string(), "sales".to_string()],
-            5,
-        ).await;
+        processor
+            .register_agent_skill(
+                "agent-2".to_string(),
+                vec!["support".to_string(), "sales".to_string()],
+                5,
+            )
+            .await;
 
-        
-        let matched = processor.find_matching_agent(&["support".to_string()]).await;
+        let matched = processor
+            .find_matching_agent(&["support".to_string()])
+            .await;
         assert_eq!(matched, Some("agent-1".to_string()));
 
-        
         processor.update_agent_call_count("agent-1", 1).await;
 
-        
-        let matched = processor.find_matching_agent(&["support".to_string()]).await;
+        let matched = processor
+            .find_matching_agent(&["support".to_string()])
+            .await;
         assert_eq!(matched, Some("agent-2".to_string()));
 
-        
         let matched = processor.find_matching_agent(&["sales".to_string()]).await;
         assert_eq!(matched, Some("agent-2".to_string()));
 
-        
         processor.unregister_agent("agent-1").await;
 
-        
         let agents = processor.agent_skills.read().await;
         assert!(!agents.contains_key("agent-1"));
     }
@@ -4962,16 +6085,20 @@ mod tests {
     async fn test_queue_stats() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let gateway = Arc::new(RwLock::new(RwiGateway::new()));
-        let processor = Arc::new(RwiCommandProcessor::new(registry.clone(), gateway));
+        let cm = Arc::new(ConferenceManager::new());
+        let processor = Arc::new(RwiCommandProcessor::new(
+            registry.clone(),
+            gateway,
+            cm.clone(),
+        ));
 
-        
         let stats = processor.get_queue_stats("test-queue").await;
         assert!(stats.is_none());
 
-        
         for i in 1..=3 {
             let call_id = format!("call-{}", i);
-            let _handle = create_test_call(&registry, &call_id, "1001", "2000", DialDirection::Inbound);
+            let _handle =
+                create_test_call(&registry, &call_id, "1001", "2000", DialDirection::Inbound);
             processor
                 .process_command(RwiCommandPayload::QueueEnqueue(QueueEnqueueRequest {
                     call_id: call_id.clone(),
@@ -4984,7 +6111,6 @@ mod tests {
                 .unwrap();
         }
 
-        
         processor
             .process_command(RwiCommandPayload::QueueHold {
                 call_id: "call-1".into(),
@@ -4992,7 +6118,6 @@ mod tests {
             .await
             .unwrap();
 
-        
         let stats = processor.get_queue_stats("test-queue").await;
         assert!(stats.is_some());
         let stats = stats.unwrap();
@@ -5005,7 +6130,7 @@ mod tests {
     async fn test_sip_message_send() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let _handle = create_test_call(&registry, "call-1", "1001", "2000", DialDirection::Inbound);
-        let processor = create_test_processor_with_registry(registry);
+        let (processor, _cm) = create_test_processor_with_registry(registry);
 
         let result = processor
             .process_command(RwiCommandPayload::SipMessage {
@@ -5014,7 +6139,7 @@ mod tests {
                 body: "Hello".into(),
             })
             .await;
-        
+
         assert!(result.is_ok() || matches!(result, Err(CommandError::CommandFailed(_))));
     }
 
@@ -5022,7 +6147,7 @@ mod tests {
     async fn test_sip_notify_send() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let _handle = create_test_call(&registry, "call-1", "1001", "2000", DialDirection::Inbound);
-        let processor = create_test_processor_with_registry(registry);
+        let (processor, _cm) = create_test_processor_with_registry(registry);
 
         let result = processor
             .process_command(RwiCommandPayload::SipNotify {
@@ -5032,7 +6157,7 @@ mod tests {
                 body: "SIP/2.0 200 OK".into(),
             })
             .await;
-        
+
         assert!(result.is_ok() || matches!(result, Err(CommandError::CommandFailed(_))));
     }
 
@@ -5040,14 +6165,14 @@ mod tests {
     async fn test_sip_options_ping() {
         let registry = Arc::new(ActiveProxyCallRegistry::new());
         let _handle = create_test_call(&registry, "call-1", "1001", "2000", DialDirection::Inbound);
-        let processor = create_test_processor_with_registry(registry);
+        let (processor, _cm) = create_test_processor_with_registry(registry);
 
         let result = processor
             .process_command(RwiCommandPayload::SipOptionsPing {
                 call_id: "call-1".into(),
             })
             .await;
-        
+
         assert!(result.is_ok() || matches!(result, Err(CommandError::CommandFailed(_))));
     }
 }

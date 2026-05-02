@@ -20,8 +20,11 @@ use crate::rwi::auth::RwiConfig;
 use argon2::Argon2;
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::{PasswordHasher, SaltString};
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::sse::{KeepAlive, Sse};
+use futures::stream;
+use std::convert::Infallible;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
@@ -33,7 +36,12 @@ use sea_orm::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value as JsonValue, json};
+use std::collections::VecDeque;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, Seek, SeekFrom};
+use std::time::Duration as StdDuration;
 use std::{fs, sync::Arc};
+use tokio::time;
 use toml_edit::{Array, DocumentMut, Item, Table, Value, value};
 use tracing::warn;
 
@@ -46,6 +54,23 @@ struct QueryDepartmentFilters {
 struct QueryUserFilters {
     pub q: Option<String>,
     pub active: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct LogRecentQuery {
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct LogFollowQuery {
+    pub position: Option<u64>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+struct LogStreamQuery {
+    pub position: Option<u64>,
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -150,11 +175,14 @@ impl From<UserModel> for UserView {
 }
 
 pub fn urls() -> Router<Arc<ConsoleState>> {
-    Router::new()
+    let router = Router::new()
         .route("/settings", get(page_settings))
         .route("/settings/config", get(get_effective_config))
         .route("/settings/config/entry", patch(upsert_config_entry))
         .route("/settings/config/entry/{key}", delete(delete_config_entry))
+        .route("/settings/logs/recent", get(fetch_recent_logs))
+        .route("/settings/logs/follow", get(follow_logs))
+        .route("/settings/logs/stream", get(stream_logs))
         .route("/settings/config/platform", patch(update_platform_settings))
         .route("/settings/config/proxy", patch(update_proxy_settings))
         .route("/settings/config/storage", patch(update_storage_settings))
@@ -188,7 +216,15 @@ pub fn urls() -> Router<Arc<ConsoleState>> {
         .route(
             "/settings/uploads/pending/clear",
             post(clear_pending_failures),
-        )
+        );
+
+    #[cfg(feature = "commerce")]
+    let router = router
+        .route("/settings/config/cluster", patch(update_cluster_settings))
+        .route("/settings/config/cluster/reload", get(cluster_reload_sse_handler))
+        .route("/settings/config/cluster/reload-addons", get(list_reload_addons_handler));
+
+    router
         .route(
             "/settings/departments",
             post(query_departments).put(create_department),
@@ -241,7 +277,7 @@ pub async fn page_settings(
 async fn build_settings_payload(state: &ConsoleState) -> JsonValue {
     let mut data = serde_json::Map::new();
     let now = Utc::now();
-    let ami_endpoint = "/ami/v1";
+    let mut ami_endpoint = "/ami/v1".to_string();
 
     let mut platform = json!({});
     let mut proxy = json!({});
@@ -260,6 +296,7 @@ async fn build_settings_payload(state: &ConsoleState) -> JsonValue {
 
     if let Some(app_state) = state.app_state() {
         let config_arc = app_state.config().clone();
+        ami_endpoint = config_arc.proxy.ami_path.clone().unwrap_or_else(|| "/ami/v1".to_string());
         let mut loaded_config: Option<Config> = None;
 
         if let Some(path) = app_state.config_path.as_ref() {
@@ -466,6 +503,30 @@ async fn build_settings_payload(state: &ConsoleState) -> JsonValue {
         serde_json::to_value(rwi_config).unwrap_or(JsonValue::Null),
     );
 
+    {
+        let cluster: Option<crate::config::ClusterConfig> =
+            if let Some(app_state) = state.app_state() {
+                let cluster_config = app_state
+                    .cluster_config
+                    .read()
+                    .map(|c| c.clone())
+                    .unwrap_or(None);
+                cluster_config.or_else(|| {
+                    // fallback: read from backing config (stale snapshot)
+                    // This should not normally happen after startup.
+                    let config_arc = app_state.config().clone();
+                    config_arc.cluster.clone()
+                })
+            } else {
+                None
+            };
+        data.insert(
+            "cluster".to_string(),
+            serde_json::to_value(cluster.or_else(|| Some(crate::config::ClusterConfig::default())))
+                .unwrap_or(JsonValue::Null),
+        );
+    }
+
     JsonValue::Object(data)
 }
 
@@ -613,6 +674,22 @@ fn build_storage_profiles(config: &crate::config::Config) -> (JsonValue, Vec<Jso
             }
             ("http".to_string(), profile)
         }
+        Some(CallRecordConfig::Database {
+            database_url,
+            table_name,
+        }) => {
+            let mut profile = Profile::new(
+                "callrecord-database",
+                "Call recordings",
+                "Storing call detail records in database",
+            );
+            profile.insert("type", json!("database"));
+            if let Some(url) = database_url {
+                profile.insert("database_url", json!(url));
+            }
+            profile.insert("table_name", json!(table_name));
+            ("database".to_string(), profile)
+        }
         None => {
             let mut profile = Profile::new(
                 "callrecord-local",
@@ -632,11 +709,10 @@ fn build_storage_profiles(config: &crate::config::Config) -> (JsonValue, Vec<Jso
     );
     spool_profile.insert("recorder_path", json!(&recorder_path));
 
-    if let Some(policy) = config.recording.as_ref() {
-        if let Ok(policy_value) = serde_json::to_value(policy) {
+    if let Some(policy) = config.recording.as_ref()
+        && let Ok(policy_value) = serde_json::to_value(policy) {
             spool_profile.insert("recording", policy_value);
         }
-    }
 
     let active_profile_id = callrecord_profile.id.clone();
     let active_description = callrecord_profile.description.clone();
@@ -675,8 +751,8 @@ async fn query_departments(
     }
     let db = state.db();
     let mut selector = DepartmentEntity::find().order_by_asc(DepartmentColumn::Name);
-    if let Some(filters) = payload.filters.as_ref() {
-        if let Some(keyword) = filters
+    if let Some(filters) = payload.filters.as_ref()
+        && let Some(keyword) = filters
             .q
             .as_ref()
             .map(|v| v.trim())
@@ -690,7 +766,6 @@ async fn query_departments(
                     .add(DepartmentColumn::Slug.like(pattern)),
             );
         }
-    }
 
     let paginator = selector.paginate(db, payload.normalize().1);
     let pagination = match forms::paginate(paginator, &payload).await {
@@ -941,11 +1016,10 @@ async fn query_users(
                     .add(UserColumn::Username.like(pattern)),
             );
         }
-        if let Some(active_only) = filters.active {
-            if active_only {
+        if let Some(active_only) = filters.active
+            && active_only {
                 selector = selector.filter(UserColumn::IsActive.eq(true));
             }
-        }
     }
 
     let paginator = selector.paginate(db, query.normalize().1);
@@ -1072,15 +1146,17 @@ async fn create_user(
         }
     };
 
-    let mut active: UserActiveModel = Default::default();
-    active.email = Set(email.to_lowercase());
-    active.username = Set(username.to_string());
-    active.password_hash = Set(hashed);
-    active.created_at = Set(now);
-    active.updated_at = Set(now);
-    active.is_active = Set(payload.is_active.unwrap_or(true));
-    active.is_staff = Set(payload.is_staff.unwrap_or(false));
-    active.is_superuser = Set(payload.is_superuser.unwrap_or(false));
+    let active = UserActiveModel {
+        email: Set(email.to_lowercase()),
+        username: Set(username.to_string()),
+        password_hash: Set(hashed),
+        created_at: Set(now),
+        updated_at: Set(now),
+        is_active: Set(payload.is_active.unwrap_or(true)),
+        is_staff: Set(payload.is_staff.unwrap_or(false)),
+        is_superuser: Set(payload.is_superuser.unwrap_or(false)),
+        ..Default::default()
+    };
 
     match active.insert(state.db()).await {
         Ok(model) => (
@@ -1330,6 +1406,14 @@ fn summarize_callrecord(config: Option<&CallRecordConfig>) -> Option<JsonValue> 
         CallRecordConfig::Http { url, .. } => Some(json!({
             "label": "Call record storage",
             "value": format!("HTTP {}", url),
+        })),
+        CallRecordConfig::Database {
+            database_url,
+            table_name,
+        } => Some(json!({
+            "label": "Call record storage",
+            "value": format!("Database ({})", table_name),
+            "hint": database_url.as_deref().unwrap_or("default"),
         })),
     }
 }
@@ -1722,14 +1806,13 @@ pub(crate) async fn update_platform_settings(
         Err(resp) => return resp,
     };
 
-    if let (Some(start), Some(end)) = (config.rtp_start_port, config.rtp_end_port) {
-        if start > end {
+    if let (Some(start), Some(end)) = (config.rtp_start_port, config.rtp_end_port)
+        && start > end {
             return json_error(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "rtp_start_port must be less than or equal to rtp_end_port",
             );
         }
-    }
 
     // Persist to DB (not to disk)
     if modified {
@@ -2357,13 +2440,13 @@ pub(crate) struct RwiSettingsPayload {
     contexts: Option<Vec<RwiContextPayload>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct RwiTokenPayload {
     token: String,
     scopes: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct RwiContextPayload {
     name: String,
     no_answer_timeout_secs: Option<u32>,
@@ -2423,64 +2506,66 @@ pub(crate) async fn update_rwi_settings(
 
     // Update tokens
     if let Some(tokens) = payload.tokens {
-        // Use toml serialization to build the tokens array
-        let tokens_vec: Vec<toml::Value> = tokens
-            .into_iter()
-            .map(|t| {
-                let mut m = toml::map::Map::new();
-                m.insert("token".to_string(), toml::Value::String(t.token));
-                m.insert(
-                    "scopes".to_string(),
-                    toml::Value::Array(t.scopes.into_iter().map(toml::Value::String).collect()),
-                );
-                toml::Value::Table(m)
-            })
-            .collect();
-        let tokens_toml = toml::Value::Array(tokens_vec);
-        // Set using toml::to_string and parse back to toml_edit
-        let tokens_str = toml::to_string(&tokens_toml).unwrap_or_default();
-        // Parse the tokens section from string
-        if let Ok(tokens_doc) = tokens_str.parse::<DocumentMut>() {
-            if let Some(tokens_item) = tokens_doc.as_table().get("") {
-                rwi_table["tokens"] = tokens_item.clone();
-                modified = true;
-            }
+        #[derive(Serialize)]
+        struct RwiTokensToml {
+            tokens: Vec<RwiTokenPayload>,
         }
+
+        let tokens_str = match toml::to_string(&RwiTokensToml { tokens }) {
+            Ok(s) => s,
+            Err(err) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("Failed to serialize RWI tokens: {err}"),
+                );
+            }
+        };
+        let tokens_doc = match tokens_str.parse::<DocumentMut>() {
+            Ok(doc) => doc,
+            Err(err) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid RWI tokens payload: {err}"),
+                );
+            }
+        };
+        let Some(tokens_item) = tokens_doc.get("tokens").cloned() else {
+            return json_error(StatusCode::BAD_REQUEST, "Invalid RWI tokens payload");
+        };
+        rwi_table["tokens"] = tokens_item;
+        modified = true;
     }
 
     // Update contexts
     if let Some(contexts) = payload.contexts {
-        let contexts_vec: Vec<toml::Value> = contexts
-            .into_iter()
-            .map(|c| {
-                let mut m = toml::map::Map::new();
-                m.insert("name".to_string(), toml::Value::String(c.name));
-                if let Some(timeout) = c.no_answer_timeout_secs {
-                    m.insert(
-                        "no_answer_timeout_secs".to_string(),
-                        toml::Value::Integer(timeout as i64),
-                    );
-                }
-                if let Some(action) = c.no_answer_action {
-                    m.insert("no_answer_action".to_string(), toml::Value::String(action));
-                }
-                if let Some(target) = c.no_answer_transfer_target {
-                    m.insert(
-                        "no_answer_transfer_target".to_string(),
-                        toml::Value::String(target),
-                    );
-                }
-                toml::Value::Table(m)
-            })
-            .collect();
-        let contexts_toml = toml::Value::Array(contexts_vec);
-        let contexts_str = toml::to_string(&contexts_toml).unwrap_or_default();
-        if let Ok(contexts_doc) = contexts_str.parse::<DocumentMut>() {
-            if let Some(contexts_item) = contexts_doc.as_table().get("") {
-                rwi_table["contexts"] = contexts_item.clone();
-                modified = true;
-            }
+        #[derive(Serialize)]
+        struct RwiContextsToml {
+            contexts: Vec<RwiContextPayload>,
         }
+
+        let contexts_str = match toml::to_string(&RwiContextsToml { contexts }) {
+            Ok(s) => s,
+            Err(err) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("Failed to serialize RWI contexts: {err}"),
+                );
+            }
+        };
+        let contexts_doc = match contexts_str.parse::<DocumentMut>() {
+            Ok(doc) => doc,
+            Err(err) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid RWI contexts payload: {err}"),
+                );
+            }
+        };
+        let Some(contexts_item) = contexts_doc.get("contexts").cloned() else {
+            return json_error(StatusCode::BAD_REQUEST, "Invalid RWI contexts payload");
+        };
+        rwi_table["contexts"] = contexts_item;
+        modified = true;
     }
 
     let doc_text = doc.to_string();
@@ -2527,6 +2612,568 @@ fn get_db(state: &ConsoleState) -> Result<sea_orm::DatabaseConnection, Response>
         .ok_or_else(|| json_error(StatusCode::SERVICE_UNAVAILABLE, "Application state unavailable"))
 }
 
+#[cfg(feature = "commerce")]
+#[derive(Debug, Deserialize)]
+pub(crate) struct ClusterSettingsPayload {
+    #[serde(default)]
+    pub peers: Option<Vec<ClusterPeerPayload>>,
+}
+
+#[cfg(feature = "commerce")]
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) struct ClusterPeerPayload {
+    pub addr: String,
+    pub sip_port: u16,
+    pub ami_port: u16,
+}
+
+#[cfg(feature = "commerce")]
+pub(crate) async fn update_cluster_settings(
+    State(state): State<Arc<ConsoleState>>,
+    AuthRequired(user): AuthRequired,
+    Json(payload): Json<ClusterSettingsPayload>,
+) -> Response {
+    if !state.has_permission(&user, "system", "write").await {
+        return json_error(StatusCode::FORBIDDEN, "Permission denied");
+    }
+    let config_path = match get_config_path(&state) {
+        Ok(path) => path,
+        Err(resp) => return resp,
+    };
+
+    let mut doc = match load_document(&config_path) {
+        Ok(doc) => doc,
+        Err(resp) => return resp,
+    };
+
+    let mut modified = false;
+
+    if let Some(peers) = payload.peers {
+        #[derive(Serialize)]
+        struct ClusterToml {
+            peers: Vec<ClusterPeerPayload>,
+        }
+        let peers_str = match toml::to_string(&ClusterToml { peers }) {
+            Ok(s) => s,
+            Err(err) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("Failed to serialize cluster peers: {err}"),
+                );
+            }
+        };
+        let peers_doc = match peers_str.parse::<DocumentMut>() {
+            Ok(doc) => doc,
+            Err(err) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid cluster peers payload: {err}"),
+                );
+            }
+        };
+        let cluster_table = ensure_table_mut(&mut doc, "cluster");
+        let Some(peers_item) = peers_doc.get("peers").cloned() else {
+            return json_error(StatusCode::BAD_REQUEST, "Invalid cluster peers payload");
+        };
+        cluster_table.insert("peers", peers_item);
+        modified = true;
+    }
+
+    let doc_text = doc.to_string();
+    let config = match parse_config_from_str(&doc_text) {
+        Ok(cfg) => cfg,
+        Err(resp) => return resp,
+    };
+
+    if modified
+        && let Err(resp) = persist_document(&config_path, doc_text) {
+            return resp;
+        }
+
+    let cluster = config.cluster;
+    // Update in-memory cluster config so the UI backfills on refresh without requiring restart.
+    if let Some(app_state) = state.app_state() {
+        app_state.update_cluster_config(cluster.clone());
+    }
+    Json(json!({
+        "status": "ok",
+        "requires_restart": true,
+        "message": "Cluster settings saved. Please restart the service for changes to take effect.",
+        "cluster": cluster,
+    }))
+    .into_response()
+}
+
+/// List registered export/reload addon handlers (no feature gate needed).
+#[cfg(feature = "commerce")]
+async fn list_reload_addons_handler(
+    State(state): State<Arc<ConsoleState>>,
+) -> Response {
+    let items: Vec<serde_json::Value> = if let Some(app_state) = state.app_state() {
+        app_state.addon_registry.export_reload.list()
+            .into_iter()
+            .map(|(id, name)| serde_json::json!({ "id": id, "name": name }))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Json(json!({ "addons": items })).into_response()
+}
+
+/// SSE-based reload that processes current node + all peers.
+#[cfg(feature = "commerce")]
+async fn cluster_reload_sse_handler(
+    State(state): State<Arc<ConsoleState>>,
+    Query(query): Query<crate::handler::ami::PingReloadPayload>,
+) -> Response {
+    use axum::response::sse::Event as SseEvent;
+
+    let app_state = match state.app_state() {
+        Some(s) => s,
+        None => {
+            use axum::response::sse::Sse;
+            return Sse::new(futures::stream::once(async move {
+                Ok::<_, std::convert::Infallible>(SseEvent::default().event("error").data(r#"{"error":"PBX not running"}"#))
+            }))
+            .into_response();
+        }
+    };
+
+    use axum::response::sse::{KeepAlive, Sse};
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<SseEvent, std::convert::Infallible>>();
+
+    let payload = crate::handler::ami::PingReloadPayload {
+        trunks: query.trunks,
+        routes: query.routes,
+        addons: query.addons,
+    };
+
+    let app = app_state.clone();
+    tokio::spawn(async move {
+        macro_rules! sse_send {
+            ($event_type:expr, $data:expr) => {
+                let tx = tx.clone();
+                let _ = tx.send(Ok(SseEvent::default().event($event_type).data($data.to_string())));
+            };
+        }
+
+        // Process trunks on current node
+        if payload.trunks {
+            sse_send!("progress", serde_json::json!({"type": "addon_start", "node": "current", "addon": "trunks"}));
+            let result = reload_trunks(&app, "current").await;
+            sse_send!("progress", serde_json::json!({"type": "addon_complete", "node": "current", "addon": "trunks", "result": result}));
+        }
+
+        // Process routes on current node
+        if payload.routes {
+            sse_send!("progress", serde_json::json!({"type": "addon_start", "node": "current", "addon": "routes"}));
+            let result = reload_routes_console(&app, "current").await;
+            sse_send!("progress", serde_json::json!({"type": "addon_complete", "node": "current", "addon": "routes", "result": result}));
+        }
+
+        // Process addon-based handlers on current node
+        for addon_id in &payload.addons {
+            sse_send!("progress", serde_json::json!({"type": "addon_start", "node": "current", "addon": addon_id}));
+            let results = app.addon_registry.export_reload
+                .invoke_selected(&[addon_id.clone()], &app)
+                .await;
+            let json_result = match results.into_iter().next() {
+                Some((_, Ok(v))) => serde_json::json!({ "status": "ok", "details": v }),
+                Some((_, Err(e))) => serde_json::json!({ "status": "error", "message": e }),
+                None => serde_json::json!({ "status": "error", "message": "Handler not found" }),
+            };
+            sse_send!("progress", serde_json::json!({"type": "addon_complete", "node": "current", "addon": addon_id, "result": json_result}));
+        }
+
+        // Process peer nodes
+        let peers = app.config().cluster.as_ref()
+            .map(|c| c.peers.clone())
+            .unwrap_or_default();
+
+        let ami_path = app
+            .config()
+            .proxy
+            .ami_path
+            .clone()
+            .unwrap_or_else(|| "/ami/v1".to_string());
+
+        for peer in &peers {
+            let peer_label = format!("{}:{}", peer.addr, peer.ami_port);
+            sse_send!("progress", serde_json::json!({"type": "node_start", "node": &peer_label}));
+
+            let url = format!("http://{}:{}{}/cluster/reload_sync", peer.addr, peer.ami_port, ami_path);
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(120))
+                .build()
+                .unwrap_or_default();
+
+            match client.post(&url).json(&payload).send().await {
+                Ok(resp) => match resp.json::<serde_json::Value>().await {
+                    Ok(peer_results) => {
+                        sse_send!("progress", serde_json::json!({"type": "node_complete", "node": &peer_label, "result": peer_results}));
+                    }
+                    Err(e) => {
+                        sse_send!("progress", serde_json::json!({"type": "node_error", "node": &peer_label, "error": format!("Invalid JSON: {}", e)}));
+                    }
+                },
+                Err(e) => {
+                    sse_send!("progress", serde_json::json!({"type": "node_error", "node": &peer_label, "error": format!("Connection failed: {}", e)}));
+                }
+            }
+        }
+
+        sse_send!("complete", serde_json::json!({"type": "complete"}));
+    });
+
+    let sse_stream = futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|event| (event, rx))
+    });
+    Sse::new(sse_stream)
+        .keep_alive(KeepAlive::new().interval(std::time::Duration::from_secs(15)).text("keep-alive"))
+        .into_response()
+}
+
+/// Reload trunks helper (mirrors the AMI handler's logic).
+#[cfg(feature = "commerce")]
+async fn reload_trunks(app: &crate::app::AppStateInner, _node: &str) -> serde_json::Value {
+    let config_path = app.config_path.clone();
+    let config_override = config_path.as_ref().and_then(|path| {
+        crate::config::Config::load(path).ok().map(|cfg| std::sync::Arc::new(cfg.proxy))
+    });
+
+    match app
+        .sip_server()
+        .inner
+        .data_context
+        .reload_trunks(true, config_override)
+        .await
+    {
+        Ok(metrics) => {
+            if let Some(ref console) = app.console {
+                console.clear_pending_reload();
+            }
+            serde_json::json!({ "addon": "trunks", "status": "ok", "reloaded": metrics.total })
+        }
+        Err(e) => serde_json::json!({ "addon": "trunks", "status": "error", "message": e.to_string() }),
+    }
+}
+
+/// Reload routes helper (mirrors the AMI handler's logic).
+#[cfg(feature = "commerce")]
+async fn reload_routes_console(app: &crate::app::AppStateInner, _node: &str) -> serde_json::Value {
+    let config_path = app.config_path.clone();
+    let config_override = config_path.as_ref().and_then(|path| {
+        crate::config::Config::load(path).ok().map(|cfg| std::sync::Arc::new(cfg.proxy))
+    });
+
+    match app
+        .sip_server()
+        .inner
+        .data_context
+        .reload_routes(true, config_override)
+        .await
+    {
+        Ok(metrics) => {
+            if let Some(ref console) = app.console {
+                console.clear_pending_reload();
+            }
+            serde_json::json!({ "addon": "routes", "status": "ok", "reloaded": metrics.total })
+        }
+        Err(e) => serde_json::json!({ "addon": "routes", "status": "error", "message": e.to_string() }),
+    }
+}
+
+const LOG_DEFAULT_LIMIT: usize = 200;
+const LOG_MAX_LIMIT: usize = 2000;
+
+struct FollowReadResult {
+    lines: Vec<String>,
+    next_position: u64,
+    reset: bool,
+    truncated: bool,
+}
+
+async fn fetch_recent_logs(
+    State(state): State<Arc<ConsoleState>>,
+    AuthRequired(user): AuthRequired,
+    Query(query): Query<LogRecentQuery>,
+) -> Response {
+    if !user.is_superuser {
+        return json_error(StatusCode::FORBIDDEN, "Permission denied. Superuser required.");
+    }
+
+    let Some(path) = resolve_log_file_path(&state) else {
+        return Json(json!({
+            "status": "ok",
+            "available": false,
+            "exists": false,
+            "path": JsonValue::Null,
+            "lines": [],
+            "next_position": 0u64,
+            "reset": false,
+            "truncated": false,
+            "message": "Log file is not configured. Set settings -> platform -> log_file first.",
+        }))
+        .into_response();
+    };
+
+    let limit = normalize_log_limit(query.limit);
+    match read_recent_log_lines(&path, limit) {
+        Ok((lines, next_position, truncated)) => Json(json!({
+            "status": "ok",
+            "available": true,
+            "exists": true,
+            "path": path,
+            "lines": lines,
+            "next_position": next_position,
+            "reset": false,
+            "truncated": truncated,
+            "message": JsonValue::Null,
+        }))
+        .into_response(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Json(json!({
+            "status": "ok",
+            "available": true,
+            "exists": false,
+            "path": path,
+            "lines": [],
+            "next_position": 0u64,
+            "reset": false,
+            "truncated": false,
+            "message": "Log file does not exist yet.",
+        }))
+        .into_response(),
+        Err(err) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to read log file: {err}"),
+        ),
+    }
+}
+
+async fn follow_logs(
+    State(state): State<Arc<ConsoleState>>,
+    AuthRequired(user): AuthRequired,
+    Query(query): Query<LogFollowQuery>,
+) -> Response {
+    if !user.is_superuser {
+        return json_error(StatusCode::FORBIDDEN, "Permission denied. Superuser required.");
+    }
+
+    let Some(path) = resolve_log_file_path(&state) else {
+        return Json(json!({
+            "status": "ok",
+            "available": false,
+            "exists": false,
+            "path": JsonValue::Null,
+            "lines": [],
+            "next_position": 0u64,
+            "reset": false,
+            "truncated": false,
+            "message": "Log file is not configured. Set settings -> platform -> log_file first.",
+        }))
+        .into_response();
+    };
+
+    let position = query.position.unwrap_or(0);
+    let limit = normalize_log_limit(query.limit);
+
+    match read_follow_log_lines(&path, position, limit) {
+        Ok(result) => Json(json!({
+            "status": "ok",
+            "available": true,
+            "exists": true,
+            "path": path,
+            "lines": result.lines,
+            "next_position": result.next_position,
+            "reset": result.reset,
+            "truncated": result.truncated,
+            "message": JsonValue::Null,
+        }))
+        .into_response(),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Json(json!({
+            "status": "ok",
+            "available": true,
+            "exists": false,
+            "path": path,
+            "lines": [],
+            "next_position": 0u64,
+            "reset": position > 0,
+            "truncated": false,
+            "message": "Log file does not exist yet.",
+        }))
+        .into_response(),
+        Err(err) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to follow log file: {err}"),
+        ),
+    }
+}
+
+async fn stream_logs(
+    State(state): State<Arc<ConsoleState>>,
+    AuthRequired(user): AuthRequired,
+    Query(query): Query<LogStreamQuery>,
+) -> Response {
+    if !user.is_superuser {
+        return json_error(StatusCode::FORBIDDEN, "Permission denied. Superuser required.");
+    }
+
+    let Some(path) = resolve_log_file_path(&state) else {
+        return Json(json!({
+            "status": "ok",
+            "available": false,
+            "exists": false,
+            "path": JsonValue::Null,
+            "lines": [],
+            "next_position": 0u64,
+            "reset": false,
+            "truncated": false,
+            "message": "Log file is not configured. Set settings -> platform -> log_file first.",
+        }))
+        .into_response();
+    };
+
+    let start_position = query.position.unwrap_or(0);
+    let limit = normalize_log_limit(query.limit);
+    let path_for_stream = path.clone();
+
+    let stream = stream::unfold(start_position, move |mut cursor| {
+        let path = path_for_stream.clone();
+        async move {
+            time::sleep(StdDuration::from_millis(1000)).await;
+
+            let payload = match read_follow_log_lines(&path, cursor, limit) {
+                Ok(result) => {
+                    cursor = result.next_position;
+                    json!({
+                        "status": "ok",
+                        "path": path,
+                        "lines": result.lines,
+                        "next_position": result.next_position,
+                        "reset": result.reset,
+                        "truncated": result.truncated,
+                    })
+                }
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                    cursor = 0;
+                    json!({
+                        "status": "ok",
+                        "path": path,
+                        "lines": [],
+                        "next_position": 0u64,
+                        "reset": true,
+                        "truncated": false,
+                        "exists": false,
+                        "message": "Log file does not exist yet.",
+                    })
+                }
+                Err(err) => json!({
+                    "status": "error",
+                    "message": format!("Failed to follow log file: {err}"),
+                }),
+            };
+
+            let event = axum::response::sse::Event::default().event("logs").data(payload.to_string());
+            Some((Ok::<_, Infallible>(event), cursor))
+        }
+    });
+
+    Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(StdDuration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response()
+}
+
+fn normalize_log_limit(limit: Option<usize>) -> usize {
+    match limit {
+        Some(value) => value.clamp(1, LOG_MAX_LIMIT),
+        None => LOG_DEFAULT_LIMIT,
+    }
+}
+
+fn resolve_log_file_path(state: &ConsoleState) -> Option<String> {
+    state.app_state().and_then(|app| {
+        app.config()
+            .log_file
+            .as_ref()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    })
+}
+
+fn read_recent_log_lines(path: &str, limit: usize) -> io::Result<(Vec<String>, u64, bool)> {
+    let file = File::open(path)?;
+    let next_position = file.metadata()?.len();
+    let reader = BufReader::new(file);
+    let mut lines = VecDeque::new();
+    let mut truncated = false;
+
+    for line in reader.lines() {
+        let line = line?;
+        if lines.len() == limit {
+            lines.pop_front();
+            truncated = true;
+        }
+        lines.push_back(line);
+    }
+
+    Ok((lines.into_iter().collect(), next_position, truncated))
+}
+
+fn read_follow_log_lines(path: &str, position: u64, limit: usize) -> io::Result<FollowReadResult> {
+    let file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+
+    if position > file_len {
+        let (lines, next_position, truncated) = read_recent_log_lines(path, limit)?;
+        return Ok(FollowReadResult {
+            lines,
+            next_position,
+            reset: true,
+            truncated,
+        });
+    }
+
+    let mut reader = BufReader::new(file);
+    reader.seek(SeekFrom::Start(position))?;
+
+    let mut lines = Vec::new();
+    let mut raw = String::new();
+    let mut truncated = false;
+
+    while lines.len() < limit {
+        raw.clear();
+        let read = reader.read_line(&mut raw)?;
+        if read == 0 {
+            break;
+        }
+        lines.push(raw.trim_end_matches(&['\n', '\r'][..]).to_string());
+    }
+
+    if lines.len() == limit {
+        let mut extra = String::new();
+        let extra_read = reader.read_line(&mut extra)?;
+        if extra_read > 0 {
+            truncated = true;
+            let rewind = i64::try_from(extra_read).unwrap_or(i64::MAX);
+            reader.seek(SeekFrom::Current(-rewind))?;
+        }
+    }
+
+    let next_position = reader.stream_position()?;
+
+    Ok(FollowReadResult {
+        lines,
+        next_position,
+        reset: false,
+        truncated,
+    })
+}
+
+#[allow(clippy::result_large_err)]
 fn get_config_path(state: &ConsoleState) -> Result<String, Response> {
     let Some(app_state) = state.app_state() else {
         return Err(json_error(
@@ -2544,6 +3191,7 @@ fn get_config_path(state: &ConsoleState) -> Result<String, Response> {
     Ok(path)
 }
 
+#[allow(clippy::result_large_err)]
 fn load_document(path: &str) -> Result<DocumentMut, Response> {
     let contents = match fs::read_to_string(path) {
         Ok(raw) => raw,
@@ -2564,6 +3212,7 @@ fn load_document(path: &str) -> Result<DocumentMut, Response> {
 }
 
 #[allow(dead_code)]
+#[allow(clippy::result_large_err)]
 fn persist_document(path: &str, contents: String) -> Result<(), Response> {
     fs::write(path, contents).map_err(|err| {
         json_error(
@@ -2573,6 +3222,7 @@ fn persist_document(path: &str, contents: String) -> Result<(), Response> {
     })
 }
 
+#[allow(clippy::result_large_err)]
 fn parse_config_from_str(contents: &str) -> Result<Config, Response> {
     toml::from_str::<Config>(contents)
         .map(|mut cfg| {
@@ -2588,10 +3238,20 @@ fn parse_config_from_str(contents: &str) -> Result<Config, Response> {
 }
 
 fn ensure_table_mut<'doc>(doc: &'doc mut DocumentMut, key: &str) -> &'doc mut Table {
-    if !doc[key].is_table() {
-        doc[key] = Item::Table(Table::new());
+    let needs_init = doc
+        .as_table()
+        .get(key)
+        .map(|item| !item.is_table())
+        .unwrap_or(true);
+
+    if needs_init {
+        doc.insert(key, Item::Table(Table::new()));
     }
-    doc[key].as_table_mut().expect("table")
+
+    doc.as_table_mut()
+        .get_mut(key)
+        .and_then(Item::as_table_mut)
+        .expect("table")
 }
 
 fn parse_lines_to_vec(raw: &str) -> Vec<String> {
@@ -2644,19 +3304,30 @@ pub(crate) async fn test_storage_connection(
     let filename = format!("test-connection-{}.txt", Uuid::new_v4());
     let content = b"RustPBX storage connection test";
 
-    if let Err(err) = storage
-        .write(&filename, bytes::Bytes::from_static(content))
-        .await
-    {
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            format!("Failed to write test file: {}", err),
-        );
-    }
+    let test_fut = async {
+        storage
+            .write(&filename, bytes::Bytes::from_static(content))
+            .await?;
+        if let Err(err) = storage.delete(&filename).await {
+            warn!("Failed to delete test file {}: {}", filename, err);
+        }
+        Ok::<_, anyhow::Error>(())
+    };
 
-    if let Err(err) = storage.delete(&filename).await {
-        // Try to delete but don't fail the test if delete fails, just warn
-        warn!("Failed to delete test file {}: {}", filename, err);
+    match tokio::time::timeout(std::time::Duration::from_secs(10), test_fut).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                format!("Failed to write test file: {}", err),
+            );
+        }
+        Err(_) => {
+            return json_error(
+                StatusCode::REQUEST_TIMEOUT,
+                "Storage connection timed out after 10 seconds",
+            );
+        }
     }
 
     Json(json!({
@@ -3245,6 +3916,8 @@ mod tests {
     use crate::models::rbac;
     use sea_orm::Database;
     use sea_orm_migration::MigratorTrait;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
 
     fn superuser() -> UserModel {
         let now = Utc::now();
@@ -3371,5 +4044,52 @@ mod tests {
         let items = parsed["items"].as_array().expect("items");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["name"], "viewer");
+    }
+
+    #[test]
+    fn read_recent_log_lines_limits_tail() {
+        let mut file = NamedTempFile::new().expect("tempfile");
+        writeln!(file, "line-1").expect("write line 1");
+        writeln!(file, "line-2").expect("write line 2");
+        writeln!(file, "line-3").expect("write line 3");
+
+        let path = file.path().to_string_lossy().to_string();
+        let (lines, next_position, truncated) =
+            read_recent_log_lines(&path, 2).expect("read recent logs");
+
+        assert_eq!(lines, vec!["line-2".to_string(), "line-3".to_string()]);
+        assert!(next_position > 0);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn follow_logs_resets_on_rotation() {
+        let mut file = NamedTempFile::new().expect("tempfile");
+        writeln!(file, "new-1").expect("write new-1");
+        writeln!(file, "new-2").expect("write new-2");
+
+        let path = file.path().to_string_lossy().to_string();
+        let result = read_follow_log_lines(&path, 10_000, 200).expect("follow logs");
+
+        assert!(result.reset);
+        assert_eq!(result.lines, vec!["new-1".to_string(), "new-2".to_string()]);
+        assert!(result.next_position > 0);
+    }
+
+    #[test]
+    fn follow_logs_keeps_position_when_truncated() {
+        let mut file = NamedTempFile::new().expect("tempfile");
+        writeln!(file, "l1").expect("write l1");
+        writeln!(file, "l2").expect("write l2");
+        writeln!(file, "l3").expect("write l3");
+
+        let path = file.path().to_string_lossy().to_string();
+        let first = read_follow_log_lines(&path, 0, 2).expect("first follow");
+        assert_eq!(first.lines, vec!["l1".to_string(), "l2".to_string()]);
+        assert!(first.truncated);
+
+        let second = read_follow_log_lines(&path, first.next_position, 2).expect("second follow");
+        assert_eq!(second.lines, vec!["l3".to_string()]);
+        assert!(!second.reset);
     }
 }

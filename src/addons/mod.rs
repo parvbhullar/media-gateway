@@ -146,6 +146,18 @@ pub trait Addon: Send + Sync {
         builder
     }
 
+    /// Return a dialplan inspector for intercepting SIP INVITEs
+    fn dialplan_inspector(
+        &self,
+    ) -> Option<Box<dyn crate::proxy::call::DialplanInspector>> {
+        None
+    }
+
+    /// Return database migrations for this addon.
+    fn migrations(&self) -> Vec<Box<dyn sea_orm_migration::MigrationTrait>> {
+        vec![]
+    }
+
     /// Seed fixtures for the addon
     async fn seed_fixtures(&self, _state: AppState) -> anyhow::Result<()> {
         Ok(())
@@ -160,9 +172,19 @@ pub trait Addon: Send + Sync {
     ) -> anyhow::Result<Option<crate::models::user::Model>> {
         Ok(None)
     }
+
+    /// Return an export/reload handler for this addon.
+    /// Addons that support export-and-reload (e.g. queues, IVR, CC) should
+    /// return a handler here so the cluster reload UI can discover them.
+    fn export_reload_handler(&self) -> Option<Box<dyn export_reload::ExportReloadHandler>> {
+        None
+    }
 }
 
+pub mod export_reload;
 pub mod registry;
+
+pub mod observability;
 
 #[cfg(feature = "addon-acme")]
 pub mod acme;
@@ -174,6 +196,10 @@ pub mod transcript;
 pub mod wholesale;
 
 pub mod queue;
+#[cfg(feature = "addon-jsonrpc-router")]
+pub mod jsonrpc_router;
+#[cfg(feature = "addon-cc")]
+pub mod cc;
 
 #[cfg(feature = "addon-endpoint-manager")]
 pub mod endpoint_manager;

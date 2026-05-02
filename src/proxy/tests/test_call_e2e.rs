@@ -9,7 +9,7 @@
 
 use super::cdr_capture::CdrExpectation;
 use super::e2e_test_server::E2eTestServer;
-use super::rtp_utils::RtpPacket;
+use super::rtp_utils::{RtpPacket, extract_media_endpoint};
 use super::test_ua::TestUaEvent;
 use crate::callrecord::CallRecordHangupReason;
 use crate::config::MediaProxyMode;
@@ -459,7 +459,7 @@ async fn test_caller_hangup_cdr() -> Result<()> {
     // Verify duration (should be ~2 seconds)
     let duration = (record.end_time - record.start_time).num_seconds();
     assert!(
-        duration >= 1 && duration <= 4,
+        (1..=4).contains(&duration),
         "Duration should be ~2 seconds, got {} seconds",
         duration
     );
@@ -551,10 +551,12 @@ async fn test_media_proxy_none_mode() -> Result<()> {
     });
 
     // Bob answers
+    let mut bob_offer_sdp = None;
     for _ in 0..50 {
         let events = bob.process_dialog_events().await?;
         for event in events {
-            if let TestUaEvent::IncomingCall(id, _) = event {
+            if let TestUaEvent::IncomingCall(id, offer) = event {
+                bob_offer_sdp = offer;
                 bob.answer_call(&id, Some(bob_sdp.clone())).await?;
                 break;
             }
@@ -562,13 +564,174 @@ async fn test_media_proxy_none_mode() -> Result<()> {
         sleep(Duration::from_millis(100)).await;
     }
 
-    let _ = tokio::time::timeout(Duration::from_secs(5), caller_handle).await;
+    let alice_id = tokio::time::timeout(Duration::from_secs(5), caller_handle)
+        .await
+        .map_err(|_| anyhow::anyhow!("timeout"))??
+        .map_err(|e| anyhow::anyhow!("call: {}", e))?;
 
-    // In None mode, the SDP should pass through unchanged (or with minimal modification)
-    // TODO: Capture and verify actual SDP received
+    let bob_offer = bob_offer_sdp.ok_or_else(|| anyhow::anyhow!("No offer SDP on callee"))?;
+    let alice_answer = alice
+        .get_negotiated_answer_sdp(&alice_id)
+        .await
+        .ok_or_else(|| anyhow::anyhow!("No answer SDP on caller"))?;
+
+    assert_eq!(
+        extract_media_endpoint(&bob_offer),
+        extract_media_endpoint(&alice_sdp),
+        "None mode should pass caller SDP to callee without anchoring",
+    );
+    assert_eq!(
+        extract_media_endpoint(&alice_answer),
+        extract_media_endpoint(&bob_sdp),
+        "None mode should pass callee SDP to caller without anchoring",
+    );
 
     server.stop();
     info!("MediaProxy None mode test completed");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_mid_dialog_passthrough_none_mode() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let server = Arc::new(E2eTestServer::start_with_mode(MediaProxyMode::None).await?);
+
+    let alice = Arc::new(server.create_ua("alice").await?);
+    let bob = server.create_ua("bob").await?;
+
+    sleep(Duration::from_millis(100)).await;
+
+    let initial_sdp = super::test_ua::create_test_sdp("127.0.0.1", 10000, false);
+    let answer_sdp = super::test_ua::create_test_sdp("127.0.0.1", 20000, false);
+
+    let caller_handle = tokio::spawn({
+        let a = alice.clone();
+        let sdp = initial_sdp.clone();
+        async move { a.make_call("bob", Some(sdp)).await }
+    });
+
+    let mut bob_dialog_id = None;
+    for _ in 0..50 {
+        let events = bob.process_dialog_events().await?;
+        for event in events {
+            if let TestUaEvent::IncomingCall(id, _) = event {
+                bob_dialog_id = Some(id.clone());
+                bob.answer_call(&id, Some(answer_sdp.clone())).await?;
+                break;
+            }
+        }
+        if bob_dialog_id.is_some() {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    let alice_id = tokio::time::timeout(Duration::from_secs(5), caller_handle)
+        .await
+        .map_err(|_| anyhow::anyhow!("timeout"))??
+        .map_err(|e| anyhow::anyhow!("call: {}", e))?;
+    let bob_id = bob_dialog_id.ok_or_else(|| anyhow::anyhow!("Bob did not receive the call"))?;
+
+    let update_sdp = "v=0\r\n\
+        o=- 123456 789012 IN IP4 127.0.0.1\r\n\
+        s=-\r\n\
+        c=IN IP4 127.0.0.1\r\n\
+        t=0 0\r\n\
+        m=audio 10000 RTP/AVP 0\r\n\
+        a=rtpmap:0 PCMU/8000\r\n\
+        a=sendonly\r\n"
+        .to_string();
+
+    let update_handle = tokio::spawn({
+        let a = alice.clone();
+        let id = alice_id.clone();
+        let sdp = update_sdp.clone();
+        async move { a.send_update(&id, Some(sdp)).await }
+    });
+
+    let mut saw_update = false;
+    for _ in 0..30 {
+        let events = bob.process_dialog_events().await?;
+        for event in events {
+            if let TestUaEvent::CallUpdated(id, method, Some(sdp)) = event {
+                if id == bob_id && method == rsipstack::sip::Method::Update {
+                    assert_eq!(sdp, update_sdp, "UPDATE SDP should be relayed unchanged");
+                    saw_update = true;
+                    break;
+                }
+            }
+        }
+        if saw_update {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    assert!(saw_update, "Bob should receive the relayed UPDATE in None mode");
+
+    let update_answer = tokio::time::timeout(Duration::from_secs(5), update_handle)
+        .await
+        .map_err(|_| anyhow::anyhow!("UPDATE timeout"))??
+        .map_err(|e| anyhow::anyhow!("UPDATE failed: {}", e))?;
+    assert_eq!(
+        update_answer,
+        Some(answer_sdp.clone()),
+        "Caller should receive callee SDP answer for UPDATE in None mode",
+    );
+
+    let reinvite_sdp = "v=0\r\n\
+        o=- 123456 789013 IN IP4 127.0.0.1\r\n\
+        s=-\r\n\
+        c=IN IP4 127.0.0.1\r\n\
+        t=0 0\r\n\
+        m=audio 10000 RTP/AVP 0\r\n\
+        a=rtpmap:0 PCMU/8000\r\n\
+        a=sendrecv\r\n"
+        .to_string();
+
+    let reinvite_handle = tokio::spawn({
+        let a = alice.clone();
+        let id = alice_id.clone();
+        let sdp = reinvite_sdp.clone();
+        async move { a.send_reinvite(&id, Some(sdp)).await }
+    });
+
+    let mut saw_reinvite = false;
+    for _ in 0..30 {
+        let events = bob.process_dialog_events().await?;
+        for event in events {
+            if let TestUaEvent::CallUpdated(id, method, Some(sdp)) = event {
+                if id == bob_id && method == rsipstack::sip::Method::Invite {
+                    assert_eq!(sdp, reinvite_sdp, "re-INVITE SDP should be relayed unchanged");
+                    saw_reinvite = true;
+                    break;
+                }
+            }
+        }
+        if saw_reinvite {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    assert!(
+        saw_reinvite,
+        "Bob should receive the relayed re-INVITE in None mode",
+    );
+
+    let reinvite_answer = tokio::time::timeout(Duration::from_secs(5), reinvite_handle)
+        .await
+        .map_err(|_| anyhow::anyhow!("re-INVITE timeout"))??
+        .map_err(|e| anyhow::anyhow!("re-INVITE failed: {}", e))?;
+    assert_eq!(
+        reinvite_answer,
+        Some(answer_sdp.clone()),
+        "Caller should receive callee SDP answer for re-INVITE in None mode",
+    );
+
+    alice.hangup(&alice_id).await?;
+    server.stop();
     Ok(())
 }
 
@@ -795,7 +958,7 @@ async fn test_multiple_calls_cdr() -> Result<()> {
 async fn test_reinvite_hold_resume() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let server = Arc::new(E2eTestServer::start().await?);
+    let server = Arc::new(E2eTestServer::start_with_mode(MediaProxyMode::All).await?);
 
     let alice = Arc::new(server.create_ua("alice").await?);
     let bob = server.create_ua("bob").await?;
@@ -842,12 +1005,14 @@ async fn test_reinvite_hold_resume() -> Result<()> {
     assert!(bob_dialog_id.is_some(), "Bob should have dialog");
 
     let alice_id = alice_dialog_id.unwrap();
-    let bob_id = bob_dialog_id.unwrap();
+    let _bob_id = bob_dialog_id.unwrap();
 
     // Let call run briefly
     sleep(Duration::from_millis(300)).await;
 
     // Test 1: Alice puts Bob on hold (re-INVITE with sendonly)
+    // In MediaProxyMode::All, the proxy handles re-INVITE locally (B2BUA anchored);
+    // Bob never receives it, so we only verify Alice gets a valid SDP answer.
     info!("=== Testing call hold (re-INVITE with sendonly) ===");
     let hold_sdp = "v=0\r\n\
         o=- 123456 789012 IN IP4 127.0.0.1\r\n\
@@ -859,48 +1024,18 @@ async fn test_reinvite_hold_resume() -> Result<()> {
         a=sendonly\r\n"
         .to_string();
 
-    // Spawn Bob's event handler to respond to re-INVITE
-    let bob_clone = bob.clone();
-    let bob_id_clone = bob_id.clone();
-    let bob_handle = tokio::spawn(async move {
-        for _ in 0..30 {
-            if let Ok(events) = bob_clone.process_dialog_events().await {
-                for event in &events {
-                    if let TestUaEvent::CallUpdated(id, method, Some(sdp)) = event {
-                        if *method == rsipstack::sip::Method::Invite && id == &bob_id_clone {
-                            info!("Bob received re-INVITE (hold) with SDP:\n{}", sdp);
-                            // Bob responds with recvonly (being held)
-                            let response_sdp = "v=0\r\n\
-                                o=- 789012 123456 IN IP4 127.0.0.1\r\n\
-                                s=-\r\n\
-                                c=IN IP4 127.0.0.1\r\n\
-                                t=0 0\r\n\
-                                m=audio 20000 RTP/AVP 0\r\n\
-                                a=rtpmap:0 PCMU/8000\r\n\
-                                a=recvonly\r\n"
-                                .to_string();
-                            return Some(response_sdp);
-                        }
-                    }
-                }
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-        None
-    });
-
-    // Alice sends re-INVITE (hold)
     let hold_result = alice.send_reinvite(&alice_id, Some(hold_sdp)).await;
     info!("Alice re-INVITE (hold) result: {:?}", hold_result);
-
-    // Wait for Bob's response
-    let bob_response = tokio::time::timeout(Duration::from_secs(3), bob_handle).await;
-    info!(
-        "Bob responded to hold re-INVITE: {:?}",
-        bob_response.is_ok()
+    assert!(
+        hold_result.is_ok(),
+        "Hold re-INVITE should succeed"
+    );
+    assert!(
+        hold_result.as_ref().unwrap().is_some(),
+        "Hold re-INVITE should return SDP answer"
     );
 
-    sleep(Duration::from_millis(200)).await;
+    sleep(Duration::from_millis(300)).await;
 
     // Test 2: Alice resumes call (re-INVITE with sendrecv)
     info!("=== Testing call resume (re-INVITE with sendrecv) ===");
@@ -914,45 +1049,15 @@ async fn test_reinvite_hold_resume() -> Result<()> {
         a=sendrecv\r\n"
         .to_string();
 
-    // Spawn Bob's event handler for resume
-    let bob_clone = bob.clone();
-    let bob_id_clone = bob_id.clone();
-    let bob_handle = tokio::spawn(async move {
-        for _ in 0..30 {
-            if let Ok(events) = bob_clone.process_dialog_events().await {
-                for event in &events {
-                    if let TestUaEvent::CallUpdated(id, method, Some(sdp)) = event {
-                        if *method == rsipstack::sip::Method::Invite && id == &bob_id_clone {
-                            info!("Bob received re-INVITE (resume) with SDP:\n{}", sdp);
-                            // Bob responds with sendrecv (resumed)
-                            let response_sdp = "v=0\r\n\
-                                o=- 789012 123457 IN IP4 127.0.0.1\r\n\
-                                s=-\r\n\
-                                c=IN IP4 127.0.0.1\r\n\
-                                t=0 0\r\n\
-                                m=audio 20000 RTP/AVP 0\r\n\
-                                a=rtpmap:0 PCMU/8000\r\n\
-                                a=sendrecv\r\n"
-                                .to_string();
-                            return Some(response_sdp);
-                        }
-                    }
-                }
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-        None
-    });
-
-    // Alice sends re-INVITE (resume)
     let resume_result = alice.send_reinvite(&alice_id, Some(resume_sdp)).await;
     info!("Alice re-INVITE (resume) result: {:?}", resume_result);
-
-    // Wait for Bob's response
-    let bob_response = tokio::time::timeout(Duration::from_secs(3), bob_handle).await;
-    info!(
-        "Bob responded to resume re-INVITE: {:?}",
-        bob_response.is_ok()
+    assert!(
+        resume_result.is_ok(),
+        "Resume re-INVITE should succeed"
+    );
+    assert!(
+        resume_result.as_ref().unwrap().is_some(),
+        "Resume re-INVITE should return SDP answer"
     );
 
     // Let call run briefly after resume
@@ -1098,7 +1203,7 @@ async fn test_cancel_during_ringing() -> Result<()> {
 async fn test_reinvite_codec_change() -> Result<()> {
     let _ = tracing_subscriber::fmt::try_init();
 
-    let server = Arc::new(E2eTestServer::start().await?);
+    let server = Arc::new(E2eTestServer::start_with_mode(MediaProxyMode::All).await?);
 
     let alice = Arc::new(server.create_ua("alice").await?);
     let bob = server.create_ua("bob").await?;
@@ -1159,11 +1264,13 @@ async fn test_reinvite_codec_change() -> Result<()> {
 
     assert!(alice_dialog_id.is_some(), "Call should be established");
     let alice_id = alice_dialog_id.unwrap();
-    let bob_id = bob_dialog_id.unwrap();
+    let _bob_id = bob_dialog_id.unwrap();
 
     sleep(Duration::from_millis(300)).await;
 
     // re-INVITE to change codec to PCMA
+    // In MediaProxyMode::All, the proxy handles re-INVITE locally (B2BUA anchored);
+    // Bob never receives it, so we only verify Alice gets a valid SDP answer.
     info!("=== Testing codec change (PCMU -> PCMA) ===");
     let pcma_sdp = "v=0\r\n\
         o=- 123456 789013 IN IP4 127.0.0.1\r\n\
@@ -1175,53 +1282,16 @@ async fn test_reinvite_codec_change() -> Result<()> {
         a=sendrecv\r\n"
         .to_string();
 
-    // Bob's handler for codec change re-INVITE
-    let bob_clone = bob.clone();
-    let bob_id_clone = bob_id.clone();
-    let bob_handle = tokio::spawn(async move {
-        for _ in 0..30 {
-            if let Ok(events) = bob_clone.process_dialog_events().await {
-                for event in &events {
-                    if let TestUaEvent::CallUpdated(id, method, Some(sdp)) = event {
-                        if *method == rsipstack::sip::Method::Invite && id == &bob_id_clone {
-                            info!("Bob received re-INVITE with codec change:\n{}", sdp);
-                            // Check if SDP contains PCMA
-                            if sdp.contains("PCMA/8000") || sdp.contains("a=rtpmap:8") {
-                                info!("✓ Bob received re-INVITE with PCMA codec");
-                                // Respond with PCMA
-                                let response_sdp = "v=0\r\n\
-                                    o=- 789012 123458 IN IP4 127.0.0.1\r\n\
-                                    s=-\r\n\
-                                    c=IN IP4 127.0.0.1\r\n\
-                                    t=0 0\r\n\
-                                    m=audio 20000 RTP/AVP 8\r\n\
-                                    a=rtpmap:8 PCMA/8000\r\n\
-                                    a=sendrecv\r\n"
-                                    .to_string();
-                                return Some(("PCMA", response_sdp));
-                            }
-                        }
-                    }
-                }
-            }
-            sleep(Duration::from_millis(100)).await;
-        }
-        None
-    });
-
-    // Alice sends re-INVITE with PCMA
     let codec_change_result = alice.send_reinvite(&alice_id, Some(pcma_sdp)).await;
     info!("Codec change re-INVITE result: {:?}", codec_change_result);
-
-    // Wait for Bob's response
-    match tokio::time::timeout(Duration::from_secs(3), bob_handle).await {
-        Ok(Ok(Some((codec, _)))) => {
-            info!("✓ Codec change successful: switched to {}", codec);
-        }
-        _ => {
-            info!("⚠ Codec change re-INVITE may not have been processed as expected");
-        }
-    }
+    assert!(
+        codec_change_result.is_ok(),
+        "Codec change re-INVITE should succeed"
+    );
+    assert!(
+        codec_change_result.as_ref().unwrap().is_some(),
+        "Codec change re-INVITE should return SDP answer"
+    );
 
     // Hang up
     sleep(Duration::from_millis(200)).await;

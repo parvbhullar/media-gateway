@@ -87,7 +87,7 @@ async fn test_update_with_sdp_flow() {
             Ok(Box::new(RegistrarModule::new(inner, config)))
         })
         .register_module("auth", |inner, _config| {
-            Ok(Box::new(AuthModule::new(inner)))
+            Ok(Box::new(AuthModule::new(inner.clone(), inner.proxy_config.clone())))
         })
         .register_module("call", |inner, config| {
             Ok(Box::new(CallModule::new(config, inner)))
@@ -149,12 +149,11 @@ async fn test_update_with_sdp_flow() {
         for _ in 0..50 {
             if let Ok(events) = bob_clone.process_dialog_events().await {
                 for event in &events {
-                    if let TestUaEvent::CallUpdated(_, method, _) = event {
-                        if *method == rsipstack::sip::Method::Invite {
+                    if let TestUaEvent::CallUpdated(_, method, _) = event
+                        && *method == rsipstack::sip::Method::Invite {
                             info!("Bob's background task processed re-INVITE");
                             return true;
                         }
-                    }
                 }
             }
             sleep(Duration::from_millis(100)).await;
@@ -168,7 +167,7 @@ async fn test_update_with_sdp_flow() {
         .send_reinvite(&alice_call_id, Some(hold_sdp.clone()))
         .await
         .unwrap();
-    
+
     // Wait for Bob's background processing to complete
     let bob_processed = bob_handle.await.unwrap();
     info!("Bob processed re-INVITE in background: {}", bob_processed);
@@ -188,7 +187,7 @@ async fn test_update_with_sdp_flow() {
         bob_processed,
         "Bob should have received a forwarded re-INVITE request"
     );
-    
+
     // Verify the SDP answer contains expected content
     let alice_sdp = alice_received_sdp.unwrap();
     assert!(

@@ -10,8 +10,8 @@ use crate::proxy::routing::{
     TrunkDirection,
 };
 use async_trait::async_trait;
-use rsipstack::sip::StatusCode;
 use rsipstack::dialog::invitation::InviteOption;
+use rsipstack::sip::StatusCode;
 use std::sync::Arc;
 use std::{collections::HashMap, net::IpAddr};
 
@@ -79,8 +79,10 @@ async fn test_trunk_matches_inbound_ip_with_hostname() {
 
 #[test]
 fn test_trunk_incoming_user_prefix_plain() {
-    let mut trunk = TrunkConfig::default();
-    trunk.incoming_from_user_prefix = Some("+852".to_string());
+    let trunk = TrunkConfig {
+        incoming_from_user_prefix: Some("+852".to_string()),
+        ..Default::default()
+    };
     assert!(
         trunk
             .matches_incoming_user_prefixes(Some("+852123456"), None)
@@ -95,8 +97,10 @@ fn test_trunk_incoming_user_prefix_plain() {
 
 #[test]
 fn test_trunk_incoming_user_prefix_regex() {
-    let mut trunk = TrunkConfig::default();
-    trunk.incoming_to_user_prefix = Some(r"^\d{10}$".to_string());
+    let trunk = TrunkConfig {
+        incoming_to_user_prefix: Some(r"^\d{10}$".to_string()),
+        ..Default::default()
+    };
     assert!(
         trunk
             .matches_incoming_user_prefixes(None, Some("1234567890"))
@@ -111,8 +115,10 @@ fn test_trunk_incoming_user_prefix_regex() {
 
 #[test]
 fn test_trunk_incoming_user_prefix_invalid_regex() {
-    let mut trunk = TrunkConfig::default();
-    trunk.incoming_from_user_prefix = Some("^(".to_string());
+    let trunk = TrunkConfig {
+        incoming_from_user_prefix: Some("^(".to_string()),
+        ..Default::default()
+    };
     let err = trunk
         .matches_incoming_user_prefixes(Some("1001"), None)
         .unwrap_err();
@@ -121,11 +127,11 @@ fn test_trunk_incoming_user_prefix_invalid_regex() {
 
 #[test]
 fn test_trunk_incoming_user_prefix_mismatch_q850_reason_format() {
-    let mut trunk = TrunkConfig::default();
-    trunk.incoming_from_user_prefix = Some("+852".to_string());
-    trunk.incoming_to_user_prefix = Some("601285".to_string());
-
-    // Test from_user mismatch
+    let trunk = TrunkConfig {
+        incoming_from_user_prefix: Some("+852".to_string()),
+        incoming_to_user_prefix: Some("601285".to_string()),
+        ..Default::default()
+    };
     let result = trunk.matches_incoming_user_prefixes(Some("+853123456"), None);
     assert!(result.is_err());
     let err = result.unwrap_err();
@@ -471,6 +477,7 @@ async fn test_match_invite_queue_action_builds_hold_and_fallback() {
             failure_reason: None,
             failure_prompt: None,
             queue_ref: None,
+            skill_group_ref: None,
         }),
         ..RouteQueueConfig::default()
     };
@@ -556,6 +563,7 @@ fn test_queue_fallback_play_then_hangup_action() {
             failure_reason: Some("Busy".to_string()),
             failure_prompt: Some("prompts/busy.wav".to_string()),
             queue_ref: None,
+            skill_group_ref: None,
         }),
         ..RouteQueueConfig::default()
     };
@@ -600,6 +608,20 @@ fn test_queue_fallback_to_named_queue() {
 }
 
 #[test]
+fn test_queue_plan_preserves_missing_hold_section() {
+    let queue_cfg = RouteQueueConfig {
+        hold: None,
+        ..RouteQueueConfig::default()
+    };
+
+    let plan = queue_cfg
+        .to_queue_plan()
+        .expect("queue config should convert to plan");
+
+    assert!(plan.hold.is_none());
+}
+
+#[test]
 fn test_queue_strategy_builds_dial_targets() {
     let queue_cfg = RouteQueueConfig {
         strategy: RouteQueueStrategyConfig {
@@ -631,6 +653,67 @@ fn test_queue_strategy_builds_dial_targets() {
         other => panic!("unexpected strategy: {:?}", other),
     }
     assert_eq!(plan.ring_timeout, Some(std::time::Duration::from_secs(12)));
+}
+
+#[test]
+fn test_queue_strategy_builds_skill_group_targets() {
+    let queue_cfg = RouteQueueConfig {
+        strategy: RouteQueueStrategyConfig {
+            mode: QueueDialMode::Sequential,
+            wait_timeout_secs: Some(15),
+            targets: vec![
+                RouteQueueTargetConfig {
+                    uri: "sip:agent1@pbx.example".to_string(),
+                    label: Some("Agent 1".to_string()),
+                },
+                RouteQueueTargetConfig {
+                    uri: "skill-group:support_l1".to_string(),
+                    label: Some("Support L1".to_string()),
+                },
+            ],
+        },
+        ..RouteQueueConfig::default()
+    };
+
+    let plan = queue_cfg
+        .to_queue_plan()
+        .expect("queue config should convert to plan");
+
+    match plan.dial_strategy.expect("dial strategy missing") {
+        DialStrategy::Sequential(targets) => {
+            assert_eq!(targets.len(), 2);
+            assert_eq!(targets[0].aor.to_string(), "sip:agent1@pbx.example");
+            assert_eq!(targets[1].aor.to_string(), "skill-group:support_l1");
+            assert_eq!(targets[1].contact_raw, Some("skill-group:support_l1".to_string()));
+        }
+        other => panic!("unexpected strategy: {:?}", other),
+    }
+}
+
+#[test]
+fn test_queue_fallback_with_skill_group() {
+    let queue_cfg = RouteQueueConfig {
+        fallback: Some(RouteQueueFallbackConfig {
+            redirect: None,
+            failure_code: None,
+            failure_reason: None,
+            failure_prompt: None,
+            queue_ref: Some("skill-group:support_l2".to_string()),
+            skill_group_ref: None,
+        }),
+        ..RouteQueueConfig::default()
+    };
+
+    let plan = queue_cfg
+        .to_queue_plan()
+        .expect("queue config should convert to plan");
+
+    match plan.fallback.expect("fallback missing") {
+        QueueFallbackAction::Queue { name } => {
+            assert_eq!(name, "skill-group:support_l2");
+        }
+        other => panic!("unexpected fallback action: {:?}", other),
+    }
 }
 
 #[tokio::test]
@@ -1286,7 +1369,7 @@ fn create_sip_request(
                 .try_into()
                 .expect("Invalid From header"),
         ),
-        rsipstack::sip::Header::To(to.try_into().expect("Invalid To header")),
+        rsipstack::sip::Header::To(to.into()),
         rsipstack::sip::Header::CallId(call_id.into()),
         rsipstack::sip::Header::CSeq(
             format!("{} {}", cseq_num, method)
@@ -1307,8 +1390,12 @@ fn create_sip_request(
     };
 
     if !body.is_empty() {
-        headers.push(rsipstack::sip::Header::ContentType("application/sdp".into()));
-        headers.push(rsipstack::sip::Header::ContentLength((body.len() as u32).into()));
+        headers.push(rsipstack::sip::Header::ContentType(
+            "application/sdp".into(),
+        ));
+        headers.push(rsipstack::sip::Header::ContentLength(
+            (body.len() as u32).into(),
+        ));
     }
 
     rsipstack::sip::Request {
@@ -2032,8 +2119,7 @@ async fn test_apply_trunk_config_rewrite_hostport_false() {
         "caller host should NOT be rewritten when rewrite_hostport is false"
     );
     assert_eq!(
-        option.caller.host_with_port.port,
-        None,
+        option.caller.host_with_port.port, None,
         "caller port should NOT be rewritten when rewrite_hostport is false"
     );
 
@@ -2081,8 +2167,14 @@ async fn test_apply_trunk_config_rewrite_hostport_preserves_user() {
 
     // Test that callee user is preserved regardless of rewrite_hostport setting
     let test_cases = vec![
-        (true, "callee user should be preserved with rewrite_hostport=true"),
-        (false, "callee user should be preserved with rewrite_hostport=false"),
+        (
+            true,
+            "callee user should be preserved with rewrite_hostport=true",
+        ),
+        (
+            false,
+            "callee user should be preserved with rewrite_hostport=false",
+        ),
     ];
 
     for (rewrite, msg) in test_cases {
@@ -2102,11 +2194,6 @@ async fn test_apply_trunk_config_rewrite_hostport_preserves_user() {
 
         apply_trunk_config(&mut option, &trunk).unwrap();
 
-        assert_eq!(
-            option.callee.user().unwrap_or_default(),
-            "12345",
-            "{}",
-            msg
-        );
+        assert_eq!(option.callee.user().unwrap_or_default(), "12345", "{}", msg);
     }
 }

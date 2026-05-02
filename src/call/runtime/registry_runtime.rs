@@ -78,6 +78,11 @@ pub trait SessionRegistry: Send + Sync {
     /// Get the number of active sessions
     fn len(&self) -> usize;
 
+    /// Check if there are no active sessions
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Get all active session IDs
     fn session_ids(&self) -> Vec<String>;
 }
@@ -92,12 +97,16 @@ pub struct RegistryAdapter {
 
 impl RegistryAdapter {
     /// Create a new adapter wrapping the given registry
-    pub fn new(registry: std::sync::Arc<crate::proxy::active_call_registry::ActiveProxyCallRegistry>) -> Self {
+    pub fn new(
+        registry: std::sync::Arc<crate::proxy::active_call_registry::ActiveProxyCallRegistry>,
+    ) -> Self {
         Self { registry }
     }
 
     /// Get the underlying registry reference
-    pub fn inner(&self) -> &std::sync::Arc<crate::proxy::active_call_registry::ActiveProxyCallRegistry> {
+    pub fn inner(
+        &self,
+    ) -> &std::sync::Arc<crate::proxy::active_call_registry::ActiveProxyCallRegistry> {
         &self.registry
     }
 }
@@ -109,7 +118,9 @@ impl SessionRegistry for RegistryAdapter {
         // Convert ActiveCallView to ActiveProxyCallEntry
         let proxy_status = match entry.status {
             CallStatus::Ringing => ActiveProxyCallStatus::Ringing,
-            CallStatus::Talking | CallStatus::Hold | CallStatus::Ended => ActiveProxyCallStatus::Talking,
+            CallStatus::Talking | CallStatus::Hold | CallStatus::Ended => {
+                ActiveProxyCallStatus::Talking
+            }
         };
 
         let proxy_entry = ActiveProxyCallEntry {

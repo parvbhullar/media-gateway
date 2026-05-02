@@ -6,10 +6,14 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="description" content="{{site_description|default('RustPBX Admin Console')}}" />
+    <meta name="locale" content="{{ locale | default('en') }}" />
     <title>{% block title %}{{page_title|default('RustPBX Admin')}}{% endblock %}</title>
+    <script type="application/json" id="__currentUser">{{ current_user | json | safe }}</script>
+    <script type="application/json" id="__locales">{{ available_locales | json | safe }}</script>
     {% block js_head %}
     <script>
-        window.__currentUser = {{ current_user | json | safe }};
+        window.__currentUser = JSON.parse(document.getElementById('__currentUser').textContent || 'null');
+        window.__consoleApiPrefix = {{ api_prefix | tojson }};
         window.hasPermission = function (perm) {
             // If current_user is missing but user reached this authenticated page,
             // default to showing items (backend has already authenticated)
@@ -23,6 +27,12 @@
     {% for js in js_files %}
     <script src="{{ js }}" defer></script>
     {% endfor %}
+    {% if addon_scripts %}
+    {% for script in addon_scripts %}
+    <script src="{{ script|safe }}" defer>
+    </script>
+    {% endfor %}
+    {% endif %}
     <script defer
         src="{{alpine_js|default('https://cdnjs.cloudflare.com/ajax/libs/alpinejs/3.15.0/cdn.min.js')|safe}}"></script>
     <script
@@ -34,11 +44,6 @@
             window.RustPBX.plugins.push(plugin);
         };
     </script>
-    {% if addon_scripts %}
-    {% for script in addon_scripts %}
-    <script src="{{ script }}"></script>
-    {% endfor %}
-    {% endif %}
     <script>
         document.addEventListener('alpine:init', () => {
             const STORAGE_KEYS = {
@@ -121,8 +126,8 @@
 
             Alpine.data('localeSwitcher', () => ({
                 open: false,
-                current: '{{ locale | default("en") }}',
-                locales: {{ available_locales | json | safe }},
+                current: (document.querySelector('meta[name="locale"]') || {}).content || 'en',
+                locales: JSON.parse(document.getElementById('__locales').textContent || '[]'),
             flags: {
             'en': '🇺🇸', 'en-US': '🇺🇸', 'en-GB': '🇬🇧',
             'zh': '🇨🇳', 'zh-CN': '🇨🇳', 'zh-TW': '🇹🇼', 'zh-HK': '🇭🇰',
@@ -491,8 +496,7 @@
                 <div x-data="{
                     show: false,
                     dismissed: false,
-                    check() {
-                        if (this.dismissed) return;
+                    init() {
                         fetch('{{ api_prefix | safe }}/pending-reloads')
                             .then(function(r) { return r.ok ? r.json() : null; })
                             .then(function(d) {
@@ -500,10 +504,6 @@
                                 this.show = !!d.pending;
                             }.bind(this))
                             .catch(function() {});
-                    },
-                    init() {
-                        this.check();
-                        setInterval(this.check.bind(this), 30000);
                     }
                 }" x-init="init()" x-show="show" x-cloak x-transition
                     class="mx-4 mt-4 flex items-start justify-between gap-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 shadow-sm">

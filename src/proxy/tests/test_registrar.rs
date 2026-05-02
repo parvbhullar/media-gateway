@@ -55,6 +55,10 @@ async fn test_registrar_register_success() {
             .unwrap()
             .contains("expires=60")
     );
+    assert!(
+        location.home_proxy.is_some(),
+        "registrar should stamp home_proxy for clustered routing"
+    );
 }
 
 #[tokio::test]
@@ -105,19 +109,16 @@ async fn test_registrar_unregister() {
         .lookup(&"sip:alice@rustpbx.com".try_into().expect("invalid uri"))
         .await;
 
-    match locations {
-        Ok(v) => assert!(v.is_empty(), "Expected no locations after unregister"),
-        Err(_) => {}
-    }
+    if let Ok(v) = locations { assert!(v.is_empty(), "Expected no locations after unregister") }
 }
 
 #[tokio::test]
 async fn test_registrar_with_custom_expires() {
     // Create a custom config with a different registrar_expires value
-    let mut config = ProxyConfig::default();
-    config.registrar_expires = Some(120); // Set to 2 minutes
-
-    // Create test server with custom config
+    let config = ProxyConfig {
+        registrar_expires: Some(120),
+        ..Default::default()
+    };
     let (server_inner, config) = create_test_server_with_config(config).await;
 
     // Create REGISTER request with no explicit expires (should use config default)
@@ -159,7 +160,13 @@ async fn test_registrar_non_register_method() {
     let (server_inner, config) = create_test_server().await;
 
     // Create an INVITE request instead of REGISTER
-    let request = create_test_request(rsipstack::sip::Method::Invite, "alice", None, "rustpbx.com", None);
+    let request = create_test_request(
+        rsipstack::sip::Method::Invite,
+        "alice",
+        None,
+        "rustpbx.com",
+        None,
+    );
 
     // Create the registrar module
     let module = RegistrarModule::new(server_inner, config);

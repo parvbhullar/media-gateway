@@ -1,7 +1,7 @@
-use crate::media::{Track, recorder::Leg};
-use anyhow::{Result, anyhow};
 use crate::media::negotiate::NegotiatedLegProfile;
 use crate::media::transcoder::{RtpTiming, Transcoder, rewrite_dtmf_duration};
+use crate::media::{Track, recorder::Leg};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use rustrtc::media::error::MediaResult;
@@ -91,6 +91,13 @@ impl ForwardingTrack {
 
     pub fn stage_egress_profile(&self, profile: NegotiatedLegProfile) {
         *self.update_egress_profile.lock() = Some(profile);
+    }
+
+    pub fn ingress_profile(&self) -> Option<NegotiatedLegProfile> {
+        self.update_ingress_profile
+            .lock()
+            .clone()
+            .or_else(|| self.current_ingress_profile.lock().clone())
     }
 
     fn rebuild_runtime_if_needed(&self) {
@@ -270,8 +277,8 @@ impl MediaStreamTrack for ForwardingTrack {
                         let mut dtmf_frame = frame.clone();
                         dtmf_frame.payload_type = Some(target_pt);
 
-                        if let Some(target_clock_rate) = mapping.target_clock_rate {
-                            if mapping.source_clock_rate != target_clock_rate {
+                        if let Some(target_clock_rate) = mapping.target_clock_rate
+                            && mapping.source_clock_rate != target_clock_rate {
                                 dtmf_frame.data = rewrite_dtmf_duration(
                                     &dtmf_frame.data,
                                     mapping.source_clock_rate,
@@ -287,7 +294,6 @@ impl MediaStreamTrack for ForwardingTrack {
                                     );
                                 }
                             }
-                        }
 
                         return Ok(MediaSample::Audio(dtmf_frame));
                     }

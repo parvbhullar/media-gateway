@@ -29,6 +29,7 @@ pub struct I18n {
     /// lang code -> flat translation map
     translations: RwLock<HashMap<String, Translations>>,
     config: LocaleConfig,
+    core_locales_dir: String,
     /// Extra locale directories registered by addons
     addon_locales_dirs: RwLock<Vec<String>>,
 }
@@ -36,9 +37,14 @@ pub struct I18n {
 impl I18n {
     /// Create a new I18n instance and eagerly load translations from disk.
     pub fn new(config: LocaleConfig) -> Self {
+        Self::new_with_core_dir(config, "locales".to_string())
+    }
+
+    fn new_with_core_dir(config: LocaleConfig, core_locales_dir: String) -> Self {
         let i18n = Self {
             translations: RwLock::new(HashMap::new()),
             config,
+            core_locales_dir,
             addon_locales_dirs: RwLock::new(vec![]),
         };
         i18n.reload();
@@ -66,10 +72,15 @@ impl I18n {
             .read()
             .unwrap_or_else(|e| e.into_inner());
         for info in &self.config.available {
-            let mut flat = match Self::load_file("locales", &info.code) {
+            let mut flat = match Self::load_file(&self.core_locales_dir, &info.code) {
                 Ok(f) => f,
                 Err(e) => {
-                    tracing::warn!("i18n: failed to load locales/{}.toml: {}", info.code, e);
+                    tracing::warn!(
+                        "i18n: failed to load {}/{}.toml: {}",
+                        self.core_locales_dir,
+                        info.code,
+                        e
+                    );
                     Translations::new()
                 }
             };
@@ -164,20 +175,17 @@ impl I18n {
         let cache = self.translations.read().unwrap_or_else(|e| e.into_inner());
 
         // 1. Requested locale
-        if let Some(flat) = cache.get(locale) {
-            if let Some(v) = flat.get(key) {
+        if let Some(flat) = cache.get(locale)
+            && let Some(v) = flat.get(key) {
                 return v.clone();
             }
-        }
 
         // 2. Default locale fallback
-        if locale != self.config.default {
-            if let Some(flat) = cache.get(&self.config.default) {
-                if let Some(v) = flat.get(key) {
+        if locale != self.config.default
+            && let Some(flat) = cache.get(&self.config.default)
+                && let Some(v) = flat.get(key) {
                     return v.clone();
                 }
-            }
-        }
 
         // 3. Return the key itself so templates always render something
         key.to_string()
@@ -286,8 +294,8 @@ pub fn detect_locale(
     }
 
     // 2. Accept-Language header
-    if let Some(accept) = headers.get(axum::http::header::ACCEPT_LANGUAGE) {
-        if let Ok(s) = accept.to_str() {
+    if let Some(accept) = headers.get(axum::http::header::ACCEPT_LANGUAGE)
+        && let Ok(s) = accept.to_str() {
             // Parse "zh-CN,zh;q=0.9,en;q=0.8" style values
             let mut candidates: Vec<(&str, f32)> = s
                 .split(',')
@@ -314,7 +322,6 @@ pub fn detect_locale(
                 }
             }
         }
-    }
 
     // 3. Default
     default.to_string()
@@ -381,16 +388,7 @@ save = "保存"
             ],
         };
 
-        // Override the locales dir for this test
-        // Save the original directory as a String path for more robust restoration
-        let original_path = std::env::current_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| "/".to_string());
-        std::env::set_current_dir(tmp.path()).unwrap();
-        let i18n = I18n::new(config);
-        // Best effort restoration - ignore errors if original dir no longer exists
-        let _ = std::env::set_current_dir(&original_path);
-        i18n
+        I18n::new_with_core_dir(config, dir.to_string_lossy().to_string())
     }
 
     #[test]

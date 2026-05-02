@@ -1,7 +1,7 @@
 use super::{
     FnCreateProxyModule, ProxyAction, ProxyModule,
     data::ProxyDataContext,
-    locator::{Locator, create_locator},
+    locator::{Locator, create_locator_with_migrate},
     user::{UserBackend, build_user_backend},
 };
 use crate::{
@@ -16,6 +16,7 @@ use crate::{
         active_call_registry::ActiveProxyCallRegistry,
         auth::AuthBackend,
         call::{CallRouter, DialplanInspector},
+        cluster_event::{ClusterEventHub, ClusterEventModule},
         locator::{DialogTargetLocator, LocatorEventSender, TransportInspectorLocator},
         presence::PresenceManager,
     },
@@ -41,10 +42,10 @@ use rsipstack::{
 
 use sea_orm::DatabaseConnection;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -82,6 +83,14 @@ pub struct SipServerInner {
     pub tls_listener: Option<rsipstack::transport::TlsListenerConnection>,
     pub queue_manager: Arc<crate::call::runtime::QueueManager>,
     pub conference_manager: Arc<crate::call::runtime::ConferenceManager>,
+    pub agent_registry: Option<Arc<dyn crate::call::app::agent_registry::AgentRegistry>>,
+    /// Subscribers for REFER NOTIFY events from SipSession.
+    pub transfer_notify_subscribers:
+        Arc<tokio::sync::Mutex<Vec<crate::call::domain::ReferNotifyTx>>>,
+    /// Cluster event hub for inter-node event sync via SIP MESSAGE.
+    pub cluster_event_hub: Option<Arc<ClusterEventHub>>,
+    /// SIP peer IPs for cluster auth bypass.
+    pub cluster_peer_ips: Vec<IpAddr>,
 }
 
 pub type SipServerRef = Arc<SipServerInner>;
@@ -120,6 +129,11 @@ pub struct SipServerBuilder {
     addon_registry: Option<Arc<crate::addons::registry::AddonRegistry>>,
     /// RWI gateway to wire into the server for call-app factory use.
     rwi_gateway: Option<Arc<tokio::sync::RwLock<crate::rwi::gateway::RwiGateway>>>,
+    /// AgentRegistry for agent management and presence state.
+    agent_registry: Option<Arc<dyn crate::call::app::agent_registry::AgentRegistry>>,
+    skip_migrate: bool,
+    /// Cluster peer SocketAddrs for inter-node sync (derived from Config.cluster).
+    cluster_peers: Vec<SocketAddr>,
 }
 
 impl SipServerBuilder {
@@ -149,7 +163,15 @@ impl SipServerBuilder {
             no_bind: false,
             addon_registry: None,
             rwi_gateway: None,
+            agent_registry: None,
+            skip_migrate: false,
+            cluster_peers: Vec::new(),
         }
+    }
+
+    pub fn with_cluster_peers(mut self, peers: Vec<SocketAddr>) -> Self {
+        self.cluster_peers = peers;
+        self
     }
 
     pub fn with_sipflow_config(mut self, config: Option<SipFlowConfig>) -> Self {
@@ -282,6 +304,19 @@ impl SipServerBuilder {
         self
     }
 
+    pub fn with_agent_registry(
+        mut self,
+        registry: Arc<dyn crate::call::app::agent_registry::AgentRegistry>,
+    ) -> Self {
+        self.agent_registry = Some(registry);
+        self
+    }
+
+    pub fn with_skip_migrate(mut self, skip: bool) -> Self {
+        self.skip_migrate = skip;
+        self
+    }
+
     pub async fn build(mut self) -> Result<SipServer> {
         let user_backend = if let Some(backend) = self.user_backend {
             backend
@@ -301,7 +336,7 @@ impl SipServerBuilder {
         let locator = if let Some(locator) = self.locator {
             locator
         } else {
-            match create_locator(&self.config.locator).await {
+            match create_locator_with_migrate(&self.config.locator, !self.skip_migrate).await {
                 Ok(locator) => locator,
                 Err(e) => {
                     warn!("failed to create locator: {} {:?}", e, self.config.locator);
@@ -317,6 +352,8 @@ impl SipServerBuilder {
         let transport_layer = TransportLayer::new(cancel_token.clone());
         // Clone of TLS listener for hot-reload support (initialized inside if !self.no_bind block)
         let mut tls_listener_clone: Option<rsipstack::transport::TlsListenerConnection> = None;
+
+        let mut local_addrs: HashSet<SocketAddr> = HashSet::new();
 
         if !self.no_bind {
             let local_addr = config
@@ -346,7 +383,7 @@ impl SipServerBuilder {
                 let local_addr = SocketAddr::new(local_addr, udp_port);
                 let external_addr = external_ip
                     .as_ref()
-                    .map(|ip| SocketAddr::new(ip.clone(), udp_port));
+                    .map(|ip| SocketAddr::new(*ip, udp_port));
                 let udp_conn = UdpConnection::create_connection(
                     local_addr,
                     external_addr,
@@ -358,25 +395,27 @@ impl SipServerBuilder {
                 })?;
                 info!("start proxy, udp port: {}", udp_conn.get_addr());
                 transport_layer.add_transport(udp_conn.into());
+                local_addrs.insert(local_addr);
             }
 
             if let Some(tcp_port) = config.tcp_port {
                 let local_addr = SocketAddr::new(local_addr, tcp_port);
                 let external_addr = external_ip
                     .as_ref()
-                    .map(|ip| SocketAddr::new(ip.clone(), tcp_port));
+                    .map(|ip| SocketAddr::new(*ip, tcp_port));
                 let tcp_conn = TcpListenerConnection::new(local_addr.into(), external_addr)
                     .await
                     .map_err(|e| anyhow!("Failed to create TCP connection: {}", e))?;
                 info!("start proxy, tcp port: {}", tcp_conn.get_addr());
                 transport_layer.add_transport(tcp_conn.into());
+                local_addrs.insert(local_addr);
             }
 
             if let Some(tls_port) = config.tls_port {
                 let local_addr = SocketAddr::new(local_addr, tls_port);
                 let external_addr = external_ip
                     .as_ref()
-                    .map(|ip| SocketAddr::new(ip.clone(), tls_port));
+                    .map(|ip| SocketAddr::new(*ip, tls_port));
 
                 let cert_path = config
                     .ssl_certificate
@@ -437,6 +476,7 @@ impl SipServerBuilder {
                                     // Clone for hot-reload support
                                     tls_listener_clone = Some(conn.clone());
                                     transport_layer.add_transport(conn.into());
+                                    local_addrs.insert(local_addr);
                                 }
                                 Err(e) => {
                                     warn!("failed to create TLS connection: {}", e);
@@ -454,15 +494,14 @@ impl SipServerBuilder {
 
             if let Some(ws_port) = config.ws_port {
                 let local_addr = SocketAddr::new(local_addr, ws_port);
-                let external_addr = external_ip
-                    .as_ref()
-                    .map(|ip| SocketAddr::new(ip.clone(), ws_port));
+                let external_addr = external_ip.as_ref().map(|ip| SocketAddr::new(*ip, ws_port));
                 let ws_conn =
                     WebSocketListenerConnection::new(local_addr.into(), external_addr, false)
                         .await
                         .map_err(|e| anyhow!("Failed to create WS connection: {}", e))?;
                 info!("start proxy, ws port: {}", ws_conn.get_addr());
                 transport_layer.add_transport(ws_conn.into());
+                local_addrs.insert(local_addr);
             }
         }
 
@@ -484,15 +523,20 @@ impl SipServerBuilder {
             endpoint_option.t1x64 = Duration::from_millis(t1x64_timer);
         }
 
+        let endpoint_local_addrs = transport_layer.get_addrs();
         let mut endpoint_builder = endpoint_builder
             .with_cancel_token(cancel_token.clone())
             .with_option(endpoint_option)
             .with_transport_layer(transport_layer);
 
+        let advertised_methods = Arc::new(OnceLock::new());
         let mut inspectors: Vec<Box<dyn MessageInspector>> = self.message_inspectors;
         if self.config.nat_fix {
             inspectors.insert(0, Box::new(super::nat::NatInspector::new()));
         }
+        inspectors.push(Box::new(
+            super::capability_headers::CapabilityHeadersInspector::new(advertised_methods.clone()),
+        ));
 
         let mut sip_flow = None;
         let sipflow_backend = self.sipflow_backend.take().or_else(|| {
@@ -518,8 +562,15 @@ impl SipServerBuilder {
             tx
         });
 
+        let locator_local_addrs = endpoint_local_addrs;
+        let cluster_enabled = !self.cluster_peers.is_empty();
+
         endpoint_builder = endpoint_builder
-            .with_target_locator(DialogTargetLocator::new(locator.clone()))
+            .with_target_locator(DialogTargetLocator::new(
+                locator.clone(),
+                locator_local_addrs,
+                cluster_enabled,
+            ))
             .with_transport_inspector(TransportInspectorLocator::new(
                 locator.clone(),
                 locator_events.clone(),
@@ -528,14 +579,14 @@ impl SipServerBuilder {
         let endpoint = endpoint_builder.build();
 
         let mut call_router = self.call_router;
-        if call_router.is_none() {
-            if let Some(http_router_config) = &self.config.http_router {
-                call_router = Some(Box::new(crate::proxy::routing::http::HttpCallRouter::new(
-                    http_router_config.clone(),
-                    rtp_config.clone(),
-                    self.config.media_proxy,
-                )));
-            }
+        if call_router.is_none()
+            && let Some(http_router_config) = &self.config.http_router
+        {
+            call_router = Some(Box::new(crate::proxy::routing::http::HttpCallRouter::new(
+                http_router_config.clone(),
+                rtp_config.clone(),
+                self.config.media_proxy,
+            )));
         }
         let dialog_layer = Arc::new(DialogLayer::new(endpoint.inner.clone()));
 
@@ -566,7 +617,22 @@ impl SipServerBuilder {
         let presence_manager = Arc::new(PresenceManager::new(database.clone()));
         presence_manager.load_from_db().await.ok();
 
+        // Create cluster event hub for inter-node sync
+        let cluster_peer_ips: Vec<IpAddr> = self.cluster_peers.iter().map(|p| p.ip()).collect();
+        let cluster_event_hub: Option<Arc<ClusterEventHub>> = if !self.cluster_peers.is_empty() {
+            Some(Arc::new(ClusterEventHub::new(
+                locator_events.clone(),
+                presence_manager.clone(),
+                endpoint.inner.clone(),
+                self.cluster_peers.clone(),
+            )))
+        } else {
+            None
+        };
+
         let queue_manager = Arc::new(crate::call::runtime::QueueManager::new());
+
+        // Create conference manager with in-server audio mixing
         let conference_manager = Arc::new(crate::call::runtime::ConferenceManager::new());
 
         let inner = Arc::new(SipServerInner {
@@ -575,9 +641,9 @@ impl SipServerBuilder {
             cancel_token,
             data_context,
             database: database.clone(),
-            user_backend: user_backend,
-            auth_backend: auth_backend,
-            call_router: call_router,
+            user_backend,
+            auth_backend,
+            call_router,
             locator: locator.clone(),
             callrecord_sender: self.callrecord_sender,
             endpoint,
@@ -598,6 +664,10 @@ impl SipServerBuilder {
             tls_listener: tls_listener_clone,
             queue_manager,
             conference_manager,
+            agent_registry: self.agent_registry,
+            transfer_notify_subscribers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            cluster_event_hub,
+            cluster_peer_ips,
         });
 
         let inner_weak = Arc::downgrade(&inner);
@@ -615,6 +685,16 @@ impl SipServerBuilder {
 
         let mut allow_methods = Vec::new();
         let mut modules = Vec::new();
+
+        // Auto-load cluster_event module when cluster peers are configured
+        if let Some(hub) = inner.cluster_event_hub.as_ref() {
+            let mut module =
+                ClusterEventModule::create(hub.clone(), &self.cluster_peers, local_addrs.clone());
+            let _ = module.on_start().await; // errors logged inside
+            allow_methods.extend(module.allow_methods());
+            modules.push(module);
+        }
+
         if let Some(load_modules) = self.config.modules.as_ref() {
             let start_time = Instant::now();
             for name in load_modules.iter() {
@@ -671,6 +751,9 @@ impl SipServerBuilder {
                     .join(",")
             );
         }
+        advertised_methods
+            .set(allow_methods.clone())
+            .map_err(|_| anyhow!("advertised SIP methods already initialized"))?;
         inner.endpoint.inner.allows.lock().replace(allow_methods);
 
         // Plan 1: spawn the gateway OPTIONS health monitor. Outbound trunks
@@ -706,14 +789,14 @@ impl SipServer {
         let incoming = self.inner.endpoint.incoming_transactions()?;
         let cancel_token = self.inner.cancel_token.clone();
 
-        if let Some(webhook_config) = &self.inner.proxy_config.locator_webhook {
-            if let Some(events) = &self.inner.locator_events {
-                let rx = events.subscribe();
-                crate::utils::spawn(super::locator_webhook::handle_locator_webhook(
-                    webhook_config.clone(),
-                    rx,
-                ));
-            }
+        if let Some(webhook_config) = &self.inner.proxy_config.locator_webhook
+            && let Some(events) = &self.inner.locator_events
+        {
+            let rx = events.subscribe();
+            crate::utils::spawn(super::locator_webhook::handle_locator_webhook(
+                webhook_config.clone(),
+                rx,
+            ));
         }
 
         // Spawn registry cleanup task
@@ -782,25 +865,24 @@ impl SipServer {
             let token = tx
                 .connection
                 .as_ref()
-                .map(|c| c.cancel_token())
-                .flatten()
+                .and_then(|c| c.cancel_token())
                 .unwrap_or_else(|| self.inner.cancel_token.clone())
                 .child_token();
 
             let runnings_tx = self.inner.runnings_tx.clone();
 
-            if let Some(max_concurrency) = self.inner.proxy_config.max_concurrency {
-                if runnings_tx.load(Ordering::Relaxed) >= max_concurrency {
-                    info!(
-                        key = %tx.key,
-                        runnings = runnings_tx.load(Ordering::Relaxed),
-                        "max concurrency reached, not process this transaction"
-                    );
-                    tx.reply(rsipstack::sip::StatusCode::ServiceUnavailable)
-                        .await
-                        .ok();
-                    continue;
-                }
+            if let Some(max_concurrency) = self.inner.proxy_config.max_concurrency
+                && runnings_tx.load(Ordering::Relaxed) >= max_concurrency
+            {
+                info!(
+                    key = %tx.key,
+                    runnings = runnings_tx.load(Ordering::Relaxed),
+                    "max concurrency reached, not process this transaction"
+                );
+                tx.reply(rsipstack::sip::StatusCode::ServiceUnavailable)
+                    .await
+                    .ok();
+                continue;
             }
             // Out-of-dialog OPTIONS keepalives (RFC 3261 §11) must be answered so
             // upstream peers can probe liveness; reply 200 OK directly without
@@ -1030,14 +1112,12 @@ impl SipServerInner {
         };
 
         match host {
-            "localhost" | "127.0.0.1" | "::1" => {
-                return port.map(is_my_port).unwrap_or(true);
-            }
+            "localhost" | "127.0.0.1" | "::1" => port.map(is_my_port).unwrap_or(true),
             _ => {
-                if let Some(external_ip) = self.rtp_config.external_ip.as_ref() {
-                    if external_ip == host {
-                        return port.map(is_my_port).unwrap_or(true);
-                    }
+                if let Some(external_ip) = self.rtp_config.external_ip.as_ref()
+                    && external_ip == host
+                {
+                    return port.map(is_my_port).unwrap_or(true);
                 }
                 if let Some(realms) = self.proxy_config.realms.as_ref() {
                     for item in realms {
@@ -1051,10 +1131,8 @@ impl SipServerInner {
                 }
                 if self.endpoint.get_addrs().iter().any(|addr| {
                     if addr.addr.host.to_string() == host {
-                        let matched = port
-                            .map(|p| addr.addr.port == Some(p.into()))
-                            .unwrap_or(true);
-                        matched
+                        port.map(|p| addr.addr.port == Some(p.into()))
+                            .unwrap_or(true)
                     } else {
                         false
                     }

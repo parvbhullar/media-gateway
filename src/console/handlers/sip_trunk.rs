@@ -83,6 +83,7 @@ async fn page_sip_trunks(
                 .any(|t| matches!(t.origin, ConfigOrigin::File(_)))
         })
         .unwrap_or(false);
+    let ami_endpoint = state.config().proxy.ami_path.clone().unwrap_or_else(|| "/ami/v1".to_string());
     state.render_with_headers(
         "console/sip_trunk.html",
         json!({
@@ -91,6 +92,7 @@ async fn page_sip_trunks(
             "create_url": state.url_for("/sip-trunk/new"),
             "current_user": current_user,
             "has_file_trunks": has_file_trunks,
+            "ami_endpoint": ami_endpoint,
         }),
         &headers,
     )
@@ -103,6 +105,7 @@ async fn page_sip_trunk_create(
 ) -> Response {
     let (filters, tenants) = build_filters_payload(state.db()).await;
     let current_user = state.build_current_user_ctx(&user).await;
+    let ami_endpoint = state.config().proxy.ami_path.clone().unwrap_or_else(|| "/ami/v1".to_string());
     state.render_with_headers(
         "console/sip_trunk_detail.html",
         json!({
@@ -112,6 +115,7 @@ async fn page_sip_trunk_create(
             "mode": "create",
             "create_url": state.url_for("/sip-trunk"),
             "current_user": current_user,
+            "ami_endpoint": ami_endpoint,
         }),
         &headers,
     )
@@ -181,6 +185,7 @@ async fn page_sip_trunk_detail(
             let dids_numbers: Vec<&str> =
                 assigned_dids.iter().map(|d| d.number.as_str()).collect();
 
+            let ami_endpoint = state.config().proxy.ami_path.clone().unwrap_or_else(|| "/ami/v1".to_string());
             state.render_with_headers(
                 "console/sip_trunk_detail.html",
                 json!({
@@ -193,6 +198,7 @@ async fn page_sip_trunk_detail(
                     "current_user": current_user,
                     "dids_count": dids_count,
                     "dids_numbers": dids_numbers,
+                    "ami_endpoint": ami_endpoint,
                 }),
                 &headers,
             )
@@ -206,7 +212,7 @@ async fn page_sip_trunk_detail(
             warn!("failed to load sip trunk {}: {}", id, err);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to load SIP trunk"})),
+                Json(json!({"message": format!("Failed to load SIP trunk: {}", err)})),
             )
                 .into_response()
         }
@@ -250,7 +256,7 @@ async fn create_sip_trunk(
                     model.id, err
                 );
             }
-            
+
             state.mark_pending_reload();
             Json(json!({"status": "ok", "id": model.id})).into_response()
         }
@@ -258,7 +264,7 @@ async fn create_sip_trunk(
             warn!("failed to create sip trunk: {}", err);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to create SIP trunk"})),
+                Json(json!({"message": format!("Failed to create SIP trunk: {}", err)})),
             )
                 .into_response()
         }
@@ -292,7 +298,7 @@ async fn update_sip_trunk(
             warn!("failed to load sip trunk {} for update: {}", id, err);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to update SIP trunk"})),
+                Json(json!({"message": format!("Failed to update SIP trunk: {}", err)})),
             )
                 .into_response();
         }
@@ -319,7 +325,7 @@ async fn update_sip_trunk(
                     model.id, err
                 );
             }
-            
+
             state.mark_pending_reload();
             Json(json!({"status": "ok"})).into_response()
         }
@@ -327,7 +333,7 @@ async fn update_sip_trunk(
             warn!("failed to update sip trunk {}: {}", id, err);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to update SIP trunk"})),
+                Json(json!({"message": format!("Failed to update SIP trunk: {}", err)})),
             )
                 .into_response()
         }
@@ -360,7 +366,7 @@ async fn delete_sip_trunk(
             warn!("failed to load sip trunk {} for delete: {}", id, err);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to delete SIP trunk"})),
+                Json(json!({"message": format!("Failed to delete SIP trunk: {}", err)})),
             )
                 .into_response();
         }
@@ -417,7 +423,7 @@ async fn delete_sip_trunk(
             warn!("failed to delete sip trunk {}: {}", id, err);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to delete SIP trunk"})),
+                Json(json!({"message": format!("Failed to delete SIP trunk: {}", err)})),
             )
                 .into_response()
         }
@@ -509,7 +515,7 @@ async fn query_sip_trunks(
             warn!("failed to paginate sip trunks: {}", err);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to query SIP trunks"})),
+                Json(json!({"message": format!("Failed to query SIP trunks: {}", err)})),
             )
                 .into_response();
         }
@@ -532,11 +538,7 @@ async fn query_sip_trunks(
 
     // Issue #179: collect file-sourced trunks from in-memory snapshot
     let file_trunks: Vec<Value> = if let Some(app_state) = state.app_state() {
-        let snapshot = app_state
-            .sip_server()
-            .inner
-            .data_context
-            .trunks_snapshot();
+        let snapshot = app_state.sip_server().inner.data_context.trunks_snapshot();
         let mut file_items: Vec<Value> = snapshot
             .into_iter()
             .filter_map(|(name, trunk)| {
@@ -663,6 +665,7 @@ async fn handle_tenant_update(
     Ok(())
 }
 
+#[allow(clippy::result_large_err)]
 fn apply_form_to_active_model(
     active: &mut SipTrunkActiveModel,
     form: &SipTrunkForm,
@@ -800,6 +803,7 @@ fn apply_form_to_active_model(
     Ok(())
 }
 
+#[allow(clippy::result_large_err)]
 fn parse_list_field(
     value: &Option<String>,
     field: &str,
@@ -830,6 +834,7 @@ fn parse_list_field(
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn normalize_list_json(
     value: Value,
     field: &str,
@@ -904,6 +909,7 @@ fn extract_list_entry(value: Value, preferred_keys: &[&str]) -> Result<Option<St
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn parse_json_field(value: &Option<String>, field: &str) -> Result<Option<Value>, Response> {
     let Some(raw) = value.as_ref().map(|v| v.trim()).filter(|v| !v.is_empty()) else {
         return Ok(None);

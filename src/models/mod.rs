@@ -4,6 +4,7 @@ use sea_orm_migration::MigratorTrait;
 use std::time::Duration;
 
 pub mod add_leg_timeline_column;
+pub mod add_metadata_column;
 pub mod add_rewrite_columns;
 pub mod add_sip_trunk_health_columns;
 pub mod add_sip_trunk_register_columns;
@@ -12,6 +13,7 @@ pub mod add_user_mfa_columns;
 pub mod api_key;
 pub mod backfill_dids_from_sip_trunks;
 pub mod call_record;
+
 pub mod call_record_dashboard_index;
 pub mod call_record_from_number_index;
 pub mod call_record_indices;
@@ -21,7 +23,6 @@ pub mod did;
 pub mod extension;
 pub mod extension_department;
 pub mod frequency_limit;
-pub mod add_metadata_column;
 pub mod migration;
 pub mod policy;
 pub mod presence;
@@ -32,7 +33,6 @@ pub mod system_config;
 pub mod system_notification;
 pub mod pending_upload;
 pub mod user;
-pub mod wholesale_agent;
 
 pub fn prepare_sqlite_database(database_url: &str) -> Result<()> {
     let Some(path_part) = database_url.strip_prefix("sqlite://") else {
@@ -45,8 +45,8 @@ pub fn prepare_sqlite_database(database_url: &str) -> Result<()> {
     }
 
     let path = std::path::Path::new(path_str);
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent).with_context(|| {
                 format!(
                     "failed to create directory for console database at {}",
@@ -54,11 +54,11 @@ pub fn prepare_sqlite_database(database_url: &str) -> Result<()> {
                 )
             })?;
         }
-    }
 
     if !path.exists() {
         std::fs::OpenOptions::new()
             .create(true)
+            .truncate(true)
             .write(true)
             .open(path)
             .with_context(|| {
@@ -70,6 +70,24 @@ pub fn prepare_sqlite_database(database_url: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+pub async fn connect_db(database_url: &str) -> Result<DatabaseConnection> {
+    if database_url.starts_with("sqlite://") {
+        prepare_sqlite_database(database_url).map_err(|e| {
+            tracing::error!("failed to prepare SQLite database {database_url} {:?}", e);
+            let msg = format!("failed to prepare SQLite database {database_url}: {e}");
+            anyhow::anyhow!(msg)
+        })?;
+    }
+
+    Database::connect(database_url)
+        .await
+        .map_err(|e: sea_orm::DbErr| {
+            tracing::error!("failed to connect to database {:?}", e);
+            let msg = format!("failed to connect to database {database_url}: {e}");
+            anyhow::anyhow!(msg)
+        })
 }
 
 pub async fn create_db(database_url: &str) -> Result<DatabaseConnection> {
@@ -115,11 +133,25 @@ pub async fn create_db(database_url: &str) -> Result<DatabaseConnection> {
         apply_sqlite_pragmas(&db).await?;
     }
 
-    migration::Migrator::up(&db, None).await.map_err(|e| {
-        tracing::error!("failed to run database migrations on {:?}", e);
-        let msg = format!("failed to run database migrations on {database_url}: {e}");
-        anyhow::anyhow!(msg)
-    })?;
+    if let Err(e) = migration::Migrator::up(&db, None).await {
+        let msg = e.to_string();
+        // sea-orm errors when a migration version exists in the tracking table but no
+        // corresponding MigrationTrait is registered (e.g. after moving a migration to
+        // an addon-specific migrator). These rows are already applied and their tables
+        // exist, so it is safe to ignore the error and proceed.
+        if msg.contains("is missing, this migration has been applied but its file is missing") {
+            tracing::warn!(
+                "some previously-applied migrations are no longer registered in the core \
+                 migrator (likely moved to an addon); skipping: {msg}"
+            );
+        } else {
+            tracing::error!("failed to run database migrations on {:?}", e);
+            return Err(anyhow::anyhow!(
+                "failed to run database migrations on {database_url}: {e}"
+            ));
+        }
+    }
+
 
     Ok(db)
 }

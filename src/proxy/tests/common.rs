@@ -7,10 +7,10 @@ use crate::proxy::{
     data::ProxyDataContext,
     locator::{Locator, MemoryLocator},
 };
+use rsipstack::dialog::dialog_layer::DialogLayer;
 use rsipstack::sip::Header;
 use rsipstack::sip::services::DigestGenerator;
 use rsipstack::sip::{HostWithPort, prelude::*};
-use rsipstack::dialog::dialog_layer::DialogLayer;
 use rsipstack::transaction::endpoint::EndpointInner;
 use rsipstack::transaction::key::{TransactionKey, TransactionRole};
 use rsipstack::transaction::random_text;
@@ -80,10 +80,10 @@ pub async fn create_test_server_with_config(
         cancel_token: CancellationToken::new(),
         data_context,
         database: None,
-        user_backend: user_backend,
+        user_backend,
         auth_backend: Vec::new(),
         call_router: None,
-        locator: locator,
+        locator,
         callrecord_sender: None,
         endpoint,
         dialog_layer,
@@ -103,6 +103,10 @@ pub async fn create_test_server_with_config(
         tls_listener: None,
         queue_manager: Arc::new(crate::call::runtime::QueueManager::new()),
         conference_manager: Arc::new(crate::call::runtime::ConferenceManager::new()),
+        agent_registry: None,
+        transfer_notify_subscribers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        cluster_event_hub: None,
+        cluster_peer_ips: vec![],
     });
 
     // Add test users
@@ -139,7 +143,9 @@ pub async fn create_test_server_with_config(
 }
 
 /// Creates a basic SIP transaction for testing
-pub async fn create_transaction(request: rsipstack::sip::Request) -> (Transaction, Arc<EndpointInner>) {
+pub async fn create_transaction(
+    request: rsipstack::sip::Request,
+) -> (Transaction, Arc<EndpointInner>) {
     let mock_addr = SipAddr {
         r#type: Some(rsipstack::sip::Transport::Udp),
         addr: HostWithPort {
@@ -160,7 +166,10 @@ pub async fn create_transaction(request: rsipstack::sip::Request) -> (Transactio
         transport_layer,
         CancellationToken::new(),
         Some(Duration::from_millis(20)),
-        vec![rsipstack::sip::Method::Invite, rsipstack::sip::Method::Register],
+        vec![
+            rsipstack::sip::Method::Invite,
+            rsipstack::sip::Method::Register,
+        ],
         None,
         None,
         None,
@@ -199,7 +208,9 @@ pub fn create_test_request(
     let from = rsipstack::sip::typed::From {
         display_name: None,
         uri: uri.clone(),
-        params: vec![rsipstack::sip::Param::Tag(rsipstack::sip::param::Tag::new(random_text(8)))],
+        params: vec![rsipstack::sip::Param::Tag(rsipstack::sip::param::Tag::new(
+            random_text(8),
+        ))],
     };
 
     let to = rsipstack::sip::typed::To {
@@ -215,10 +226,7 @@ pub fn create_test_request(
     ));
 
     let call_id = rsipstack::sip::headers::CallId::new(random_text(16));
-    let cseq = rsipstack::sip::headers::typed::CSeq {
-        seq: 1u32.into(),
-        method,
-    };
+    let cseq = rsipstack::sip::headers::typed::CSeq { seq: 1u32, method };
 
     // Create contact with the same user and host
     let contact_uri = rsipstack::sip::Uri {
@@ -269,7 +277,7 @@ pub fn create_test_request(
             username,
             realm,
             demo_nonce,
-            uri.to_string(),
+            uri,
             digest.compute()
         ));
         headers.push(auth_header.into());
@@ -284,8 +292,18 @@ pub fn create_test_request(
     }
 }
 /// Creates a test REGISTER request
-pub fn create_register_request(username: &str, realm: &str, expires: Option<u32>) -> rsipstack::sip::Request {
-    create_test_request(rsipstack::sip::Method::Register, username, None, realm, expires)
+pub fn create_register_request(
+    username: &str,
+    realm: &str,
+    expires: Option<u32>,
+) -> rsipstack::sip::Request {
+    create_test_request(
+        rsipstack::sip::Method::Register,
+        username,
+        None,
+        realm,
+        expires,
+    )
 }
 
 /// Creates a test request with proper authentication
@@ -299,7 +317,11 @@ pub fn create_auth_request(
 }
 
 /// Creates a test request with specific source IP (for acl module tests)
-pub fn create_acl_request(method: rsipstack::sip::Method, username: &str, realm: &str) -> rsipstack::sip::Request {
+pub fn create_acl_request(
+    method: rsipstack::sip::Method,
+    username: &str,
+    realm: &str,
+) -> rsipstack::sip::Request {
     create_test_request(method, username, None, realm, None)
 }
 
@@ -330,7 +352,9 @@ pub fn create_proxy_auth_request_with_nonce(
     let from = rsipstack::sip::typed::From {
         display_name: None,
         uri: uri.clone(),
-        params: vec![rsipstack::sip::Param::Tag(rsipstack::sip::param::Tag::new(random_text(8)))],
+        params: vec![rsipstack::sip::Param::Tag(rsipstack::sip::param::Tag::new(
+            random_text(8),
+        ))],
     };
 
     let to = rsipstack::sip::typed::To {
@@ -346,10 +370,7 @@ pub fn create_proxy_auth_request_with_nonce(
     ));
 
     let call_id = rsipstack::sip::headers::CallId::new(random_text(16));
-    let cseq = rsipstack::sip::headers::typed::CSeq {
-        seq: 1u32.into(),
-        method,
-    };
+    let cseq = rsipstack::sip::headers::typed::CSeq { seq: 1u32, method };
 
     // Create contact with the same user and host
     let contact_uri = rsipstack::sip::Uri {
@@ -396,7 +417,7 @@ pub fn create_proxy_auth_request_with_nonce(
             username,
             realm,
             nonce,
-            uri.to_string(),
+            uri,
             digest.compute()
         ));
         headers.push(proxy_auth_header.into());
@@ -412,7 +433,9 @@ pub fn create_proxy_auth_request_with_nonce(
 }
 
 /// Extracts nonce from Proxy-Authenticate header
-pub fn extract_nonce_from_proxy_authenticate(response: &rsipstack::sip::Response) -> Option<String> {
+pub fn extract_nonce_from_proxy_authenticate(
+    response: &rsipstack::sip::Response,
+) -> Option<String> {
     for header in response.headers().iter() {
         if let Header::ProxyAuthenticate(proxy_auth) = header {
             let auth_str = proxy_auth.value();

@@ -49,6 +49,11 @@
                             <span
                                 x-text="connection.expires ? connection.expires + ' s' : '{{ 'diagnostics.label_expires_default' | t }}'"></span>
                         </span>
+                        <span
+                            class="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2.5 py-1 font-semibold text-slate-600">
+                            {{ "diagnostics.label_locator" | t }}
+                            <span class="font-mono text-slate-700" x-text="connection.locator || '—'"></span>
+                        </span>
                     </div>
                 </div>
                 <div class="mt-4 grid gap-4 md:grid-cols-3">
@@ -884,6 +889,13 @@
                                                             <span x-text="record.destination"></span>
                                                         </div>
                                                     </template>
+                                                    <template x-if="record.home_proxy">
+                                                        <div class="text-xs text-slate-500">
+                                                            <span class="font-semibold text-slate-700">{{
+                                                                "diagnostics.label_home_proxy" | t }}</span>
+                                                            <span x-text="record.home_proxy"></span>
+                                                        </div>
+                                                    </template>
                                                     <template x-if="record.contact">
                                                         <div class="text-xs text-slate-500">
                                                             <span class="font-semibold text-slate-700">{{
@@ -1044,6 +1056,18 @@
                                 <template x-for="plugin in activePlugins" :key="plugin.id">
                                     <div x-html="plugin.ui_form" x-show="callMode === plugin.mode" class="mb-4"></div>
                                 </template>
+                            </div>
+                            <div class="flex flex-wrap items-center gap-4 text-xs text-slate-600" x-show="callMode === 'standard'">
+                                <label class="inline-flex items-center gap-1.5">
+                                    <input type="checkbox" x-model="sipIceEnable"
+                                        class="h-3.5 w-3.5 rounded border border-slate-300 text-sky-600 focus:ring-sky-500">
+                                    {{ "diagnostics.use_iceservers" | t }}
+                                </label>
+                                <label class="inline-flex items-center gap-1.5">
+                                    <input type="checkbox" x-model="sipRelayOnly"
+                                        class="h-3.5 w-3.5 rounded border border-slate-300 text-sky-600 focus:ring-sky-500">
+                                    {{ "diagnostics.relay_only" | t }}
+                                </label>
                             </div>
                             <div class="flex flex-wrap items-center gap-3" x-show="callMode === 'standard'">
                                 <button type="button" @click="registerSip" :disabled="sipRegistering"
@@ -1409,6 +1433,8 @@
                     dialogCallIdInput: '',
                     dialogCallId: '',
                     dialer: {},
+                    sipIceEnable: true,
+                    sipRelayOnly: false,
                     sipForm: { wsServer: '', uri: '', authUser: '', password: '', displayName: '', target: '' },
                     sipUaReady: false,
                     get hasSipUa() {
@@ -1588,7 +1614,8 @@
                                 const origin = window.location.origin || '';
                                 if (origin) {
                                     const base = origin.replace(/^http/i, 'ws');
-                                    this.sipForm.wsServer = `${base.replace(/\/$/, '')}/ws`;
+                                    const wsPath = (this.testData && this.testData.ws_handler) ? this.testData.ws_handler : '/ws';
+                                    this.sipForm.wsServer = `${base.replace(/\/$/, '')}${wsPath}`;
                                 }
                             }
                         }
@@ -1759,9 +1786,10 @@
                         this.sipIceServersLoading = true;
                         let servers = [];
                         try {
-                            let url = '/iceservers';
+                            let icePath = (this.testData && this.testData.ice_servers_path) ? this.testData.ice_servers_path : '/iceservers';
+                            let url = icePath;
                             if (typeof window !== 'undefined' && window.location) {
-                                url = new URL('/iceservers', window.location.origin).toString();
+                                url = new URL(icePath, window.location.origin).toString();
                             }
                             const response = await fetch(url, {
                                 credentials: 'same-origin',
@@ -2081,7 +2109,11 @@
                             this.sipRegisterError = this.t.err_invalid_sip_uri || 'Invalid SIP URI (expected sip:1001@rustpbx.com).';
                             return;
                         }
-                        await this.ensureIceServers();
+                        if (this.sipIceEnable) {
+                            await this.ensureIceServers();
+                        } else {
+                            this.sipIceServers = [];
+                        }
                         this.sipRegisterError = null;
                         this.sipRegistering = true;
                         this.setSipStatus(this.t.sip_status_connecting || 'Connecting...', 'pending');
@@ -2124,10 +2156,16 @@
                         if (!configuration.password) {
                             console.warn('[Diagnostics] No password provided for SIP registration. Authentication may fail.');
                         }
-                        const iceServers = Array.isArray(this.sipIceServers) ? this.sipIceServers : [];
-                        if (iceServers.length) {
-                            configuration.pcConfig = { iceServers };
-                            configuration.iceServers = iceServers;
+                        if (this.sipIceEnable) {
+                            const iceServers = Array.isArray(this.sipIceServers) ? this.sipIceServers : [];
+                            if (iceServers.length) {
+                                const pcConfig = { iceServers };
+                                if (this.sipRelayOnly) {
+                                    pcConfig.iceTransportPolicy = 'relay';
+                                }
+                                configuration.pcConfig = pcConfig;
+                                configuration.iceServers = iceServers;
+                            }
                         }
                         const ua = new JsSIP.UA(configuration);
                         sipUa = ua;
@@ -2251,7 +2289,11 @@
                             this.sipCallError = this.t.err_enter_destination || 'Enter a destination URI or number.';
                             return;
                         }
-                        await this.ensureIceServers();
+                        if (this.sipIceEnable) {
+                            await this.ensureIceServers();
+                        } else {
+                            this.sipIceServers = [];
+                        }
                         this.rememberRecentTarget(rawTarget, targetUri);
                         this.sipCallError = null;
                         let mediaStream = null;
@@ -2276,9 +2318,15 @@
                             rtcOfferConstraints: { offerToReceiveAudio: true, offerToReceiveVideo: false },
                             sessionTimersExpires: 120,
                         };
-                        const iceServers = Array.isArray(this.sipIceServers) ? this.sipIceServers : [];
-                        if (iceServers.length) {
-                            options.pcConfig = { iceServers };
+                        if (this.sipIceEnable) {
+                            const iceServers = Array.isArray(this.sipIceServers) ? this.sipIceServers : [];
+                            if (iceServers.length) {
+                                const pcConfig = { iceServers };
+                                if (this.sipRelayOnly) {
+                                    pcConfig.iceTransportPolicy = 'relay';
+                                }
+                                options.pcConfig = pcConfig;
+                            }
                         }
                         this.appendSipEvent(`Calling ${targetUri}`, 'info');
                         try {
@@ -2306,7 +2354,11 @@
                         }
                         this.sipCallError = null;
                         try {
-                            await this.ensureIceServers();
+                            if (this.sipIceEnable) {
+                                await this.ensureIceServers();
+                            } else {
+                                this.sipIceServers = [];
+                            }
                             const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
                             this.sipLocalStream = stream;
                             if (this.$refs.sipLocalAudio) {
@@ -2317,9 +2369,15 @@
                                 mediaStream: stream,
                                 mediaConstraints: { audio: true, video: false },
                             };
-                            const iceServers = Array.isArray(this.sipIceServers) ? this.sipIceServers : [];
-                            if (iceServers.length) {
-                                options.pcConfig = { iceServers };
+                            if (this.sipIceEnable) {
+                                const iceServers = Array.isArray(this.sipIceServers) ? this.sipIceServers : [];
+                                if (iceServers.length) {
+                                    const pcConfig = { iceServers };
+                                    if (this.sipRelayOnly) {
+                                        pcConfig.iceTransportPolicy = 'relay';
+                                    }
+                                    options.pcConfig = pcConfig;
+                                }
                             }
                             sipSession.answer(options);
                             this.appendSipEvent('Answered incoming call', 'success');

@@ -310,16 +310,18 @@ pub struct ConferenceCreateParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ConferenceBackend {
+    #[default]
     Internal,
     External,
 }
 
-impl Default for ConferenceBackend {
-    fn default() -> Self {
-        ConferenceBackend::Internal
-    }
-}
+
+/// Type alias for RWI event sender.
+pub type RwiEventTx = tokio::sync::mpsc::UnboundedSender<RwiEvent>;
+/// Type alias for RWI event receiver.
+pub type RwiEventRx = tokio::sync::mpsc::UnboundedReceiver<RwiEvent>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -465,6 +467,10 @@ pub enum RwiEvent {
         supervisor_call_id: String,
         target_call_id: String,
     },
+    SupervisorTakeoverStarted {
+        supervisor_call_id: String,
+        target_call_id: String,
+    },
     SupervisorModeStopped {
         supervisor_call_id: String,
         target_call_id: String,
@@ -529,6 +535,73 @@ pub enum RwiEvent {
     ConferenceMergeFailed {
         conf_id: String,
         call_id: String,
+        reason: String,
+    },
+    // CC addon events
+    AgentStateChanged {
+        agent_id: String,
+        from_status: String,
+        to_status: String,
+        call_id: Option<String>,
+    },
+    QueueCandidatesFound {
+        call_id: String,
+        queue_id: String,
+        candidates: Vec<String>,
+        trace_id: String,
+    },
+    QueueAgentRinging {
+        call_id: String,
+        queue_id: String,
+        agent_id: String,
+        trace_id: String,
+    },
+    QueueAgentNoAnswer {
+        call_id: String,
+        queue_id: String,
+        agent_id: String,
+        attempt: u32,
+        trace_id: String,
+    },
+    QueueAgentRejected {
+        call_id: String,
+        queue_id: String,
+        agent_id: String,
+        attempt: u32,
+        trace_id: String,
+    },
+    QueueFallbackExecuted {
+        call_id: String,
+        queue_id: String,
+        action: String,
+        reason: String,
+        trace_id: String,
+    },
+    QueueAlert {
+        queue_id: String,
+        alert_type: String,
+        message: String,
+    },
+    ConferenceSeatReplaceStarted {
+        conf_id: String,
+        old_call_id: String,
+        new_call_id: String,
+    },
+    ConferenceSeatReplaceSucceeded {
+        conf_id: String,
+        old_call_id: String,
+        new_call_id: String,
+    },
+    ConferenceSeatReplaceFailed {
+        conf_id: String,
+        old_call_id: String,
+        new_call_id: String,
+        reason: String,
+    },
+    ConferenceSeatReplaceRollbackFailed {
+        conf_id: String,
+        old_call_id: String,
+        new_call_id: String,
         reason: String,
     },
     CallOwnershipChanged {
@@ -604,10 +677,21 @@ impl RwiEvent {
             RwiEvent::QueueWaitTimeout { call_id, .. } => Some(call_id),
             RwiEvent::QueueOverflowed { call_id, .. } => Some(call_id),
             RwiEvent::QueueVoicemailRedirected { call_id, .. } => Some(call_id),
-            RwiEvent::SupervisorListenStarted { supervisor_call_id, .. } => Some(supervisor_call_id),
-            RwiEvent::SupervisorWhisperStarted { supervisor_call_id, .. } => Some(supervisor_call_id),
-            RwiEvent::SupervisorBargeStarted { supervisor_call_id, .. } => Some(supervisor_call_id),
-            RwiEvent::SupervisorModeStopped { supervisor_call_id, .. } => Some(supervisor_call_id),
+            RwiEvent::SupervisorListenStarted {
+                supervisor_call_id, ..
+            } => Some(supervisor_call_id),
+            RwiEvent::SupervisorWhisperStarted {
+                supervisor_call_id, ..
+            } => Some(supervisor_call_id),
+            RwiEvent::SupervisorBargeStarted {
+                supervisor_call_id, ..
+            } => Some(supervisor_call_id),
+            RwiEvent::SupervisorTakeoverStarted {
+                supervisor_call_id, ..
+            } => Some(supervisor_call_id),
+            RwiEvent::SupervisorModeStopped {
+                supervisor_call_id, ..
+            } => Some(supervisor_call_id),
             RwiEvent::SipMessageReceived { call_id, .. } => Some(call_id),
             RwiEvent::SipNotifyReceived { call_id, .. } => Some(call_id),
             RwiEvent::Dtmf { call_id, .. } => Some(call_id),
@@ -620,16 +704,31 @@ impl RwiEvent {
             RwiEvent::ConferenceMergeRequested { call_id, .. } => Some(call_id),
             RwiEvent::ConferenceMerged { call_id, .. } => Some(call_id),
             RwiEvent::ConferenceMergeFailed { call_id, .. } => Some(call_id),
+            RwiEvent::ConferenceSeatReplaceStarted { old_call_id, .. } => Some(old_call_id),
+            RwiEvent::ConferenceSeatReplaceSucceeded { old_call_id, .. } => Some(old_call_id),
+            RwiEvent::ConferenceSeatReplaceFailed { old_call_id, .. } => Some(old_call_id),
+            RwiEvent::ConferenceSeatReplaceRollbackFailed { old_call_id, .. } => Some(old_call_id),
             RwiEvent::CallOwnershipChanged { call_id, .. } => Some(call_id),
-            
+
             RwiEvent::ParallelOriginateStarted { .. } => None,
             RwiEvent::ParallelOriginateLegRinging { call_id, .. } => Some(call_id),
             RwiEvent::ParallelOriginateWinner { call_id, .. } => Some(call_id),
             RwiEvent::ParallelOriginateLegCancelled { call_id, .. } => Some(call_id),
-            RwiEvent::ParallelOriginateCompleted { winning_call_id, .. } => Some(winning_call_id),
+            RwiEvent::ParallelOriginateCompleted {
+                winning_call_id, ..
+            } => Some(winning_call_id),
             RwiEvent::ParallelOriginateFailed { .. } => None,
-            
+
             RwiEvent::CallBridged { leg_a, .. } => Some(leg_a),
+            // CC addon events
+            RwiEvent::AgentStateChanged { call_id, .. } => call_id.as_deref(),
+            RwiEvent::QueueCandidatesFound { call_id, .. } => Some(call_id),
+            RwiEvent::QueueAgentRinging { call_id, .. } => Some(call_id),
+            RwiEvent::QueueAgentNoAnswer { call_id, .. } => Some(call_id),
+            RwiEvent::QueueAgentRejected { call_id, .. } => Some(call_id),
+            RwiEvent::QueueFallbackExecuted { call_id, .. } => Some(call_id),
+            RwiEvent::QueueAlert { .. } => None,
+
             RwiEvent::ConferenceCreated { .. } => None,
             RwiEvent::ConferenceDestroyed { .. } => None,
             RwiEvent::ConferenceError { .. } => None,
@@ -766,5 +865,38 @@ mod tests {
         assert_eq!(data.caller, "1001");
         assert_eq!(data.callee, "2000");
         assert_eq!(data.direction, "inbound");
+    }
+
+    #[test]
+    fn test_seat_replace_events_call_id_mapping() {
+        let started = RwiEvent::ConferenceSeatReplaceStarted {
+            conf_id: "room-1".to_string(),
+            old_call_id: "call-old".to_string(),
+            new_call_id: "call-new".to_string(),
+        };
+        assert_eq!(started.call_id(), Some("call-old"));
+
+        let succeeded = RwiEvent::ConferenceSeatReplaceSucceeded {
+            conf_id: "room-1".to_string(),
+            old_call_id: "call-old".to_string(),
+            new_call_id: "call-new".to_string(),
+        };
+        assert_eq!(succeeded.call_id(), Some("call-old"));
+
+        let failed = RwiEvent::ConferenceSeatReplaceFailed {
+            conf_id: "room-1".to_string(),
+            old_call_id: "call-old".to_string(),
+            new_call_id: "call-new".to_string(),
+            reason: "busy".to_string(),
+        };
+        assert_eq!(failed.call_id(), Some("call-old"));
+
+        let rollback_failed = RwiEvent::ConferenceSeatReplaceRollbackFailed {
+            conf_id: "room-1".to_string(),
+            old_call_id: "call-old".to_string(),
+            new_call_id: "call-new".to_string(),
+            reason: "rollback error".to_string(),
+        };
+        assert_eq!(rollback_failed.call_id(), Some("call-old"));
     }
 }

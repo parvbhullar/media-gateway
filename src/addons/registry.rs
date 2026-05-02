@@ -1,14 +1,45 @@
+use crate::addons::export_reload::ExportReloadRegistry;
 use crate::addons::Addon;
 use crate::app::AppState;
 use std::sync::Arc;
 
+/// Replace `/static` prefix in a URL with the configured static_path.
+fn normalize_static_url(url: &str, config: &crate::config::Config) -> String {
+    let prefix = config.static_path();
+    if url.starts_with("/static/") && prefix != "/static" {
+        format!("{}{}", prefix, &url["/static".len()..])
+    } else {
+        url.to_string()
+    }
+}
+
 pub struct AddonRegistry {
     addons: Vec<Box<dyn Addon>>,
+    pub export_reload: ExportReloadRegistry,
+}
+
+impl Default for AddonRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl AddonRegistry {
     pub fn new() -> Self {
         let mut addons: Vec<Box<dyn Addon>> = Vec::new();
+
+        // Observability: community build uses ObservabilityAddon (/metrics + /healthz);
+        // commercial addon-telemetry replaces it with OTel tracing + Prometheus.
+        #[cfg(not(feature = "addon-telemetry"))]
+        {
+            super::observability::ObservabilityAddon::install_recorder().ok();
+            addons.push(Box::new(super::observability::ObservabilityAddon::new()));
+        }
+        #[cfg(feature = "addon-telemetry")]
+        {
+            super::telemetry::TelemetryAddon::install_recorder().ok();
+            addons.push(Box::new(super::telemetry::TelemetryAddon::new()));
+        }
 
         // ACME Addon (Free/Built-in for now as per request)
         #[cfg(feature = "addon-acme")]
@@ -44,16 +75,32 @@ impl AddonRegistry {
         #[cfg(feature = "addon-ivr-editor")]
         addons.push(Box::new(super::ivr_editor::IvrEditorAddon::new()));
 
+        // JSON-RPC Router Addon
+        #[cfg(feature = "addon-jsonrpc-router")]
+        addons.push(Box::new(super::jsonrpc_router::JsonRpcRouterAddon::new()));
+
         // Queue Addon
         addons.push(Box::new(super::queue::QueueAddon::new()));
 
-        Self { addons }
+        // CC Addon (Contact Center)
+        #[cfg(feature = "addon-cc")]
+        addons.push(Box::new(super::cc::CcAddon::new()));
+
+        // Collect export/reload handlers from addons (not gated by feature)
+        let mut export_reload = ExportReloadRegistry::default();
+        for addon in &addons {
+            if let Some(handler) = addon.export_reload_handler() {
+                export_reload.register(handler);
+            }
+        }
+
+        Self { addons, export_reload }
     }
 
     pub async fn initialize_all(&self, state: AppState) -> anyhow::Result<()> {
         let config = state.config();
         for addon in &self.addons {
-            if !self.is_enabled(addon.id(), &config) {
+            if !self.is_enabled(addon.id(), config) {
                 tracing::info!("Addon {} is disabled", addon.name());
                 continue;
             }
@@ -69,7 +116,7 @@ impl AddonRegistry {
     pub async fn seed_all_fixtures(&self, state: AppState) -> anyhow::Result<()> {
         let config = state.config();
         for addon in &self.addons {
-            if !self.is_enabled(addon.id(), &config) {
+            if !self.is_enabled(addon.id(), config) {
                 continue;
             }
             if let Err(e) = addon.seed_fixtures(state.clone()).await {
@@ -100,11 +147,10 @@ impl AddonRegistry {
                 continue;
             }
             for injection in addon.inject_scripts() {
-                if let Ok(re) = regex::Regex::new(injection.url_path_regex) {
-                    if re.is_match(path) {
-                        scripts.push(injection.script_url);
+                if let Ok(re) = regex::Regex::new(injection.url_path_regex)
+                    && re.is_match(path) {
+                        scripts.push(normalize_static_url(&injection.script_url, config));
                     }
-                }
             }
         }
         scripts
@@ -143,6 +189,7 @@ impl AddonRegistry {
     }
 
     pub fn list_addons(&self, state: AppState) -> Vec<super::AddonInfo> {
+        let config = state.config().clone();
         self.addons
             .iter()
             .map(|a| {
@@ -159,7 +206,7 @@ impl AddonRegistry {
                     developer: a.developer().to_string(),
                     website: a.website().to_string(),
                     cost: a.cost().to_string(),
-                    screenshots: a.screenshots().iter().map(|s| s.to_string()).collect(),
+                    screenshots: a.screenshots().iter().map(|s| normalize_static_url(s, &config)).collect(),
                     restart_required: false, // Caller should set this
                     #[cfg(feature = "commerce")]
                     license_status: None,
@@ -186,7 +233,7 @@ impl AddonRegistry {
     ) -> Vec<Box<dyn crate::callrecord::CallRecordHook>> {
         self.addons
             .iter()
-            .filter(|a| self.is_enabled(a.id(), &config))
+            .filter(|a| self.is_enabled(a.id(), config))
             .filter_map(|a| a.call_record_hook(db))
             .collect()
     }
@@ -226,11 +273,36 @@ impl AddonRegistry {
     ) -> crate::proxy::server::SipServerBuilder {
         let config = &ctx.config;
         for addon in &self.addons {
-            if !self.is_enabled(addon.id(), &config) {
+            if !self.is_enabled(addon.id(), config) {
                 continue;
             }
             builder = addon.proxy_server_hook(builder, ctx.clone());
+            // Register dialplan inspectors from addons
+            if let Some(inspector) = addon.dialplan_inspector() {
+                builder = builder.with_dialplan_inspector(inspector);
+            }
         }
         builder
+    }
+
+    /// Run database migrations for all enabled addons.
+    pub async fn run_migrations(
+        &self,
+        db: &sea_orm::DatabaseConnection,
+    ) -> anyhow::Result<()> {
+        let manager = sea_orm_migration::SchemaManager::new(db);
+        for addon in &self.addons {
+            for migration in addon.migrations() {
+                if let Err(e) = migration.up(&manager).await {
+                    return Err(anyhow::anyhow!(
+                        "Migration '{}' for addon '{}' failed: {}",
+                        migration.name(),
+                        addon.name(),
+                        e
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 }

@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 // tests/helpers/sipbot_helper.rs
 //
 // Thin wrapper around `sipbot::sip::SipBot` that makes it easy to spin up a
@@ -31,11 +33,7 @@ pub struct TestUa {
 }
 
 impl TestUa {
-    /// Create and start a callee UA that rings for `ring_secs` seconds then
-    /// auto-answers with echo.  The UA binds UDP on `127.0.0.1:<sip_port>`.
-    ///
-    /// The underlying `SipBot::run_wait()` loop is spawned in a background
-    /// task.  Drop (or call `stop()`) to terminate it.
+    #[allow(dead_code)]
     pub async fn callee(sip_port: u16, ring_secs: u64) -> Self {
         Self::callee_with_username(sip_port, ring_secs, "bob").await
     }
@@ -45,9 +43,123 @@ impl TestUa {
         Self::callee_with_options(sip_port, ring_secs, username, None).await
     }
 
+    /// Create and start a REGISTERED callee UA that registers with a proxy.
+    /// This is used for web agents that need to be discoverable via registrar.
+    pub async fn registered_callee(
+        sip_port: u16,
+        ring_secs: u64,
+        username: &str,
+        password: &str,
+        domain: &str,
+        proxy_addr: &str,
+    ) -> Self {
+        let cancel_token = CancellationToken::new();
+
+        let account = AccountConfig {
+            username: username.to_string(),
+            domain: domain.to_string(),
+            password: Some(password.to_string()),
+            proxy: Some(proxy_addr.to_string()),
+            register: Some(true),
+            ring: Some(RingConfig {
+                duration_secs: ring_secs,
+                ringback: None,
+                local: None,
+            }),
+            answer: Some(AnswerConfig::Echo),
+            ..Default::default()
+        };
+
+        let global_config = SipBotConfig {
+            addr: Some(format!("127.0.0.1:{}", sip_port)),
+            external_ip: None,
+            recorders: None,
+            accounts: vec![account.clone()],
+        };
+
+        let stats = Arc::new(CallStats::new());
+        let stats_clone = stats.clone();
+        let ct = cancel_token.clone();
+
+        tokio::spawn(async move {
+            let mut bot = SipBot::new(account, global_config, stats_clone, false, ct.clone());
+            tokio::select! {
+                _ = ct.cancelled() => {}
+                res = bot.run_wait() => {
+                    if let Err(e) = res {
+                        tracing::error!("sipbot run_wait error: {e:?}");
+                    }
+                }
+            }
+        });
+
+        // Give the UA a moment to bind its UDP socket and register.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        Self {
+            cancel_token,
+            domain: format!("{}:{}", domain, sip_port),
+            stats,
+        }
+    }
+
+    /// Create and start an outbound caller UA that will place calls to `target_uri`.
+    pub async fn caller_with_target(
+        sip_port: u16,
+        username: &str,
+        target_uri: String,
+    ) -> Self {
+        let cancel_token = CancellationToken::new();
+        let domain = format!("127.0.0.1:{}", sip_port);
+
+        let account = AccountConfig {
+            username: username.to_string(),
+            domain: domain.clone(),
+            password: None,
+            register: Some(false),
+            target: Some(target_uri),
+            ..Default::default()
+        };
+
+        let global_config = SipBotConfig {
+            addr: Some(format!("127.0.0.1:{}", sip_port)),
+            external_ip: None,
+            recorders: None,
+            accounts: vec![account.clone()],
+        };
+
+        let stats = Arc::new(CallStats::new());
+        let stats_clone = stats.clone();
+        let ct = cancel_token.clone();
+
+        tokio::spawn(async move {
+            let mut bot = SipBot::new(account, global_config, stats_clone, false, ct.clone());
+            tokio::select! {
+                _ = ct.cancelled() => {}
+                res = bot.run_call(1, 1) => {
+                    if let Err(e) = res {
+                        tracing::error!("sipbot run_call error: {e:?}");
+                    }
+                }
+            }
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        Self {
+            cancel_token,
+            domain,
+            stats,
+        }
+    }
+
     /// Create and start a callee UA with REFER rejection (for 3PCC fallback testing).
     #[allow(dead_code)]
-    pub async fn callee_with_refer_reject(sip_port: u16, ring_secs: u64, refer_reject_code: u16) -> Self {
+    pub async fn callee_with_refer_reject(
+        sip_port: u16,
+        ring_secs: u64,
+        refer_reject_code: u16,
+    ) -> Self {
         Self::callee_with_options(sip_port, ring_secs, "bob", Some(refer_reject_code)).await
     }
 

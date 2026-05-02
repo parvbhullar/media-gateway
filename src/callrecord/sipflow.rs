@@ -1,10 +1,7 @@
 use crate::sipflow::{SipFlowBackend, SipFlowItem, SipFlowMsgType};
 use bytes::Bytes;
 use crossbeam_channel::{RecvTimeoutError, Sender, bounded};
-use rsipstack::sip::{
-    SipMessage,
-    prelude::HeadersExt,
-};
+use rsipstack::sip::{SipMessage, prelude::HeadersExt};
 use rsipstack::{transaction::endpoint::MessageInspector, transport::SipAddr};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -55,14 +52,13 @@ impl ItemPool {
 
         for i in 0..POOL_SIZE {
             let idx = (start + i) % POOL_SIZE;
-            if let Ok(mut guard) = self.items[idx].try_lock() {
-                if !guard.in_use {
+            if let Ok(mut guard) = self.items[idx].try_lock()
+                && !guard.in_use {
                     guard.in_use = true;
                     // Clone the item for use
                     let cloned = Self::clone_item(&guard.item);
                     return Some((idx, cloned));
                 }
-            }
         }
         // Pool exhausted, allocate new
         None
@@ -70,14 +66,13 @@ impl ItemPool {
 
     /// Release item back to pool
     fn release(&self, idx: usize) {
-        if idx < POOL_SIZE {
-            if let Ok(mut guard) = self.items[idx].lock() {
+        if idx < POOL_SIZE
+            && let Ok(mut guard) = self.items[idx].lock() {
                 guard.in_use = false;
                 // Clear strings to keep capacity but free content
                 guard.item.src_addr.clear();
                 guard.item.dst_addr.clear();
             }
-        }
     }
 
     fn clone_item(item: &SipFlowItem) -> SipFlowItem {
@@ -320,11 +315,10 @@ impl SipFlow {
             } else {
                 src.push_str(&addr_str);
             }
-        } else if is_outgoing {
-            if let Ok(dest) = rsipstack::transport::SipConnection::get_destination(msg) {
+        } else if is_outgoing
+            && let Ok(dest) = rsipstack::transport::SipConnection::get_destination(msg) {
                 dst.push_str(&dest.to_string());
             }
-        }
 
         (src, dst)
     }

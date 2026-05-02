@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod tests {
+    use crate::config::SessionTimerMode;
     use crate::proxy::proxy_call::session_timer::*;
     use std::str::FromStr;
     use std::sync::{Arc, Mutex};
@@ -39,6 +40,7 @@ mod tests {
     #[test]
     fn test_session_timer_state_memory() {
         let timer = Arc::new(Mutex::new(SessionTimerState {
+            mode: SessionTimerMode::Supported,
             enabled: true,
             active: true,
             refresher: SessionRefresher::Uas,
@@ -62,31 +64,35 @@ mod tests {
 
     #[test]
     fn test_should_refresh_when_inactive() {
-        let mut timer = SessionTimerState::default();
-        timer.enabled = true;
-        timer.active = false;
-        timer.session_interval = Duration::from_secs(100);
-
+        let timer = SessionTimerState {
+            enabled: true,
+            active: false,
+            session_interval: Duration::from_secs(100),
+            ..Default::default()
+        };
         assert!(!timer.should_refresh());
     }
 
     #[test]
     fn test_should_refresh_when_disabled() {
-        let mut timer = SessionTimerState::default();
-        timer.enabled = false;
-        timer.active = true;
-        timer.session_interval = Duration::from_secs(100);
-
+        let timer = SessionTimerState {
+            enabled: false,
+            active: true,
+            session_interval: Duration::from_secs(100),
+            ..Default::default()
+        };
         assert!(!timer.should_refresh());
     }
 
     #[test]
     fn test_should_refresh_when_refreshing() {
-        let mut timer = SessionTimerState::default();
-        timer.enabled = true;
-        timer.active = true;
-        timer.refreshing = true;
-        timer.session_interval = Duration::from_secs(100);
+        let mut timer = SessionTimerState {
+            enabled: true,
+            active: true,
+            refreshing: true,
+            session_interval: Duration::from_secs(100),
+            ..Default::default()
+        };
         timer.last_refresh = Instant::now() - Duration::from_secs(60); // Past half interval
 
         assert!(!timer.should_refresh());
@@ -94,10 +100,12 @@ mod tests {
 
     #[test]
     fn test_should_refresh_before_half_interval() {
-        let mut timer = SessionTimerState::default();
-        timer.enabled = true;
-        timer.active = true;
-        timer.session_interval = Duration::from_secs(100);
+        let mut timer = SessionTimerState {
+            enabled: true,
+            active: true,
+            session_interval: Duration::from_secs(100),
+            ..Default::default()
+        };
         timer.last_refresh = Instant::now() - Duration::from_secs(40); // Before half (50s)
 
         assert!(!timer.should_refresh());
@@ -105,10 +113,12 @@ mod tests {
 
     #[test]
     fn test_should_refresh_at_half_interval() {
-        let mut timer = SessionTimerState::default();
-        timer.enabled = true;
-        timer.active = true;
-        timer.session_interval = Duration::from_secs(100);
+        let mut timer = SessionTimerState {
+            enabled: true,
+            active: true,
+            session_interval: Duration::from_secs(100),
+            ..Default::default()
+        };
         timer.last_refresh = Instant::now() - Duration::from_secs(51); // Past half (50s)
 
         assert!(timer.should_refresh());
@@ -118,10 +128,12 @@ mod tests {
 
     #[test]
     fn test_is_expired_when_inactive() {
-        let mut timer = SessionTimerState::default();
-        timer.enabled = true;
-        timer.active = false;
-        timer.session_interval = Duration::from_secs(100);
+        let mut timer = SessionTimerState {
+            enabled: true,
+            active: false,
+            session_interval: Duration::from_secs(100),
+            ..Default::default()
+        };
         timer.last_refresh = Instant::now() - Duration::from_secs(150); // Past interval
 
         assert!(!timer.is_expired());
@@ -129,10 +141,12 @@ mod tests {
 
     #[test]
     fn test_is_expired_before_interval() {
-        let mut timer = SessionTimerState::default();
-        timer.enabled = true;
-        timer.active = true;
-        timer.session_interval = Duration::from_secs(100);
+        let mut timer = SessionTimerState {
+            enabled: true,
+            active: true,
+            session_interval: Duration::from_secs(100),
+            ..Default::default()
+        };
         timer.last_refresh = Instant::now() - Duration::from_secs(50); // Before 100s
 
         assert!(!timer.is_expired());
@@ -140,10 +154,12 @@ mod tests {
 
     #[test]
     fn test_is_expired_at_interval() {
-        let mut timer = SessionTimerState::default();
-        timer.enabled = true;
-        timer.active = true;
-        timer.session_interval = Duration::from_secs(100);
+        let mut timer = SessionTimerState {
+            enabled: true,
+            active: true,
+            session_interval: Duration::from_secs(100),
+            ..Default::default()
+        };
         timer.last_refresh = Instant::now() - Duration::from_secs(101); // Past 100s
 
         assert!(timer.is_expired());
@@ -151,26 +167,26 @@ mod tests {
 
     #[test]
     fn test_should_refresh_just_past_half_interval() {
-        let mut timer = SessionTimerState::default();
-        timer.enabled = true;
-        timer.active = true;
-        timer.refreshing = false;
-        timer.session_interval = Duration::from_secs(1800);
-
-        // Just past half (901 seconds out of 1800)
-        timer.last_refresh = Instant::now() - Duration::from_secs(901);
+        let timer = SessionTimerState {
+            enabled: true,
+            active: true,
+            refreshing: false,
+            session_interval: Duration::from_secs(1800),
+            last_refresh: Instant::now() - Duration::from_secs(901),
+            ..Default::default()
+        };
         assert!(timer.should_refresh());
     }
 
     #[test]
     fn test_should_not_refresh_before_half_interval() {
-        let mut timer = SessionTimerState::default();
-        timer.active = true;
-        timer.refreshing = false;
-        timer.session_interval = Duration::from_secs(1800);
-
-        // Just before half (899 seconds out of 1800)
-        timer.last_refresh = Instant::now() - Duration::from_secs(899);
+        let timer = SessionTimerState {
+            active: true,
+            refreshing: false,
+            session_interval: Duration::from_secs(1800),
+            last_refresh: Instant::now() - Duration::from_secs(899),
+            ..Default::default()
+        };
         assert!(
             !timer.should_refresh(),
             "Should NOT refresh before half interval"
@@ -179,8 +195,10 @@ mod tests {
 
     #[test]
     fn test_should_not_refresh_when_refreshing_flag_is_set() {
-        let mut timer = SessionTimerState::default();
-        timer.active = true;
+        let mut timer = SessionTimerState {
+            active: true,
+            ..Default::default()
+        };
         timer.refreshing = true; // Already refreshing
         timer.session_interval = Duration::from_secs(1800);
         timer.last_refresh = Instant::now() - Duration::from_secs(1000); // Well past half
@@ -194,11 +212,13 @@ mod tests {
 
     #[test]
     fn test_should_not_refresh_when_inactive() {
-        let mut timer = SessionTimerState::default();
-        timer.active = false; // Not active
-        timer.refreshing = false;
-        timer.session_interval = Duration::from_secs(1800);
-        timer.last_refresh = Instant::now() - Duration::from_secs(1000);
+        let timer = SessionTimerState {
+            active: false,
+            refreshing: false,
+            session_interval: Duration::from_secs(1800),
+            last_refresh: Instant::now() - Duration::from_secs(1000),
+            ..Default::default()
+        };
 
         assert!(
             !timer.should_refresh(),
@@ -208,24 +228,24 @@ mod tests {
 
     #[test]
     fn test_is_expired_after_full_interval() {
-        let mut timer = SessionTimerState::default();
-        timer.enabled = true;
-        timer.active = true;
-        timer.session_interval = Duration::from_secs(100);
-
-        // Just past full interval
-        timer.last_refresh = Instant::now() - Duration::from_secs(101);
+        let timer = SessionTimerState {
+            enabled: true,
+            active: true,
+            session_interval: Duration::from_secs(100),
+            last_refresh: Instant::now() - Duration::from_secs(101),
+            ..Default::default()
+        };
         assert!(timer.is_expired(), "Should be expired after full interval");
     }
 
     #[test]
     fn test_is_not_expired_before_full_interval() {
-        let mut timer = SessionTimerState::default();
-        timer.active = true;
-        timer.session_interval = Duration::from_secs(100);
-
-        // Just before full interval
-        timer.last_refresh = Instant::now() - Duration::from_secs(99);
+        let timer = SessionTimerState {
+            active: true,
+            session_interval: Duration::from_secs(100),
+            last_refresh: Instant::now() - Duration::from_secs(99),
+            ..Default::default()
+        };
         assert!(
             !timer.is_expired(),
             "Should NOT be expired before full interval"
@@ -234,11 +254,12 @@ mod tests {
 
     #[test]
     fn test_is_not_expired_when_inactive() {
-        let mut timer = SessionTimerState::default();
-        timer.active = false;
-        timer.session_interval = Duration::from_secs(100);
-        timer.last_refresh = Instant::now() - Duration::from_secs(200);
-
+        let timer = SessionTimerState {
+            active: false,
+            session_interval: Duration::from_secs(100),
+            last_refresh: Instant::now() - Duration::from_secs(200),
+            ..Default::default()
+        };
         assert!(
             !timer.is_expired(),
             "Should NOT be expired when timer is not active"
@@ -247,9 +268,10 @@ mod tests {
 
     #[test]
     fn test_update_refresh_sets_last_refresh_to_now() {
-        let mut timer = SessionTimerState::default();
-        timer.last_refresh = Instant::now() - Duration::from_secs(1000);
-
+        let mut timer = SessionTimerState {
+            last_refresh: Instant::now() - Duration::from_secs(1000),
+            ..Default::default()
+        };
         let before_update = Instant::now();
         timer.update_refresh();
         let after_update = Instant::now();
@@ -266,14 +288,14 @@ mod tests {
         // Note: should_refresh() does NOT check who the refresher is.
         // The caller (run_server_events_loop) checks refresher role before calling should_refresh().
         // This method only checks if the time has passed since last refresh.
-        let mut timer = SessionTimerState::default();
-        timer.enabled = true;
-        timer.active = true;
-        timer.refreshing = false;
-        timer.session_interval = Duration::from_secs(1800);
-        timer.last_refresh = Instant::now() - Duration::from_secs(1000);
-
-        // should_refresh returns true when past half interval, regardless of refresher role
+        let timer = SessionTimerState {
+            enabled: true,
+            active: true,
+            refreshing: false,
+            session_interval: Duration::from_secs(1800),
+            last_refresh: Instant::now() - Duration::from_secs(1000),
+            ..Default::default()
+        };
         assert!(
             timer.should_refresh(),
             "should_refresh returns true when past half interval"
@@ -284,30 +306,30 @@ mod tests {
     fn test_should_refresh_with_uac_refresher() {
         // UAC refresher - the UAC is responsible for sending refresh
         // But should_refresh() doesn't check this - the caller does
-        let mut timer = SessionTimerState::default();
-        timer.enabled = true;
-        timer.active = true;
-        timer.refreshing = false;
-        timer.refresher = SessionRefresher::Uac;
-        timer.session_interval = Duration::from_secs(1800);
-        timer.last_refresh = Instant::now() - Duration::from_secs(1000);
-
-        // should_refresh only checks time, not who the refresher is
+        let timer = SessionTimerState {
+            enabled: true,
+            active: true,
+            refreshing: false,
+            refresher: SessionRefresher::Uac,
+            session_interval: Duration::from_secs(1800),
+            last_refresh: Instant::now() - Duration::from_secs(1000),
+            ..Default::default()
+        };
         assert!(timer.should_refresh());
     }
 
     #[test]
     fn test_should_refresh_with_uas_refresher() {
         // UAS refresher - the UAS is responsible for sending refresh
-        let mut timer = SessionTimerState::default();
-        timer.enabled = true;
-        timer.active = true;
-        timer.refreshing = false;
-        timer.refresher = SessionRefresher::Uas;
-        timer.session_interval = Duration::from_secs(1800);
-        timer.last_refresh = Instant::now() - Duration::from_secs(1000);
-
-        // should_refresh only checks time, not who the refresher is
+        let timer = SessionTimerState {
+            enabled: true,
+            active: true,
+            refreshing: false,
+            refresher: SessionRefresher::Uas,
+            session_interval: Duration::from_secs(1800),
+            last_refresh: Instant::now() - Duration::from_secs(1000),
+            ..Default::default()
+        };
         assert!(timer.should_refresh());
     }
 
@@ -382,6 +404,7 @@ mod tests {
     #[test]
     fn test_session_timer_expiration_logic() {
         let mut timer = SessionTimerState {
+            mode: SessionTimerMode::Supported,
             enabled: true,
             active: true,
             refresher: SessionRefresher::Uas,
@@ -407,6 +430,7 @@ mod tests {
     #[test]
     fn test_session_timer_refresh_logic() {
         let mut timer = SessionTimerState {
+            mode: SessionTimerMode::Supported,
             enabled: true,
             active: true,
             refresher: SessionRefresher::Uas,
@@ -420,19 +444,13 @@ mod tests {
         };
 
         // Logic from handle_server_events
-        let mut next_time = None;
-        if timer.active {
-            if timer.refresher == SessionRefresher::Uas {
-                let refresh_at = timer.last_refresh + (timer.session_interval / 2);
-                next_time = Some(refresh_at);
-            }
-        }
-
-        if let Some(next_refresh) = next_time {
-            if Instant::now() >= next_refresh {
-                // Simulate refresh
-                timer.last_refresh = Instant::now();
-            }
+        if timer.active
+            && timer.refresher == SessionRefresher::Uas
+            && let Some(next_refresh) = Some(timer.last_refresh + (timer.session_interval / 2))
+            && Instant::now() >= next_refresh
+        {
+            // Simulate refresh
+            timer.last_refresh = Instant::now();
         }
 
         // Should be refreshed now
@@ -441,12 +459,13 @@ mod tests {
 
     #[test]
     fn test_session_timer_methods() {
-        let mut timer = SessionTimerState::default();
-        timer.enabled = true;
-        timer.active = true;
-        timer.session_interval = Duration::from_secs(100);
-        timer.last_refresh = Instant::now() - Duration::from_secs(51);
-
+        let mut timer = SessionTimerState {
+            enabled: true,
+            active: true,
+            session_interval: Duration::from_secs(100),
+            last_refresh: Instant::now() - Duration::from_secs(51),
+            ..Default::default()
+        };
         assert!(timer.should_refresh());
         assert!(!timer.is_expired());
 
@@ -470,11 +489,12 @@ mod tests {
 
     #[test]
     fn test_complete_refresh() {
-        let mut timer = SessionTimerState::default();
-        timer.active = true;
-        timer.refreshing = true;
-        timer.last_refresh = Instant::now() - Duration::from_secs(60);
-
+        let mut timer = SessionTimerState {
+            active: true,
+            refreshing: true,
+            last_refresh: Instant::now() - Duration::from_secs(60),
+            ..Default::default()
+        };
         let old_refresh_time = timer.last_refresh;
         timer.complete_refresh();
 
@@ -485,9 +505,10 @@ mod tests {
 
     #[test]
     fn test_fail_refresh() {
-        let mut timer = SessionTimerState::default();
-        timer.refreshing = true;
-
+        let mut timer = SessionTimerState {
+            refreshing: true,
+            ..Default::default()
+        };
         timer.fail_refresh();
 
         assert!(!timer.refreshing);
@@ -496,10 +517,11 @@ mod tests {
 
     #[test]
     fn test_update_refresh() {
-        let mut timer = SessionTimerState::default();
-        timer.active = true;
-        timer.last_refresh = Instant::now() - Duration::from_secs(60);
-
+        let mut timer = SessionTimerState {
+            active: true,
+            last_refresh: Instant::now() - Duration::from_secs(60),
+            ..Default::default()
+        };
         let old_refresh_time = timer.last_refresh;
         timer.update_refresh();
 
@@ -517,10 +539,12 @@ mod tests {
 
     #[test]
     fn test_next_refresh_time_when_active() {
-        let mut timer = SessionTimerState::default();
-        timer.active = true;
-        timer.enabled = true;
-        timer.session_interval = Duration::from_secs(100);
+        let mut timer = SessionTimerState {
+            active: true,
+            enabled: true,
+            session_interval: Duration::from_secs(100),
+            ..Default::default()
+        };
         let now = Instant::now();
         timer.last_refresh = now;
 
@@ -544,10 +568,12 @@ mod tests {
 
     #[test]
     fn test_expiration_time_when_active() {
-        let mut timer = SessionTimerState::default();
-        timer.active = true;
-        timer.enabled = true;
-        timer.session_interval = Duration::from_secs(100);
+        let mut timer = SessionTimerState {
+            active: true,
+            enabled: true,
+            session_interval: Duration::from_secs(100),
+            ..Default::default()
+        };
         let now = Instant::now();
         timer.last_refresh = now;
 
@@ -565,12 +591,13 @@ mod tests {
 
     #[test]
     fn test_time_until_expiration() {
-        let mut timer = SessionTimerState::default();
-        timer.active = true;
-        timer.enabled = true;
-        timer.session_interval = Duration::from_secs(100);
-        timer.last_refresh = Instant::now();
-
+        let timer = SessionTimerState {
+            active: true,
+            enabled: true,
+            session_interval: Duration::from_secs(100),
+            last_refresh: Instant::now(),
+            ..Default::default()
+        };
         let remaining = timer.time_until_expiration();
         assert!(remaining.is_some());
         // Should be close to 100s
@@ -580,12 +607,13 @@ mod tests {
 
     #[test]
     fn test_time_until_expiration_when_expired() {
-        let mut timer = SessionTimerState::default();
-        timer.active = true;
-        timer.enabled = true;
-        timer.session_interval = Duration::from_secs(100);
-        timer.last_refresh = Instant::now() - Duration::from_secs(150);
-
+        let timer = SessionTimerState {
+            active: true,
+            enabled: true,
+            session_interval: Duration::from_secs(100),
+            last_refresh: Instant::now() - Duration::from_secs(150),
+            ..Default::default()
+        };
         let remaining = timer.time_until_expiration();
         assert!(remaining.is_some());
         assert_eq!(remaining.unwrap(), Duration::ZERO);
@@ -593,12 +621,13 @@ mod tests {
 
     #[test]
     fn test_time_until_refresh() {
-        let mut timer = SessionTimerState::default();
-        timer.active = true;
-        timer.enabled = true;
-        timer.session_interval = Duration::from_secs(100);
-        timer.last_refresh = Instant::now();
-
+        let timer = SessionTimerState {
+            active: true,
+            enabled: true,
+            session_interval: Duration::from_secs(100),
+            last_refresh: Instant::now(),
+            ..Default::default()
+        };
         let remaining = timer.time_until_refresh();
         assert!(remaining.is_some());
         // Should be close to 50s (half interval)
@@ -636,10 +665,11 @@ mod tests {
 
     #[test]
     fn test_activate() {
-        let mut timer = SessionTimerState::default();
-        timer.enabled = true;
-        timer.active = false;
-
+        let mut timer = SessionTimerState {
+            enabled: true,
+            active: false,
+            ..Default::default()
+        };
         let old_refresh = timer.last_refresh;
         timer.activate();
 
@@ -649,10 +679,11 @@ mod tests {
 
     #[test]
     fn test_activate_when_disabled() {
-        let mut timer = SessionTimerState::default();
-        timer.enabled = false;
-        timer.active = false;
-
+        let mut timer = SessionTimerState {
+            enabled: false,
+            active: false,
+            ..Default::default()
+        };
         timer.activate();
 
         // Should not activate if disabled
@@ -661,9 +692,10 @@ mod tests {
 
     #[test]
     fn test_deactivate() {
-        let mut timer = SessionTimerState::default();
-        timer.active = true;
-
+        let mut timer = SessionTimerState {
+            active: true,
+            ..Default::default()
+        };
         timer.deactivate();
 
         assert!(!timer.active);
@@ -671,13 +703,14 @@ mod tests {
 
     #[test]
     fn test_reset() {
-        let mut timer = SessionTimerState::default();
-        timer.active = true;
-        timer.refreshing = true;
-        timer.session_interval = Duration::from_secs(100);
-        timer.refresher = SessionRefresher::Uac;
-        timer.last_refresh = Instant::now() - Duration::from_secs(50);
-
+        let mut timer = SessionTimerState {
+            active: true,
+            refreshing: true,
+            session_interval: Duration::from_secs(100),
+            refresher: SessionRefresher::Uac,
+            last_refresh: Instant::now() - Duration::from_secs(50),
+            ..Default::default()
+        };
         timer.reset(Duration::from_secs(200), SessionRefresher::Uas);
 
         assert_eq!(timer.session_interval, Duration::from_secs(200));
@@ -688,10 +721,11 @@ mod tests {
 
     #[test]
     fn test_get_session_expires_value() {
-        let mut timer = SessionTimerState::default();
-        timer.session_interval = Duration::from_secs(1800);
-        timer.refresher = SessionRefresher::Uac;
-
+        let mut timer = SessionTimerState {
+            session_interval: Duration::from_secs(1800),
+            refresher: SessionRefresher::Uac,
+            ..Default::default()
+        };
         assert_eq!(timer.get_session_expires_value(), "1800;refresher=uac");
 
         timer.refresher = SessionRefresher::Uas;
@@ -700,9 +734,10 @@ mod tests {
 
     #[test]
     fn test_get_min_se_value() {
-        let mut timer = SessionTimerState::default();
-        timer.min_se = Duration::from_secs(90);
-
+        let timer = SessionTimerState {
+            min_se: Duration::from_secs(90),
+            ..Default::default()
+        };
         assert_eq!(timer.get_min_se_value(), "90");
     }
 
@@ -735,16 +770,17 @@ mod tests {
 
     #[test]
     fn test_stats() {
-        let mut timer = SessionTimerState::default();
-        timer.enabled = true;
-        timer.active = true;
-        timer.refreshing = false;
-        timer.session_interval = Duration::from_secs(1800);
-        timer.min_se = Duration::from_secs(90);
-        timer.refresher = SessionRefresher::Uac;
-        timer.refresh_count = 5;
-        timer.failed_refreshes = 2;
-
+        let timer = SessionTimerState {
+            enabled: true,
+            active: true,
+            refreshing: false,
+            session_interval: Duration::from_secs(1800),
+            min_se: Duration::from_secs(90),
+            refresher: SessionRefresher::Uac,
+            refresh_count: 5,
+            failed_refreshes: 2,
+            ..Default::default()
+        };
         let stats = timer.stats();
 
         assert!(stats.enabled);
@@ -806,11 +842,9 @@ mod tests {
 
     #[test]
     fn test_get_header_value_typed_session_expires() {
-        let headers = rsipstack::sip::Headers::from(vec![
-            rsipstack::sip::Header::SessionExpires(
-                rsipstack::sip::headers::SessionExpires::new("1800;refresher=uac"),
-            ),
-        ]);
+        let headers = rsipstack::sip::Headers::from(vec![rsipstack::sip::Header::SessionExpires(
+            rsipstack::sip::headers::SessionExpires::new("1800;refresher=uac"),
+        )]);
 
         let value = get_header_value(&headers, HEADER_SESSION_EXPIRES);
         assert_eq!(value, Some("1800;refresher=uac".to_string()));
@@ -829,9 +863,9 @@ mod tests {
 
     #[test]
     fn test_get_header_value_typed_min_se() {
-        let headers = rsipstack::sip::Headers::from(vec![
-            rsipstack::sip::Header::MinSE(rsipstack::sip::headers::MinSE::new("90")),
-        ]);
+        let headers = rsipstack::sip::Headers::from(vec![rsipstack::sip::Header::MinSE(
+            rsipstack::sip::headers::MinSE::new("90"),
+        )]);
 
         let value = get_header_value(&headers, HEADER_MIN_SE);
         assert_eq!(value, Some("90".to_string()));
@@ -928,16 +962,16 @@ mod tests {
     }
 
     #[test]
-    fn test_build_session_timer_response_headers_require_timer_for_uac_refresher() {
+    fn test_build_session_timer_response_headers_do_not_require_timer_for_uac_refresher() {
         let mut timer = SessionTimerState::default();
         timer.enabled = true;
         timer.active = true;
         timer.refresher = SessionRefresher::Uac;
         timer.session_interval = Duration::from_secs(1800);
 
-        let headers = rsipstack::sip::Headers::from(build_session_timer_response_headers(&timer, true));
+        let headers = rsipstack::sip::Headers::from(build_session_timer_response_headers(&timer));
 
-        assert!(is_timer_required(&headers));
+        assert!(!is_timer_required(&headers));
         assert_eq!(
             get_header_value(&headers, HEADER_SESSION_EXPIRES),
             Some("1800;refresher=uac".to_string())
@@ -952,7 +986,7 @@ mod tests {
         timer.refresher = SessionRefresher::Uas;
         timer.session_interval = Duration::from_secs(1800);
 
-        let headers = rsipstack::sip::Headers::from(build_session_timer_response_headers(&timer, true));
+        let headers = rsipstack::sip::Headers::from(build_session_timer_response_headers(&timer));
 
         assert!(!is_timer_required(&headers));
     }
@@ -965,25 +999,81 @@ mod tests {
         timer.refresher = SessionRefresher::Uac;
         timer.session_interval = Duration::from_secs(1800);
 
-        let headers = rsipstack::sip::Headers::from(build_session_timer_response_headers(&timer, false));
+        let headers = rsipstack::sip::Headers::from(build_session_timer_response_headers(&timer));
 
         assert!(!is_timer_required(&headers));
     }
 
     #[test]
-    fn test_select_timer_refresher_defaults_to_uas_without_timer_support() {
-        assert_eq!(select_timer_refresher(false, None), SessionRefresher::Uas);
+    fn test_build_default_session_timer_headers_include_supported_timer() {
+        let headers = rsipstack::sip::Headers::from(build_default_session_timer_headers(1800, 90));
+
+        assert!(has_timer_support(&headers));
         assert_eq!(
-            select_timer_refresher(false, Some(SessionRefresher::Uac)),
+            get_header_value(&headers, HEADER_SESSION_EXPIRES),
+            Some("1800".to_string())
+        );
+        assert_eq!(
+            get_header_value(&headers, HEADER_MIN_SE),
+            Some("90".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_session_timer_response_headers_omit_min_se() {
+        let mut timer = SessionTimerState::default();
+        timer.enabled = true;
+        timer.active = true;
+        timer.refresher = SessionRefresher::Uas;
+        timer.session_interval = Duration::from_secs(1800);
+
+        let headers = rsipstack::sip::Headers::from(build_session_timer_response_headers(&timer));
+
+        assert_eq!(
+            get_header_value(&headers, HEADER_SESSION_EXPIRES),
+            Some("1800;refresher=uas".to_string())
+        );
+        assert_eq!(get_header_value(&headers, HEADER_MIN_SE), None);
+        assert!(!has_timer_support(&headers));
+    }
+
+    #[test]
+    fn test_select_server_timer_refresher_defaults_to_uas_without_timer_support() {
+        assert_eq!(
+            select_server_timer_refresher(false, true, None),
+            SessionRefresher::Uas
+        );
+        assert_eq!(
+            select_server_timer_refresher(false, true, Some(SessionRefresher::Uac)),
+            SessionRefresher::Uac
+        );
+    }
+
+    #[test]
+    fn test_select_server_timer_refresher_uses_request_when_peer_supports_timer() {
+        assert_eq!(
+            select_server_timer_refresher(true, true, None),
+            SessionRefresher::Uac
+        );
+        assert_eq!(
+            select_server_timer_refresher(true, true, Some(SessionRefresher::Uas)),
             SessionRefresher::Uas
         );
     }
 
     #[test]
-    fn test_select_timer_refresher_uses_request_when_peer_supports_timer() {
-        assert_eq!(select_timer_refresher(true, None), SessionRefresher::Uac);
+    fn test_select_server_timer_refresher_defaults_to_uas_without_session_expires() {
         assert_eq!(
-            select_timer_refresher(true, Some(SessionRefresher::Uas)),
+            select_server_timer_refresher(true, false, None),
+            SessionRefresher::Uas
+        );
+    }
+
+    #[test]
+    fn test_select_client_timer_refresher_defaults_to_uac() {
+        assert_eq!(select_client_timer_refresher(None), SessionRefresher::Uac);
+        assert_eq!(
+            select_client_timer_refresher(Some(SessionRefresher::Uas)),
             SessionRefresher::Uas
         );
     }
@@ -991,18 +1081,61 @@ mod tests {
     #[test]
     fn test_apply_refresh_response_disables_timer_without_session_expires() {
         let mut timer = SessionTimerState::default();
+        timer.mode = SessionTimerMode::Supported;
         timer.enabled = true;
         timer.active = true;
         timer.refreshing = true;
         timer.session_interval = Duration::from_secs(1800);
 
         let headers = rsipstack::sip::Headers::default();
-        let result = apply_refresh_response(&mut timer, &headers);
+        let result = apply_refresh_response(&mut timer, &headers, false);
 
         assert!(result.is_ok());
         assert!(!timer.enabled);
         assert!(!timer.active);
         assert!(!timer.refreshing);
+        assert_eq!(timer.refresh_count, 1);
+    }
+
+    #[test]
+    fn test_apply_refresh_response_keeps_local_uas_without_session_expires_in_always_mode() {
+        let mut timer = SessionTimerState::default();
+        timer.mode = SessionTimerMode::Always;
+        timer.enabled = true;
+        timer.active = true;
+        timer.refreshing = true;
+        timer.refresher = SessionRefresher::Uas;
+        timer.session_interval = Duration::from_secs(1800);
+
+        let headers = rsipstack::sip::Headers::default();
+        let result = apply_refresh_response(&mut timer, &headers, false);
+
+        assert!(result.is_ok());
+        assert!(timer.enabled);
+        assert!(timer.active);
+        assert!(!timer.refreshing);
+        assert_eq!(timer.refresher, SessionRefresher::Uas);
+        assert_eq!(timer.refresh_count, 1);
+    }
+
+    #[test]
+    fn test_apply_refresh_response_keeps_local_uac_without_session_expires_in_always_mode() {
+        let mut timer = SessionTimerState::default();
+        timer.mode = SessionTimerMode::Always;
+        timer.enabled = true;
+        timer.active = true;
+        timer.refreshing = true;
+        timer.refresher = SessionRefresher::Uas;
+        timer.session_interval = Duration::from_secs(1800);
+
+        let headers = rsipstack::sip::Headers::default();
+        let result = apply_refresh_response(&mut timer, &headers, true);
+
+        assert!(result.is_ok());
+        assert!(timer.enabled);
+        assert!(timer.active);
+        assert!(!timer.refreshing);
+        assert_eq!(timer.refresher, SessionRefresher::Uac);
         assert_eq!(timer.refresh_count, 1);
     }
 
@@ -1019,7 +1152,7 @@ mod tests {
             HEADER_SESSION_EXPIRES.to_string(),
             "900;refresher=uas".to_string(),
         )]);
-        let result = apply_refresh_response(&mut timer, &headers);
+        let result = apply_refresh_response(&mut timer, &headers, false);
 
         assert!(result.is_ok());
         assert!(timer.enabled);
@@ -1034,10 +1167,12 @@ mod tests {
 
     #[test]
     fn test_full_refresh_cycle() {
-        let mut timer = SessionTimerState::default();
-        timer.enabled = true;
-        timer.active = true;
-        timer.session_interval = Duration::from_secs(100);
+        let mut timer = SessionTimerState {
+            enabled: true,
+            active: true,
+            session_interval: Duration::from_secs(100),
+            ..Default::default()
+        };
         timer.refresher = SessionRefresher::Uas; // We are the refresher
 
         // Initial state - should not need refresh yet
@@ -1068,14 +1203,14 @@ mod tests {
 
     #[test]
     fn test_refresh_failure_recovery() {
-        let mut timer = SessionTimerState::default();
-        timer.enabled = true;
-        timer.active = true;
-        timer.session_interval = Duration::from_secs(100);
-        timer.refresher = SessionRefresher::Uas;
-        timer.last_refresh = Instant::now() - Duration::from_secs(51);
-
-        // Start refresh
+        let mut timer = SessionTimerState {
+            enabled: true,
+            active: true,
+            session_interval: Duration::from_secs(100),
+            refresher: SessionRefresher::Uas,
+            last_refresh: Instant::now() - Duration::from_secs(51),
+            ..Default::default()
+        };
         assert!(timer.start_refresh());
         assert!(timer.refreshing);
 
@@ -1091,10 +1226,12 @@ mod tests {
 
     #[test]
     fn test_remote_refresh_update() {
-        let mut timer = SessionTimerState::default();
-        timer.enabled = true;
-        timer.active = true;
-        timer.session_interval = Duration::from_secs(100);
+        let mut timer = SessionTimerState {
+            enabled: true,
+            active: true,
+            session_interval: Duration::from_secs(100),
+            ..Default::default()
+        };
         timer.refresher = SessionRefresher::Uac; // Remote is refresher
         timer.last_refresh = Instant::now() - Duration::from_millis(100);
 
@@ -1117,10 +1254,11 @@ mod tests {
         ];
 
         for (secs, refresher, expected) in test_cases {
-            let mut timer = SessionTimerState::default();
-            timer.session_interval = Duration::from_secs(secs);
-            timer.refresher = refresher;
-
+            let timer = SessionTimerState {
+                session_interval: Duration::from_secs(secs),
+                refresher,
+                ..Default::default()
+            };
             assert_eq!(timer.get_session_expires_value(), expected);
         }
     }
@@ -1158,12 +1296,12 @@ mod tests {
     #[test]
     fn test_rfc4028_refresh_at_half_interval() {
         // RFC 4028: The refresher MUST send a refresh at half the session interval
-        let mut timer = SessionTimerState::default();
-        timer.enabled = true;
-        timer.active = true;
-        timer.refreshing = false;
-
-        // Test with various intervals
+        let mut timer = SessionTimerState {
+            enabled: true,
+            active: true,
+            refreshing: false,
+            ..Default::default()
+        };
         for interval_secs in [300, 600, 900, 1800, 3600] {
             timer.session_interval = Duration::from_secs(interval_secs);
 
@@ -1188,13 +1326,13 @@ mod tests {
     #[test]
     fn test_rfc4028_session_expires_if_no_refresh() {
         // RFC 4028: If no refresh is received within the session interval, session is expired
-        let mut timer = SessionTimerState::default();
-        timer.enabled = true;
-        timer.active = true;
-        timer.session_interval = Duration::from_secs(1800);
-
-        // At exactly full interval
-        timer.last_refresh = Instant::now() - Duration::from_secs(1800);
+        let mut timer = SessionTimerState {
+            enabled: true,
+            active: true,
+            session_interval: Duration::from_secs(1800),
+            last_refresh: Instant::now() - Duration::from_secs(1800),
+            ..Default::default()
+        };
         assert!(
             timer.is_expired(),
             "Should be expired at exactly full interval"

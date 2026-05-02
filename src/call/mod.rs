@@ -26,7 +26,7 @@ pub mod queue_config;
 pub mod runtime;
 pub mod sip;
 pub mod user;
-pub use cookie::{CalleeDisplayName, TenantId, TransactionCookie, TrunkContext};
+pub use cookie::{CalleeDisplayName, CalleeOfflineMarker, TenantId, TransactionCookie, TrunkContext};
 pub use user::SipUser;
 
 pub struct RouteContext<'a> {
@@ -69,6 +69,55 @@ pub const DEFAULT_QUEUE_HOLD_AUDIO: &str = "sounds/phone-calling.wav";
 /// Default prompt played when a queue cannot find an available agent.
 pub const DEFAULT_QUEUE_FAILURE_AUDIO: &str = "sounds/unavailable-phone.wav";
 
+// --- Built-in voice prompts for queue events ---
+
+pub const DEFAULT_QUEUE_TRANSFER_PROMPT_ZH: &str = "sounds/queue-transfer-zh.wav";
+pub const DEFAULT_QUEUE_TRANSFER_PROMPT_EN: &str = "sounds/queue-transfer-en.wav";
+pub const DEFAULT_QUEUE_BUSY_PROMPT_ZH: &str = "sounds/queue-busy-zh.wav";
+pub const DEFAULT_QUEUE_BUSY_PROMPT_EN: &str = "sounds/queue-busy-en.wav";
+pub const DEFAULT_QUEUE_OFF_HOURS_PROMPT_ZH: &str = "sounds/queue-off-hours-zh.wav";
+pub const DEFAULT_QUEUE_OFF_HOURS_PROMPT_EN: &str = "sounds/queue-off-hours-en.wav";
+pub const DEFAULT_QUEUE_NO_ANSWER_PROMPT_ZH: &str = "sounds/queue-no-answer-zh.wav";
+pub const DEFAULT_QUEUE_NO_ANSWER_PROMPT_EN: &str = "sounds/queue-no-answer-en.wav";
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VoicePrompts {
+    #[serde(default)]
+    pub transfer_prompt: Option<String>,
+    #[serde(default)]
+    pub busy_prompt: Option<String>,
+    #[serde(default)]
+    pub off_hours_prompt: Option<String>,
+    #[serde(default)]
+    pub no_answer_prompt: Option<String>,
+}
+
+impl VoicePrompts {
+    pub fn zh() -> Self {
+        Self {
+            transfer_prompt: Some(DEFAULT_QUEUE_TRANSFER_PROMPT_ZH.to_string()),
+            busy_prompt: Some(DEFAULT_QUEUE_BUSY_PROMPT_ZH.to_string()),
+            off_hours_prompt: Some(DEFAULT_QUEUE_OFF_HOURS_PROMPT_ZH.to_string()),
+            no_answer_prompt: Some(DEFAULT_QUEUE_NO_ANSWER_PROMPT_ZH.to_string()),
+        }
+    }
+
+    pub fn en() -> Self {
+        Self {
+            transfer_prompt: Some(DEFAULT_QUEUE_TRANSFER_PROMPT_EN.to_string()),
+            busy_prompt: Some(DEFAULT_QUEUE_BUSY_PROMPT_EN.to_string()),
+            off_hours_prompt: Some(DEFAULT_QUEUE_OFF_HOURS_PROMPT_EN.to_string()),
+            no_answer_prompt: Some(DEFAULT_QUEUE_NO_ANSWER_PROMPT_EN.to_string()),
+        }
+    }
+}
+
+impl Default for VoicePrompts {
+    fn default() -> Self {
+        Self::zh()
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct Location {
     pub aor: rsipstack::sip::Uri,
@@ -89,6 +138,7 @@ pub struct Location {
     pub reg_id: Option<String>,
     pub transport: Option<Transport>,
     pub user_agent: Option<String>,
+    pub home_proxy: Option<SipAddr>,
 }
 
 impl std::fmt::Display for Location {
@@ -96,9 +146,14 @@ impl std::fmt::Display for Location {
         let is_webrtc = if self.supports_webrtc { ",webrtc" } else { "" };
         let fallback = self.aor.to_string();
         let contact = self.contact_raw.as_deref().unwrap_or(fallback.as_str());
+        let home = self
+            .home_proxy
+            .as_ref()
+            .map(|h| format!("[home={}]", h))
+            .unwrap_or_default();
         match &self.destination {
-            Some(d) => write!(f, "({} -> {} {})", contact, d, is_webrtc),
-            None => write!(f, "({} -> ? {})", contact, is_webrtc),
+            Some(d) => write!(f, "({} -> {} {}{})", contact, d, is_webrtc, home),
+            None => write!(f, "({} -> ? {}{})", contact, is_webrtc, home),
         }
     }
 }
@@ -123,6 +178,7 @@ impl std::fmt::Debug for Location {
             .field("reg_id", &self.reg_id)
             .field("transport", &self.transport)
             .field("user_agent", &self.user_agent)
+            .field("home_proxy", &self.home_proxy)
             .field(
                 "credential",
                 &self.credential.as_ref().map(|_| "<redacted>"),
@@ -164,6 +220,8 @@ pub enum DialStrategy {
 pub enum TransferEndpoint {
     Uri(String),
     Queue(String),
+    /// Forward to an IVR project by name (config/ivr/<name>.toml).
+    Ivr(String),
 }
 
 impl TransferEndpoint {
@@ -174,6 +232,7 @@ impl TransferEndpoint {
         }
 
         const QUEUE_PREFIX: &str = "queue:";
+        const IVR_PREFIX: &str = "ivr:";
 
         if trimmed.len() >= QUEUE_PREFIX.len()
             && trimmed[..QUEUE_PREFIX.len()].eq_ignore_ascii_case(QUEUE_PREFIX)
@@ -185,6 +244,17 @@ impl TransferEndpoint {
             // If name is numeric, it's likely an ID, but we store it as string in TransferEndpoint::Queue
             return Some(TransferEndpoint::Queue(name.to_string()));
         }
+
+        if trimmed.len() >= IVR_PREFIX.len()
+            && trimmed[..IVR_PREFIX.len()].eq_ignore_ascii_case(IVR_PREFIX)
+        {
+            let name = trimmed[IVR_PREFIX.len()..].trim();
+            if name.is_empty() {
+                return None;
+            }
+            return Some(TransferEndpoint::Ivr(name.to_string()));
+        }
+
         Some(TransferEndpoint::Uri(trimmed.to_string()))
     }
 }
@@ -194,6 +264,7 @@ impl std::fmt::Display for TransferEndpoint {
         match self {
             TransferEndpoint::Uri(uri) => write!(f, "{}", uri),
             TransferEndpoint::Queue(name) => write!(f, "queue:{}", name),
+            TransferEndpoint::Ivr(name) => write!(f, "ivr:{}", name),
         }
     }
 }
@@ -272,17 +343,13 @@ impl std::fmt::Display for DialStrategy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum RingbackMode {
     Local,
     Passthrough,
+    #[default]
     Auto,
     None,
-}
-
-impl Default for RingbackMode {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -365,7 +432,8 @@ pub enum QueueFallbackAction {
     Failure(FailureAction),
     /// Redirect to a specific SIP URI (e.g., external voicemail)
     Redirect { target: rsipstack::sip::Uri },
-    /// Transfer caller to another named queue
+    /// Transfer caller to another named queue or skill group.
+    /// Skill groups are identified by the "skill-group:" prefix in the name.
     Queue { name: String },
 }
 
@@ -377,9 +445,11 @@ pub struct QueuePlan {
     pub fallback: Option<QueueFallbackAction>,
     pub dial_strategy: Option<DialStrategy>,
     pub ring_timeout: Option<Duration>,
+    pub acd_policy: Option<String>,
     pub label: Option<String>,
     pub retry_codes: Option<Vec<u16>>,
     pub no_trying_timeout: Option<Duration>,
+    pub voice_prompts: Option<VoicePrompts>,
 }
 
 impl Default for QueuePlan {
@@ -400,9 +470,11 @@ impl Default for QueuePlan {
             )),
             dial_strategy: None,
             ring_timeout: None,
+            acd_policy: None,
             label: None,
             retry_codes: None,
             no_trying_timeout: None,
+            voice_prompts: None,
         }
     }
 }
@@ -423,6 +495,7 @@ impl QueuePlan {
 }
 
 #[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
 pub enum DialplanFlow {
     Targets(DialStrategy),
     Queue {
@@ -663,12 +736,12 @@ pub enum DialDirection {
     Internal, // 3. User to user call, both sides are internal
 }
 
-impl ToString for DialDirection {
-    fn to_string(&self) -> String {
+impl std::fmt::Display for DialDirection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DialDirection::Outbound => "outbound".to_string(),
-            DialDirection::Inbound => "inbound".to_string(),
-            DialDirection::Internal => "internal".to_string(),
+            DialDirection::Outbound => write!(f, "outbound"),
+            DialDirection::Inbound => write!(f, "inbound"),
+            DialDirection::Internal => write!(f, "internal"),
         }
     }
 }
@@ -1006,6 +1079,30 @@ impl Default for RoutingState {
     }
 }
 
+impl RoutingState {
+    pub fn new() -> Self {
+        Self {
+            round_robin_counters: Arc::new(Mutex::new(HashMap::new())),
+            policy_guard: None,
+        }
+    }
+
+    /// Get the next trunk index for round-robin selection
+    pub fn next_round_robin_index(&self, destination_key: &str, trunk_count: usize) -> usize {
+        if trunk_count == 0 {
+            return 0;
+        }
+
+        let mut counters = self.round_robin_counters.lock().unwrap();
+        let counter = counters
+            .entry(destination_key.to_string())
+            .or_insert_with(|| 0);
+        let r = *counter % trunk_count;
+        *counter += 1;
+        r
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1153,9 +1250,11 @@ mod tests {
             dial_strategy: None,
             ring_timeout: None,
             fallback: None,
+            acd_policy: None,
             label: None,
             retry_codes: None,
             no_trying_timeout: None,
+            voice_prompts: None,
         };
         let flow = DialplanFlow::Queue {
             plan: queue_plan,
@@ -1179,9 +1278,11 @@ mod tests {
             )])),
             ring_timeout: None,
             fallback: None,
+            acd_policy: None,
             label: None,
             retry_codes: None,
             no_trying_timeout: None,
+            voice_prompts: None,
         };
         let flow = DialplanFlow::Queue {
             plan: queue_plan,
@@ -1205,9 +1306,11 @@ mod tests {
             )])),
             ring_timeout: None,
             fallback: None,
+            acd_policy: None,
             label: None,
             retry_codes: None,
             no_trying_timeout: None,
+            voice_prompts: None,
         };
         let flow = DialplanFlow::Queue {
             plan: queue_plan,
@@ -1229,9 +1332,11 @@ mod tests {
             dial_strategy: Some(DialStrategy::Sequential(vec![])),
             ring_timeout: None,
             fallback: None,
+            acd_policy: None,
             label: None,
             retry_codes: None,
             no_trying_timeout: None,
+            voice_prompts: None,
         };
         let flow = DialplanFlow::Queue {
             plan: queue_plan,
@@ -1253,29 +1358,5 @@ mod tests {
             auto_answer: false,
         };
         assert!(!flow.all_webrtc_target());
-    }
-}
-
-impl RoutingState {
-    pub fn new() -> Self {
-        Self {
-            round_robin_counters: Arc::new(Mutex::new(HashMap::new())),
-            policy_guard: None,
-        }
-    }
-
-    /// Get the next trunk index for round-robin selection
-    pub fn next_round_robin_index(&self, destination_key: &str, trunk_count: usize) -> usize {
-        if trunk_count == 0 {
-            return 0;
-        }
-
-        let mut counters = self.round_robin_counters.lock().unwrap();
-        let counter = counters
-            .entry(destination_key.to_string())
-            .or_insert_with(|| 0);
-        let r = *counter % trunk_count;
-        *counter += 1;
-        return r;
     }
 }

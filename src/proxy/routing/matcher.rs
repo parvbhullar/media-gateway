@@ -51,6 +51,7 @@ enum MatchMode {
     Inspect,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn match_invite(
     trunks: Option<&HashMap<String, TrunkConfig>>,
     routes: Option<&Vec<RouteRule>>,
@@ -76,6 +77,7 @@ pub async fn match_invite(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn match_invite_with_trace(
     trunks: Option<&HashMap<String, TrunkConfig>>,
     routes: Option<&Vec<RouteRule>>,
@@ -102,6 +104,7 @@ pub async fn match_invite_with_trace(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn inspect_invite(
     trunks: Option<&HashMap<String, TrunkConfig>>,
     routes: Option<&Vec<RouteRule>>,
@@ -127,6 +130,7 @@ pub async fn inspect_invite(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn match_invite_impl(
     trunks: Option<&HashMap<String, TrunkConfig>>,
     routes: Option<&Vec<RouteRule>>,
@@ -182,7 +186,7 @@ async fn match_invite_impl(
 
         if !rule.source_trunk_ids.is_empty() {
             match source_trunk.and_then(|t| t.id) {
-                Some(id) if rule.source_trunk_ids.iter().any(|rule_id| *rule_id == id) => {}
+                Some(id) if rule.source_trunk_ids.contains(&id) => {}
                 _ => continue,
             }
         }
@@ -236,8 +240,8 @@ async fn match_invite_impl(
         );
 
         // Check Route Policy (using rewritten numbers)
-        if let Some(policy) = &rule.policy {
-            if let Some(guard) = &routing_state.policy_guard {
+        if let Some(policy) = &rule.policy
+            && let Some(guard) = &routing_state.policy_guard {
                 let current_caller = option.caller.user().unwrap_or_default();
                 let current_callee = option.callee.user().unwrap_or_default();
 
@@ -245,8 +249,8 @@ async fn match_invite_impl(
                     .check_policy(
                         &rule.name,
                         policy,
-                        &current_caller,
-                        &current_callee,
+                        current_caller,
+                        current_callee,
                         origin_country,
                     )
                     .await?
@@ -268,11 +272,13 @@ async fn match_invite_impl(
                     ));
                 }
             }
-        }
 
-        let hints = if !rule.codecs.is_empty() {
+        let hints = if !rule.codecs.is_empty() || rule.disable_ice_servers.is_some() {
             let mut hints = DialplanHints::default();
-            hints.allow_codecs = Some(rule.codecs.clone());
+            if !rule.codecs.is_empty() {
+                hints.allow_codecs = Some(rule.codecs.clone());
+            }
+            hints.disable_ice_servers = rule.disable_ice_servers;
             Some(hints)
         } else {
             None
@@ -301,7 +307,10 @@ async fn match_invite_impl(
                             reason: None,
                         });
                     }
-                    return Ok(RouteResult::Abort(rsipstack::sip::StatusCode::Forbidden, None));
+                    return Ok(RouteResult::Abort(
+                        rsipstack::sip::StatusCode::Forbidden,
+                        None,
+                    ));
                 }
             }
             ActionType::Busy => {
@@ -311,11 +320,14 @@ async fn match_invite_impl(
                         reason: None,
                     });
                 }
-                return Ok(RouteResult::Abort(rsipstack::sip::StatusCode::BusyHere, None));
+                return Ok(RouteResult::Abort(
+                    rsipstack::sip::StatusCode::BusyHere,
+                    None,
+                ));
             }
             ActionType::Forward => {
-                if let Some(dest_config) = &rule.action.dest {
-                    if mode == MatchMode::Execute {
+                if let Some(dest_config) = &rule.action.dest
+                    && mode == MatchMode::Execute {
                         let selected_trunk = select_trunk(
                             dest_config,
                             &rule.action.select,
@@ -334,8 +346,8 @@ async fn match_invite_impl(
                             .and_then(|trunks| trunks.get(&selected_trunk))
                         {
                             // Check Trunk Policy
-                            if let Some(policy) = &trunk_config.policy {
-                                if let Some(guard) = &routing_state.policy_guard {
+                            if let Some(policy) = &trunk_config.policy
+                                && let Some(guard) = &routing_state.policy_guard {
                                     let current_caller = option.caller.user().unwrap_or_default();
                                     let current_callee = option.callee.user().unwrap_or_default();
 
@@ -343,8 +355,8 @@ async fn match_invite_impl(
                                         .check_policy(
                                             &format!("trunk:{}", selected_trunk),
                                             policy,
-                                            &current_caller,
-                                            &current_callee,
+                                            current_caller,
+                                            current_callee,
                                             origin_country,
                                         )
                                         .await?
@@ -366,7 +378,6 @@ async fn match_invite_impl(
                                         ));
                                     }
                                 }
-                            }
 
                             apply_trunk_config(&mut option, trunk_config)?;
                             info!(
@@ -377,7 +388,6 @@ async fn match_invite_impl(
                             info!("Trunk '{}' not found in configuration", selected_trunk);
                         }
                     }
-                }
                 return Ok(RouteResult::Forward(option, hints));
             }
             ActionType::Queue => {
@@ -442,8 +452,8 @@ async fn match_invite_impl(
                             .and_then(|trunks| trunks.get(&selected_trunk))
                         {
                             // Check Trunk Policy
-                            if let Some(policy) = &trunk_config.policy {
-                                if let Some(guard) = &routing_state.policy_guard {
+                            if let Some(policy) = &trunk_config.policy
+                                && let Some(guard) = &routing_state.policy_guard {
                                     let current_caller = option.caller.user().unwrap_or_default();
                                     let current_callee = option.callee.user().unwrap_or_default();
 
@@ -451,8 +461,8 @@ async fn match_invite_impl(
                                         .check_policy(
                                             &format!("trunk:{}", selected_trunk),
                                             policy,
-                                            &current_caller,
-                                            &current_callee,
+                                            current_caller,
+                                            current_callee,
                                             origin_country,
                                         )
                                         .await?
@@ -474,7 +484,6 @@ async fn match_invite_impl(
                                         ));
                                     }
                                 }
-                            }
                             apply_trunk_config(&mut option, trunk_config)?;
                         }
                     }
@@ -503,7 +512,7 @@ async fn match_invite_impl(
         }
     }
 
-    return Ok(RouteResult::NotHandled(option, None));
+    Ok(RouteResult::NotHandled(option, None))
 }
 
 /// Context for rule matching to reduce function arguments
@@ -522,46 +531,40 @@ fn matches_rule(rule: &crate::proxy::routing::RouteRule, ctx: &MatchContext) -> 
     let conditions = &rule.match_conditions;
 
     // Check from.user
-    if let Some(pattern) = &conditions.from_user {
-        if !matches_pattern(pattern, ctx.caller_user)? {
+    if let Some(pattern) = &conditions.from_user
+        && !matches_pattern(pattern, ctx.caller_user)? {
             return Ok(false);
         }
-    }
 
     // Check from.host
-    if let Some(pattern) = &conditions.from_host {
-        if !matches_pattern(pattern, &ctx.caller_host.to_string())? {
+    if let Some(pattern) = &conditions.from_host
+        && !matches_pattern(pattern, &ctx.caller_host.to_string())? {
             return Ok(false);
         }
-    }
 
     // Check to.user
-    if let Some(pattern) = &conditions.to_user {
-        if !matches_pattern(pattern, ctx.callee_user)? {
+    if let Some(pattern) = &conditions.to_user
+        && !matches_pattern(pattern, ctx.callee_user)? {
             return Ok(false);
         }
-    }
 
     // Check to.host
-    if let Some(pattern) = &conditions.to_host {
-        if !matches_pattern(pattern, &ctx.callee_host.to_string())? {
+    if let Some(pattern) = &conditions.to_host
+        && !matches_pattern(pattern, &ctx.callee_host.to_string())? {
             return Ok(false);
         }
-    }
 
     // Check request_uri.user
-    if let Some(pattern) = &conditions.request_uri_user {
-        if !matches_pattern(pattern, ctx.request_user)? {
+    if let Some(pattern) = &conditions.request_uri_user
+        && !matches_pattern(pattern, ctx.request_user)? {
             return Ok(false);
         }
-    }
 
     // Check request_uri.host
-    if let Some(pattern) = &conditions.request_uri_host {
-        if !matches_pattern(pattern, &ctx.request_host.to_string())? {
+    if let Some(pattern) = &conditions.request_uri_host
+        && !matches_pattern(pattern, &ctx.request_host.to_string())? {
             return Ok(false);
         }
-    }
 
     // Check compatibility fields
     if let Some(pattern) = &conditions.caller {
@@ -669,11 +672,10 @@ fn collect_match_captures(
     }
 
     for (header_key, pattern) in &conditions.headers {
-        if let Some(header_name) = header_key.strip_prefix("header.") {
-            if let Some(value) = get_header_value(ctx.origin, header_name) {
+        if let Some(header_name) = header_key.strip_prefix("header.")
+            && let Some(value) = get_header_value(ctx.origin, header_name) {
                 collect_field_capture(&mut captures, header_key, Some(pattern.as_str()), &value)?;
             }
-        }
     }
 
     Ok(captures)
@@ -685,11 +687,10 @@ fn collect_field_capture(
     pattern: Option<&str>,
     value: &str,
 ) -> Result<()> {
-    if let Some(pattern) = pattern {
-        if let Some(groups) = extract_regex_captures(pattern, value)? {
+    if let Some(pattern) = pattern
+        && let Some(groups) = extract_regex_captures(pattern, value)? {
             captures.insert(key.to_string(), groups);
         }
-    }
     Ok(())
 }
 
@@ -747,7 +748,9 @@ fn get_header_value(request: &rsipstack::sip::Request, header_name: &str) -> Opt
             {
                 return Some(value.clone());
             }
-            rsipstack::sip::Header::UserAgent(value) if header_name.to_lowercase() == "user-agent" => {
+            rsipstack::sip::Header::UserAgent(value)
+                if header_name.to_lowercase() == "user-agent" =>
+            {
                 return Some(value.to_string());
             }
             rsipstack::sip::Header::Contact(contact) if header_name.to_lowercase() == "contact" => {
@@ -934,13 +937,12 @@ fn extract_capture_group(original: &str, group_num: usize) -> Option<String> {
     ];
 
     for (pattern_str, positions) in &patterns {
-        if let Ok(regex) = Regex::new(pattern_str) {
-            if let Some(captures) = regex.captures(original) {
-                if group_num <= captures.len() && group_num > 0 {
-                    if let Some(capture) = captures.get(group_num) {
+        if let Ok(regex) = Regex::new(pattern_str)
+            && let Some(captures) = regex.captures(original) {
+                if group_num <= captures.len() && group_num > 0
+                    && let Some(capture) = captures.get(group_num) {
                         return Some(capture.as_str().to_string());
                     }
-                }
                 // Fallback for simple position-based extraction
                 if !positions.is_empty() && group_num == 1 {
                     let start_pos = positions[0];
@@ -955,14 +957,17 @@ fn extract_capture_group(original: &str, group_num: usize) -> Option<String> {
                     }
                 }
             }
-        }
     }
 
     None
 }
 
 /// Apply rewrite pattern
-fn apply_rewrite_pattern(pattern: &str, original: &str, _origin: &rsipstack::sip::Request) -> Result<String> {
+fn apply_rewrite_pattern(
+    pattern: &str,
+    original: &str,
+    _origin: &rsipstack::sip::Request,
+) -> Result<String> {
     // Support simple replacement patterns like "96123{1}" where {1} is capture group
     if pattern.contains('{') && pattern.contains('}') {
         // This is a pattern with capture groups, need to extract from original value
@@ -1071,39 +1076,39 @@ fn select_trunk_weighted(
     trunks_config: Option<&std::collections::HashMap<String, crate::proxy::routing::TrunkConfig>>,
 ) -> Result<String> {
     use rand::RngExt;
-    
+
     if trunks.is_empty() {
         return Err(anyhow!("No trunks for weighted selection"));
     }
-    
+
     if trunks.len() == 1 {
         return Ok(trunks[0].clone());
     }
-    
+
     // Collect weights for each trunk
     let mut weights: Vec<u32> = Vec::with_capacity(trunks.len());
     let mut total_weight: u32 = 0;
-    
+
     for trunk_name in trunks {
         let weight = trunks_config
             .and_then(|configs| configs.get(trunk_name))
             .and_then(|config| config.weight)
             .unwrap_or(100); // Default weight: 100
-        
+
         weights.push(weight);
         total_weight = total_weight.saturating_add(weight);
     }
-    
+
     if total_weight == 0 {
         // Fall back to uniform random if all weights are 0
         let index = rand::rng().random_range(0..trunks.len());
         return Ok(trunks[index].clone());
     }
-    
+
     // Generate random value between 0 and total_weight
     let mut rng = rand::rng();
     let random_val = rng.random_range(0..total_weight);
-    
+
     // Find the trunk corresponding to the random value
     let mut cumulative_weight: u32 = 0;
     for (idx, weight) in weights.iter().enumerate() {
@@ -1112,7 +1117,7 @@ fn select_trunk_weighted(
             return Ok(trunks[idx].clone());
         }
     }
-    
+
     // Fallback to last trunk (shouldn't reach here)
     Ok(trunks[trunks.len() - 1].clone())
 }

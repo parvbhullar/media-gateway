@@ -1,5 +1,6 @@
 use crate::call::{
     DialStrategy, FailureAction, Location, QueueFallbackAction, QueueHoldConfig, QueuePlan,
+    VoicePrompts,
 };
 use anyhow::{Result, anyhow};
 use rsipstack::sip::{StatusCode, Uri};
@@ -31,9 +32,17 @@ pub struct QueueConfig {
     #[serde(default)]
     pub ring_timeout_secs: Option<u64>,
 
+    /// Optional ACD policy name to use for agent selection.
+    #[serde(default)]
+    pub acd_policy: Option<String>,
+
     /// Fallback action when all agents fail
     #[serde(default)]
     pub fallback: Option<FallbackConfig>,
+
+    /// Voice prompts for queue events (transfer, busy, off-hours).
+    #[serde(default)]
+    pub voice_prompts: Option<VoicePrompts>,
 }
 
 /// Hold music configuration
@@ -151,10 +160,16 @@ impl QueueConfig {
             }),
             fallback: self.fallback.as_ref().map(|f| f.to_fallback_action()),
             dial_strategy: Some(self.strategy.to_dial_strategy()?),
-            ring_timeout: self.ring_timeout_secs.map(|s| Duration::from_secs(s)),
+            ring_timeout: self.ring_timeout_secs.map(Duration::from_secs),
+            acd_policy: self
+                .acd_policy
+                .as_ref()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
             label: self.name.clone(),
             retry_codes: None,
             no_trying_timeout: None,
+            voice_prompts: self.voice_prompts.clone(),
         };
 
         Ok(plan)
@@ -210,11 +225,10 @@ impl QueueConfig {
         }
 
         // Validate hold music file if configured
-        if let Some(hold) = &self.hold {
-            if hold.audio_file.is_empty() {
+        if let Some(hold) = &self.hold
+            && hold.audio_file.is_empty() {
                 return Err(anyhow!("Hold music audio_file cannot be empty"));
             }
-        }
 
         // Validate fallback
         if let Some(fallback) = &self.fallback {
@@ -276,6 +290,7 @@ impl AgentConfig {
             reg_id: None,
             transport: None,
             user_agent: None,
+            home_proxy: None,
         })
     }
 }
@@ -456,6 +471,7 @@ uri = "sip:test@example.com"
         assert!(plan.accept_immediately);
         assert_eq!(plan.ring_timeout, Some(Duration::from_secs(20)));
         assert_eq!(plan.label, Some("test-queue".to_string()));
+        assert!(plan.acd_policy.is_none());
     }
 
     #[test]
@@ -539,7 +555,9 @@ uri = "://invalid"
                 }],
             },
             ring_timeout_secs: Some(15),
+            acd_policy: Some("support-default".to_string()),
             fallback: None,
+            voice_prompts: None,
         };
 
         let toml_str = original.to_toml().expect("Failed to serialize");
@@ -547,5 +565,6 @@ uri = "://invalid"
 
         assert_eq!(parsed.name, original.name);
         assert_eq!(parsed.accept_immediately, original.accept_immediately);
+        assert_eq!(parsed.acd_policy, original.acd_policy);
     }
 }

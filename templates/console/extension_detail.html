@@ -277,6 +277,14 @@
                                                 @change="setForwardingTargetType('queue')">
                                             <span>{{ "extension_detail.queue" | t }}</span>
                                         </label>
+                                        <label x-show="ivrTargets.length > 0"
+                                            class="inline-flex items-center gap-2 rounded-lg border px-3 py-1.5 text-slate-600 transition"
+                                            :class="forwardingTargetType === 'ivr' ? 'border-sky-200 bg-sky-50 text-sky-700 shadow-sm' : 'border-slate-200 hover:border-slate-300'">
+                                            <input type="radio" class="h-4 w-4 border-slate-300 text-sky-600"
+                                                :checked="forwardingTargetType === 'ivr'"
+                                                @change="setForwardingTargetType('ivr')">
+                                            <span>{{ "extension_detail.ivr" | t }}</span>
+                                        </label>
                                         <label x-show="voicemailAddonEnabled"
                                             class="inline-flex items-center gap-2 rounded-lg border px-3 py-1.5 text-slate-600 transition"
                                             :class="forwardingTargetType === 'voicemail' ? 'border-sky-200 bg-sky-50 text-sky-700 shadow-sm' : 'border-slate-200 hover:border-slate-300'">
@@ -321,6 +329,22 @@
                                             class="rounded-lg border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-500">
                                             {{ "extension_detail.no_queues" | t }}
                                         </div>
+                                    </template>
+                                </div>
+                                <div x-show="forwardingTargetType === 'ivr'" x-cloak class="space-y-3">
+                                    <template x-if="ivrTargets.length">
+                                        <label class="flex flex-col gap-1 text-sm font-medium text-slate-700">
+                                            {{ "extension_detail.select_ivr_label" | t }}
+                                            <select
+                                                class="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                                :disabled="form.call_forwarding_mode === 'none'"
+                                                x-model="forwardingTargetValue" @change="syncForwardingDestination()">
+                                                <option value="">{{ "extension_detail.select_ivr" | t }}</option>
+                                                <template x-for="ivr in ivrTargets" :key="ivr.name">
+                                                    <option :value="ivr.name" x-text="ivr.name"></option>
+                                                </template>
+                                            </select>
+                                        </label>
                                     </template>
                                 </div>
                                 <div x-show="forwardingTargetType === 'voicemail'" x-cloak class="space-y-2">
@@ -379,78 +403,91 @@
                         </template>
 
                         <template x-if="locator.available && locator.records.length">
-                            <div class="overflow-x-auto">
-                                <table class="min-w-full divide-y divide-slate-200 text-left text-xs">
-                                    <thead
-                                        class="bg-slate-50 text-[11px] font-semibold uppercase tracking-wide text-slate-500">
-                                        <tr>
-                                            <th scope="col" class="px-3 py-2">{{ "extension_detail.contact" | t }}</th>
-                                            <th scope="col" class="px-3 py-2">{{ "extension_detail.destination" | t }}</th>
-                                            <th scope="col" class="px-3 py-2">{{ "extension_detail.transport" | t }}</th>
-                                            <th scope="col" class="px-3 py-2">{{ "extension_detail.ttl" | t }}</th>
-                                            <th scope="col" class="px-3 py-2">{{ "extension_detail.updated" | t }}</th>
-                                            <th scope="col" class="px-3 py-2">{{ "extension_detail.flags" | t }}</th>
-                                            <th scope="col" class="px-3 py-2">{{ "extension_detail.user_agent" | t }}</th>
-                                        </tr>
-                                    </thead>
-                                    <tbody class="divide-y divide-slate-100 text-slate-600">
-                                        <template x-for="record in locator.records" :key="record.binding_key">
-                                            <tr>
-                                                <td class="px-3 py-2 align-top">
-                                                    <div class="font-medium text-slate-900"
-                                                        x-text="record.contact || record.registered_aor || record.aor">
-                                                    </div>
-                                                    <template x-if="record.binding_key">
-                                                        <div class="text-[11px] text-slate-400"
-                                                            x-text="record.binding_key"></div>
+                            <div class="space-y-3">
+                                <template x-for="(record, index) in locator.records"
+                                    :key="record.binding_key || `${record.contact || record.registered_aor || record.aor || 'record'}-${index}`">
+                                    <div class="rounded-xl border border-slate-200 bg-slate-50/40 p-4 sm:p-5">
+                                        <div class="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                                            <div class="min-w-0 space-y-1">
+                                                <div class="break-all text-sm font-semibold text-slate-900"
+                                                    x-text="record.contact || record.registered_aor || record.aor || '—'"></div>
+                                                <template x-if="record.binding_key">
+                                                    <div class="break-all text-[11px] text-slate-400"
+                                                        x-text="record.binding_key"></div>
+                                                </template>
+                                            </div>
+                                            <span
+                                                class="inline-flex w-max items-center rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-600 ring-1 ring-emerald-100">
+                                                {{ "extension_detail.active" | t }}
+                                            </span>
+                                        </div>
+
+                                        <div class="mt-4 grid gap-3 text-xs text-slate-600 sm:grid-cols-2 lg:grid-cols-3">
+                                            <div class="space-y-1">
+                                                <div class="text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                                                    {{ "extension_detail.destination" | t }}</div>
+                                                <div class="break-all text-slate-700" x-text="record.destination || '—'"></div>
+                                            </div>
+                                            <div class="space-y-1">
+                                                <div class="text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                                                    {{ "extension_detail.home_proxy" | t }}</div>
+                                                <div class="break-all text-slate-700" x-text="record.home_proxy || '—'"></div>
+                                            </div>
+                                            <div class="space-y-1">
+                                                <div class="text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                                                    {{ "extension_detail.transport" | t }}</div>
+                                                <div class="flex flex-wrap items-center gap-1">
+                                                    <span class="text-slate-700" x-text="record.transport || '—'"></span>
+                                                    <template x-if="record.supports_webrtc">
+                                                        <span
+                                                            class="inline-flex w-max items-center rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-600 ring-1 ring-emerald-100">
+                                                            WebRTC
+                                                        </span>
                                                     </template>
-                                                </td>
-                                                <td class="px-3 py-2 align-top">
-                                                    <span x-text="record.destination || '—'"></span>
-                                                </td>
-                                                <td class="px-3 py-2 align-top">
-                                                    <div class="flex flex-col gap-1">
-                                                        <span x-text="record.transport || '—'"></span>
-                                                        <template x-if="record.supports_webrtc">
-                                                            <span
-                                                                class="inline-flex w-max items-center rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-medium text-emerald-600 ring-1 ring-emerald-100">
-                                                                WebRTC
-                                                            </span>
-                                                        </template>
-                                                    </div>
-                                                </td>
-                                                <td class="px-3 py-2 align-top">
-                                                    <div class="font-semibold text-slate-900"
-                                                        x-text="formatDuration(remainingTtl(record))"></div>
-                                                    <div class="text-[11px] text-slate-400">{{ "extension_detail.ttl_max" | t }}
-                                                        <span x-text="formatDuration(record.expires)"></span>
-                                                    </div>
-                                                </td>
-                                                <td class="px-3 py-2 align-top">
-                                                    <div class="text-sm font-semibold text-slate-700"
-                                                        x-text="formatRelativeSeconds(record.age_seconds)"></div>
-                                                </td>
-                                                <td class="px-3 py-2 align-top">
-                                                    <div class="flex flex-wrap gap-1">
-                                                        <template x-for="flag in recordFlags(record)" :key="flag">
-                                                            <span
-                                                                class="inline-flex items-center rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-600 ring-1 ring-slate-200"
-                                                                x-text="flag"></span>
-                                                        </template>
-                                                        <template x-if="!recordFlags(record).length">
-                                                            <span class="text-[11px] text-slate-400">—</span>
-                                                        </template>
-                                                    </div>
-                                                </td>
-                                                <td class="px-3 py-2 align-top">
-                                                    <span class="block max-w-xs truncate text-xs"
-                                                        :title="record.user_agent || undefined"
-                                                        x-text="record.user_agent || '—'"></span>
-                                                </td>
-                                            </tr>
-                                        </template>
-                                    </tbody>
-                                </table>
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        <div class="mt-4 grid gap-3 text-xs text-slate-600 sm:grid-cols-2 lg:grid-cols-3">
+                                            <div class="space-y-1">
+                                                <div class="text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                                                    {{ "extension_detail.ttl" | t }}</div>
+                                                <div class="text-sm font-semibold text-slate-900"
+                                                    x-text="formatDuration(remainingTtl(record))"></div>
+                                                <div class="text-[11px] text-slate-400">{{ "extension_detail.ttl_max" | t }}
+                                                    <span x-text="formatDuration(record.expires)"></span>
+                                                </div>
+                                            </div>
+                                            <div class="space-y-1">
+                                                <div class="text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                                                    {{ "extension_detail.updated" | t }}</div>
+                                                <div class="text-sm font-semibold text-slate-700"
+                                                    x-text="formatRelativeSeconds(record.age_seconds)"></div>
+                                            </div>
+                                            <div class="space-y-1">
+                                                <div class="text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                                                    {{ "extension_detail.flags" | t }}</div>
+                                                <div class="flex flex-wrap gap-1">
+                                                    <template x-for="flag in recordFlags(record)" :key="flag">
+                                                        <span
+                                                            class="inline-flex items-center rounded-full bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-600 ring-1 ring-slate-200"
+                                                            x-text="flag"></span>
+                                                    </template>
+                                                    <template x-if="!recordFlags(record).length">
+                                                        <span class="text-[11px] text-slate-400">—</span>
+                                                    </template>
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        <div class="mt-4 border-t border-slate-200 pt-3">
+                                            <div class="text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                                                {{ "extension_detail.user_agent" | t }}</div>
+                                            <div class="mt-1 break-all text-xs text-slate-700"
+                                                x-text="record.user_agent || '—'"></div>
+                                        </div>
+                                    </div>
+                                </template>
                             </div>
                         </template>
 
@@ -600,13 +637,14 @@
             const normalizeForwardingCatalog = (raw) => {
                 const catalog = {
                     queues: [],
+                    ivr_projects: [],
                 };
                 if (raw && Array.isArray(raw.queues)) {
                     catalog.queues = raw.queues
                         .map((queue) => {
                             const reference = typeof queue.reference === 'string'
                                 ? queue.reference.trim()
-                                : '';
+                                : String(queue.id || '');
                             return {
                                 id: queue.id,
                                 name: queue.name || '{{ "extension_detail.unnamed_queue" | t }}',
@@ -615,6 +653,14 @@
                             };
                         })
                         .filter((queue) => queue.reference.length);
+                }
+                if (raw && Array.isArray(raw.ivr_projects)) {
+                    catalog.ivr_projects = raw.ivr_projects
+                        .filter((ivr) => ivr && ivr.name)
+                        .map((ivr) => ({
+                            name: ivr.name,
+                            description: ivr.description || null,
+                        }));
                 }
                 return catalog;
             };
@@ -625,6 +671,7 @@
 
             return {
                 basePath: options.basePath || '/console',
+                apiPrefix: options.apiPrefix || options.basePath || '/console',
                 mode: options.mode || 'create',
                 model: options.model || {},
                 availableDepartmentsRaw: options.departments || [],
@@ -722,6 +769,9 @@
                 get queueTargets() {
                     return this.forwardingCatalog.queues;
                 },
+                get ivrTargets() {
+                    return this.forwardingCatalog.ivr_projects || [];
+                },
                 setActiveTab(tabId) {
                     const fallback = this.tabs[0]?.id || 'profile';
                     this.activeTab = this.tabs.some((tab) => tab.id === tabId) ? tabId : fallback;
@@ -770,10 +820,11 @@
                     }
                 },
                 async fetchPresence() {
-                    if (this.mode !== 'edit' || !this.form.extension) return;
+                    const extension = this.form.extension || this.model?.extension;
+                    if (this.mode !== 'edit' || !extension) return;
                     this.presence.loading = true;
                     try {
-                        const response = await fetch(`${this.apiPrefix}/presence/${this.form.extension}`);
+                        const response = await fetch(`${this.apiPrefix}/presence/${extension}`);
                         if (response.ok) {
                             const result = await response.json();
                             const data = result.data || {};
@@ -788,9 +839,14 @@
                     }
                 },
                 async updateManualPresence(status) {
+                    const extension = this.form.extension || this.model?.extension;
+                    if (!extension) {
+                        this.error = '{{ "extension_detail.extension_required" | t }}';
+                        return;
+                    }
                     this.presence.saving_manual = true;
                     try {
-                        const response = await fetch(`${this.apiPrefix}/presence/${this.form.extension}`, {
+                        const response = await fetch(`${this.apiPrefix}/presence/${extension}`, {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({ status, note: this.presence.note })
@@ -1070,7 +1126,15 @@
                     const lower = destination.toLowerCase();
                     if (lower.startsWith('queue:')) {
                         this.forwardingTargetType = 'queue';
-                        this.forwardingTargetValue = destination.slice(6);
+                        // Use $nextTick so x-if + x-for options render before x-model syncs
+                        this.$nextTick(() => {
+                            this.forwardingTargetValue = destination.slice(6);
+                        });
+                    } else if (lower.startsWith('ivr:')) {
+                        this.forwardingTargetType = 'ivr';
+                        this.$nextTick(() => {
+                            this.forwardingTargetValue = destination.slice(4);
+                        });
                     } else if (lower.startsWith('voicemail:')) {
                         this.forwardingTargetType = 'voicemail';
                         this.forwardingTargetValue = destination.slice(10);
@@ -1080,7 +1144,7 @@
                     }
                 },
                 setForwardingTargetType(type) {
-                    const allowed = ['uri', 'queue', 'voicemail'];
+                    const allowed = ['uri', 'queue', 'ivr', 'voicemail'];
                     const normalized = allowed.includes(type) ? type : 'uri';
                     if (this.forwardingTargetType === normalized) {
                         return;
@@ -1092,9 +1156,11 @@
                         this.forwardingTargetValue = '';
                     } else if (normalized === 'queue' && lower.startsWith('queue:')) {
                         this.forwardingTargetValue = dest.slice(6);
+                    } else if (normalized === 'ivr' && lower.startsWith('ivr:')) {
+                        this.forwardingTargetValue = dest.slice(4);
                     } else if (normalized === 'voicemail' && lower.startsWith('voicemail:')) {
                         this.forwardingTargetValue = dest.slice(10);
-                    } else if (normalized === 'uri' && !lower.startsWith('queue:') && !lower.startsWith('voicemail:')) {
+                    } else if (normalized === 'uri' && !lower.startsWith('queue:') && !lower.startsWith('ivr:') && !lower.startsWith('voicemail:')) {
                         this.forwardingTargetValue = dest;
                     } else {
                         this.forwardingTargetValue = '';
@@ -1105,6 +1171,8 @@
                     const value = this.forwardingTargetValue.trim();
                     if (this.forwardingTargetType === 'queue') {
                         this.form.call_forwarding_destination = value ? `queue:${value}` : '';
+                    } else if (this.forwardingTargetType === 'ivr') {
+                        this.form.call_forwarding_destination = value ? `ivr:${value}` : '';
                     } else if (this.forwardingTargetType === 'voicemail') {
                         // Default to own extension's mailbox when the field is left empty
                         const ext = value || this.form.extension || '';

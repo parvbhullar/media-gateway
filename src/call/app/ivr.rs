@@ -193,11 +193,20 @@ impl IvrApp {
     /// Navigate to a menu. If `"root"`, reset the stack. Otherwise push only
     /// if the menu is not already the current top (avoids unbounded growth on Repeat).
     fn navigate_to_menu(&mut self, menu_key: &str) {
+        let old_stack = self.menu_stack.clone();
         if menu_key == "root" {
             self.menu_stack.clear();
             self.menu_stack.push("root".to_string());
         } else if self.current_menu_key() != menu_key {
             self.menu_stack.push(menu_key.to_string());
+        }
+        if old_stack != self.menu_stack {
+            info!(
+                ivr = %self.definition.name,
+                old_stack = ?old_stack,
+                new_stack = ?self.menu_stack,
+                "IVR menu stack changed"
+            );
         }
         // If already on this menu (e.g. Repeat), keep the stack as-is.
     }
@@ -210,11 +219,10 @@ impl IvrApp {
         text: Option<&str>,
         voice: Option<&str>,
     ) -> Option<String> {
-        if let Some(path) = file {
-            if !path.is_empty() {
+        if let Some(path) = file
+            && !path.is_empty() {
                 return Some(path.to_string());
             }
-        }
         if let (Some(t), Some(service)) = (text, self.tts_service.as_ref()) {
             match service.synthesize(t, voice).await {
                 Ok(path) => return Some(path),
@@ -234,6 +242,12 @@ impl IvrApp {
         _ctx: &ApplicationContext,
     ) -> anyhow::Result<AppAction> {
         self.navigate_to_menu(menu_key);
+        info!(
+            ivr = %self.definition.name,
+            menu = menu_key,
+            menu_stack = ?self.menu_stack,
+            "IVR entering menu"
+        );
         let menu = self
             .definition
             .get_menu(menu_key)
@@ -249,10 +263,10 @@ impl IvrApp {
             menu_key: menu_key.to_string(),
         };
         if let Some(path) = greeting {
-            debug!(ivr = %self.definition.name, menu = menu_key, "Playing greeting: {}", path);
+            info!(ivr = %self.definition.name, menu = menu_key, "Playing greeting: {}", path);
             ctrl.play_audio(&path, false).await?;
         } else {
-            debug!(
+            info!(
                 ivr = %self.definition.name,
                 menu = menu_key,
                 "No greeting audio, waiting DTMF immediately"
@@ -271,12 +285,12 @@ impl IvrApp {
             retry_count,
         };
         ctrl.set_timeout("ivr_dtmf_timeout", Duration::from_millis(timeout_ms));
-        debug!(
+        info!(
             ivr = %self.definition.name,
             menu = menu_key,
             retry_count,
             timeout_ms,
-            "Waiting for DTMF input"
+            "IVR waiting for DTMF input"
         );
     }
 
@@ -294,14 +308,29 @@ impl IvrApp {
                 self.state = IvrState::Done;
                 Ok(AppAction::Transfer(target.clone()))
             }
-            EntryAction::Queue { target } => {
-                info!(ivr = %self.definition.name, queue = target, "IVR sending to queue");
+            EntryAction::Queue {
+                target,
+                return_to_ivr,
+            } => {
+                info!(
+                    ivr = %self.definition.name,
+                    queue = target,
+                    return_to_ivr = ?return_to_ivr,
+                    "IVR sending to queue"
+                );
                 self.state = IvrState::Done;
-                // Queue is handled as a transfer to the queue endpoint
-                Ok(AppAction::Transfer(format!("queue:{}", target)))
+                if return_to_ivr.unwrap_or(false) {
+                    // Encode return IVR name so the queue can come back on failure
+                    Ok(AppAction::Transfer(format!(
+                        "queue:{}?return_ivr={}",
+                        target, self.definition.name
+                    )))
+                } else {
+                    Ok(AppAction::Transfer(format!("queue:{}", target)))
+                }
             }
             EntryAction::Menu { menu } => {
-                debug!(ivr = %self.definition.name, menu, "IVR navigating to menu");
+                info!(ivr = %self.definition.name, from = %self.current_menu_key(), to = %menu, "IVR navigating to menu");
                 self.enter_menu(menu, ctrl, ctx).await
             }
             EntryAction::Voicemail { target } => {
@@ -319,19 +348,24 @@ impl IvrApp {
                     return_menu: return_menu.clone(),
                 };
                 if let Some(path) = self
-                    .resolve_audio(Some(prompt), prompt_text.as_deref(), prompt_voice.as_deref())
+                    .resolve_audio(
+                        Some(prompt),
+                        prompt_text.as_deref(),
+                        prompt_voice.as_deref(),
+                    )
                     .await
                 {
-                    debug!(ivr = %self.definition.name, prompt = %path, return_menu, "Playing announcement");
+                    info!(ivr = %self.definition.name, prompt = %path, return_menu, "IVR playing announcement");
                     ctrl.play_audio(&path, false).await?;
                     Ok(AppAction::Continue)
                 } else {
+                    info!(ivr = %self.definition.name, return_menu, "IVR announcement has no audio, returning to menu");
                     return self.enter_menu(&return_menu, ctrl, ctx).await;
                 }
             }
             EntryAction::Repeat => {
                 let current = self.current_menu_key().to_string();
-                debug!(ivr = %self.definition.name, menu = %current, "Repeating menu");
+                info!(ivr = %self.definition.name, menu = %current, "IVR repeating menu");
                 self.enter_menu(&current, ctrl, ctx).await
             }
             EntryAction::Hangup {
@@ -340,7 +374,11 @@ impl IvrApp {
                 prompt_voice,
             } => {
                 if let Some(path) = self
-                    .resolve_audio(prompt.as_deref(), prompt_text.as_deref(), prompt_voice.as_deref())
+                    .resolve_audio(
+                        prompt.as_deref(),
+                        prompt_text.as_deref(),
+                        prompt_voice.as_deref(),
+                    )
                     .await
                 {
                     self.state = IvrState::PlayingHangup;
@@ -364,7 +402,11 @@ impl IvrApp {
             } => {
                 self.state = IvrState::PlayingAndHangup { code: *code };
                 if let Some(path) = self
-                    .resolve_audio(prompt.as_deref(), prompt_text.as_deref(), prompt_voice.as_deref())
+                    .resolve_audio(
+                        prompt.as_deref(),
+                        prompt_text.as_deref(),
+                        prompt_voice.as_deref(),
+                    )
                     .await
                 {
                     debug!(ivr = %self.definition.name, prompt = %path, code = ?code, "Playing prompt before hangup with code");
@@ -390,7 +432,11 @@ impl IvrApp {
             } => {
                 self.state = IvrState::CollectingExtension;
                 let resolved_prompt = self
-                    .resolve_audio(Some(prompt), prompt_text.as_deref(), prompt_voice.as_deref())
+                    .resolve_audio(
+                        Some(prompt),
+                        prompt_text.as_deref(),
+                        prompt_voice.as_deref(),
+                    )
                     .await;
                 debug!(
                     ivr = %self.definition.name,
@@ -464,7 +510,11 @@ impl IvrApp {
                 );
                 let terminator = end_key.as_ref().and_then(|k| k.chars().next());
                 let resolved_prompt = self
-                    .resolve_audio(prompt.as_deref(), prompt_text.as_deref(), prompt_voice.as_deref())
+                    .resolve_audio(
+                        prompt.as_deref(),
+                        prompt_text.as_deref(),
+                        prompt_voice.as_deref(),
+                    )
                     .await;
 
                 // Check if we have a pending digit from unknown_key_action
@@ -687,7 +737,7 @@ impl IvrApp {
                     ivr = %self.definition.name,
                     menu = %menu_key,
                     retries = new_retry,
-                    "Max retries exceeded, executing fallback action"
+                    "IVR max retries exceeded (timeout), executing fallback action"
                 );
                 return self.execute_action(&action, ctrl, ctx).await;
             } else {
@@ -695,7 +745,7 @@ impl IvrApp {
                     ivr = %self.definition.name,
                     menu = %menu_key,
                     retries = new_retry,
-                    "Max retries exceeded, no fallback — hanging up"
+                    "IVR max retries exceeded (timeout), no fallback — hanging up"
                 );
                 self.state = IvrState::Done;
                 return Ok(AppAction::Hangup {
@@ -709,11 +759,11 @@ impl IvrApp {
         if let Some(action) = timeout_action {
             match action {
                 EntryAction::Repeat => {
-                    debug!(
+                    info!(
                         ivr = %self.definition.name,
                         menu = %menu_key,
                         retry = new_retry,
-                        "Timeout: repeating menu"
+                        "IVR timeout: repeating menu"
                     );
                     self.state = IvrState::PlayingGreeting {
                         menu_key: menu_key.clone(),
@@ -737,11 +787,11 @@ impl IvrApp {
             }
         } else {
             // No timeout_action defined; replay the greeting
-            debug!(
+            info!(
                 ivr = %self.definition.name,
                 menu = %menu_key,
                 retry = new_retry,
-                "Timeout: replaying greeting (default)"
+                "IVR timeout: replaying greeting (default)"
             );
             self.state = IvrState::PlayingGreeting {
                 menu_key: menu_key.clone(),
@@ -790,18 +840,31 @@ impl IvrApp {
         };
 
         let new_retry = retry_count + 1;
-        debug!(
+        info!(
             ivr = %self.definition.name,
             menu = menu_key,
-            digit,
+            digit = %digit,
             retry = new_retry,
-            "Invalid DTMF key"
+            max_retries,
+            "IVR invalid DTMF key"
         );
 
         if new_retry > max_retries {
             if let Some(action) = max_retries_action {
+                info!(
+                    ivr = %self.definition.name,
+                    menu = menu_key,
+                    retries = new_retry,
+                    "IVR max retries exceeded after invalid key, executing fallback"
+                );
                 return self.execute_action(&action, ctrl, ctx).await;
             } else {
+                info!(
+                    ivr = %self.definition.name,
+                    menu = menu_key,
+                    retries = new_retry,
+                    "IVR max retries exceeded after invalid key, hanging up"
+                );
                 self.state = IvrState::Done;
                 return Ok(AppAction::Hangup {
                     reason: None,
@@ -818,6 +881,11 @@ impl IvrApp {
             )
             .await
         {
+            info!(
+                ivr = %self.definition.name,
+                menu = menu_key,
+                "IVR playing invalid prompt"
+            );
             self.state = IvrState::PlayingInvalid {
                 menu_key: menu_key.to_string(),
                 retry_count: new_retry,
@@ -826,6 +894,12 @@ impl IvrApp {
             Ok(AppAction::Continue)
         } else {
             // No invalid prompt — just go back to waiting
+            info!(
+                ivr = %self.definition.name,
+                menu = menu_key,
+                retry = new_retry,
+                "IVR no invalid prompt, returning to wait DTMF"
+            );
             self.start_waiting_dtmf(menu_key, new_retry, ctrl);
             Ok(AppAction::Continue)
         }
@@ -909,11 +983,11 @@ impl CallApp for IvrApp {
 
         let Some((retry_count, menu_key, is_greeting)) = state_snapshot else {
             // DTMF in other states is ignored
-            debug!(
+            info!(
                 ivr = %self.definition.name,
                 digit,
                 state = ?self.state,
-                "DTMF ignored in current state"
+                "IVR DTMF ignored in current state"
             );
             return Ok(AppAction::Continue);
         };
@@ -927,17 +1001,22 @@ impl CallApp for IvrApp {
                 .map(|e| e.action.clone());
 
             if let Some(action) = action {
-                debug!(
+                info!(
                     ivr = %self.definition.name,
                     menu = %menu_key,
                     digit = %digit,
-                    "DTMF barge-in during greeting"
+                    "IVR DTMF barge-in during greeting"
                 );
                 ctrl.cancel_timeout("ivr_dtmf_timeout");
                 let _ = ctrl.stop_audio().await;
                 self.execute_action(&action, ctrl, ctx).await
             } else {
-                // Ignore invalid DTMF during greeting
+                info!(
+                    ivr = %self.definition.name,
+                    menu = %menu_key,
+                    digit = %digit,
+                    "IVR DTMF ignored during greeting (no matching entry)"
+                );
                 Ok(AppAction::Continue)
             }
         } else {
@@ -958,21 +1037,33 @@ impl CallApp for IvrApp {
                 });
 
             if let Some(action) = entry_action {
+                info!(
+                    ivr = %self.definition.name,
+                    menu = %menu_key,
+                    digit = %digit,
+                    "IVR DTMF matched entry, executing action"
+                );
                 self.execute_action(&action, ctrl, ctx).await
             } else if let Some(menu) = self.definition.get_menu(&menu_key) {
                 // Check for unknown_key_action (e.g., direct extension dial)
                 let unknown_action = menu.unknown_key_action.clone();
                 if let Some(unknown_action) = unknown_action {
-                    debug!(
+                    info!(
                         ivr = %self.definition.name,
                         menu = %menu_key,
                         digit = %digit,
-                        "DTMF not matched, executing unknown_key_action"
+                        "IVR DTMF not matched, executing unknown_key_action"
                     );
                     // Store the first digit for Collect actions
                     self.pending_unknown_digit = Some(digit.to_string());
                     self.execute_action(&unknown_action, ctrl, ctx).await
                 } else {
+                    info!(
+                        ivr = %self.definition.name,
+                        menu = %menu_key,
+                        digit = %digit,
+                        "IVR DTMF invalid key"
+                    );
                     self.handle_invalid_key(&menu_key, retry_count, &digit, ctrl, ctx)
                         .await
                 }
@@ -1026,6 +1117,12 @@ impl CallApp for IvrApp {
             AudioDone::Greeting { menu_key } => {
                 let retry_count = self.pending_retry_count;
                 self.pending_retry_count = 0;
+                info!(
+                    ivr = %self.definition.name,
+                    menu = %menu_key,
+                    retry_count,
+                    "IVR greeting complete, waiting DTMF"
+                );
                 self.start_waiting_dtmf(&menu_key, retry_count, ctrl);
                 Ok(AppAction::Continue)
             }
@@ -1034,6 +1131,12 @@ impl CallApp for IvrApp {
                 retry_count,
             } => {
                 // Invalid prompt finished → re-play greeting
+                info!(
+                    ivr = %self.definition.name,
+                    menu = %menu_key,
+                    retry_count,
+                    "IVR invalid prompt complete, replaying greeting"
+                );
                 let menu = self.definition.get_menu(&menu_key).cloned();
                 if let Some(menu) = menu {
                     self.state = IvrState::PlayingGreeting {
@@ -1056,9 +1159,15 @@ impl CallApp for IvrApp {
                 Ok(AppAction::Continue)
             }
             AudioDone::Announcement { return_menu } => {
+                info!(
+                    ivr = %self.definition.name,
+                    return_menu = %return_menu,
+                    "IVR announcement complete, returning to menu"
+                );
                 self.enter_menu(&return_menu, ctrl, _ctx).await
             }
             AudioDone::Hangup => {
+                info!(ivr = %self.definition.name, "IVR hangup prompt complete, hanging up");
                 self.state = IvrState::Done;
                 Ok(AppAction::Hangup {
                     reason: None,
@@ -1066,6 +1175,7 @@ impl CallApp for IvrApp {
                 })
             }
             AudioDone::AndHangup { code } => {
+                info!(ivr = %self.definition.name, code = ?code, "IVR prompt complete, hanging up with code");
                 self.state = IvrState::Done;
                 Ok(AppAction::Hangup { reason: None, code })
             }
@@ -1092,11 +1202,11 @@ impl CallApp for IvrApp {
         };
 
         if let Some((menu_key, retry_count)) = waiting {
-            debug!(
+            info!(
                 ivr = %self.definition.name,
                 menu = %menu_key,
                 retry_count,
-                "DTMF timeout"
+                "IVR DTMF timeout fired"
             );
             self.handle_timeout(menu_key, retry_count, ctrl, ctx).await
         } else {

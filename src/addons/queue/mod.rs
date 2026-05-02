@@ -1,7 +1,8 @@
-use crate::addons::{Addon, SidebarItem};
+use crate::addons::{Addon, SidebarItem, export_reload::ExportReloadHandler};
 use crate::app::AppState;
 use async_trait::async_trait;
 use axum::Router;
+use serde_json::{json, Value as JsonValue};
 use tower_http::services::ServeDir;
 
 pub mod console;
@@ -10,6 +11,12 @@ pub mod services;
 mod tests;
 
 pub struct QueueAddon;
+
+impl Default for QueueAddon {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl QueueAddon {
     pub fn new() -> Self {
@@ -45,15 +52,16 @@ impl Addon for QueueAddon {
         let base_path = console_state.base_path().to_string();
         let router = console::handlers::urls().with_state(console_state);
 
-        let static_path = if std::path::Path::new("src/addons/queue/static").exists() {
+        let static_fs_path = if std::path::Path::new("src/addons/queue/static").exists() {
             "src/addons/queue/static"
         } else {
             "static/queue"
         };
+        let static_url_prefix = state.config().static_path();
 
         Some(
             Router::new()
-                .nest_service("/static/queue", ServeDir::new(static_path))
+                .nest_service(&format!("{}/queue", static_url_prefix), ServeDir::new(static_fs_path))
                 .nest(&base_path, router),
         )
     }
@@ -91,5 +99,50 @@ impl Addon for QueueAddon {
         } else {
             Some(deployed.to_string())
         }
+    }
+
+    fn migrations(&self) -> Vec<Box<dyn sea_orm_migration::MigrationTrait>> {
+        vec![Box::new(models::Migration)]
+    }
+
+    fn export_reload_handler(&self) -> Option<Box<dyn ExportReloadHandler>> {
+        Some(Box::new(QueueExportReloadHandler))
+    }
+}
+
+// ── Export/Reload Handler ──────────────────────────────────────────────────────
+
+struct QueueExportReloadHandler;
+
+#[async_trait]
+impl ExportReloadHandler for QueueExportReloadHandler {
+    fn addon_id(&self) -> &str {
+        "queue"
+    }
+
+    fn display_name(&self) -> &str {
+        "Queues"
+    }
+
+    async fn export_and_reload(&self, app_state: &AppState) -> Result<JsonValue, String> {
+        let db = app_state.db();
+        let proxy_cfg = crate::config::ProxyConfig::default();
+        let exporter = crate::addons::queue::services::exporter::QueueExporter::new(db.clone());
+
+        exporter.export_all(&proxy_cfg).await.map_err(|e| format!("Export failed: {}", e))?;
+
+        app_state
+            .sip_server()
+            .inner
+            .data_context
+            .reload_queues(true, None)
+            .await
+            .map_err(|e| format!("Reload failed: {}", e))?;
+
+        if let Some(ref console) = app_state.console {
+            console.clear_pending_reload();
+        }
+
+        Ok(json!({"status": "ok"}))
     }
 }

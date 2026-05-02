@@ -80,7 +80,7 @@ impl E2eTestServer {
                 Ok(Box::new(RegistrarModule::new(inner, config)))
             })
             .register_module("auth", |inner, _config| {
-                Ok(Box::new(AuthModule::new(inner)))
+                Ok(Box::new(AuthModule::new(inner.clone(), inner.proxy_config.clone())))
             })
             .register_module("call", |inner, config| {
                 Ok(Box::new(CallModule::new(config, inner)))
@@ -166,7 +166,7 @@ impl E2eTestServer {
                 Ok(Box::new(RegistrarModule::new(inner, config)))
             })
             .register_module("auth", |inner, _config| {
-                Ok(Box::new(AuthModule::new(inner)))
+                Ok(Box::new(AuthModule::new(inner.clone(), inner.proxy_config.clone())))
             })
             .register_module("call", |inner, config| {
                 Ok(Box::new(CallModule::new(config, inner)))
@@ -274,7 +274,9 @@ impl E2eTestServer {
     }
 
     /// Get active calls from registry
-    pub fn get_active_calls(&self) -> Vec<crate::proxy::active_call_registry::ActiveProxyCallEntry> {
+    pub fn get_active_calls(
+        &self,
+    ) -> Vec<crate::proxy::active_call_registry::ActiveProxyCallEntry> {
         self.registry.list_recent(100)
     }
 

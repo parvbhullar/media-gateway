@@ -49,8 +49,8 @@ mod tests {
             method: rsipstack::sip::Method::Invite,
             uri: "sip:target@example.com".try_into().unwrap(),
             headers: vec![
-                rsipstack::sip::Header::From("sip:caller@example.com".try_into().unwrap()),
-                rsipstack::sip::Header::To("sip:target@example.com".try_into().unwrap()),
+                rsipstack::sip::Header::From("sip:caller@example.com".into()),
+                rsipstack::sip::Header::To("sip:target@example.com".into()),
                 rsipstack::sip::Header::CallId("test-call-id".into()),
             ]
             .into(),
@@ -104,7 +104,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(dialplan.recording.enabled, true);
+        assert!(dialplan.recording.enabled);
         assert_eq!(dialplan.max_call_duration.unwrap().as_secs(), 30);
 
         let payload = rx.recv().await.unwrap();
@@ -146,8 +146,8 @@ mod tests {
             method: rsipstack::sip::Method::Invite,
             uri: "sip:target@example.com".try_into().unwrap(),
             headers: vec![
-                rsipstack::sip::Header::From("sip:caller@example.com".try_into().unwrap()),
-                rsipstack::sip::Header::To("sip:target@example.com".try_into().unwrap()),
+                rsipstack::sip::Header::From("sip:caller@example.com".into()),
+                rsipstack::sip::Header::To("sip:target@example.com".into()),
                 rsipstack::sip::Header::CallId("test-call-id".into()),
             ]
             .into(),
@@ -203,7 +203,10 @@ mod tests {
             Err(err) => {
                 assert_eq!(err.status, Some(rsipstack::sip::StatusCode::Forbidden));
                 assert!(err.error.to_string().contains("Forbidden by test"));
-                assert!(err.extensions.is_none(), "extensions should be None when not provided in reject");
+                assert!(
+                    err.extensions.is_none(),
+                    "extensions should be None when not provided in reject"
+                );
             }
             _ => panic!("Expected rejection"),
         }
@@ -246,8 +249,8 @@ mod tests {
             method: rsipstack::sip::Method::Invite,
             uri: "sip:target@example.com".try_into().unwrap(),
             headers: vec![
-                rsipstack::sip::Header::From("sip:caller@example.com".try_into().unwrap()),
-                rsipstack::sip::Header::To("sip:target@example.com".try_into().unwrap()),
+                rsipstack::sip::Header::From("sip:caller@example.com".into()),
+                rsipstack::sip::Header::To("sip:target@example.com".into()),
                 rsipstack::sip::Header::CallId("test-abort-ext".into()),
             ]
             .into(),
@@ -303,7 +306,9 @@ mod tests {
             Some(rsipstack::sip::StatusCode::ServiceUnavailable)
         );
         assert!(err.error.to_string().contains("Service unavailable"));
-        let exts = err.extensions.expect("extensions should be preserved on abort");
+        let exts = err
+            .extensions
+            .expect("extensions should be preserved on abort");
         assert_eq!(exts.get("reason_code").unwrap(), "maintenance");
         assert_eq!(exts.get("retry_after").unwrap(), "3600");
     }
@@ -345,8 +350,8 @@ mod tests {
             method: rsipstack::sip::Method::Invite,
             uri: "sip:target@example.com".try_into().unwrap(),
             headers: vec![
-                rsipstack::sip::Header::From("sip:caller@example.com".try_into().unwrap()),
-                rsipstack::sip::Header::To("sip:target@example.com".try_into().unwrap()),
+                rsipstack::sip::Header::From("sip:caller@example.com".into()),
+                rsipstack::sip::Header::To("sip:target@example.com".into()),
                 rsipstack::sip::Header::CallId("test-reject-ext".into()),
             ]
             .into(),
@@ -393,7 +398,9 @@ mod tests {
         let err = result.expect_err("reject should return error");
         assert_eq!(err.status, Some(rsipstack::sip::StatusCode::Forbidden));
         assert!(err.error.to_string().contains("Blocked"));
-        let exts = err.extensions.expect("extensions should be preserved on reject");
+        let exts = err
+            .extensions
+            .expect("extensions should be preserved on reject");
         assert_eq!(exts.get("block_reason").unwrap(), "blacklist");
         assert_eq!(exts.get("source_ip").unwrap(), "10.0.0.1");
     }
@@ -431,8 +438,8 @@ mod tests {
             method: rsipstack::sip::Method::Invite,
             uri: "sip:target@example.com".try_into().unwrap(),
             headers: vec![
-                rsipstack::sip::Header::From("sip:caller@example.com".try_into().unwrap()),
-                rsipstack::sip::Header::To("sip:target@example.com".try_into().unwrap()),
+                rsipstack::sip::Header::From("sip:caller@example.com".into()),
+                rsipstack::sip::Header::To("sip:target@example.com".into()),
                 rsipstack::sip::Header::CallId("test-abort-noext".into()),
             ]
             .into(),
@@ -479,7 +486,10 @@ mod tests {
         let err = result.expect_err("abort should return error");
         assert_eq!(err.status, Some(rsipstack::sip::StatusCode::BusyHere));
         assert!(err.error.to_string().contains("Busy"));
-        assert!(err.extensions.is_none(), "extensions should be None when not provided");
+        assert!(
+            err.extensions.is_none(),
+            "extensions should be None when not provided"
+        );
     }
 
     #[tokio::test]
@@ -522,8 +532,8 @@ mod tests {
             method: rsipstack::sip::Method::Invite,
             uri: "sip:target@example.com".try_into().unwrap(),
             headers: vec![
-                rsipstack::sip::Header::From("sip:caller@example.com".try_into().unwrap()),
-                rsipstack::sip::Header::To("sip:target@example.com".try_into().unwrap()),
+                rsipstack::sip::Header::From("sip:caller@example.com".into()),
+                rsipstack::sip::Header::To("sip:target@example.com".into()),
                 rsipstack::sip::Header::CallId("test-id".into()),
             ]
             .into(),
@@ -560,10 +570,10 @@ mod tests {
             dialplan.media.proxy_mode,
             crate::config::MediaProxyMode::None
         );
-        assert_eq!(dialplan.with_original_headers, true);
+        assert!(dialplan.with_original_headers);
 
         let target = dialplan.first_target().unwrap();
-        let header = target.headers.as_ref().unwrap().get(0).unwrap();
+        let header = target.headers.as_ref().unwrap().first().unwrap();
         assert_eq!(header.to_string(), "X-Custom-Header: test-value");
 
         let exts = dialplan
@@ -615,8 +625,8 @@ mod tests {
             method: rsipstack::sip::Method::Invite,
             uri: "sip:target@example.com".try_into().unwrap(),
             headers: vec![
-                rsipstack::sip::Header::From("sip:caller@example.com".try_into().unwrap()),
-                rsipstack::sip::Header::To("sip:target@example.com".try_into().unwrap()),
+                rsipstack::sip::Header::From("sip:caller@example.com".into()),
+                rsipstack::sip::Header::To("sip:target@example.com".into()),
                 rsipstack::sip::Header::CallId("test-rtp-config".into()),
             ]
             .into(),

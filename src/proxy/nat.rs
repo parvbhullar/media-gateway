@@ -5,6 +5,12 @@ use tracing::debug;
 
 pub struct NatInspector;
 
+impl Default for NatInspector {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NatInspector {
     pub fn new() -> Self {
         Self
@@ -19,7 +25,11 @@ impl NatInspector {
         }
     }
 
-    fn fix_contact_header(&self, header_value: &mut String, from_addr: &rsipstack::sip::HostWithPort) {
+    fn fix_contact_header(
+        &self,
+        header_value: &mut String,
+        from_addr: &rsipstack::sip::HostWithPort,
+    ) {
         // Simple regex-less replacement of host:port in Contact header if it contains a private IP
         // Contact header looks like: "Display Name" <sip:user@host:port;params> or <sip:host:port> or sip:host:port
 
@@ -52,14 +62,13 @@ impl NatInspector {
                 host_part
             };
 
-            if let Ok(ip) = host_only.parse::<IpAddr>() {
-                if Self::is_private_ip(&ip) {
+            if let Ok(ip) = host_only.parse::<IpAddr>()
+                && Self::is_private_ip(&ip) {
                     let from_host = from_addr.host.to_string();
-                    if let Ok(from_ip) = from_host.parse::<IpAddr>() {
-                        if from_ip == ip || Self::is_private_ip(&from_ip) {
+                    if let Ok(from_ip) = from_host.parse::<IpAddr>()
+                        && (from_ip == ip || Self::is_private_ip(&from_ip)) {
                             return;
                         }
-                    }
 
                     let from_port = from_addr.port.as_ref().map(|p| p.to_string());
 
@@ -79,24 +88,21 @@ impl NatInspector {
                     debug!(old = %header_value, new = %new_header, "Fixed NAT Contact header");
                     *header_value = new_header;
                 }
-            }
-        } else if uri_str.starts_with("sip:") {
-            let host_part = &uri_str[4..];
+        } else if let Some(host_part) = uri_str.strip_prefix("sip:") {
             let host_only = if let Some(col_idx) = host_part.find(':') {
                 &host_part[..col_idx]
             } else {
                 host_part
             };
 
-            if let Ok(ip) = host_only.parse::<IpAddr>() {
-                if Self::is_private_ip(&ip) {
+            if let Ok(ip) = host_only.parse::<IpAddr>()
+                && Self::is_private_ip(&ip) {
                     let from_host = from_addr.host.to_string();
                     // If the ip is the same as the source ip, we don't need to fix it
-                    if let Ok(from_ip) = from_host.parse::<IpAddr>() {
-                        if from_ip == ip {
+                    if let Ok(from_ip) = from_host.parse::<IpAddr>()
+                        && from_ip == ip {
                             return;
                         }
-                    }
 
                     let from_port = from_addr.port.as_ref().map(|p| p.to_string());
 
@@ -115,7 +121,6 @@ impl NatInspector {
                     debug!(old = %header_value, new = %new_header, "Fixed NAT Contact header");
                     *header_value = new_header;
                 }
-            }
         }
     }
 }
@@ -152,25 +157,81 @@ impl MessageInspector for NatInspector {
             let kind = resp.status_code.kind();
             let is_target_forming = matches!(
                 kind,
-                rsipstack::sip::StatusCodeKind::Provisional | rsipstack::sip::StatusCodeKind::Successful
+                rsipstack::sip::StatusCodeKind::Provisional
+                    | rsipstack::sip::StatusCodeKind::Successful
             );
 
             if is_target_forming {
                 for header in resp.headers.iter_mut() {
-                    match header {
-                        rsipstack::sip::Header::Contact(contact) => {
-                            let mut val = contact.to_string();
-                            let old_val = val.clone();
-                            self.fix_contact_header(&mut val, &from.addr);
-                            if val != old_val {
-                                *contact = val.into();
-                            }
+                    if let rsipstack::sip::Header::Contact(contact) = header {
+                        let mut val = contact.value().to_string();
+                        let old_val = val.clone();
+                        self.fix_contact_header(&mut val, &from.addr);
+                        if val != old_val {
+                            *contact = val.into();
                         }
-                        _ => {}
                     }
                 }
             }
         }
         msg
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NatInspector;
+    use rsipstack::sip::SipMessage;
+    use rsipstack::transaction::endpoint::MessageInspector;
+    use rsipstack::transport::SipAddr;
+
+    #[test]
+    fn test_nat_fix_rewritten_contact_should_not_duplicate_header_name() {
+        let raw = concat!(
+            "SIP/2.0 200 OK\r\n",
+            "Via: SIP/2.0/UDP 198.51.100.24:15060;rport=15060;received=198.51.100.24;branch=z9hG4bKdDbDaK1ixkQ7\r\n",
+            "Call-ID: lFG6BkmOTiJ7fbAS5as6S2@voltecall\r\n",
+            "From: <sip:alice@198.51.100.23>;tag=aTNjBN8v\r\n",
+            "To: <sip:79900123456@203.0.113.52>;tag=df598941-c590-4772-9a26-7c9633759dd6\r\n",
+            "CSeq: 7 INVITE\r\n",
+            "Allow: PRACK, INVITE, ACK, BYE, CANCEL, UPDATE, INFO, SUBSCRIBE, NOTIFY, REFER, MESSAGE, OPTIONS\r\n",
+            "Contact: <sip:41111112222@10.10.10.10:15060>\r\n",
+            "Supported: replaces, 100rel, timer, norefersub\r\n",
+            "Content-Type: application/sdp\r\n",
+            "Content-Length:   311\r\n",
+            "\r\n",
+            "v=0\r\n",
+            "o=- 3985392156 3985392157 IN IP4 10.10.10.10\r\n",
+            "s=volte\r\n",
+            "b=AS:84\r\n",
+            "t=0 0\r\n",
+            "a=X-nat:0\r\n",
+            "m=audio 4000 RTP/AVP 8 101\r\n",
+            "c=IN IP4 10.10.10.10\r\n",
+            "b=TIAS:64000\r\n",
+            "a=rtcp:4001 IN IP4 10.10.10.10\r\n",
+            "a=sendrecv\r\n",
+            "a=rtpmap:8 PCMA/8000\r\n",
+            "a=ssrc:1173482294 cname:0ea64c6460b897ba\r\n",
+            "a=rtpmap:101 telephone-event/8000\r\n",
+            "a=fmtp:101 0-16\r\n"
+        );
+        let msg = SipMessage::try_from(raw).unwrap();
+        let from: SipAddr = rsipstack::sip::HostWithPort::try_from("198.51.100.24:15060")
+            .unwrap()
+            .into();
+
+        let rewritten = NatInspector::new().after_received(msg, &from);
+        let text = rewritten.to_string();
+        let contact_line = text
+            .lines()
+            .find(|line| line.starts_with("Contact:"))
+            .expect("Contact header should exist");
+
+        assert_eq!(
+            contact_line,
+            "Contact: <sip:41111112222@198.51.100.24:15060>",
+            "rewritten Contact header should not duplicate the header name"
+        );
     }
 }

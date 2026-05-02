@@ -1,10 +1,11 @@
+use crate::call::Location;
+use crate::call::app::{ApplicationContext, CallInfo};
 use crate::call::domain::{
     CallCommand, HangupCascade, HangupCommand, LegId, LegState, MediaPathMode, MediaRuntimeProfile,
     RingbackPolicy,
 };
 use crate::call::domain::{Leg, SessionState};
 use crate::call::runtime::BridgeConfig;
-use crate::call::app::{ApplicationContext, CallInfo};
 use crate::call::runtime::{
     AppFactory, AppRuntime, AppRuntimeConfig, CommandResult, DefaultAppRuntime, ExecutionContext,
     MediaCapabilityCheck, SessionId,
@@ -28,9 +29,9 @@ use crate::call::domain::SessionPolicy;
 use crate::call::sip::{ClientDialogGuard, ServerDialogGuard};
 use crate::callrecord::{CallRecordHangupMessage, CallRecordHangupReason, CallRecordSender};
 use crate::config::MediaProxyMode;
-use crate::media::bridge::BridgePeerBuilder;
+use crate::media::bridge::{BridgeEndpoint, BridgePeerBuilder};
 use crate::media::mixer::MediaMixer;
-use crate::media::negotiate::MediaNegotiator;
+use crate::media::negotiate::{CodecInfo, MediaNegotiator};
 use crate::media::recorder::Recorder;
 use crate::media::{FileTrack, RtpTrackBuilder, Track};
 use crate::proxy::proxy_call::{
@@ -41,7 +42,8 @@ use crate::proxy::proxy_call::{
         MIN_MIN_SE, SessionRefresher, SessionTimerState, apply_refresh_response,
         apply_session_timer_headers, build_default_session_timer_headers,
         build_session_timer_headers, build_session_timer_response_headers, get_header_value,
-        has_timer_support, parse_min_se, parse_session_expires, select_timer_refresher,
+        has_timer_support, parse_min_se, parse_session_expires, select_client_timer_refresher,
+        select_server_timer_refresher,
     },
     state::{CallContext, CallSessionRecordSnapshot, SessionHangupMessage},
 };
@@ -56,10 +58,13 @@ use rsipstack::dialog::{
     dialog::TransactionHandle, server_dialog::ServerInviteDialog,
 };
 use rsipstack::sip::StatusCode;
+use rsipstack::transport::SipAddr;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use tokio_util::{
     sync::CancellationToken,
@@ -86,6 +91,51 @@ enum DialogSide {
     Callee,
 }
 
+struct CallerIngressMonitor {
+    cancel_token: CancellationToken,
+    task: JoinHandle<()>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RtpDtmfEventKey {
+    digit_code: u8,
+    rtp_timestamp: u32,
+}
+
+#[derive(Debug, Default)]
+struct RtpDtmfDetector {
+    last_event: Option<RtpDtmfEventKey>,
+}
+
+impl RtpDtmfDetector {
+    fn observe(&mut self, payload: &[u8], rtp_timestamp: u32) -> Option<char> {
+        if payload.len() < 4 {
+            return None;
+        }
+
+        let digit_code = payload[0];
+        let digit = match digit_code {
+            0..=9 => (b'0' + digit_code) as char,
+            10 => '*',
+            11 => '#',
+            12..=15 => (b'A' + (digit_code - 12)) as char,
+            _ => return None,
+        };
+
+        let event = RtpDtmfEventKey {
+            digit_code,
+            rtp_timestamp,
+        };
+
+        if self.last_event == Some(event) {
+            return None;
+        }
+
+        self.last_event = Some(event);
+        Some(digit)
+    }
+}
+
 pub struct SipSession {
     pub id: SessionId,
     pub state: SessionState,
@@ -110,6 +160,7 @@ pub struct SipSession {
     pub cancel_token: CancellationToken,
     pub pending_hangup: HashSet<DialogId>,
     pub connected_callee: Option<String>,
+    pub connected_callee_dialog_id: Option<DialogId>,
     pub callee_call_ids: HashSet<String>,
     pub ring_time: Option<Instant>,
     pub answer_time: Option<Instant>,
@@ -139,14 +190,31 @@ pub struct SipSession {
     pub reporter: Option<CallReporter>,
     pub recorder: Arc<RwLock<Option<Recorder>>>,
     pub playback_tracks: std::collections::HashMap<String, FileTrack>,
+    caller_ingress_monitor: Option<CallerIngressMonitor>,
 
     pub media_bridge: Option<Arc<crate::media::bridge::BridgePeer>>,
+    caller_answer_uses_media_bridge: bool,
+    callee_offer_uses_media_bridge: bool,
+    media_bridge_started: bool,
+    bridge_playback_track_id: Option<String>,
     pub caller_is_webrtc: bool,
     pub callee_is_webrtc: bool,
     /// IP of the caller (from the incoming INVITE's Via/Contact). Used to
     /// pick the correct local interface IP for Contact and SDP so the
     /// caller can actually reach us for ACK/RTP.
     pub caller_peer_ip: Option<std::net::IpAddr>,
+    pub conference_bridge: crate::call::runtime::SessionConferenceBridge,
+
+    /// Per-leg media peers (for dynamic leg management)
+    #[allow(dead_code)]
+    pub leg_peers: std::collections::HashMap<LegId, Arc<dyn MediaPeer>>,
+
+    /// Command sender for internal async tasks (e.g., leg dial completion)
+    #[allow(dead_code)]
+    pub cmd_tx: Option<mpsc::UnboundedSender<CallCommand>>,
+
+    /// Per-leg spawned task handles (for cleanup when leg is removed)
+    pub leg_tasks: std::collections::HashMap<LegId, Vec<tokio::task::JoinHandle<()>>>,
 }
 
 #[derive(Clone)]
@@ -206,17 +274,22 @@ impl AppFactory for BuiltinAppFactory {
                     }
                 };
                 // Allow per-instance TTS override via app_params
-                if let Some(tts_value) = params.as_ref()?.get("tts") {
-                    if let Ok(tts_cfg) = serde_json::from_value::<crate::tts::TtsConfig>(tts_value.clone()) {
-                        app = app.with_tts(Some(tts_cfg));
-                    }
+                if let Some(tts_value) = params.as_ref()?.get("tts")
+                    && let Ok(tts_cfg) =
+                        serde_json::from_value::<crate::tts::TtsConfig>(tts_value.clone())
+                {
+                    app = app.with_tts(Some(tts_cfg));
                 }
                 Some(Box::new(app) as Box<dyn crate::call::app::CallApp>)
             }
             "voicemail" => {
                 let extension = params.as_ref()?.get("extension")?.as_str()?.to_string();
                 let mut app = crate::call::app::voicemail::VoicemailApp::new(extension);
-                if let Some(greeting) = params.as_ref()?.get("greeting_path").and_then(|v| v.as_str()) {
+                if let Some(greeting) = params
+                    .as_ref()?
+                    .get("greeting_path")
+                    .and_then(|v| v.as_str())
+                {
                     app = app.with_greeting_path(greeting);
                 }
                 Some(Box::new(app) as Box<dyn crate::call::app::CallApp>)
@@ -254,6 +327,7 @@ impl SipSession {
     pub const CALLEE_TRACK_ID: &'static str = "callee-track";
     pub const CALLER_FORWARDING_TRACK_ID: &'static str = "caller-forwarding-track";
     pub const CALLEE_FORWARDING_TRACK_ID: &'static str = "callee-forwarding-track";
+    pub const QUEUE_HOLD_TRACK_ID: &'static str = "queue-hold";
     const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 
     /// IP to advertise in caller-side SDP (c=/o= lines). For public callers,
@@ -313,12 +387,13 @@ impl SipSession {
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let snapshot_cache: Arc<RwLock<Option<SessionSnapshot>>> = Arc::new(RwLock::new(None));
-        let app_event_bridge: Arc<RwLock<Option<crate::proxy::proxy_call::state::SipSessionHandle>>> =
-            Arc::new(RwLock::new(None));
+        let app_event_bridge: Arc<
+            RwLock<Option<crate::proxy::proxy_call::state::SipSessionHandle>>,
+        > = Arc::new(RwLock::new(None));
 
         let sip_handle = SipSessionHandle {
             session_id: session_id.clone(),
-            cmd_tx,
+            cmd_tx: cmd_tx.clone(),
             snapshot_cache: snapshot_cache.clone(),
             app_event_bridge: app_event_bridge.clone(),
         };
@@ -332,15 +407,12 @@ impl SipSession {
             started_at: chrono::Utc::now(),
         };
         let app_ctx = ApplicationContext::new(
-            server.database.clone().unwrap_or(sea_orm::DatabaseConnection::Disconnected),
+            server
+                .database
+                .clone()
+                .unwrap_or(sea_orm::DatabaseConnection::Disconnected),
             call_info,
             Arc::new(crate::config::Config::default()),
-            server.storage.clone().unwrap_or_else(|| {
-                crate::storage::Storage::new(&crate::storage::StorageConfig::Local {
-                    path: std::env::temp_dir().to_string_lossy().to_string(),
-                })
-                .expect("fallback storage")
-            }),
         );
 
         // Create a bridge handle that speaks SessionAction (for DefaultAppRuntime)
@@ -367,7 +439,10 @@ impl SipSession {
                 match session_action_to_call_command(action) {
                     Ok(cmd) => {
                         if let Err(e) = sip_handle_clone.send_command(cmd) {
-                            tracing::warn!("SessionAction bridge failed to send CallCommand: {}", e);
+                            tracing::warn!(
+                                "SessionAction bridge failed to send CallCommand: {}",
+                                e
+                            );
                             break;
                         }
                     }
@@ -415,6 +490,7 @@ impl SipSession {
             call_record_sender,
             cancel_token,
             connected_callee: None,
+            connected_callee_dialog_id: None,
             callee_call_ids: HashSet::new(),
             ring_time: None,
             answer_time: None,
@@ -440,10 +516,19 @@ impl SipSession {
             reporter: None,
             recorder: Arc::new(RwLock::new(None)),
             playback_tracks: std::collections::HashMap::new(),
+            caller_ingress_monitor: None,
             media_bridge: None,
+            caller_answer_uses_media_bridge: false,
+            callee_offer_uses_media_bridge: false,
+            media_bridge_started: false,
+            bridge_playback_track_id: None,
             caller_is_webrtc: false,
             callee_is_webrtc: false,
             caller_peer_ip,
+            conference_bridge: crate::call::runtime::SessionConferenceBridge::new(),
+            leg_peers: std::collections::HashMap::new(),
+            cmd_tx: Some(cmd_tx.clone()),
+            leg_tasks: std::collections::HashMap::new(),
         };
 
         (session, sip_handle, cmd_rx)
@@ -577,6 +662,119 @@ impl SipSession {
         matches!(mode, MediaProxyMode::All)
     }
 
+    fn is_local_home_proxy(local_addrs: &[SipAddr], home_proxy: &SipAddr) -> bool {
+        local_addrs
+            .iter()
+            .any(|addr| addr.addr.to_string() == home_proxy.addr.to_string())
+    }
+
+    fn route_via_home_proxy(target: &Location, local_addrs: &[SipAddr], cluster_enabled: bool) -> bool {
+        if !cluster_enabled {
+            return false;
+        }
+        if let Some(home_proxy) = target.home_proxy.as_ref() {
+            return !Self::is_local_home_proxy(local_addrs, home_proxy);
+        }
+
+        false
+    }
+
+    fn resolve_outbound_callee_uri(
+        target: &Location,
+        route_via_home_proxy: bool,
+    ) -> rsipstack::sip::Uri {
+        if route_via_home_proxy && let Some(registered_aor) = target.registered_aor.as_ref() {
+            return registered_aor.clone();
+        }
+
+        target.aor.clone()
+    }
+
+    fn bypasses_local_media(&self) -> bool {
+        self.media_profile.path == MediaPathMode::Bypass && self.media_bridge.is_none()
+    }
+
+    async fn send_mid_dialog_request_to_side(
+        &mut self,
+        side: DialogSide,
+        method: rsipstack::sip::Method,
+        headers: Vec<rsipstack::sip::Header>,
+        body: Option<Vec<u8>>,
+    ) -> Result<Option<rsipstack::sip::Response>> {
+        let dialog_id = match side {
+            DialogSide::Caller => self.caller_dialog_id(),
+            DialogSide::Callee => self
+                .callee_dialogs
+                .iter()
+                .map(|entry| entry.key().clone())
+                .next()
+                .ok_or_else(|| anyhow!("No callee dialog available for {}", method))?,
+        };
+
+        let mut dialog = self
+            .server
+            .dialog_layer
+            .get_dialog(&dialog_id)
+            .or_else(|| {
+                (side == DialogSide::Caller)
+                    .then(|| Dialog::ServerInvite(self.server_dialog.clone()))
+            })
+            .ok_or_else(|| anyhow!("No dialog found for {}", dialog_id))?;
+
+        match (method, &mut dialog) {
+            (rsipstack::sip::Method::Invite, Dialog::ClientInvite(d)) => d
+                .reinvite(Some(headers), body)
+                .await
+                .map_err(|e| anyhow!("re-INVITE failed: {}", e)),
+            (rsipstack::sip::Method::Invite, Dialog::ServerInvite(d)) => d
+                .reinvite(Some(headers), body)
+                .await
+                .map_err(|e| anyhow!("re-INVITE failed: {}", e)),
+            (rsipstack::sip::Method::Update, Dialog::ClientInvite(d)) => d
+                .update(Some(headers), body)
+                .await
+                .map_err(|e| anyhow!("UPDATE failed: {}", e)),
+            (rsipstack::sip::Method::Update, Dialog::ServerInvite(d)) => d
+                .update(Some(headers), body)
+                .await
+                .map_err(|e| anyhow!("UPDATE failed: {}", e)),
+            (other, _) => Err(anyhow!("Dialog does not support {} request", other)),
+        }
+    }
+
+    async fn relay_signaling_only_offer(
+        &mut self,
+        side: DialogSide,
+        method: rsipstack::sip::Method,
+        offer_sdp: &str,
+    ) -> Result<(StatusCode, Option<String>)> {
+        let target_side = match side {
+            DialogSide::Caller => DialogSide::Callee,
+            DialogSide::Callee => DialogSide::Caller,
+        };
+        let headers = vec![rsipstack::sip::Header::ContentType(
+            "application/sdp".into(),
+        )];
+        let response = self
+            .send_mid_dialog_request_to_side(
+                target_side,
+                method,
+                headers,
+                Some(offer_sdp.as_bytes().to_vec()),
+            )
+            .await?
+            .ok_or_else(|| anyhow!("{} timed out", method))?;
+
+        let status = response.status_code.clone();
+        let answer_sdp = if response.body().is_empty() {
+            None
+        } else {
+            Some(String::from_utf8_lossy(response.body()).to_string())
+        };
+
+        Ok((status, answer_sdp))
+    }
+
     pub async fn process(
         &mut self,
         mut state_rx: mpsc::UnboundedReceiver<DialogState>,
@@ -586,19 +784,19 @@ impl SipSession {
     ) -> Result<()> {
         let _cancel_guard = self.cancel_token.clone().drop_guard();
 
-        if !self.context.dialplan.is_empty() {
-            if let Err((status_code, reason)) = self.execute_dialplan(&mut callee_state_rx).await {
-                warn!(?status_code, ?reason, "Dialplan execution failed");
+        if !self.context.dialplan.is_empty()
+            && let Err((status_code, reason)) = self.execute_dialplan(&mut callee_state_rx).await
+        {
+            warn!(?status_code, ?reason, "Dialplan execution failed");
 
-                let code = status_code.clone();
-                let _ = self.server_dialog.reject(Some(code), reason.clone());
-                // Store error so cleanup/CDR can report the failure reason
-                self.last_error = Some((status_code.clone(), reason));
-                self.hangup_reason = Some(CallRecordHangupReason::Failed);
-                // Ensure cleanup runs (generates CDR) even on early failure
-                self.cleanup().await;
-                return Err(anyhow!("Dialplan failed: {:?}", status_code));
-            }
+            let code = status_code.clone();
+            let _ = self.server_dialog.reject(Some(code), reason.clone());
+            // Store error so cleanup/CDR can report the failure reason
+            self.last_error = Some((status_code.clone(), reason));
+            self.hangup_reason = Some(CallRecordHangupReason::Failed);
+            // Ensure cleanup runs (generates CDR) even on early failure
+            self.cleanup().await;
+            return Err(anyhow!("Dialplan failed: {:?}", status_code));
         }
 
         let hangup_futures = FuturesUnordered::new();
@@ -731,7 +929,7 @@ impl SipSession {
 
         let snapshot = SessionSnapshot {
             id: self.id.clone(),
-            state: self.state.clone(),
+            state: self.state,
             leg_count: self.legs.len(),
             bridge_active: self.bridge.active,
             media_path: self.media_profile.path,
@@ -780,30 +978,58 @@ impl SipSession {
                 )]
             })
         } else {
-            self.successful_refresh_response_headers(
-                &dialog_id,
-                has_timer_support(&request.headers),
-            )
+            self.successful_refresh_response_headers(&dialog_id)
         }
         .unwrap_or_default();
 
         let body = if update_result.is_ok() && !request.body.is_empty() {
             let offer_sdp = String::from_utf8_lossy(&request.body).to_string();
-            match self.build_local_dialog_answer(side, &offer_sdp).await {
-                Ok(answer_sdp) => {
-                    headers.push(rsipstack::sip::Header::ContentType(
-                        "application/sdp".into(),
-                    ));
-                    Some(answer_sdp.into_bytes())
+            let answer_result = if self.bypasses_local_media() {
+                self.relay_signaling_only_offer(side, request.method.clone(), &offer_sdp)
+                    .await
+                    .map_err(|e| {
+                        (
+                            rsipstack::sip::StatusCode::ServerInternalError,
+                            "Failed to relay signaling-only dialog offer",
+                            e,
+                        )
+                    })
+            } else {
+                self.build_local_dialog_answer(side, &offer_sdp)
+                    .await
+                    .map(|answer_sdp| (status.clone(), Some(answer_sdp)))
+                    .map_err(|e| {
+                        (
+                            rsipstack::sip::StatusCode::NotAcceptableHere,
+                            "Failed to build local answer for re-INVITE",
+                            e,
+                        )
+                    })
+            };
+
+            match answer_result {
+                Ok((result_status, answer_sdp)) => {
+                    status = result_status;
+                    if status.kind() != rsipstack::sip::status_code::StatusCodeKind::Successful {
+                        headers.clear();
+                    }
+                    if let Some(answer_sdp) = answer_sdp {
+                        headers.push(rsipstack::sip::Header::ContentType(
+                            "application/sdp".into(),
+                        ));
+                        Some(answer_sdp.into_bytes())
+                    } else {
+                        None
+                    }
                 }
-                Err(e) => {
+                Err((error_status, message, error)) => {
                     warn!(
                         %dialog_id,
-                        error = %e,
+                        error = %error,
                         side = ?side,
-                        "Failed to build local answer for re-INVITE"
+                        "{message}"
                     );
-                    status = rsipstack::sip::StatusCode::NotAcceptableHere;
+                    status = error_status;
                     headers.clear();
                     None
                 }
@@ -846,7 +1072,8 @@ impl SipSession {
                     for line in body.lines() {
                         let line = line.trim();
                         if line.to_lowercase().starts_with("signal=") {
-                            let digit = line.trim_start_matches(|c: char| c.to_ascii_lowercase() != 's')
+                            let digit = line
+                                .trim_start_matches(|c: char| !c.eq_ignore_ascii_case(&'s'))
                                 .trim_start_matches("Signal=")
                                 .trim_start_matches("signal=")
                                 .trim();
@@ -862,7 +1089,53 @@ impl SipSession {
                         }
                     }
                 }
-                tx_handle.respond(rsipstack::sip::StatusCode::OK, None, None).await.ok();
+                tx_handle
+                    .respond(rsipstack::sip::StatusCode::OK, None, None)
+                    .await
+                    .ok();
+            }
+            DialogState::Notify(_, request, tx_handle) => {
+                // Respond 200 OK to NOTIFY
+                let _ = tx_handle
+                    .respond(rsipstack::sip::StatusCode::OK, None, None)
+                    .await;
+
+                // Check if this is a REFER-related NOTIFY
+                let is_refer = request.headers.iter().any(|h| {
+                    matches!(h, rsipstack::sip::Header::Event(e) if e.value().eq_ignore_ascii_case("refer"))
+                });
+
+                if is_refer {
+                    let body = String::from_utf8_lossy(request.body());
+                    if let Some(sip_status) = parse_sipfrag_status(&body) {
+                        info!(
+                            session_id = %self.context.session_id,
+                            sip_status = %sip_status,
+                            body = %body.trim(),
+                            "Received REFER NOTIFY"
+                        );
+                        let event = crate::call::domain::ReferNotifyEvent {
+                            call_id: self.id.0.clone(),
+                            sip_status,
+                            reason: None,
+                            event_type: crate::call::domain::ReferNotifyEventType::Notify,
+                        };
+                        let subscribers = self.server.transfer_notify_subscribers.lock().await;
+                        for tx in subscribers.iter() {
+                            let _ = tx.send(event.clone());
+                        }
+                        if (200..300).contains(&sip_status) {
+                            self.hangup_reason
+                                .get_or_insert(CallRecordHangupReason::ByRefer);
+                            self.pending_hangup.insert(self.server_dialog.id());
+                            info!(
+                                session_id = %self.context.session_id,
+                                sip_status = %sip_status,
+                                "REFER completed successfully, hanging up original dialog"
+                            );
+                        }
+                    }
+                }
             }
             DialogState::Terminated(_, reason) => {
                 self.update_leg_state(&LegId::from("caller"), LegState::Ended);
@@ -909,7 +1182,6 @@ impl SipSession {
                     .await?;
             }
             DialogState::Terminated(terminated_dialog_id, reason) => {
-                self.update_leg_state(&LegId::from("callee"), LegState::Ended);
                 self.pending_hangup.remove(&terminated_dialog_id);
                 self.callee_dialogs.remove(&terminated_dialog_id);
                 self.unschedule_timer(&terminated_dialog_id);
@@ -917,6 +1189,20 @@ impl SipSession {
                 self.update_refresh_disabled.remove(&terminated_dialog_id);
                 self.callee_guards
                     .retain(|guard| guard.id() != &terminated_dialog_id);
+
+                let connected_callee_terminated =
+                    self.connected_callee_dialog_id.as_ref() == Some(&terminated_dialog_id);
+                if self.connected_callee_dialog_id.is_some() && !connected_callee_terminated {
+                    debug!(
+                        dialog_id = %terminated_dialog_id,
+                        connected_dialog_id = ?self.connected_callee_dialog_id,
+                        ?reason,
+                        "Ignoring terminated non-connected callee dialog"
+                    );
+                    return Ok(());
+                }
+
+                self.update_leg_state(&LegId::from("callee"), LegState::Ended);
 
                 match &reason {
                     TerminatedReason::UasBye => {
@@ -932,7 +1218,11 @@ impl SipSession {
                     }
                 }
 
-                if self.connected_callee.is_none() {
+                if connected_callee_terminated {
+                    self.connected_callee = None;
+                    self.connected_callee_dialog_id = None;
+                    self.pending_hangup.insert(self.server_dialog.id());
+                } else {
                     let (code, reason_str) = match reason {
                         TerminatedReason::UasBusy => {
                             (Some(StatusCode::BusyHere), Some("Busy Here".to_string()))
@@ -970,8 +1260,6 @@ impl SipSession {
                             warn!(error = %e, "Failed to send rejection response to caller");
                         }
                     }
-                } else {
-                    self.pending_hangup.insert(self.server_dialog.id());
                 }
             }
             _ => {}
@@ -1001,11 +1289,13 @@ impl SipSession {
                     self.run_targets(strategy, callee_state_rx).await
                 }
                 DialplanFlow::Queue { plan, next } => {
-                    if let Err((code, reason)) = self.execute_queue(plan, callee_state_rx).await {
-                        warn!(?code, ?reason, "Queue execution failed, trying next flow");
+                    match self.execute_queue(plan, callee_state_rx).await {
+                        Ok(()) => Ok(()),
+                        Err((code, reason)) => {
+                            warn!(?code, ?reason, "Queue execution failed, trying next flow");
+                            self.execute_flow(next, callee_state_rx).await
+                        }
                     }
-
-                    self.execute_flow(next, callee_state_rx).await
                 }
                 DialplanFlow::Application {
                     app_name,
@@ -1013,8 +1303,14 @@ impl SipSession {
                     auto_answer,
                 } => {
                     info!(app_name = %app_name, "Executing application flow");
-                    if let Err(e) = self.app_runtime.start_app(app_name, app_params.clone(), *auto_answer).await {
+                    if let Err(e) = self
+                        .app_runtime
+                        .start_app(app_name, app_params.clone(), *auto_answer)
+                        .await
+                    {
                         warn!(error = %e, "Failed to start application");
+                    } else {
+                        self.start_caller_ingress_monitor_if_needed().await;
                     }
                     Ok(())
                 }
@@ -1051,7 +1347,7 @@ impl SipSession {
         for (idx, target) in targets.iter().enumerate() {
             info!(index = idx, target = %target.aor, "Trying sequential target");
 
-            match self.try_single_target(target, callee_state_rx).await {
+            match self.try_single_target(target, callee_state_rx, None, None).await {
                 Ok(()) => {
                     info!(index = idx, "Sequential target succeeded");
                     return Ok(());
@@ -1072,7 +1368,7 @@ impl SipSession {
         callee_state_rx: &mut mpsc::UnboundedReceiver<DialogState>,
     ) -> Result<(), (StatusCode, Option<String>)> {
         if let Some(target) = targets.first() {
-            self.try_single_target(target, callee_state_rx).await
+            self.try_single_target(target, callee_state_rx, None, None).await
         } else {
             Err((
                 StatusCode::TemporarilyUnavailable,
@@ -1104,9 +1400,19 @@ impl SipSession {
             return Ok(());
         }
 
+        let resolved_agents = self
+            .resolve_custom_targets(agents, plan.acd_policy.as_deref())
+            .await;
+
+        if resolved_agents.is_empty() {
+            warn!("No agents available after resolving queue targets");
+            return self.execute_queue_fallback(plan).await;
+        }
+
         if plan.accept_immediately {
             info!("Queue: answering call immediately");
-            if let Err(e) = self.accept_call(None, None, None).await {
+            let caller_answer = self.prepare_queue_early_answer(&resolved_agents).await;
+            if let Err(e) = self.accept_call(None, caller_answer, None).await {
                 warn!(error = %e, "Failed to answer call in queue");
             }
         }
@@ -1115,30 +1421,70 @@ impl SipSession {
             if let Some(ref audio_file) = hold.audio_file {
                 info!(file = %audio_file, "Queue: starting hold music");
 
-                self.play_audio_file(audio_file, false, "caller", hold.loop_playback)
+                match self
+                    .play_audio_file(
+                        audio_file,
+                        false,
+                        Self::QUEUE_HOLD_TRACK_ID,
+                        hold.loop_playback,
+                    )
                     .await
-                    .ok()
+                {
+                    Ok(()) => {
+                        info!(track_id = %Self::QUEUE_HOLD_TRACK_ID, "Queue: hold music started");
+                        true
+                    }
+                    Err(error) => {
+                        warn!(
+                            error = %error,
+                            track_id = %Self::QUEUE_HOLD_TRACK_ID,
+                            "Queue: failed to start hold music"
+                        );
+                        false
+                    }
+                }
             } else {
-                None
+                false
             }
         } else {
-            None
+            false
         };
 
         let result = match &plan.dial_strategy {
             Some(DialStrategy::Sequential(_)) => {
-                self.dial_queue_sequential(&agents, plan.ring_timeout, callee_state_rx)
-                    .await
+                self.dial_queue_sequential(
+                    &resolved_agents,
+                    plan.ring_timeout,
+                    callee_state_rx,
+                    plan.voice_prompts
+                        .as_ref()
+                        .and_then(|prompts| prompts.transfer_prompt.as_deref()),
+                )
+                .await
             }
             Some(DialStrategy::Parallel(_)) => {
-                self.dial_queue_parallel(&agents, plan.ring_timeout, callee_state_rx)
-                    .await
+                self.dial_queue_parallel(
+                    &resolved_agents,
+                    plan.ring_timeout,
+                    callee_state_rx,
+                    plan.voice_prompts
+                        .as_ref()
+                        .and_then(|prompts| prompts.transfer_prompt.as_deref()),
+                )
+                .await
             }
             None => Ok(()),
         };
 
-        if hold_handle.is_some() {
+        if hold_handle {
             info!("Queue: stopping hold music");
+            self.stop_playback_track(Self::QUEUE_HOLD_TRACK_ID, false)
+                .await;
+        }
+
+        if self.cancel_token.is_cancelled() || self.server_dialog.state().is_terminated() {
+            info!("Queue: caller ended, stopping queue execution");
+            return Ok(());
         }
 
         match result {
@@ -1153,11 +1499,427 @@ impl SipSession {
         }
     }
 
+    async fn prepare_queue_early_answer(
+        &mut self,
+        agents: &[crate::call::Location],
+    ) -> Option<String> {
+        let caller_is_webrtc = self.is_caller_webrtc();
+        self.caller_is_webrtc = caller_is_webrtc;
+
+        let Some(first_agent) = agents.first() else {
+            return self.ensure_caller_answer_sdp().await;
+        };
+
+        let callee_is_webrtc = first_agent.supports_webrtc;
+        self.callee_is_webrtc = callee_is_webrtc;
+
+        if caller_is_webrtc == callee_is_webrtc {
+            self.caller_answer_uses_media_bridge = false;
+            self.callee_offer_uses_media_bridge = false;
+            return self.ensure_caller_answer_sdp().await;
+        }
+
+        if self.media_bridge.is_none() {
+            match self.create_callee_track(callee_is_webrtc).await {
+                Ok(callee_offer) => {
+                    self.callee_offer = Some(callee_offer);
+                }
+                Err(error) => {
+                    warn!(
+                        session_id = %self.context.session_id,
+                        error = %error,
+                        "Queue early answer: failed to prepare bridge, falling back to caller media"
+                    );
+                    self.caller_answer_uses_media_bridge = false;
+                    self.callee_offer_uses_media_bridge = false;
+                    return self.ensure_caller_answer_sdp().await;
+                }
+            }
+        }
+
+        match self.prepare_bridge_caller_answer().await {
+            Ok(answer) => {
+                self.answer = Some(answer.clone());
+                self.caller_answer_uses_media_bridge = true;
+                self.replace_caller_bridge_output_with_silence().await;
+                Some(answer)
+            }
+            Err(error) => {
+                warn!(
+                    session_id = %self.context.session_id,
+                    error = %error,
+                    "Queue early answer: failed to answer from bridge, falling back to caller media"
+                );
+                self.caller_answer_uses_media_bridge = false;
+                self.callee_offer_uses_media_bridge = false;
+                self.ensure_caller_answer_sdp().await
+            }
+        }
+    }
+
+    async fn prepare_app_caller_media_bridge(&mut self) -> Option<String> {
+        if let Some(ref answer) = self.answer {
+            return Some(answer.clone());
+        }
+
+        let caller_offer = self.caller_offer.clone()?;
+        let caller_is_webrtc = self.is_caller_webrtc();
+        self.caller_is_webrtc = caller_is_webrtc;
+        self.callee_offer_uses_media_bridge = false;
+
+        let created_bridge = self.media_bridge.is_none();
+        if self.media_bridge.is_none()
+            && let Err(error) = self
+                .create_app_caller_media_bridge(&caller_offer, caller_is_webrtc)
+                .await
+        {
+            warn!(
+                session_id = %self.context.session_id,
+                error = %error,
+                "Application answer: failed to prepare media bridge, falling back to caller media"
+            );
+            self.caller_answer_uses_media_bridge = false;
+            return None;
+        }
+
+        match self.prepare_bridge_caller_answer().await {
+            Ok(answer) => {
+                self.answer = Some(answer.clone());
+                self.caller_answer_uses_media_bridge = true;
+                self.replace_caller_bridge_output_with_silence().await;
+                Some(answer)
+            }
+            Err(error) => {
+                if created_bridge
+                    && let Some(bridge) = self.media_bridge.take()
+                {
+                    bridge.stop().await;
+                }
+                warn!(
+                    session_id = %self.context.session_id,
+                    error = %error,
+                    "Application answer: failed to answer from media bridge, falling back to caller media"
+                );
+                self.caller_answer_uses_media_bridge = false;
+                None
+            }
+        }
+    }
+
+    async fn create_app_caller_media_bridge(
+        &mut self,
+        caller_offer: &str,
+        caller_is_webrtc: bool,
+    ) -> Result<()> {
+        let mut bridge_builder = BridgePeerBuilder::new(format!("{}-app-bridge", self.id))
+            .with_enable_latching(self.server.proxy_config.enable_latching);
+
+        if let (Some(start), Some(end)) = (
+            self.server.rtp_config.start_port,
+            self.server.rtp_config.end_port,
+        ) {
+            bridge_builder = bridge_builder.with_rtp_port_range(start, end);
+        }
+
+        if !caller_is_webrtc && caller_offer.contains("a=group:BUNDLE") {
+            bridge_builder = bridge_builder
+                .with_rtp_sdp_compatibility(rustrtc::config::SdpCompatibilityMode::Standard)
+                .with_enable_latching(true);
+            info!(session_id = %self.id, "RTP caller offered BUNDLE, using Standard SDP mode + latching for app media bridge");
+        }
+
+        if let Some(ref external_ip) = self.server.rtp_config.external_ip {
+            bridge_builder = bridge_builder.with_external_ip(external_ip.clone());
+        }
+        if let Some(ref bind_ip) = self.server.rtp_config.bind_ip {
+            bridge_builder = bridge_builder.with_bind_ip(bind_ip.clone());
+        }
+        if let Some(ref ice_servers) = self.context.dialplan.media.ice_servers {
+            bridge_builder = bridge_builder.with_ice_servers(ice_servers.clone());
+        }
+
+        let allow_codecs = &self.context.dialplan.allow_codecs;
+        let codec_lists = MediaNegotiator::build_bridge_codec_lists(
+            caller_offer,
+            caller_is_webrtc,
+            !caller_is_webrtc,
+            allow_codecs,
+        );
+        let webrtc_side_codecs = if caller_is_webrtc {
+            &codec_lists.caller_side
+        } else {
+            &codec_lists.callee_side
+        };
+        let rtp_side_codecs = if caller_is_webrtc {
+            &codec_lists.callee_side
+        } else {
+            &codec_lists.caller_side
+        };
+
+        let webrtc_caps: Vec<_> = webrtc_side_codecs
+            .iter()
+            .filter_map(|codec| codec.to_audio_capability())
+            .collect();
+        let rtp_caps: Vec<_> = rtp_side_codecs
+            .iter()
+            .filter_map(|codec| codec.to_audio_capability())
+            .collect();
+        if !webrtc_caps.is_empty() || !rtp_caps.is_empty() {
+            bridge_builder = bridge_builder
+                .with_webrtc_audio_capabilities(webrtc_caps)
+                .with_rtp_audio_capabilities(rtp_caps);
+        }
+
+        let webrtc_sender = webrtc_side_codecs
+            .iter()
+            .find(|codec| !codec.is_dtmf())
+            .map(|codec| codec.to_params());
+        let rtp_sender = rtp_side_codecs
+            .iter()
+            .find(|codec| !codec.is_dtmf())
+            .map(|codec| codec.to_params());
+        if let (Some(webrtc_sender), Some(rtp_sender)) = (webrtc_sender, rtp_sender) {
+            bridge_builder = bridge_builder.with_sender_codecs(webrtc_sender, rtp_sender);
+        }
+
+        if self.context.dialplan.recording.enabled {
+            bridge_builder = bridge_builder.with_recorder(self.recorder.clone());
+        }
+
+        let bridge = bridge_builder.build();
+        bridge.setup_bridge().await?;
+        self.media_bridge = Some(bridge);
+
+        debug!(
+            session_id = %self.context.session_id,
+            caller_is_webrtc,
+            "Application caller media bridge prepared"
+        );
+
+        Ok(())
+    }
+
+    async fn replace_caller_bridge_output_with_silence(&self) {
+        let Some(bridge) = self.media_bridge.as_ref() else {
+            return;
+        };
+
+        if let Err(error) = bridge
+            .replace_output_with_silence(
+                self.caller_bridge_endpoint(),
+                self.caller_output_codec_info(),
+            )
+            .await
+        {
+            warn!(
+                session_id = %self.context.session_id,
+                error = %error,
+                "Failed to install caller bridge silence source"
+            );
+        }
+    }
+
+    fn caller_output_codec_info(&self) -> CodecInfo {
+        self.caller_offer
+            .as_ref()
+            .map(|offer| MediaNegotiator::extract_codec_params(offer).audio)
+            .and_then(|codecs| codecs.first().cloned())
+            .unwrap_or_else(|| {
+                let codec = CodecType::PCMU;
+                CodecInfo {
+                    payload_type: codec.payload_type(),
+                    codec,
+                    clock_rate: codec.clock_rate(),
+                    channels: codec.channels(),
+                }
+            })
+    }
+
+    async fn prepare_bridge_caller_answer(&self) -> Result<String> {
+        let caller_offer = self
+            .caller_offer
+            .as_deref()
+            .ok_or_else(|| anyhow!("No caller offer available for bridge answer"))?;
+        let bridge = self
+            .media_bridge
+            .as_ref()
+            .ok_or_else(|| anyhow!("No media bridge available for caller answer"))?;
+
+        let pc = if self.caller_is_webrtc {
+            bridge.webrtc_pc().clone()
+        } else {
+            bridge.rtp_pc().clone()
+        };
+
+        if let Some(local_description) = pc.local_description() {
+            return Ok(local_description.to_sdp_string());
+        }
+
+        if pc.remote_description().is_none() {
+            let offer =
+                rustrtc::SessionDescription::parse(rustrtc::SdpType::Offer, caller_offer)
+                    .map_err(|e| anyhow!("Failed to parse caller offer SDP: {}", e))?;
+            pc.set_remote_description(offer)
+                .await
+                .map_err(|e| anyhow!("Failed to set bridge caller remote description: {}", e))?;
+        }
+
+        let answer = pc
+            .create_answer()
+            .await
+            .map_err(|e| anyhow!("Failed to create bridge caller answer: {}", e))?;
+        pc.set_local_description(answer)
+            .map_err(|e| anyhow!("Failed to set bridge caller local answer: {}", e))?;
+
+        if self.caller_is_webrtc {
+            pc.wait_for_gathering_complete().await;
+        }
+
+        pc.local_description()
+            .map(|desc| desc.to_sdp_string())
+            .ok_or_else(|| anyhow!("Bridge caller side has no local answer"))
+    }
+
+    /// Resolve queue targets to the concrete locations used for dialing.
+    ///
+    /// Custom targets (e.g. skill-group:) are expanded through the AgentRegistry.
+    /// Same-realm SIP targets are then looked up in the registrar locator so
+    /// registered contact metadata such as transport and WebRTC support is used.
+    /// Uses the AgentRegistry trait's resolve_target hook, which allows addons
+    /// to implement custom routing logic without queue knowing the details.
+    async fn resolve_custom_targets(
+        &self,
+        locations: Vec<crate::call::Location>,
+        acd_policy: Option<&str>,
+    ) -> Vec<crate::call::Location> {
+        let mut expanded = Vec::new();
+        let agent_registry = self.server.agent_registry.clone();
+
+        for location in locations {
+            let uri_str = location.aor.to_string();
+
+            // Check if this is a custom target that needs resolution
+            // Custom targets typically have a scheme prefix like "skill-group:"
+            if uri_str.contains(':') {
+                let scheme = uri_str.split(':').next().unwrap_or("");
+
+                // Only resolve known custom schemes, not standard SIP URIs
+                if scheme != "sip" && scheme != "sips" && scheme != "tel" {
+                    info!(target = %uri_str, "Resolving custom target to agents");
+
+                    if let Some(registry) = &agent_registry {
+                        // Use the registry's resolve_target hook
+                        // CC addon implements this to resolve skill-group: URIs
+                        let agent_uris = registry
+                            .resolve_target_with_policy(&uri_str, acd_policy)
+                            .await;
+
+                        if agent_uris.is_empty() {
+                            warn!(target = %uri_str, "No agents resolved for custom target");
+                        } else {
+                            let resolved_sample =
+                                agent_uris.iter().take(5).cloned().collect::<Vec<_>>();
+                            let mut parsed_count = 0usize;
+                            info!(
+                                target = %uri_str,
+                                agent_count = agent_uris.len(),
+                                resolved_uris = ?resolved_sample,
+                                "Resolved custom target to agents"
+                            );
+
+                            // Create locations for each resolved agent URI.
+                            // Try to look up the agent's registered location via the
+                            // locator so we get the real transport/webrtc flags instead
+                            // of building a bare Location that defaults to RTP.
+                            for agent_uri in agent_uris {
+                                if let Ok(uri) = rsipstack::sip::Uri::try_from(agent_uri.clone()) {
+                                    // Query the SIP registrar for this agent's live contact.
+                                    let registered_locations =
+                                        self.server.locator.lookup(&uri).await.unwrap_or_default();
+
+                                    if let Some(reg_loc) = registered_locations.into_iter().next() {
+                                        // Use the full registered location (preserves
+                                        // supports_webrtc, destination, transport, etc.)
+                                        expanded.push(reg_loc);
+                                    } else {
+                                        // Agent not currently registered.
+                                        let host = uri.host().to_string();
+                                        if self.server.is_same_realm(&host).await {
+                                            // Local realm agent not registered → offline; skip.
+                                            warn!(
+                                                agent = %agent_uri,
+                                                "Agent offline (not registered in local realm), skipping"
+                                            );
+                                            continue;
+                                        }
+                                        // External realm address not in locator; pass
+                                        // through as a bare location for external delivery.
+                                        let agent_location = crate::call::Location {
+                                            aor: uri,
+                                            contact_raw: Some(agent_uri),
+                                            ..Default::default()
+                                        };
+                                        expanded.push(agent_location);
+                                    }
+                                    parsed_count += 1;
+                                }
+                            }
+
+                            info!(
+                                target = %uri_str,
+                                parsed_location_count = parsed_count,
+                                "Resolved custom target parsed into dialable locations"
+                            );
+                        }
+                    } else {
+                        warn!("No agent registry available to resolve custom target");
+                    }
+                    continue;
+                }
+            }
+
+            // Standard target, pass through as-is
+            expanded.push(location);
+        }
+
+        let mut resolved = Vec::new();
+        for location in expanded {
+            let target_realm = location.aor.host().to_string();
+            if !self.server.is_same_realm(&target_realm).await {
+                resolved.push(location);
+                continue;
+            }
+
+            match self.server.locator.lookup(&location.aor).await {
+                Ok(locations) if !locations.is_empty() => {
+                    info!(
+                        target = %location.aor,
+                        resolved_count = locations.len(),
+                        "Resolved queue target through locator"
+                    );
+                    resolved.extend(locations);
+                }
+                Ok(_) => resolved.push(location),
+                Err(error) => {
+                    warn!(
+                        target = %location.aor,
+                        error = %error,
+                        "Failed to resolve queue target through locator"
+                    );
+                    resolved.push(location);
+                }
+            }
+        }
+
+        resolved
+    }
+
     async fn dial_queue_sequential(
         &mut self,
         agents: &[crate::call::Location],
         _ring_timeout: Option<Duration>,
         callee_state_rx: &mut mpsc::UnboundedReceiver<DialogState>,
+        transfer_prompt: Option<&str>,
     ) -> Result<(), (StatusCode, Option<String>)> {
         let mut last_error = (
             StatusCode::TemporarilyUnavailable,
@@ -1165,9 +1927,22 @@ impl SipSession {
         );
 
         for (idx, agent) in agents.iter().enumerate() {
+            if self.cancel_token.is_cancelled() || self.server_dialog.state().is_terminated() {
+                info!("Queue: caller ended before next agent");
+                return Ok(());
+            }
+
             info!(index = idx, agent = %agent.aor, "Queue: trying agent");
 
-            match self.try_single_target(agent, callee_state_rx).await {
+            match self
+                .try_single_target(
+                    agent,
+                    callee_state_rx,
+                    Some(Self::QUEUE_HOLD_TRACK_ID),
+                    transfer_prompt,
+                )
+                .await
+            {
                 Ok(()) => {
                     info!(index = idx, "Queue: agent connected");
                     return Ok(());
@@ -1187,10 +1962,17 @@ impl SipSession {
         agents: &[crate::call::Location],
         _ring_timeout: Option<Duration>,
         callee_state_rx: &mut mpsc::UnboundedReceiver<DialogState>,
+        transfer_prompt: Option<&str>,
     ) -> Result<(), (StatusCode, Option<String>)> {
         if let Some(agent) = agents.first() {
             info!(agent = %agent.aor, "Queue: trying parallel agent");
-            self.try_single_target(agent, callee_state_rx).await
+            self.try_single_target(
+                agent,
+                callee_state_rx,
+                Some(Self::QUEUE_HOLD_TRACK_ID),
+                transfer_prompt,
+            )
+            .await
         } else {
             Err((
                 StatusCode::TemporarilyUnavailable,
@@ -1199,19 +1981,43 @@ impl SipSession {
         }
     }
 
+    async fn play_queue_transfer_prompt_before_bridge(&mut self, transfer_prompt: Option<&str>) {
+        let Some(audio_file) = transfer_prompt.map(str::trim).filter(|value| !value.is_empty())
+        else {
+            debug!("Queue: no transfer prompt configured");
+            return;
+        };
+
+        info!(file = %audio_file, "Queue: playing transfer prompt before bridging agent audio");
+        match self
+            .play_audio_file(audio_file, true, "queue-transfer-prompt", false)
+            .await
+        {
+            Ok(()) => {
+                self.stop_playback_track("queue-transfer-prompt", false).await;
+                info!(file = %audio_file, "Queue: transfer prompt completed");
+            }
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    file = %audio_file,
+                    "Queue: failed to play transfer prompt before bridging agent audio"
+                );
+            }
+        }
+    }
+
     async fn execute_queue_fallback(
         &mut self,
         plan: &crate::call::QueuePlan,
     ) -> Result<(), (StatusCode, Option<String>)> {
-        use crate::call::{FailureAction, QueueFallbackAction};
+        use crate::call::{FailureAction, QueueFallbackAction, TransferEndpoint};
 
         match &plan.fallback {
             Some(QueueFallbackAction::Failure(FailureAction::Hangup { code, reason })) => {
-                info!(?code, ?reason, "Queue fallback: hangup");
+                info!(?code, ?reason, "Queue fallback - hangup");
                 Err((
-                    code.as_ref()
-                        .map(|c| StatusCode::from(c.clone()))
-                        .unwrap_or(StatusCode::TemporarilyUnavailable),
+                    code.clone().unwrap_or(StatusCode::TemporarilyUnavailable),
                     reason.clone(),
                 ))
             }
@@ -1221,7 +2027,9 @@ impl SipSession {
                 status_code,
                 reason,
             })) => {
-                info!(file = %audio_file, "Queue fallback: play then hangup");
+                info!(file = %audio_file, "Queue fallback - play then hangup");
+
+                self.prepare_queue_fallback_audio_media().await;
 
                 if let Err(e) = self
                     .play_audio_file(audio_file, true, "caller", false)
@@ -1229,37 +2037,138 @@ impl SipSession {
                 {
                     warn!(error = %e, "Failed to play fallback audio");
                 }
-                Err((StatusCode::from(status_code.clone()), reason.clone()))
+                Err((status_code.clone(), reason.clone()))
             }
             Some(QueueFallbackAction::Failure(FailureAction::Transfer(target))) => {
-                info!(target = %target, "Queue fallback: transfer");
+                info!(target = ?target, "Queue fallback - transfer");
 
-                Err((
-                    StatusCode::TemporarilyUnavailable,
-                    Some(format!("Transfer to {} not implemented", target)),
-                ))
+                match target {
+                    TransferEndpoint::Uri(uri) => {
+                        Box::pin(self.handle_blind_transfer(LegId::from("caller"), uri.clone()))
+                            .await
+                            .map_err(|e| {
+                                (
+                                    StatusCode::TemporarilyUnavailable,
+                                    Some(format!("Transfer failed: {}", e)),
+                                )
+                            })
+                    }
+                    TransferEndpoint::Queue(queue_name) => {
+                        Box::pin(
+                            self.handle_queue_transfer(LegId::from("caller"), queue_name, None),
+                        )
+                        .await
+                        .map_err(|e| {
+                            (
+                                StatusCode::TemporarilyUnavailable,
+                                Some(format!("Transfer failed: {}", e)),
+                            )
+                        })
+                    }
+                    TransferEndpoint::Ivr(ivr_name) => {
+                        info!(ivr = %ivr_name, "Queue fallback - transferring to IVR");
+                        self.start_ivr_app(ivr_name).await.map_err(|e| {
+                            (
+                                StatusCode::ServerInternalError,
+                                Some(format!("Failed to start IVR: {}", e)),
+                            )
+                        })?;
+                        Ok(())
+                    }
+                }
             }
             Some(QueueFallbackAction::Redirect { target }) => {
-                info!(target = %target, "Queue fallback: redirect");
-                Err((
-                    StatusCode::TemporarilyUnavailable,
-                    Some("Redirect not implemented".to_string()),
-                ))
+                info!(target = %target, "Queue fallback - redirecting call");
+
+                // Current dialog API does not expose direct 302 + Contact helper.
+                // Use REFER-based transfer to approximate redirect behavior.
+                Box::pin(self.handle_blind_transfer(LegId::from("caller"), target.to_string()))
+                    .await
+                    .map_err(|e| {
+                        (
+                            StatusCode::TemporarilyUnavailable,
+                            Some(format!("Redirect failed: {}", e)),
+                        )
+                    })
             }
             Some(QueueFallbackAction::Queue { name }) => {
-                info!(queue = %name, "Queue fallback: transfer to another queue");
-                Err((
-                    StatusCode::TemporarilyUnavailable,
-                    Some(format!("Queue transfer to {} not implemented", name)),
-                ))
+                if name.starts_with("skill-group:") {
+                    let skill_group_id = name.strip_prefix("skill-group:").unwrap_or(name).trim();
+                    info!(skill_group = %skill_group_id, "Queue fallback - transfer to skill group");
+
+                    // Use AgentRegistry to resolve skill group to agents
+                    if let Some(registry) = self.server.agent_registry.clone() {
+                        let skill_group_uri = format!("skill-group:{}", skill_group_id);
+                        let agents = registry.resolve_target(&skill_group_uri).await;
+                        if !agents.is_empty() {
+                            info!(agents = ?agents, "Resolved skill group to agents");
+                            // Try to transfer to first available agent
+                            let target = agents[0].clone();
+                            Box::pin(self.handle_blind_transfer(LegId::from("caller"), target))
+                                .await
+                                .map_err(|e| {
+                                    (
+                                        StatusCode::TemporarilyUnavailable,
+                                        Some(format!("Transfer failed: {}", e)),
+                                    )
+                                })
+                        } else {
+                            warn!(skill_group = %skill_group_id, "No agents found for this skill group");
+                            Err((
+                                StatusCode::TemporarilyUnavailable,
+                                Some(format!(
+                                    "No agents available for skill group {}",
+                                    skill_group_id
+                                )),
+                            ))
+                        }
+                    } else {
+                        warn!("No agent registry available for skill group resolution");
+                        Err((
+                            StatusCode::TemporarilyUnavailable,
+                            Some("Agent registry not available".to_string()),
+                        ))
+                    }
+                } else {
+                    info!(queue = %name, "Queue fallback - transfer to another queue");
+                    // Re-enqueue to another queue by starting QueueApp with new plan
+                    match Box::pin(self.handle_queue_transfer(LegId::from("caller"), name, None)).await {
+                        Ok(_) => {
+                            info!(queue = %name, "Queue fallback - re-enqueue succeeded");
+                            Ok(())
+                        }
+                        Err(e) => {
+                            warn!(queue = %name, error = %e, "Queue fallback - re-enqueue operation failed");
+                            Err((
+                                StatusCode::TemporarilyUnavailable,
+                                Some(format!("Re-enqueue failed: {}", e)),
+                            ))
+                        }
+                    }
+                }
             }
             None => {
-                info!("Queue fallback: default hangup");
+                info!("Queue fallback - default hangup with busy tone");
                 Err((
-                    StatusCode::TemporarilyUnavailable,
+                    StatusCode::BusyHere,
                     Some("All agents unavailable".to_string()),
                 ))
             }
+        }
+    }
+
+    async fn prepare_queue_fallback_audio_media(&mut self) {
+        if self.server_dialog.state().is_confirmed() {
+            let _ = self.ensure_caller_answer_sdp().await;
+            return;
+        }
+
+        let caller_answer = self.ensure_caller_answer_sdp().await;
+        if let Err(error) = self.accept_call(None, caller_answer, None).await {
+            warn!(
+                error = %error,
+                "Queue fallback: failed to prepare caller media before fallback audio"
+            );
         }
     }
 
@@ -1267,6 +2176,8 @@ impl SipSession {
         &mut self,
         target: &crate::call::Location,
         callee_state_rx: &mut mpsc::UnboundedReceiver<DialogState>,
+        stop_playback_on_answer: Option<&str>,
+        transfer_prompt_after_answer: Option<&str>,
     ) -> Result<(), (StatusCode, Option<String>)> {
         use rsipstack::dialog::dialog::DialogState;
         use rsipstack::dialog::invitation::InviteOption;
@@ -1278,16 +2189,35 @@ impl SipSession {
             )
         })?;
 
-        let callee_uri = target.aor.clone();
+        let local_addrs = self.server.endpoint.get_addrs();
+        let cluster_enabled = !self.server.cluster_peer_ips.is_empty();
+        let route_via_home_proxy = Self::route_via_home_proxy(target, &local_addrs, cluster_enabled);
+        let callee_uri = Self::resolve_outbound_callee_uri(target, route_via_home_proxy);
 
         let mut headers: Vec<rsipstack::sip::Header> =
             vec![rsipstack::sip::headers::MaxForwards::from(self.context.max_forwards).into()];
+
+        // When routing to another PBX node via home_proxy, we intentionally do NOT
+        // add a Record-Route on the outbound INVITE. The Contact header already
+        // provides the correct return path for the callee's responses and in-dialog
+        // requests to reach this proxy. Adding a self-referencing Record-Route would
+        // pollute the dialog route-set with the local address, causing all subsequent
+        // in-dialog requests (BYE, ACK) to loopback to this node instead of reaching
+        // the remote agent node.
+        if route_via_home_proxy {
+            debug!(
+                session_id = %self.context.session_id,
+                %callee_uri,
+                "Routing via home_proxy request URI without self-referencing Record-Route"
+            );
+        }
+
         let default_expires = self
             .server
             .proxy_config
             .session_expires
             .unwrap_or(DEFAULT_SESSION_EXPIRES);
-        if self.server.proxy_config.session_timer {
+        if self.server.proxy_config.session_timer_mode().is_enabled() {
             headers.extend(build_default_session_timer_headers(
                 default_expires,
                 MIN_MIN_SE,
@@ -1295,8 +2225,16 @@ impl SipSession {
         }
 
         let callee_is_webrtc = target.supports_webrtc;
+        let caller_is_webrtc = self.is_caller_webrtc();
+        self.caller_is_webrtc = caller_is_webrtc;
+        self.callee_is_webrtc = callee_is_webrtc;
 
-        let callee_sdp = self.create_callee_track(callee_is_webrtc).await.ok();
+        let callee_sdp = if self.bypasses_local_media() && caller_is_webrtc == callee_is_webrtc {
+            self.callee_offer_uses_media_bridge = false;
+            self.caller_offer.clone()
+        } else {
+            self.create_callee_track(callee_is_webrtc).await.ok()
+        };
         self.callee_offer = callee_sdp.clone();
 
         let offer = if self.media_bridge.is_some() {
@@ -1328,6 +2266,18 @@ impl SipSession {
         });
         self.callee_call_ids.insert(callee_call_id.clone());
 
+        if route_via_home_proxy {
+            if let Some(home_proxy) = target.home_proxy.as_ref() {
+                info!(
+                    session_id = %self.context.session_id,
+                    %caller,
+                    %callee_uri,
+                    %home_proxy,
+                    "Routing INVITE to home proxy node"
+                );
+            }
+        }
+
         info!(session_id = %self.context.session_id, %caller, %callee_uri, callee_call_id, "Sending INVITE to callee");
 
         let mut invite_option = InviteOption {
@@ -1336,7 +2286,7 @@ impl SipSession {
             caller: caller.clone(),
             content_type,
             offer,
-            destination: target.destination.clone(),
+            destination: None,
             contact: contact_uri,
             credential: target.credential.clone(),
             headers: Some(headers),
@@ -1356,9 +2306,23 @@ impl SipSession {
         let mut invitation = dialog_layer
             .do_invite(invite_option.clone(), state_tx.clone())
             .boxed();
+        let mut caller_end_check = tokio::time::interval(Duration::from_millis(100));
 
         let result = loop {
             tokio::select! {
+                _ = caller_end_check.tick() => {
+                    if self.server_dialog.state().is_terminated() {
+                        info!(
+                            session_id = %self.context.session_id,
+                            "Caller dialog terminated while callee INVITE was pending"
+                        );
+                        self.cancel_token.cancel();
+                        break Err((
+                            StatusCode::RequestTerminated,
+                            Some("Caller cancelled".to_string()),
+                        ));
+                    }
+                }
                 _ = self.cancel_token.cancelled() => {
                     break Err((
                         StatusCode::RequestTerminated,
@@ -1369,26 +2333,20 @@ impl SipSession {
                     break match res {
                         Ok((dialog, response)) => {
                             if let Some(ref resp) = response {
-                                if self.server.proxy_config.session_timer
+                                if self.server.proxy_config.session_timer_mode().is_enabled()
                                     && resp.status_code == StatusCode::SessionIntervalTooSmall
                                     && retry_count < 1
-                                {
-                                    if let Some(min_se_value) =
+                                    && let Some(min_se_value) =
                                         get_header_value(&resp.headers, HEADER_MIN_SE)
-                                    {
-                                        if let Some(min_se) = parse_min_se(&min_se_value) {
+                                        && let Some(min_se) = parse_min_se(&min_se_value) {
                                             if let Some(headers) = &mut invite_option.headers {
-                                                headers.retain(|header| match header {
+                                                headers.retain(|header| !matches!(header,
                                                     rsipstack::sip::Header::Other(name, _)
                                                         if name.eq_ignore_ascii_case(
                                                             HEADER_SESSION_EXPIRES,
                                                         )
-                                                            || name.eq_ignore_ascii_case(HEADER_MIN_SE) =>
-                                                    {
-                                                        false
-                                                    }
-                                                    _ => true,
-                                                });
+                                                            || name.eq_ignore_ascii_case(HEADER_MIN_SE)
+                                                ));
 
                                                 for header in headers.iter_mut() {
                                                     if let rsipstack::sip::Header::Supported(value) = header {
@@ -1432,14 +2390,12 @@ impl SipSession {
                                                 .boxed();
                                             continue;
                                         }
-                                    }
-                                }
 
                                 if resp.status_code.kind() == rsipstack::sip::StatusCodeKind::Successful {
                                     Ok((dialog.id(), response))
                                 } else {
 
-                                    let code = StatusCode::from(resp.status_code.code() as u16);
+                                    let code = StatusCode::from(resp.status_code.code());
 
                                     Err((code, None))
                                 }
@@ -1527,6 +2483,9 @@ impl SipSession {
                 Some(String::from_utf8_lossy(body).to_string())
             }
         });
+        if let Some(track_id) = stop_playback_on_answer {
+            self.stop_playback_track(track_id, false).await;
+        }
         let caller_answer = self
             .prepare_caller_answer_from_callee_sdp(callee_sdp, false)
             .await;
@@ -1539,10 +2498,29 @@ impl SipSession {
         .await
         .map_err(|e| (StatusCode::ServerInternalError, Some(e.to_string())))?;
 
+        self.play_queue_transfer_prompt_before_bridge(transfer_prompt_after_answer)
+            .await;
+
+        self.connected_callee_dialog_id = Some(dialog_id.clone());
         self.callee_dialogs.insert(dialog_id.clone(), ());
-        if self.server.proxy_config.session_timer {
+        if self.server.proxy_config.session_timer_mode().is_enabled() {
             if let Some(ref response) = response {
-                self.init_callee_timer(dialog_id.clone(), response, default_expires);
+                let requested_session_interval = invite_option
+                    .headers
+                    .as_ref()
+                    .and_then(|headers| {
+                        headers
+                            .iter()
+                            .find(|header| {
+                                header.name().eq_ignore_ascii_case(HEADER_SESSION_EXPIRES)
+                            })
+                            .map(|header| header.value().to_string())
+                    })
+                    .as_deref()
+                    .and_then(parse_session_expires)
+                    .map(|(interval, _)| interval)
+                    .unwrap_or_else(|| Duration::from_secs(default_expires));
+                self.init_callee_timer(dialog_id.clone(), response, requested_session_interval);
             }
         }
         self.callee_guards.push(ClientDialogGuard::new(
@@ -1581,6 +2559,68 @@ impl SipSession {
             );
         }
 
+        if self.server_dialog.state().is_confirmed()
+            && self.answer.is_some()
+            && self.media_bridge.is_some()
+            && self.caller_answer_uses_media_bridge
+            && self.callee_offer_uses_media_bridge
+        {
+            match self.apply_bridge_callee_answer(&callee_sdp_value).await {
+                Ok(()) => {
+                    self.configure_media_bridge_transcoders(
+                        self.answer.as_deref(),
+                        Some(&callee_sdp_value),
+                    );
+                    self.start_media_bridge_forwarding().await;
+                }
+                Err(error) => {
+                    warn!(
+                        session_id = %self.context.session_id,
+                        error = %error,
+                        "Failed to apply callee answer to existing media bridge"
+                    );
+                }
+            }
+
+            self.callee_answer_sdp = Some(callee_sdp_value);
+            return self.answer.clone();
+        }
+
+        if self.server_dialog.state().is_confirmed()
+            && self.answer.is_some()
+            && self.media_profile.path == MediaPathMode::Anchored
+            && self.media_bridge.is_none()
+        {
+            debug!(
+                session_id = %self.context.session_id,
+                "Caller dialog already confirmed; keeping existing caller track/SDP and only updating callee-side forwarding"
+            );
+
+            let caller_answer = self.answer.clone();
+
+            if let Err(e) = self
+                .callee_peer
+                .update_remote_description(Self::CALLEE_TRACK_ID, &callee_sdp_value)
+                .await
+            {
+                warn!(
+                    session_id = %self.context.session_id,
+                    error = %e,
+                    "Failed to set callee answer on callee track"
+                );
+            }
+
+            self.callee_answer_sdp = Some(callee_sdp_value);
+            let callee_answer_for_forwarding = self.callee_answer_sdp.clone();
+            self.start_anchored_media_forwarding(
+                caller_answer.as_deref(),
+                callee_answer_for_forwarding.as_deref(),
+            )
+            .await;
+
+            return caller_answer;
+        }
+
         let callee_sdp = Some(callee_sdp_value.clone());
         let caller_is_webrtc = self.is_caller_webrtc();
         let callee_is_webrtc = self.callee_is_webrtc;
@@ -1590,8 +2630,6 @@ impl SipSession {
             if let Some(ref sdp) = callee_sdp {
                 if let Some(ref bridge) = self.media_bridge {
                     use rustrtc::sdp::{SdpType, SessionDescription};
-
-                    let callee_profile = MediaNegotiator::extract_leg_profile(sdp);
 
                     // 1. Set callee's RTP answer on bridge's RTP side
                     if let Ok(desc) = SessionDescription::parse(SdpType::Answer, sdp) {
@@ -1618,13 +2656,21 @@ impl SipSession {
 
                     // Log post-negotiation RTP pair and payload map for diagnostics
                     if let Some(pair) = bridge.rtp_pc().ice_transport().get_selected_pair().await {
-                        let payload_map = bridge.rtp_pc().get_transceivers()
+                        let payload_map = bridge
+                            .rtp_pc()
+                            .get_transceivers()
                             .iter()
                             .find(|t| t.kind() == rustrtc::MediaKind::Audio)
                             .map(|t| t.get_payload_map())
                             .unwrap_or_default();
-                        let pt_info: Vec<String> = payload_map.iter()
-                            .map(|(pt, params)| format!("{}(clock_rate={},channels={})", pt, params.clock_rate, params.channels))
+                        let pt_info: Vec<String> = payload_map
+                            .iter()
+                            .map(|(pt, params)| {
+                                format!(
+                                    "{}(clock_rate={},channels={})",
+                                    pt, params.clock_rate, params.channels
+                                )
+                            })
                             .collect();
                         info!(
                             session_id = %self.context.session_id,
@@ -1662,9 +2708,9 @@ impl SipSession {
                                                         .local_description()
                                                         .map(|d| d.to_sdp_string())
                                                         .map(|answer_sdp| {
-                                                            MediaNegotiator::restrict_audio_answer_to_profile(
+                                                            MediaNegotiator::restrict_answer_to_callee_accepted_codecs(
                                                                 &answer_sdp,
-                                                                &callee_profile,
+                                                                sdp,
                                                             )
                                                             .unwrap_or(answer_sdp)
                                                         })
@@ -1708,10 +2754,10 @@ impl SipSession {
 
                     // 1. Set callee's WebRTC answer on bridge's WebRTC side
                     debug!(session_id = %self.context.session_id, sdp= %sdp, "Bridge: Setting WebRTC side remote from callee answer");
-                    if let Ok(desc) = SessionDescription::parse(SdpType::Answer, sdp) {
-                        if let Err(e) = bridge.webrtc_pc().set_remote_description(desc).await {
-                            warn!(session_id = %self.context.session_id, error = %e, "Failed to set bridge WebRTC remote description");
-                        }
+                    if let Ok(desc) = SessionDescription::parse(SdpType::Answer, sdp)
+                        && let Err(e) = bridge.webrtc_pc().set_remote_description(desc).await
+                    {
+                        warn!(session_id = %self.context.session_id, error = %e, "Failed to set bridge WebRTC remote description");
                     }
 
                     // 2. Set caller's RTP offer on bridge's RTP side and create answer
@@ -1768,23 +2814,26 @@ impl SipSession {
                 callee_sdp.clone()
             }
         } else if self.media_profile.path == MediaPathMode::Anchored {
-            if let Some(ref sdp) = callee_sdp {
-                if let Err(e) = self
+            if let Some(ref sdp) = callee_sdp
+                && let Err(e) = self
                     .callee_peer
                     .update_remote_description(Self::CALLEE_TRACK_ID, sdp)
                     .await
-                {
-                    warn!(
-                        session_id = %self.context.session_id,
-                        error = %e,
-                        "Failed to set callee answer on callee track"
-                    );
-                }
+            {
+                warn!(
+                    session_id = %self.context.session_id,
+                    error = %e,
+                    "Failed to set callee answer on callee track"
+                );
             }
 
             if let Some(ref caller_offer) = self.caller_offer {
                 let codec_info =
-                    MediaNegotiator::build_caller_answer_codec_list(caller_offer, caller_is_webrtc);
+                    MediaNegotiator::build_caller_answer_codec_list_with_allow(
+                        caller_offer,
+                        caller_is_webrtc,
+                        &self.context.dialplan.allow_codecs,
+                    );
 
                 let mut track_builder = RtpTrackBuilder::new(Self::CALLER_TRACK_ID.to_string())
                     .with_cancel_token(self.caller_peer.cancel_token())
@@ -1792,6 +2841,9 @@ impl SipSession {
 
                 if let Some(ip) = self.caller_facing_ip_str() {
                     track_builder = track_builder.with_external_ip(ip);
+                }
+                if let Some(ref bind_ip) = self.server.rtp_config.bind_ip {
+                    track_builder = track_builder.with_bind_ip(bind_ip.clone());
                 }
 
                 let (start_port, end_port) = if caller_is_webrtc {
@@ -1816,7 +2868,7 @@ impl SipSession {
 
                 if caller_is_webrtc {
                     track_builder = track_builder.with_mode(rustrtc::TransportMode::WebRtc);
-                    if let Some(ref ice_servers) = self.server.rtp_config.ice_servers {
+                    if let Some(ref ice_servers) = self.context.dialplan.media.ice_servers {
                         track_builder = track_builder.with_ice_servers(ice_servers.clone());
                     }
                 }
@@ -1849,6 +2901,11 @@ impl SipSession {
 
         self.callee_answer_sdp = callee_sdp.clone();
         self.answer = caller_answer.clone();
+        self.caller_answer_uses_media_bridge = self.callee_offer_uses_media_bridge
+            && self.media_bridge.is_some()
+            && caller_answer.is_some();
+
+        self.configure_media_bridge_transcoders(caller_answer.as_deref(), callee_sdp.as_deref());
 
         if self.media_profile.path == MediaPathMode::Anchored && self.media_bridge.is_none() {
             let caller_answer_for_forwarding = self.answer.clone();
@@ -1860,13 +2917,138 @@ impl SipSession {
             .await;
         }
 
+        if self.media_bridge.is_some() && self.caller_answer_uses_media_bridge {
+            self.start_media_bridge_forwarding().await;
+        }
+
         caller_answer
     }
+
+    fn configure_media_bridge_transcoders(
+        &self,
+        caller_answer_sdp: Option<&str>,
+        callee_answer_sdp: Option<&str>,
+    ) {
+        let Some(bridge) = self.media_bridge.as_ref() else {
+            return;
+        };
+        let Some(caller_answer_sdp) = caller_answer_sdp else {
+            return;
+        };
+        let Some(callee_answer_sdp) = callee_answer_sdp else {
+            return;
+        };
+
+        let caller_profile = MediaNegotiator::extract_leg_profile(caller_answer_sdp);
+        let callee_profile = MediaNegotiator::extract_leg_profile(callee_answer_sdp);
+
+        let (Some(caller_audio), Some(callee_audio)) =
+            (&caller_profile.audio, &callee_profile.audio)
+        else {
+            return;
+        };
+
+        if caller_audio.codec == callee_audio.codec {
+            bridge.clear_transcoder(self.caller_bridge_endpoint());
+            bridge.clear_transcoder(self.callee_bridge_endpoint());
+            debug!(
+                session_id = %self.context.session_id,
+                codec = ?caller_audio.codec,
+                "Bridge transcoder not needed; caller and callee selected the same codec"
+            );
+            return;
+        }
+
+        bridge.set_transcoder(
+            self.caller_bridge_endpoint(),
+            caller_audio.codec,
+            callee_audio.codec,
+            callee_audio.payload_type,
+        );
+        bridge.set_transcoder(
+            self.callee_bridge_endpoint(),
+            callee_audio.codec,
+            caller_audio.codec,
+            caller_audio.payload_type,
+        );
+        info!(
+            session_id = %self.context.session_id,
+            caller_codec = ?caller_audio.codec,
+            caller_pt = caller_audio.payload_type,
+            callee_codec = ?callee_audio.codec,
+            callee_pt = callee_audio.payload_type,
+            "Bridge transcoder configured for selected codec mismatch"
+        );
+    }
+
+    async fn start_media_bridge_forwarding(&mut self) {
+        if self.media_bridge_started {
+            return;
+        }
+
+        if let Some(ref bridge) = self.media_bridge {
+            let caller_pc = if self.caller_is_webrtc {
+                bridge.webrtc_pc()
+            } else {
+                bridge.rtp_pc()
+            };
+            let callee_pc = if self.callee_is_webrtc {
+                bridge.webrtc_pc()
+            } else {
+                bridge.rtp_pc()
+            };
+
+            if caller_pc.local_description().is_none()
+                || caller_pc.remote_description().is_none()
+                || callee_pc.local_description().is_none()
+                || callee_pc.remote_description().is_none()
+            {
+                warn!(
+                    session_id = %self.context.session_id,
+                    caller_local = caller_pc.local_description().is_some(),
+                    caller_remote = caller_pc.remote_description().is_some(),
+                    callee_local = callee_pc.local_description().is_some(),
+                    callee_remote = callee_pc.remote_description().is_some(),
+                    "Media bridge forwarding not started because SDP is incomplete"
+                );
+                return;
+            }
+
+            bridge.replace_output_with_peer(self.caller_bridge_endpoint());
+            bridge.replace_output_with_peer(self.callee_bridge_endpoint());
+
+            info!(
+                session_id = %self.context.session_id,
+                "Starting media bridge forwarding"
+            );
+            bridge.start_bridge().await;
+            self.media_bridge_started = true;
+        }
+    }
+
+    fn caller_bridge_endpoint(&self) -> BridgeEndpoint {
+        if self.caller_is_webrtc {
+            BridgeEndpoint::WebRtc
+        } else {
+            BridgeEndpoint::Rtp
+        }
+    }
+
+    fn callee_bridge_endpoint(&self) -> BridgeEndpoint {
+        if self.callee_is_webrtc {
+            BridgeEndpoint::WebRtc
+        } else {
+            BridgeEndpoint::Rtp
+        }
+    }
+
     async fn start_anchored_media_forwarding(
         &mut self,
         caller_answer_sdp: Option<&str>,
         callee_answer_sdp: Option<&str>,
     ) {
+        self.stop_caller_ingress_monitor().await;
+
         use crate::media::recorder::Leg;
 
         let session_id = self.context.session_id.clone();
@@ -1883,10 +3065,10 @@ impl SipSession {
         };
 
         let caller_profile = caller_answer_sdp
-            .map(|sdp| MediaNegotiator::extract_leg_profile(sdp))
+            .map(MediaNegotiator::extract_leg_profile)
             .unwrap_or_default();
         let callee_profile = callee_answer_sdp
-            .map(|sdp| MediaNegotiator::extract_leg_profile(sdp))
+            .map(MediaNegotiator::extract_leg_profile)
             .unwrap_or_default();
 
         if let (Some(ca), Some(ce)) = (&caller_profile.audio, &callee_profile.audio) {
@@ -1993,6 +3175,202 @@ impl SipSession {
         None
     }
 
+    async fn find_audio_receiver_track(
+        pc: &rustrtc::PeerConnection,
+    ) -> Option<Arc<dyn rustrtc::media::MediaStreamTrack>> {
+        for transceiver in pc.get_transceivers() {
+            if transceiver.kind() == rustrtc::MediaKind::Audio
+                && let Some(receiver) = transceiver.receiver()
+            {
+                return Some(receiver.track());
+            }
+        }
+        None
+    }
+
+    async fn start_caller_ingress_monitor_if_needed(&mut self) {
+        if self.connected_callee.is_some() {
+            return;
+        }
+
+        let Some(answer_sdp) = self.answer.as_deref() else {
+            return;
+        };
+
+        let caller_profile = MediaNegotiator::extract_leg_profile(answer_sdp);
+        let Some(dtmf_codec) = caller_profile.dtmf else {
+            return;
+        };
+
+        let session_id = self.context.session_id.clone();
+        let app_runtime = self.app_runtime.clone();
+        let dtmf_payload_type = dtmf_codec.payload_type;
+
+        if self.caller_answer_uses_media_bridge {
+            if self.caller_ingress_monitor.is_some() {
+                self.stop_caller_ingress_monitor().await;
+            }
+
+            let Some(bridge) = self.media_bridge.as_ref() else {
+                return;
+            };
+            let endpoint = self.caller_bridge_endpoint();
+            bridge.set_dtmf_sink(
+                endpoint,
+                dtmf_payload_type,
+                Arc::new(move |digit| {
+                    let event = serde_json::json!({
+                        "type": "dtmf",
+                        "digit": digit.to_string(),
+                    });
+
+                    if let Err(error) = app_runtime.inject_event(event) {
+                        debug!(
+                            session_id = %session_id,
+                            digit = %digit,
+                            error = %error,
+                            "Bridge DTMF sink observed RTP DTMF with no active app receiver"
+                        );
+                    } else {
+                        debug!(
+                            session_id = %session_id,
+                            digit = %digit,
+                            "Injected RTP DTMF from bridge sink"
+                        );
+                    }
+                }),
+            );
+            bridge.start_bridge().await;
+            info!(
+                session_id = %self.context.session_id,
+                endpoint = ?endpoint,
+                payload_type = dtmf_payload_type,
+                "Installed caller bridge DTMF sink"
+            );
+            return;
+        }
+
+        if self
+            .caller_ingress_monitor
+            .as_ref()
+            .is_some_and(|monitor| !monitor.task.is_finished())
+        {
+            return;
+        }
+
+        if self.caller_ingress_monitor.is_some() {
+            self.stop_caller_ingress_monitor().await;
+        }
+
+        let caller_pc = Self::get_peer_pc(&self.caller_peer, Self::CALLER_TRACK_ID).await;
+        let Some(caller_pc) = caller_pc else {
+            return;
+        };
+
+        let cancel_token = self.cancel_token.child_token();
+        let monitor_cancel = cancel_token.clone();
+
+        let task = tokio::spawn(async move {
+            let track = loop {
+                if let Some(track) = Self::find_audio_receiver_track(&caller_pc).await {
+                    break track;
+                }
+
+                tokio::select! {
+                    _ = monitor_cancel.cancelled() => return,
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                }
+            };
+
+            let mut detector = RtpDtmfDetector::default();
+
+            loop {
+                tokio::select! {
+                    _ = monitor_cancel.cancelled() => break,
+                    sample = track.recv() => {
+                        match sample {
+                            Ok(rustrtc::media::MediaSample::Audio(frame)) => {
+                                if frame.payload_type != Some(dtmf_payload_type) {
+                                    continue;
+                                }
+
+                                let Some(digit) = detector.observe(&frame.data, frame.rtp_timestamp) else {
+                                    continue;
+                                };
+
+                                let event = serde_json::json!({
+                                    "type": "dtmf",
+                                    "digit": digit.to_string(),
+                                });
+
+                                if let Err(error) = app_runtime.inject_event(event) {
+                                    debug!(
+                                        session_id = %session_id,
+                                        digit = %digit,
+                                        error = %error,
+                                        "Caller ingress monitor observed RTP DTMF with no active app receiver"
+                                    );
+                                } else {
+                                    debug!(
+                                        session_id = %session_id,
+                                        digit = %digit,
+                                        "Injected RTP DTMF from caller ingress monitor"
+                                    );
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(error) => {
+                                debug!(
+                                    session_id = %session_id,
+                                    error = %error,
+                                    "Caller ingress monitor stopped while reading inbound RTP"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        info!(
+            session_id = %self.context.session_id,
+            payload_type = dtmf_payload_type,
+            "Started caller ingress monitor for RTP DTMF"
+        );
+
+        self.caller_ingress_monitor = Some(CallerIngressMonitor { cancel_token, task });
+    }
+
+    async fn stop_caller_ingress_monitor(&mut self) {
+        let Some(monitor) = self.caller_ingress_monitor.take() else {
+            return;
+        };
+
+        monitor.cancel_token.cancel();
+        let mut task = monitor.task;
+
+        tokio::select! {
+            result = &mut task => {
+                if let Err(error) = result {
+                    warn!(
+                        session_id = %self.context.session_id,
+                        error = %error,
+                        "Caller ingress monitor task ended with join error"
+                    );
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {
+                warn!(
+                    session_id = %self.context.session_id,
+                    "Caller ingress monitor did not stop in time; aborting task"
+                );
+                task.abort();
+                let _ = task.await;
+            }
+        }
+    }
+
     #[allow(dead_code)]
     async fn get_forwarding_track(
         peer: &Arc<dyn MediaPeer>,
@@ -2013,6 +3391,7 @@ impl SipSession {
         None
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn wire_with_forwarding_track(
         track_id: &str,
         source_pc: &rustrtc::PeerConnection,
@@ -2047,6 +3426,12 @@ impl SipSession {
         let existing_sender = target_transceiver
             .sender()
             .ok_or_else(|| anyhow!("{}: no sender on target audio transceiver", direction))?;
+        {
+            let mut guard = recorder.write();
+            if let Some(recorder) = guard.as_mut() {
+                recorder.set_leg_profile(leg, ingress_profile.clone());
+            }
+        }
 
         // Issue #171: spin up a dedicated recorder drain task so that
         // write_sample (codec decode + disk I/O) never blocks the RTP recv loop.
@@ -2063,14 +3448,14 @@ impl SipSession {
                 crate::media::recorder::Leg,
                 rustrtc::media::frame::MediaSample,
             )>(RECORDER_CHANNEL_CAPACITY);
-            let recorder_arc = recorder;
+            let recorder_arc = recorder.clone();
             tokio::spawn(async move {
                 while let Some((sample_leg, sample)) = rx.recv().await {
                     let mut guard = recorder_arc.write();
-                    if let Some(rec) = guard.as_mut() {
-                        if let Err(err) = rec.write_sample(sample_leg, &sample, None, None, None) {
-                            tracing::warn!("recorder write_sample failed: {err}");
-                        }
+                    if let Some(rec) = guard.as_mut()
+                        && let Err(err) = rec.write_sample(sample_leg, &sample, None, None, None)
+                    {
+                        tracing::warn!("recorder write_sample failed: {err}");
                     }
                 }
             });
@@ -2105,6 +3490,65 @@ impl SipSession {
         Ok(forwarding)
     }
 
+    async fn bridge_callee_offer_sdp(
+        bridge: &crate::media::bridge::BridgePeer,
+        callee_is_webrtc: bool,
+    ) -> Result<String> {
+        let pc = if callee_is_webrtc {
+            bridge.webrtc_pc().clone()
+        } else {
+            bridge.rtp_pc().clone()
+        };
+
+        if let Some(local_description) = pc.local_description() {
+            return Ok(local_description.to_sdp_string());
+        }
+
+        let offer = pc.create_offer().await?;
+        pc.set_local_description(offer)?;
+        if callee_is_webrtc {
+            pc.wait_for_gathering_complete().await;
+        }
+
+        pc.local_description()
+            .map(|desc| desc.to_sdp_string())
+            .ok_or_else(|| anyhow!("Bridge callee side has no local offer"))
+    }
+
+    async fn apply_bridge_callee_answer(&self, callee_sdp: &str) -> Result<()> {
+        let Some(bridge) = &self.media_bridge else {
+            return Ok(());
+        };
+
+        let pc = if self.callee_is_webrtc {
+            bridge.webrtc_pc().clone()
+        } else {
+            bridge.rtp_pc().clone()
+        };
+
+        if let Some(remote_description) = pc.remote_description() {
+            if remote_description.to_sdp_string() == callee_sdp {
+                return Ok(());
+            }
+
+            let offer = pc
+                .create_offer()
+                .await
+                .map_err(|e| anyhow!("Failed to create bridge callee re-offer: {}", e))?;
+            pc.set_local_description(offer)
+                .map_err(|e| anyhow!("Failed to set bridge callee local re-offer: {}", e))?;
+            if self.callee_is_webrtc {
+                pc.wait_for_gathering_complete().await;
+            }
+        }
+
+        let answer = rustrtc::SessionDescription::parse(rustrtc::SdpType::Answer, callee_sdp)
+            .map_err(|e| anyhow!("Failed to parse callee answer SDP: {}", e))?;
+        pc.set_remote_description(answer)
+            .await
+            .map_err(|e| anyhow!("Failed to set bridge callee remote answer: {}", e))
+    }
+
     pub async fn create_callee_track(&mut self, callee_is_webrtc: bool) -> Result<String> {
         let track_id = Self::CALLEE_TRACK_ID.to_string();
 
@@ -2125,7 +3569,21 @@ impl SipSession {
 
         let need_transport_bridge = transport_bridge_needed;
 
+        if need_transport_bridge
+            && self.caller_answer_uses_media_bridge
+            && let Some(ref bridge) = self.media_bridge
+        {
+            self.callee_offer_uses_media_bridge = true;
+            debug!(
+                session_id = %self.id,
+                callee_is_webrtc,
+                "Reusing existing media bridge callee-facing offer"
+            );
+            return Self::bridge_callee_offer_sdp(bridge, callee_is_webrtc).await;
+        }
+
         if need_transport_bridge {
+            self.callee_offer_uses_media_bridge = true;
             let mut bridge_builder = BridgePeerBuilder::new(format!("{}-bridge", self.id))
                 .with_enable_latching(self.server.proxy_config.enable_latching);
             if let (Some(start), Some(end)) = (
@@ -2134,20 +3592,24 @@ impl SipSession {
             ) {
                 bridge_builder = bridge_builder.with_rtp_port_range(start, end);
             }
-            if let Some(ref caller_sdp) = self.caller_offer {
-                if !caller_is_webrtc && caller_sdp.contains("a=group:BUNDLE") {
-                    bridge_builder = bridge_builder
-                        .with_rtp_sdp_compatibility(rustrtc::config::SdpCompatibilityMode::Standard)
-                        .with_enable_latching(true);
-                    info!(session_id = %self.id, "RTP caller offered BUNDLE, using Standard SDP mode + latching for RTP side");
-                }
+            if let Some(ref caller_sdp) = self.caller_offer
+                && !caller_is_webrtc
+                && caller_sdp.contains("a=group:BUNDLE")
+            {
+                bridge_builder = bridge_builder
+                    .with_rtp_sdp_compatibility(rustrtc::config::SdpCompatibilityMode::Standard)
+                    .with_enable_latching(true);
+                info!(session_id = %self.id, "RTP caller offered BUNDLE, using Standard SDP mode + latching for RTP side");
             }
 
             if let Some(ip) = self.caller_facing_ip_str() {
                 bridge_builder = bridge_builder.with_external_ip(ip);
             }
+            if let Some(ref bind_ip) = self.server.rtp_config.bind_ip {
+                bridge_builder = bridge_builder.with_bind_ip(bind_ip.clone());
+            }
 
-            if let Some(ref ice_servers) = self.server.rtp_config.ice_servers {
+            if let Some(ref ice_servers) = self.context.dialplan.media.ice_servers {
                 bridge_builder = bridge_builder.with_ice_servers(ice_servers.clone());
             }
 
@@ -2161,43 +3623,50 @@ impl SipSession {
                     allow_codecs,
                 );
 
-                let webrtc_side = if caller_is_webrtc {
+                let webrtc_side_codecs = if caller_is_webrtc {
                     &codec_lists.caller_side
                 } else {
                     &codec_lists.callee_side
                 };
-                let rtp_side = if callee_is_webrtc {
-                    &codec_lists.caller_side
-                } else {
+                let rtp_side_codecs = if caller_is_webrtc {
                     &codec_lists.callee_side
+                } else {
+                    &codec_lists.caller_side
                 };
 
-                let webrtc_caps: Vec<_> = webrtc_side
+                let webrtc_caps: Vec<_> = webrtc_side_codecs
                     .iter()
                     .filter_map(|c| c.to_audio_capability())
                     .collect();
-                let rtp_caps: Vec<_> = rtp_side
+                let rtp_caps: Vec<_> = rtp_side_codecs
                     .iter()
                     .filter_map(|c| c.to_audio_capability())
                     .collect();
 
                 bridge_builder = bridge_builder
-                    .with_webrtc_audio_capabilities(webrtc_caps)
+                    .with_webrtc_audio_capabilities(webrtc_caps.clone())
                     .with_rtp_audio_capabilities(rtp_caps);
 
-                // Sender codecs: first non-DTMF codec for each side
-                let webrtc_sender = webrtc_side
+                let webrtc_sender = webrtc_side_codecs
                     .iter()
                     .find(|c| !c.is_dtmf())
                     .map(|c| c.to_params());
-                let rtp_sender = rtp_side
+                let rtp_sender = rtp_side_codecs
                     .iter()
                     .find(|c| !c.is_dtmf())
                     .map(|c| c.to_params());
 
-                if let (Some(w), Some(r)) = (webrtc_sender, rtp_sender) {
-                    bridge_builder = bridge_builder.with_sender_codecs(w, r);
+                if let (Some(webrtc_sender), Some(rtp_sender)) = (webrtc_sender, rtp_sender) {
+                    bridge_builder = bridge_builder.with_sender_codecs(webrtc_sender, rtp_sender);
                 }
+
+                debug!(
+                    session_id = %self.context.session_id,
+                    caller_side_codecs = ?codec_lists.caller_side.iter().filter(|c| !c.is_dtmf()).map(|c| format!("{:?}", c.codec)).collect::<Vec<_>>(),
+                    callee_side_codecs = ?codec_lists.callee_side.iter().filter(|c| !c.is_dtmf()).map(|c| format!("{:?}", c.codec)).collect::<Vec<_>>(),
+                    common_codecs = ?codec_lists.common.iter().filter(|c| !c.is_dtmf()).map(|c| format!("{:?}", c.codec)).collect::<Vec<_>>(),
+                    "Bridge codecs configured for transport sides"
+                );
 
                 // Extract video capabilities from caller SDP
                 match rustrtc::SessionDescription::parse(rustrtc::SdpType::Offer, caller_sdp) {
@@ -2265,9 +3734,16 @@ impl SipSession {
 
                 debug!(
                     session_id = %self.id,
-                    webrtc_codecs = ?webrtc_side.iter().map(|c| format!("{:?}", c.codec)).collect::<Vec<_>>(),
-                    rtp_codecs = ?rtp_side.iter().map(|c| format!("{:?}", c.codec)).collect::<Vec<_>>(),
-                    "Bridge codecs configured from allow_codecs"
+                    common_codecs = ?codec_lists.common.iter().filter(|c| !c.is_dtmf()).map(|c| format!("{:?}", c.codec)).collect::<Vec<_>>(),
+                    webrtc_codecs = ?webrtc_side_codecs
+                        .iter()
+                        .map(|c| format!("{:?}", c.codec))
+                        .collect::<Vec<_>>(),
+                    rtp_codecs = ?rtp_side_codecs
+                        .iter()
+                        .map(|c| format!("{:?}", c.codec))
+                        .collect::<Vec<_>>(),
+                    "Bridge codecs configured for transport sides"
                 );
             }
 
@@ -2294,8 +3770,6 @@ impl SipSession {
                 bridge.rtp_pc().set_local_description(offer)?;
             }
 
-            bridge.start_bridge().await;
-
             self.media_bridge = Some(bridge.clone());
 
             if callee_is_webrtc {
@@ -2314,12 +3788,16 @@ impl SipSession {
                 Ok(sdp)
             }
         } else if media_proxy_enabled {
+            self.callee_offer_uses_media_bridge = false;
             let mut track_builder = RtpTrackBuilder::new(track_id.clone())
                 .with_cancel_token(self.callee_peer.cancel_token())
                 .with_enable_latching(self.server.proxy_config.enable_latching);
 
             if let Some(ref external_ip) = self.server.rtp_config.external_ip {
                 track_builder = track_builder.with_external_ip(external_ip.clone());
+            }
+            if let Some(ref bind_ip) = self.server.rtp_config.bind_ip {
+                track_builder = track_builder.with_bind_ip(bind_ip.clone());
             }
 
             let (start_port, end_port) = if callee_is_webrtc {
@@ -2340,7 +3818,11 @@ impl SipSession {
 
             if let Some(ref caller_offer) = self.caller_offer {
                 let codecs =
-                    MediaNegotiator::build_callee_codec_offer(caller_offer, callee_is_webrtc);
+                    MediaNegotiator::build_callee_codec_offer_with_allow(
+                        caller_offer,
+                        callee_is_webrtc,
+                        &self.context.dialplan.allow_codecs,
+                    );
                 if !codecs.is_empty() {
                     track_builder = track_builder.with_codec_info(codecs);
                 }
@@ -2363,7 +3845,7 @@ impl SipSession {
 
             if callee_is_webrtc {
                 track_builder = track_builder.with_mode(rustrtc::TransportMode::WebRtc);
-                if let Some(ref ice_servers) = self.server.rtp_config.ice_servers {
+                if let Some(ref ice_servers) = self.context.dialplan.media.ice_servers {
                     track_builder = track_builder.with_ice_servers(ice_servers.clone());
                 }
             }
@@ -2375,6 +3857,7 @@ impl SipSession {
 
             Ok(sdp)
         } else {
+            self.callee_offer_uses_media_bridge = false;
             let mut track_builder = RtpTrackBuilder::new(track_id.clone())
                 .with_cancel_token(self.callee_peer.cancel_token());
 
@@ -2396,11 +3879,23 @@ impl SipSession {
             return Some(answer.clone());
         }
 
+        if self.bypasses_local_media() {
+            if let Some(answer_sdp) = self.callee_answer_sdp.clone() {
+                self.answer = Some(answer_sdp.clone());
+                self.caller_answer_uses_media_bridge = false;
+                return Some(answer_sdp);
+            }
+        }
+
         let caller_offer = self.caller_offer.clone()?;
         let caller_is_webrtc = self.is_caller_webrtc();
 
         let codec_info =
-            MediaNegotiator::build_caller_answer_codec_list(&caller_offer, caller_is_webrtc);
+            MediaNegotiator::build_caller_answer_codec_list_with_allow(
+                &caller_offer,
+                caller_is_webrtc,
+                &self.context.dialplan.allow_codecs,
+            );
 
         let mut track_builder = RtpTrackBuilder::new(Self::CALLER_TRACK_ID.to_string())
             .with_cancel_token(self.caller_peer.cancel_token())
@@ -2408,6 +3903,9 @@ impl SipSession {
 
         if let Some(ip) = self.caller_facing_ip_str() {
             track_builder = track_builder.with_external_ip(ip);
+        }
+        if let Some(ref bind_ip) = self.server.rtp_config.bind_ip {
+            track_builder = track_builder.with_bind_ip(bind_ip.clone());
         }
 
         let (start_port, end_port) = if caller_is_webrtc {
@@ -2432,7 +3930,7 @@ impl SipSession {
 
         if caller_is_webrtc {
             track_builder = track_builder.with_mode(rustrtc::TransportMode::WebRtc);
-            if let Some(ref ice_servers) = self.server.rtp_config.ice_servers {
+            if let Some(ref ice_servers) = self.context.dialplan.media.ice_servers {
                 track_builder = track_builder.with_ice_servers(ice_servers.clone());
             }
         }
@@ -2446,6 +3944,7 @@ impl SipSession {
                 );
                 self.caller_peer.update_track(Box::new(track), None).await;
                 self.answer = Some(answer_sdp.clone());
+                self.caller_answer_uses_media_bridge = false;
                 Some(answer_sdp)
             }
             Err(e) => {
@@ -2475,7 +3974,7 @@ impl SipSession {
         self.connected_callee = callee.clone();
 
         let mut timer_headers = vec![];
-        if self.server.proxy_config.session_timer {
+        if self.server.proxy_config.session_timer_mode().is_enabled() {
             let default_expires = self
                 .server
                 .proxy_config
@@ -2486,12 +3985,7 @@ impl SipSession {
                     let caller_dialog_id = self.caller_dialog_id();
                     if let Some(timer) = self.timers.get(&caller_dialog_id) {
                         if timer.enabled {
-                            let caller_supports_timer =
-                                has_timer_support(&self.server_dialog.initial_request().headers);
-                            timer_headers.extend(build_session_timer_response_headers(
-                                timer,
-                                caller_supports_timer,
-                            ));
+                            timer_headers.extend(build_session_timer_response_headers(timer));
                             debug!(
                                 session_expires = %timer.get_session_expires_value(),
                                 "Session timer negotiated in 200 OK"
@@ -2516,31 +4010,67 @@ impl SipSession {
                 "application/sdp".into(),
             )];
             headers.extend(timer_headers);
-            self.server_dialog
+            if let Err(e) = self
+                .server_dialog
                 .accept(Some(headers), Some(answer_sdp.into_bytes()))
-                .map_err(|e| anyhow!("Failed to send answer: {}", e))?;
+            {
+                if self.server_dialog.state().is_confirmed() {
+                    debug!(
+                        session_id = %self.context.session_id,
+                        error = %e,
+                        "Caller leg already confirmed; skipping duplicate 200 OK"
+                    );
+                } else {
+                    return Err(anyhow!("Failed to send answer: {}", e));
+                }
+            }
         }
 
         self.answer_time = Some(Instant::now());
+
+        let session_id = self.id.to_string();
+        let caller = self
+            .routed_caller
+            .clone()
+            .or_else(|| Some(self.context.original_caller.clone()));
+        let callee = self
+            .connected_callee
+            .clone()
+            .or_else(|| self.routed_callee.clone())
+            .or_else(|| Some(self.context.original_callee.clone()));
+
+        self.server
+            .active_call_registry
+            .update(&session_id, |entry| {
+                entry.answered_at = Some(chrono::Utc::now());
+                entry.status = crate::proxy::active_call_registry::ActiveProxyCallStatus::Talking;
+                if entry.caller.is_none() {
+                    entry.caller = caller.clone();
+                }
+                if entry.callee.is_none() {
+                    entry.callee = callee.clone();
+                }
+            });
 
         // Auto-start recording when the call is answered if configured.
         if self.context.dialplan.recording.enabled
             && self.context.dialplan.recording.auto_start
             && self.recording_state.is_none()
+            && let Some(ref option) = self.context.dialplan.recording.option
         {
-            if let Some(ref option) = self.context.dialplan.recording.option {
-                let path = option.recorder_file.clone();
-                if !path.is_empty() {
-                    if let Err(e) = self.start_recording(&path, None, false).await {
-                        warn!(
-                            session_id = %self.context.session_id,
-                            error = %e,
-                            "Auto-start recording failed"
-                        );
-                    }
-                }
+            let path = option.recorder_file.clone();
+            if !path.is_empty()
+                && let Err(e) = self.start_recording(&path, None, false).await
+            {
+                warn!(
+                    session_id = %self.context.session_id,
+                    error = %e,
+                    "Auto-start recording failed"
+                );
             }
         }
+
+        self.start_caller_ingress_monitor_if_needed().await;
 
         Ok(())
     }
@@ -2550,6 +4080,19 @@ impl SipSession {
     }
 
     async fn get_local_reinvite_pc(&self, side: DialogSide) -> Option<rustrtc::PeerConnection> {
+        if let Some(bridge) = &self.media_bridge {
+            let leg_is_webrtc = match side {
+                DialogSide::Caller => self.caller_is_webrtc,
+                DialogSide::Callee => self.callee_is_webrtc,
+            };
+
+            return Some(if leg_is_webrtc {
+                bridge.webrtc_pc().clone()
+            } else {
+                bridge.rtp_pc().clone()
+            });
+        }
+
         let (peer, track_id) = match side {
             DialogSide::Caller => (&self.caller_peer, Self::CALLER_TRACK_ID),
             DialogSide::Callee => (&self.callee_peer, Self::CALLEE_TRACK_ID),
@@ -2590,6 +4133,15 @@ impl SipSession {
             return Ok(());
         }
 
+        let has_remote_callee = self.connected_callee.is_some() || !self.callee_dialogs.is_empty();
+        if side == DialogSide::Caller && !has_remote_callee {
+            debug!(
+                session_id = %self.context.session_id,
+                "Skipping callee forwarding update for app-only caller dialog"
+            );
+            return Ok(());
+        }
+
         let changed_profile = MediaNegotiator::extract_leg_profile(changed_leg_sdp);
         let caller_to_callee_forwarding =
             Self::get_forwarding_track(&self.caller_peer, Self::CALLER_FORWARDING_TRACK_ID)
@@ -2605,13 +4157,13 @@ impl SipSession {
                 // caller->callee track reads caller RTP, so caller-side re-INVITE updates ingress.
                 caller_to_callee_forwarding.stage_ingress_profile(changed_profile.clone());
                 // callee->caller track sends toward caller, so caller-side re-INVITE updates egress.
-                callee_to_caller_forwarding.stage_egress_profile(changed_profile);
+                callee_to_caller_forwarding.stage_egress_profile(changed_profile.clone());
             }
             DialogSide::Callee => {
                 // caller->callee track sends toward callee, so callee-side re-INVITE updates egress.
                 caller_to_callee_forwarding.stage_egress_profile(changed_profile.clone());
                 // callee->caller track reads callee RTP, so callee-side re-INVITE updates ingress.
-                callee_to_caller_forwarding.stage_ingress_profile(changed_profile);
+                callee_to_caller_forwarding.stage_ingress_profile(changed_profile.clone());
             }
         }
 
@@ -2693,7 +4245,9 @@ impl SipSession {
                 return Ok(self.answer.clone());
             }
         };
-        self.caller_offer = Some(offer_sdp.clone());
+        if !self.bypasses_local_media() {
+            self.caller_offer = Some(offer_sdp.clone());
+        }
 
         let callee_dialogs: Vec<DialogId> = self
             .callee_dialogs
@@ -2723,20 +4277,18 @@ impl SipSession {
                     _ => continue,
                 };
 
-                if let Some(response) = resp {
-                    if !response.body().is_empty() {
-                        let answer_sdp = String::from_utf8_lossy(response.body()).to_string();
-                        if self.media_profile.path == MediaPathMode::Anchored
-                            || self.media_bridge.is_some()
-                        {
-                            final_answer = self
-                                .prepare_caller_answer_from_callee_sdp(Some(answer_sdp), true)
-                                .await;
-                        } else {
-                            final_answer = Some(answer_sdp.clone());
-                            self.answer = Some(answer_sdp.clone());
-                            self.callee_answer_sdp = Some(answer_sdp);
-                        }
+                if let Some(response) = resp
+                    && !response.body().is_empty()
+                {
+                    let answer_sdp = String::from_utf8_lossy(response.body()).to_string();
+                    if self.media_profile.path == MediaPathMode::Anchored
+                        || self.media_bridge.is_some()
+                    {
+                        final_answer = self
+                            .prepare_caller_answer_from_callee_sdp(Some(answer_sdp), true)
+                            .await;
+                    } else {
+                        final_answer = Some(answer_sdp.clone());
                     }
                 }
             }
@@ -2747,10 +4299,8 @@ impl SipSession {
                 "application/sdp".into(),
             )];
             let caller_dialog_id = self.caller_dialog_id();
-            if let Some(timer_headers) = self.successful_refresh_response_headers(
-                &caller_dialog_id,
-                has_timer_support(&self.server_dialog.initial_request().headers),
-            ) {
+            if let Some(timer_headers) = self.successful_refresh_response_headers(&caller_dialog_id)
+            {
                 headers.extend(timer_headers);
             }
             self.server_dialog
@@ -2764,42 +4314,124 @@ impl SipSession {
     pub async fn play_audio_file(
         &mut self,
         audio_file: &str,
-        _await_completion: bool,
+        await_completion: bool,
         track_id: &str,
         loop_playback: bool,
     ) -> Result<()> {
-        info!(audio_file = %audio_file, track_id = %track_id, "Playing audio file");
+        let resolved_audio_file = Self::resolve_audio_file_path(audio_file);
+        info!(
+            audio_file = %audio_file,
+            resolved_audio_file = %resolved_audio_file,
+            track_id = %track_id,
+            "Playing audio file"
+        );
 
         let caller_codec = self
             .caller_offer
             .as_ref()
             .map(|offer| MediaNegotiator::extract_codec_params(offer).audio)
-            .and_then(|codecs| codecs.first().map(|c| c.codec))
-            .unwrap_or(CodecType::PCMU);
+            .and_then(|codecs| codecs.first().cloned())
+            .unwrap_or_else(|| {
+                let codec = CodecType::PCMU;
+                CodecInfo {
+                    payload_type: codec.payload_type(),
+                    codec,
+                    clock_rate: codec.clock_rate(),
+                    channels: codec.channels(),
+                }
+            });
 
-        let hold_ssrc = rand::random::<u32>();
         let track = FileTrack::new(track_id.to_string())
-            .with_path(audio_file.to_string())
+            .with_path(resolved_audio_file)
             .with_loop(loop_playback)
-            .with_ssrc(hold_ssrc)
-            .with_codec_preference(vec![caller_codec]);
+            .with_codec_info(caller_codec);
 
-        let caller_pc = {
-            let tracks = self.caller_peer.get_tracks().await;
-            if let Some(t) = tracks.first() {
-                t.lock().await.get_peer_connection().await
-            } else {
-                None
+        let mut uses_existing_caller_media = false;
+        if self.caller_answer_uses_media_bridge {
+            let bridge = self
+                .media_bridge
+                .as_ref()
+                .ok_or_else(|| anyhow!("No media bridge available for playback"))?;
+            bridge
+                .replace_output_with_file(self.caller_bridge_endpoint(), &track)
+                .await?;
+            self.bridge_playback_track_id = Some(track_id.to_string());
+            uses_existing_caller_media = true;
+        } else if let Some(pc) = self.get_caller_peer_connection().await {
+            uses_existing_caller_media = true;
+            if let Err(e) = track.start_playback_on(Some(pc)).await {
+                warn!(error = %e, "Failed to start playback");
             }
-        };
-
-        if let Err(e) = track.start_playback_on(caller_pc).await {
-            warn!(error = %e, "Failed to start playback");
+        } else {
+            // Fallback: use FileTrack's own un-negotiated PC (no audio to caller)
+            if let Err(e) = track.start_playback_on(None).await {
+                warn!(error = %e, "Failed to start playback");
+            }
         }
 
-        self.caller_peer.update_track(Box::new(track), None).await;
+        if let Some(previous) = self.playback_tracks.remove(track_id) {
+            previous.stop().await;
+        }
+        self.playback_tracks
+            .insert(track_id.to_string(), track.clone());
+
+        let wait_track = if await_completion && !loop_playback {
+            Some(track.clone())
+        } else {
+            None
+        };
+
+        if !uses_existing_caller_media {
+            self.caller_peer.update_track(Box::new(track), None).await;
+        }
+
+        if let Some(track) = wait_track {
+            track.wait_for_completion().await;
+        }
 
         Ok(())
+    }
+
+    async fn stop_playback_track(&mut self, track_id: &str, remove_from_caller_peer: bool) {
+        let Some(track) = self.playback_tracks.remove(track_id) else {
+            return;
+        };
+
+        track.stop().await;
+        if self.bridge_playback_track_id.as_deref() == Some(track_id)
+            && self.caller_answer_uses_media_bridge
+            && let Some(ref bridge) = self.media_bridge
+        {
+            self.bridge_playback_track_id = None;
+            if self.media_bridge_started {
+                bridge.replace_output_with_peer(self.caller_bridge_endpoint());
+            } else {
+                bridge.mute_output(self.caller_bridge_endpoint());
+            }
+        }
+        if remove_from_caller_peer {
+            self.caller_peer.remove_track(track_id, true).await;
+        }
+
+        info!(track_id = %track_id, "Playback stopped");
+    }
+
+    fn resolve_audio_file_path(audio_file: &str) -> String {
+        let path = Path::new(audio_file);
+        if path.is_absolute() || path.exists() {
+            return audio_file.to_string();
+        }
+
+        if audio_file.starts_with("config/") || audio_file.starts_with("./config/") {
+            return audio_file.to_string();
+        }
+
+        let fallback = Path::new("config").join(audio_file);
+        if fallback.exists() {
+            fallback.to_string_lossy().to_string()
+        } else {
+            audio_file.to_string()
+        }
     }
 
     pub async fn start_recording(
@@ -2808,7 +4440,27 @@ impl SipSession {
         _max_duration: Option<Duration>,
         beep: bool,
     ) -> Result<()> {
-        let recorder = Recorder::new(path, CodecType::PCMU)?;
+        let mut recorder = Recorder::new(path, CodecType::PCMU)?;
+        if let Some(forwarding) =
+            Self::get_forwarding_track(&self.caller_peer, Self::CALLER_FORWARDING_TRACK_ID).await
+        {
+            if let Some(profile) = forwarding.ingress_profile() {
+                recorder.set_leg_profile(crate::media::recorder::Leg::A, profile);
+            }
+        } else if let Some(answer_sdp) = self.answer.as_deref() {
+            let caller_profile = MediaNegotiator::extract_leg_profile(answer_sdp);
+            recorder.set_leg_profile(crate::media::recorder::Leg::A, caller_profile);
+        }
+        if let Some(forwarding) =
+            Self::get_forwarding_track(&self.callee_peer, Self::CALLEE_FORWARDING_TRACK_ID).await
+        {
+            if let Some(profile) = forwarding.ingress_profile() {
+                recorder.set_leg_profile(crate::media::recorder::Leg::B, profile);
+            }
+        } else if let Some(callee_answer_sdp) = self.callee_answer_sdp.as_deref() {
+            let callee_profile = MediaNegotiator::extract_leg_profile(callee_answer_sdp);
+            recorder.set_leg_profile(crate::media::recorder::Leg::B, callee_profile);
+        }
         {
             let mut guard = self.recorder.write();
             if guard.is_some() {
@@ -2869,6 +4521,8 @@ impl SipSession {
     async fn cleanup(&mut self) {
         debug!(session_id = %self.context.session_id, "Cleaning up session");
 
+        self.stop_caller_ingress_monitor().await;
+
         if self.recording_state.is_some() {
             let _ = self.stop_recording().await;
         }
@@ -2877,6 +4531,8 @@ impl SipSession {
         if let Some(bridge) = self.media_bridge.take() {
             info!(session_id = %self.context.session_id, "Stopping media bridge during cleanup");
             bridge.stop().await;
+            self.media_bridge_started = false;
+            self.bridge_playback_track_id = None;
         }
 
         // Stop caller and callee media peers (cancels their tasks)
@@ -2900,7 +4556,10 @@ impl SipSession {
                 .collect::<Vec<_>>();
             let hangups: FuturesUnordered<_> = hangup_dialogs
                 .iter()
-                .map(|dialog| dialog.hangup().map(|result| result.map(|_| dialog.id())))
+                .map(|dialog| {
+                    #[allow(clippy::result_large_err)]
+                    dialog.hangup().map(|result| result.map(|_| dialog.id()))
+                })
                 .collect();
 
             if tokio::time::timeout(Duration::from_secs(2), hangups.collect::<Vec<_>>())
@@ -2915,6 +4574,7 @@ impl SipSession {
         }
 
         self.callee_dialogs.clear();
+        self.connected_callee_dialog_id = None;
         self.timers.clear();
         self.update_refresh_disabled.clear();
         self.timer_queue.clear();
@@ -2939,31 +4599,41 @@ impl SipSession {
         let request = self.server_dialog.initial_request();
         let headers = &request.headers;
         let dialog_id = self.caller_dialog_id();
+        let session_timer_mode = self.server.proxy_config.session_timer_mode();
 
         let supported = has_timer_support(headers);
         let session_expires_value = get_header_value(headers, HEADER_SESSION_EXPIRES);
         let mut timer = SessionTimerState::default();
+        timer.mode = session_timer_mode;
 
-        let local_min_se = Duration::from_secs(MIN_MIN_SE);
+        if let Some(min_se) = get_header_value(headers, HEADER_MIN_SE)
+            .as_deref()
+            .and_then(parse_min_se)
+        {
+            if timer.min_se < min_se {
+                timer.min_se = min_se;
+            }
+        }
+
         if let Some(value) = session_expires_value {
             if let Some((interval, refresher)) = parse_session_expires(&value) {
-                if interval < local_min_se {
+                if interval < timer.min_se {
                     return Err((
                         StatusCode::SessionIntervalTooSmall,
-                        Some(local_min_se.as_secs().to_string()),
+                        Some(timer.min_se.as_secs().to_string()),
                     ));
                 }
 
                 timer.enabled = true;
                 timer.session_interval = interval;
                 timer.active = true;
-                timer.refresher = select_timer_refresher(supported, refresher);
+                timer.refresher = select_server_timer_refresher(supported, true, refresher);
             }
-        } else {
+        } else if session_timer_mode.is_always() {
             timer.enabled = true;
-            timer.session_interval = Duration::from_secs(default_expires);
+            timer.session_interval = Duration::from_secs(default_expires).max(timer.min_se);
             timer.active = true;
-            timer.refresher = select_timer_refresher(supported, None);
+            timer.refresher = select_server_timer_refresher(supported, false, None);
         }
 
         self.timers.insert(dialog_id.clone(), timer);
@@ -2976,24 +4646,30 @@ impl SipSession {
         &mut self,
         dialog_id: DialogId,
         response: &rsipstack::sip::Response,
-        default_expires: u64,
+        requested_session_interval: Duration,
     ) {
         let headers = &response.headers;
         let session_expires_value = get_header_value(headers, HEADER_SESSION_EXPIRES);
 
         let mut timer = SessionTimerState::default();
+        timer.mode = self.server.proxy_config.session_timer_mode();
         if let Some((session_interval, refresher)) = session_expires_value
             .as_deref()
             .and_then(parse_session_expires)
-            .map(|(interval, refresher)| (interval, refresher.unwrap_or(SessionRefresher::Uac)))
         {
             timer.enabled = true;
             timer.active = true;
             timer.last_refresh = Instant::now();
             timer.session_interval = session_interval;
-            timer.refresher = refresher;
+            timer.refresher = select_client_timer_refresher(refresher);
+        } else if timer.mode.is_always() {
+            timer.enabled = true;
+            timer.active = true;
+            timer.last_refresh = Instant::now();
+            timer.session_interval = requested_session_interval;
+            timer.refresher = SessionRefresher::Uac;
         } else {
-            timer.session_interval = Duration::from_secs(default_expires);
+            timer.session_interval = requested_session_interval;
         }
 
         self.timers.insert(dialog_id.clone(), timer);
@@ -3053,17 +4729,13 @@ impl SipSession {
     fn successful_refresh_response_headers(
         &self,
         dialog_id: &DialogId,
-        peer_supports_timer: bool,
     ) -> Option<Vec<rsipstack::sip::Header>> {
         let timer = self.timers.get(dialog_id)?;
         if !timer.enabled || !timer.active {
             return None;
         }
 
-        Some(build_session_timer_response_headers(
-            timer,
-            peer_supports_timer,
-        ))
+        Some(build_session_timer_response_headers(timer))
     }
 
     fn should_fallback_to_reinvite(status: StatusCode) -> bool {
@@ -3108,17 +4780,18 @@ impl SipSession {
         dialog_id: &DialogId,
         response: &rsipstack::sip::Response,
     ) -> Result<()> {
+        let we_are_uac = self.is_uac_dialog(dialog_id);
         if let Some(timer) = self.timers.get_mut(dialog_id) {
-            apply_refresh_response(timer, &response.headers)?;
+            apply_refresh_response(timer, &response.headers, we_are_uac)?;
         }
         Ok(())
     }
 
     fn fail_refresh_if_pending(&mut self, dialog_id: &DialogId) {
-        if let Some(timer) = self.timers.get_mut(dialog_id) {
-            if timer.refreshing {
-                timer.fail_refresh();
-            }
+        if let Some(timer) = self.timers.get_mut(dialog_id)
+            && timer.refreshing
+        {
+            timer.fail_refresh();
         }
     }
 
@@ -3450,17 +5123,22 @@ impl SipSession {
         match command {
             CallCommand::Answer { leg_id } => {
                 if leg_id.0 == "caller" {
-                    match self.accept_call(None, None, None).await {
+                    let answer_sdp = if self.app_runtime.is_running() {
+                        self.prepare_app_caller_media_bridge().await
+                    } else {
+                        None
+                    };
+                    match self.accept_call(None, answer_sdp, None).await {
                         Ok(()) => {
                             self.update_leg_state(&leg_id, LegState::Connected);
                             CommandResult::success()
                         }
-                        Err(e) => CommandResult::failure(&e.to_string()),
+                        Err(e) => CommandResult::failure(e.to_string()),
                     }
                 } else if self.update_leg_state(&leg_id, LegState::Connected) {
                     CommandResult::success()
                 } else {
-                    CommandResult::failure(&format!("Leg not found: {}", leg_id))
+                    CommandResult::failure(format!("Leg not found: {}", leg_id))
                 }
             }
 
@@ -3487,12 +5165,12 @@ impl SipSession {
 
             CallCommand::Hold { leg_id, music } => match self.handle_hold(leg_id, music).await {
                 Ok(_) => CommandResult::success(),
-                Err(e) => CommandResult::failure(&e.to_string()),
+                Err(e) => CommandResult::failure(e.to_string()),
             },
 
             CallCommand::Unhold { leg_id } => match self.handle_unhold(leg_id).await {
                 Ok(_) => CommandResult::success(),
-                Err(e) => CommandResult::failure(&e.to_string()),
+                Err(e) => CommandResult::failure(e.to_string()),
             },
 
             CallCommand::StartApp {
@@ -3505,21 +5183,27 @@ impl SipSession {
                     .start_app(&app_name, params, auto_answer)
                     .await
                 {
-                    Ok(()) => CommandResult::success(),
-                    Err(e) => CommandResult::failure(&e.to_string()),
+                    Ok(()) => {
+                        self.start_caller_ingress_monitor_if_needed().await;
+                        CommandResult::success()
+                    }
+                    Err(e) => CommandResult::failure(e.to_string()),
                 }
             }
 
             CallCommand::StopApp { reason } => match self.app_runtime.stop_app(reason).await {
-                Ok(()) => CommandResult::success(),
-                Err(e) => CommandResult::failure(&e.to_string()),
+                Ok(()) => {
+                    self.stop_caller_ingress_monitor().await;
+                    CommandResult::success()
+                }
+                Err(e) => CommandResult::failure(e.to_string()),
             },
 
             CallCommand::InjectAppEvent { event } => {
                 let event_value = serde_json::to_value(&event).unwrap_or(serde_json::Value::Null);
                 match self.app_runtime.inject_event(event_value) {
                     Ok(()) => CommandResult::success(),
-                    Err(e) => CommandResult::degraded(&e.to_string()),
+                    Err(e) => CommandResult::degraded(e.to_string()),
                 }
             }
 
@@ -3529,12 +5213,12 @@ impl SipSession {
                 options,
             } => match self.handle_play(leg_id, source, options).await {
                 Ok(_) => CommandResult::success(),
-                Err(e) => CommandResult::failure(&e.to_string()),
+                Err(e) => CommandResult::failure(e.to_string()),
             },
 
             CallCommand::StopPlayback { leg_id } => match self.handle_stop_playback(leg_id).await {
                 Ok(_) => CommandResult::success(),
-                Err(e) => CommandResult::failure(&e.to_string()),
+                Err(e) => CommandResult::failure(e.to_string()),
             },
 
             CallCommand::StartRecording { config } => {
@@ -3549,23 +5233,23 @@ impl SipSession {
                     .await
                 {
                     Ok(_) => CommandResult::success(),
-                    Err(e) => CommandResult::failure(&e.to_string()),
+                    Err(e) => CommandResult::failure(e.to_string()),
                 }
             }
 
-            CallCommand::StopRecording { .. } => match self.stop_recording().await {
+            CallCommand::StopRecording => match self.stop_recording().await {
                 Ok(_) => CommandResult::success(),
-                Err(e) => CommandResult::failure(&e.to_string()),
+                Err(e) => CommandResult::failure(e.to_string()),
             },
 
-            CallCommand::PauseRecording { .. } => match self.pause_recording().await {
+            CallCommand::PauseRecording => match self.pause_recording().await {
                 Ok(_) => CommandResult::success(),
-                Err(e) => CommandResult::failure(&e.to_string()),
+                Err(e) => CommandResult::failure(e.to_string()),
             },
 
-            CallCommand::ResumeRecording { .. } => match self.resume_recording().await {
+            CallCommand::ResumeRecording => match self.resume_recording().await {
                 Ok(_) => CommandResult::success(),
-                Err(e) => CommandResult::failure(&e.to_string()),
+                Err(e) => CommandResult::failure(e.to_string()),
             },
 
             CallCommand::Transfer {
@@ -3574,108 +5258,154 @@ impl SipSession {
                 attended,
             } => match self.handle_transfer(leg_id, target, attended).await {
                 Ok(_) => CommandResult::success(),
-                Err(e) => CommandResult::failure(&e.to_string()),
+                Err(e) => CommandResult::failure(e.to_string()),
             },
 
             CallCommand::TransferComplete { consult_leg } => {
                 match self.handle_transfer_complete(consult_leg).await {
                     Ok(_) => CommandResult::success(),
-                    Err(e) => CommandResult::failure(&e.to_string()),
+                    Err(e) => CommandResult::failure(e.to_string()),
                 }
             }
 
             CallCommand::TransferCancel { consult_leg } => {
                 match self.handle_transfer_cancel(consult_leg).await {
                     Ok(_) => CommandResult::success(),
-                    Err(e) => CommandResult::failure(&e.to_string()),
+                    Err(e) => CommandResult::failure(e.to_string()),
+                }
+            }
+
+            CallCommand::TransferCompleteCrossSession {
+                from_session,
+                leg_id,
+                into_conference,
+            } => {
+                match self
+                    .handle_transfer_complete_cross_session(from_session, leg_id, into_conference)
+                    .await
+                {
+                    Ok(_) => CommandResult::success(),
+                    Err(e) => CommandResult::failure(e.to_string()),
+                }
+            }
+
+            CallCommand::BridgeCrossSession {
+                session_a,
+                leg_a,
+                session_b,
+                leg_b,
+            } => {
+                match self
+                    .handle_bridge_cross_session(session_a, leg_a, session_b, leg_b)
+                    .await
+                {
+                    Ok(_) => CommandResult::success(),
+                    Err(e) => CommandResult::failure(e.to_string()),
                 }
             }
 
             CallCommand::SupervisorListen {
                 supervisor_leg,
                 target_leg,
+                supervisor_session_id,
             } => {
                 match self
-                    .handle_supervisor_listen(supervisor_leg, target_leg)
+                    .handle_supervisor_listen(supervisor_leg, target_leg, supervisor_session_id)
                     .await
                 {
                     Ok(_) => CommandResult::success(),
-                    Err(e) => CommandResult::failure(&e.to_string()),
+                    Err(e) => CommandResult::failure(e.to_string()),
                 }
             }
 
             CallCommand::SupervisorWhisper {
                 supervisor_leg,
                 target_leg,
+                supervisor_session_id,
             } => {
                 match self
-                    .handle_supervisor_whisper(supervisor_leg, target_leg)
+                    .handle_supervisor_whisper(supervisor_leg, target_leg, supervisor_session_id)
                     .await
                 {
                     Ok(_) => CommandResult::success(),
-                    Err(e) => CommandResult::failure(&e.to_string()),
+                    Err(e) => CommandResult::failure(e.to_string()),
                 }
             }
 
             CallCommand::SupervisorBarge {
                 supervisor_leg,
                 target_leg,
+                supervisor_session_id,
             } => {
                 match self
-                    .handle_supervisor_barge(supervisor_leg, target_leg)
+                    .handle_supervisor_barge(supervisor_leg, target_leg, supervisor_session_id)
                     .await
                 {
                     Ok(_) => CommandResult::success(),
-                    Err(e) => CommandResult::failure(&e.to_string()),
+                    Err(e) => CommandResult::failure(e.to_string()),
+                }
+            }
+
+            CallCommand::SupervisorTakeover {
+                supervisor_leg,
+                target_leg,
+                supervisor_session_id,
+            } => {
+                match self
+                    .handle_supervisor_takeover(supervisor_leg, target_leg, supervisor_session_id)
+                    .await
+                {
+                    Ok(_) => CommandResult::success(),
+                    Err(e) => CommandResult::failure(e.to_string()),
                 }
             }
 
             CallCommand::SupervisorStop { supervisor_leg } => {
                 match self.handle_supervisor_stop(supervisor_leg).await {
                     Ok(_) => CommandResult::success(),
-                    Err(e) => CommandResult::failure(&e.to_string()),
+                    Err(e) => CommandResult::failure(e.to_string()),
                 }
             }
 
             CallCommand::ConferenceCreate { conf_id, options } => {
                 match self.handle_conference_create(conf_id, options).await {
                     Ok(_) => CommandResult::success(),
-                    Err(e) => CommandResult::failure(&e.to_string()),
+                    Err(e) => CommandResult::failure(e.to_string()),
                 }
             }
 
             CallCommand::ConferenceAdd { conf_id, leg_id } => {
                 match self.handle_conference_add(conf_id, leg_id).await {
                     Ok(_) => CommandResult::success(),
-                    Err(e) => CommandResult::failure(&e.to_string()),
+                    Err(e) => CommandResult::failure(e.to_string()),
                 }
             }
 
             CallCommand::ConferenceRemove { conf_id, leg_id } => {
                 match self.handle_conference_remove(conf_id, leg_id).await {
                     Ok(_) => CommandResult::success(),
-                    Err(e) => CommandResult::failure(&e.to_string()),
+                    Err(e) => CommandResult::failure(e.to_string()),
                 }
             }
 
             CallCommand::ConferenceMute { conf_id, leg_id } => {
                 match self.handle_conference_mute(conf_id, leg_id).await {
                     Ok(_) => CommandResult::success(),
-                    Err(e) => CommandResult::failure(&e.to_string()),
+                    Err(e) => CommandResult::failure(e.to_string()),
                 }
             }
 
             CallCommand::ConferenceUnmute { conf_id, leg_id } => {
                 match self.handle_conference_unmute(conf_id, leg_id).await {
                     Ok(_) => CommandResult::success(),
-                    Err(e) => CommandResult::failure(&e.to_string()),
+                    Err(e) => CommandResult::failure(e.to_string()),
                 }
             }
 
             CallCommand::ConferenceDestroy { conf_id } => {
                 match self.handle_conference_destroy(conf_id).await {
                     Ok(_) => CommandResult::success(),
-                    Err(e) => CommandResult::failure(&e.to_string()),
+                    Err(e) => CommandResult::failure(e.to_string()),
                 }
             }
 
@@ -3685,58 +5415,58 @@ impl SipSession {
                 priority,
             } => match self.handle_queue_enqueue(leg_id, queue_id, priority).await {
                 Ok(_) => CommandResult::success(),
-                Err(e) => CommandResult::failure(&e.to_string()),
+                Err(e) => CommandResult::failure(e.to_string()),
             },
 
             CallCommand::QueueDequeue { leg_id } => match self.handle_queue_dequeue(leg_id).await {
                 Ok(_) => CommandResult::success(),
-                Err(e) => CommandResult::failure(&e.to_string()),
+                Err(e) => CommandResult::failure(e.to_string()),
             },
 
             CallCommand::Reject { leg_id, reason } => {
                 match self.handle_reject(leg_id, reason).await {
                     Ok(_) => CommandResult::success(),
-                    Err(e) => CommandResult::failure(&e.to_string()),
+                    Err(e) => CommandResult::failure(e.to_string()),
                 }
             }
 
             CallCommand::Ring { leg_id, ringback } => {
                 match self.handle_ring(leg_id, ringback).await {
                     Ok(_) => CommandResult::success(),
-                    Err(e) => CommandResult::failure(&e.to_string()),
+                    Err(e) => CommandResult::failure(e.to_string()),
                 }
             }
 
             CallCommand::SendDtmf { leg_id, digits } => {
                 match self.handle_send_dtmf(leg_id, digits).await {
                     Ok(_) => CommandResult::success(),
-                    Err(e) => CommandResult::failure(&e.to_string()),
+                    Err(e) => CommandResult::failure(e.to_string()),
                 }
             }
 
             CallCommand::HandleReInvite { leg_id, sdp } => {
                 match self.handle_reinvite_command(leg_id, sdp).await {
                     Ok(_) => CommandResult::success(),
-                    Err(e) => CommandResult::failure(&e.to_string()),
+                    Err(e) => CommandResult::failure(e.to_string()),
                 }
             }
 
             CallCommand::MuteTrack { track_id } => match self.handle_mute_track(track_id).await {
                 Ok(_) => CommandResult::success(),
-                Err(e) => CommandResult::failure(&e.to_string()),
+                Err(e) => CommandResult::failure(e.to_string()),
             },
 
             CallCommand::UnmuteTrack { track_id } => {
                 match self.handle_unmute_track(track_id).await {
                     Ok(_) => CommandResult::success(),
-                    Err(e) => CommandResult::failure(&e.to_string()),
+                    Err(e) => CommandResult::failure(e.to_string()),
                 }
             }
 
             CallCommand::SendSipMessage { content_type, body } => {
                 match self.handle_send_sip_message(content_type, body).await {
                     Ok(_) => CommandResult::success(),
-                    Err(e) => CommandResult::failure(&e.to_string()),
+                    Err(e) => CommandResult::failure(e.to_string()),
                 }
             }
 
@@ -3746,13 +5476,50 @@ impl SipSession {
                 body,
             } => match self.handle_send_sip_notify(event, content_type, body).await {
                 Ok(_) => CommandResult::success(),
-                Err(e) => CommandResult::failure(&e.to_string()),
+                Err(e) => CommandResult::failure(e.to_string()),
             },
 
             CallCommand::SendSipOptionsPing => match self.handle_send_sip_options_ping().await {
                 Ok(_) => CommandResult::success(),
-                Err(e) => CommandResult::failure(&e.to_string()),
+                Err(e) => CommandResult::failure(e.to_string()),
             },
+
+            CallCommand::JoinMixer { mixer_id } => match self.handle_join_mixer(mixer_id).await {
+                Ok(_) => CommandResult::success(),
+                Err(e) => CommandResult::failure(e.to_string()),
+            },
+
+            CallCommand::LeaveMixer => match self.handle_leave_mixer().await {
+                Ok(_) => CommandResult::success(),
+                Err(e) => CommandResult::failure(e.to_string()),
+            },
+
+            CallCommand::LegAdd { target, leg_id } => {
+                match self.handle_add_leg(target, leg_id).await {
+                    Ok(new_leg_id) => CommandResult::success_with_leg(new_leg_id),
+                    Err(e) => CommandResult::failure(e.to_string()),
+                }
+            }
+
+            CallCommand::LegRemove { leg_id } => match self.handle_remove_leg(leg_id).await {
+                Ok(_) => CommandResult::success(),
+                Err(e) => CommandResult::failure(e.to_string()),
+            },
+
+            CallCommand::LegConnected { leg_id } => {
+                info!(%leg_id, "Leg connected async notification");
+                self.update_leg_state(&leg_id, LegState::Connected);
+                self.update_media_path().await;
+                CommandResult::success()
+            }
+
+            CallCommand::LegFailed { leg_id, reason } => {
+                warn!(%leg_id, %reason, "Leg failed async notification");
+                self.update_leg_state(&leg_id, LegState::Ended);
+                self.legs.remove(&leg_id);
+                self.update_media_path().await;
+                CommandResult::failure(reason)
+            }
 
             _ => CommandResult::not_supported("Command not yet implemented"),
         }
@@ -3784,6 +5551,7 @@ impl SipSession {
             }
         }
 
+        self.stop_caller_ingress_monitor().await;
         self.cancel_token.cancel();
 
         CommandResult::success()
@@ -3799,6 +5567,492 @@ impl SipSession {
         }
         self.state = Self::derive_state(&self.legs);
         true
+    }
+
+    /// Add a new leg to the session dynamically.
+    async fn handle_add_leg(&mut self, target: String, leg_id: Option<LegId>) -> Result<LegId> {
+        let new_leg_id =
+            leg_id.unwrap_or_else(|| LegId::new(format!("leg-{}", uuid::Uuid::new_v4())));
+
+        info!(%new_leg_id, %target, "Adding new SIP leg to session");
+
+        // Parse target as SIP URI
+        let uri = rsipstack::sip::Uri::try_from(target.as_str())
+            .map_err(|e| anyhow!("Invalid SIP URI '{}': {}", target, e))?;
+
+        // Create leg
+        let leg = crate::call::domain::Leg::new(new_leg_id.clone()).with_endpoint(target.clone());
+        self.legs.insert(new_leg_id.clone(), leg);
+        self.update_leg_state(&new_leg_id, LegState::Initializing);
+
+        // Create peer and initiate INVITE in background
+        if let Err(e) = self.initiate_sip_leg(&new_leg_id, uri).await {
+            warn!(error = %e, "Failed to initiate SIP leg, cleaning up");
+            self.legs.remove(&new_leg_id);
+            return Err(e);
+        }
+
+        self.update_media_path().await;
+
+        info!(%new_leg_id, "SIP leg added successfully");
+        Ok(new_leg_id)
+    }
+
+    /// Remove a leg from the session.
+    async fn handle_remove_leg(&mut self, leg_id: LegId) -> Result<()> {
+        info!(%leg_id, "Removing leg from session");
+
+        if let Some(leg) = self.legs.remove(&leg_id) {
+            // Send BYE to SIP dialog if exists
+            let dialog_id = format!("{}-{}", self.id.0, leg_id);
+            if leg.dialog_id.is_some() {
+                if let Some(dlg) = self.server.dialog_layer.get_dialog_with(&dialog_id) {
+                    if let Err(e) = dlg.hangup().await {
+                        warn!(%leg_id, %dialog_id, error = %e, "Failed to hangup SIP dialog");
+                    } else {
+                        info!(%leg_id, %dialog_id, "SIP dialog hangup sent");
+                    }
+                }
+            }
+            info!(%leg_id, "Leg removed");
+        }
+
+        // Abort any spawned tasks for this leg
+        if let Some(handles) = self.leg_tasks.remove(&leg_id) {
+            let count = handles.len();
+            for handle in handles {
+                handle.abort();
+            }
+            info!(%leg_id, "Aborted {} tasks for removed leg", count);
+        }
+
+        // Remove peer for this leg
+        self.leg_peers.remove(&leg_id);
+
+        self.update_media_path().await;
+        Ok(())
+    }
+
+    /// Create a media peer for a dynamic leg.
+    async fn create_leg_peer(
+        &self,
+        leg_id: &LegId,
+    ) -> Result<(Arc<dyn MediaPeer>, Box<dyn crate::media::Track>, String)> {
+        let track_id = format!("leg-{}-{}", self.id.0, leg_id);
+
+        // Create media stream
+        let media_stream_builder = crate::media::MediaStreamBuilder::new()
+            .with_id(track_id.clone())
+            .with_cancel_token(self.cancel_token.child_token());
+        let media_stream = media_stream_builder.build();
+
+        // Create peer (using VoiceEnginePeer for now - can be extended for WebRTC)
+        let peer: Arc<dyn MediaPeer> = Arc::new(VoiceEnginePeer::new(Arc::new(media_stream)));
+
+        // Create RTP track
+        let mut track_builder = crate::media::RtpTrackBuilder::new(track_id.clone())
+            .with_cancel_token(self.cancel_token.child_token());
+
+        if let Some(ref external_ip) = self.server.rtp_config.external_ip {
+            track_builder = track_builder.with_external_ip(external_ip.clone());
+        }
+        if let Some(ref bind_ip) = self.server.rtp_config.bind_ip {
+            track_builder = track_builder.with_bind_ip(bind_ip.clone());
+        }
+
+        let track = track_builder.build();
+
+        // Get SDP offer from track BEFORE moving it into peer
+        let sdp = track
+            .local_description()
+            .await
+            .map_err(|e| anyhow!("Failed to get local description: {}", e))?;
+
+        // Add track to peer (moves track)
+        peer.update_track(Box::new(track), None).await;
+
+        // Re-create a placeholder track for the return value (the real one is inside peer now)
+        let placeholder_track = crate::media::RtpTrackBuilder::new(track_id)
+            .with_cancel_token(self.cancel_token.child_token())
+            .build();
+
+        Ok((peer, Box::new(placeholder_track), sdp))
+    }
+
+    /// Initiate a SIP INVITE for a dynamic leg.
+    async fn initiate_sip_leg(
+        &mut self,
+        leg_id: &LegId,
+        callee_uri: rsipstack::sip::Uri,
+    ) -> Result<()> {
+        // Create peer for this leg
+        let (peer, _track, sdp_offer) = self.create_leg_peer(leg_id).await?;
+        self.leg_peers.insert(leg_id.clone(), peer.clone());
+
+        info!(%leg_id, %callee_uri, sdp_len = %sdp_offer.len(), "Initiating SIP leg");
+
+        // Build INVITE option
+        let caller = self
+            .context
+            .dialplan
+            .caller
+            .clone()
+            .unwrap_or_else(|| callee_uri.clone());
+        let contact = self
+            .context
+            .dialplan
+            .caller_contact
+            .as_ref()
+            .map(|c| c.uri.clone())
+            .unwrap_or_else(|| caller.clone());
+
+        let invite_option = rsipstack::dialog::invitation::InviteOption {
+            callee: callee_uri.clone(),
+            caller: caller.clone(),
+            contact: contact.clone(),
+            content_type: Some("application/sdp".to_string()),
+            offer: Some(sdp_offer.into_bytes()),
+            destination: None,
+            credential: None,
+            headers: None,
+            call_id: Some(format!("{}-{}", self.id.0, leg_id)),
+            ..Default::default()
+        };
+
+        let dialog_layer = self.server.dialog_layer.clone();
+        let leg_id_for_spawn = leg_id.clone();
+        let cmd_tx = self
+            .cmd_tx
+            .clone()
+            .ok_or_else(|| anyhow!("No command sender available"))?;
+        let track_id = format!("leg-{}-{}", self.id.0, leg_id);
+        let cancel_token = self.cancel_token.child_token();
+
+        // Spawn background task to handle INVITE response
+        let invite_handle = tokio::spawn(async move {
+            let leg_id = leg_id_for_spawn;
+            let (state_tx, mut state_rx) = tokio::sync::mpsc::unbounded_channel();
+            let invitation = dialog_layer.do_invite(invite_option, state_tx).boxed();
+
+            let result = match invitation.await {
+                Ok((dialog, response)) => {
+                    if let Some(ref resp) = response {
+                        let status_code = resp.status_code.code();
+                        if (200..300).contains(&status_code) {
+                            info!(%leg_id, status = %status_code, "SIP leg answered successfully");
+
+                            // Extract SDP answer from response body
+                            if !resp.body().is_empty() {
+                                let answer_sdp = String::from_utf8_lossy(resp.body()).to_string();
+
+                                // Set remote description on the peer
+                                if let Err(e) =
+                                    peer.update_remote_description(&track_id, &answer_sdp).await
+                                {
+                                    warn!(%leg_id, error = %e, "Failed to set remote description on leg peer");
+                                } else {
+                                    info!(%leg_id, "Remote description set successfully");
+                                }
+                            }
+
+                            // Send LegConnected with SDP answer
+                            let _ = cmd_tx.send(CallCommand::LegConnected {
+                                leg_id: leg_id.clone(),
+                            });
+
+                            // Return dialog for further processing
+                            Ok(dialog)
+                        } else {
+                            warn!(%leg_id, status = %status_code, "SIP leg rejected");
+                            let _ = cmd_tx.send(CallCommand::LegFailed {
+                                leg_id: leg_id.clone(),
+                                reason: format!("Rejected with {}", status_code),
+                            });
+                            Err(format!("Rejected with {}", status_code))
+                        }
+                    } else {
+                        warn!(%leg_id, "SIP leg timeout (no response)");
+                        let _ = cmd_tx.send(CallCommand::LegFailed {
+                            leg_id: leg_id.clone(),
+                            reason: "Timeout".to_string(),
+                        });
+                        Err("Timeout".to_string())
+                    }
+                }
+                Err(e) => {
+                    warn!(%leg_id, error = %e, "SIP leg failed");
+                    let _ = cmd_tx.send(CallCommand::LegFailed {
+                        leg_id: leg_id.clone(),
+                        reason: e.to_string(),
+                    });
+                    Err(e.to_string())
+                }
+            };
+
+            // Process dialog state changes (e.g., BYE from remote)
+            if let Ok(dialog) = result {
+                let dialog_cancel = cancel_token.child_token();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = dialog_cancel.cancelled() => {
+                                info!(%leg_id, "Dialog monitor cancelled");
+                                break;
+                            }
+                            state = state_rx.recv() => {
+                                match state {
+                                    Some(rsipstack::dialog::dialog::DialogState::Terminated(..)) => {
+                                        info!(%leg_id, "SIP leg dialog terminated");
+                                        let _ = cmd_tx.send(CallCommand::LegFailed {
+                                            leg_id: leg_id.clone(),
+                                            reason: "Remote hung up".to_string(),
+                                        });
+                                        break;
+                                    }
+                                    Some(_) => {}
+                                    None => break,
+                                }
+                            }
+                        }
+                    }
+                    // Keep dialog alive
+                    let _ = dialog;
+                });
+            }
+        });
+
+        self.leg_tasks
+            .entry(leg_id.clone())
+            .or_default()
+            .push(invite_handle);
+
+        Ok(())
+    }
+
+    /// Update media path based on number of active legs.
+    async fn update_media_path(&mut self) {
+        let active_count = self.legs.values().filter(|l| l.is_active()).count();
+
+        info!(session_id = %self.id, active_legs = active_count, "Updating media path");
+
+        match active_count {
+            2 => {
+                // Direct bridge: caller ↔ callee (or caller ↔ target)
+                info!("Switching to direct bridge mode");
+                // Clean up conference bridges if any
+                self.stop_conference_bridges().await;
+                // Setup direct bridge between the two active legs
+                let active_legs: Vec<LegId> = self
+                    .legs
+                    .iter()
+                    .filter(|(_, leg)| leg.is_active())
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                if active_legs.len() == 2 {
+                    self.setup_bridge(active_legs[0].clone(), active_legs[1].clone())
+                        .await;
+                    info!(leg_a = %active_legs[0], leg_b = %active_legs[1], "Direct bridge configured");
+                }
+            }
+            n if n >= 3 => {
+                // Conference mixer: all legs mixed together
+                info!("Switching to conference mixer mode ({} legs)", n);
+                // Clean up direct bridge if any
+                self.stop_direct_bridge().await;
+                // Setup conference mixer
+                self.setup_conference_mixer().await;
+            }
+            _ => {
+                // Single leg or none - no bridging needed
+                info!("No bridging needed");
+                self.stop_all_bridges().await;
+            }
+        }
+    }
+
+    /// Stop all conference bridges for this session.
+    async fn stop_conference_bridges(&mut self) {
+        if self.conference_bridge.is_active() {
+            info!("Stopping conference bridges");
+            self.conference_bridge.stop_bridge();
+        }
+    }
+
+    /// Stop direct bridge if active.
+    async fn stop_direct_bridge(&mut self) {
+        if self.bridge.active {
+            info!("Stopping direct bridge");
+            self.bridge.clear();
+        }
+    }
+
+    /// Stop all bridges (both direct and conference).
+    async fn stop_all_bridges(&mut self) {
+        self.stop_conference_bridges().await;
+        self.stop_direct_bridge().await;
+        // Abort all leg-specific spawned tasks
+        for (leg_id, handles) in self.leg_tasks.drain() {
+            for handle in handles {
+                handle.abort();
+            }
+            info!(%leg_id, "Aborted tasks for leg");
+        }
+        info!("All bridges stopped");
+    }
+
+    /// Setup conference mixer for all active legs.
+    async fn setup_conference_mixer(&mut self) {
+        let conf_id_str = format!("conf-{}", self.id.0);
+        let conf_id = crate::call::runtime::ConferenceId::from(conf_id_str.as_str());
+
+        // Create conference if not exists
+        if self
+            .server
+            .conference_manager
+            .get_conference(&conf_id)
+            .await
+            .is_none()
+        {
+            if let Err(e) = self
+                .server
+                .conference_manager
+                .create_conference(conf_id.clone(), None)
+                .await
+            {
+                warn!("Failed to create conference: {}", e);
+                return;
+            }
+            info!(conf_id = %conf_id_str, "Conference created");
+        }
+
+        // Collect active leg IDs first to avoid borrow issues
+        let active_legs: Vec<(LegId, Option<Arc<dyn MediaPeer>>)> = self
+            .legs
+            .iter()
+            .filter(|(_, leg)| leg.is_active())
+            .map(|(id, _)| {
+                let peer = self.leg_peers.get(id).cloned();
+                (id.clone(), peer)
+            })
+            .collect();
+
+        // Add all active legs as participants
+        for (leg_id, peer) in active_legs {
+            let participant_leg = LegId::new(format!("{}-{}", self.id.0, leg_id));
+
+            if let Err(e) = self
+                .server
+                .conference_manager
+                .add_participant(&conf_id, participant_leg.clone())
+                .await
+            {
+                warn!(%leg_id, "Failed to add participant: {}", e);
+                continue;
+            }
+
+            info!(%leg_id, "Added participant to conference");
+
+            // Start media bridge for this leg using its own peer if available
+            if let Some(peer) = peer {
+                if let Err(e) = self
+                    .start_conference_media_bridge_for_peer(&conf_id_str, &leg_id, &peer)
+                    .await
+                {
+                    warn!(%leg_id, "Failed to start conference media bridge for dynamic leg: {}", e);
+                }
+            } else {
+                // Fallback to legacy caller/callee peer for existing legs
+                if let Err(e) = self
+                    .start_conference_media_bridge(&conf_id_str, &leg_id)
+                    .await
+                {
+                    warn!(%leg_id, "Failed to start conference media bridge: {}", e);
+                }
+            }
+        }
+    }
+
+    /// Start conference media bridge for a specific peer (dynamic leg).
+    async fn start_conference_media_bridge_for_peer(
+        &mut self,
+        conf_id: &str,
+        leg_id: &LegId,
+        peer: &Arc<dyn MediaPeer>,
+    ) -> Result<crate::call::runtime::ConferenceBridgeHandle> {
+        use rustrtc::media::MediaSample;
+
+        // Get the first track from the peer and check if it has a sender
+        let tracks = peer.get_tracks().await;
+        let mut audio_sender = None;
+        for t in &tracks {
+            let guard = t.lock().await;
+            if let Some(sender) = guard.get_sender() {
+                audio_sender = Some(sender);
+                break;
+            }
+        }
+
+        // Create a channel to bridge between ConferenceMediaBridge and audio_sender
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<MediaSample>(100);
+
+        if let Some(sender) = audio_sender {
+            info!(
+                session_id = %self.id,
+                conf_id = %conf_id,
+                leg_id = %leg_id,
+                "Using existing track sender for conference media bridge"
+            );
+
+            // Spawn a forwarder task with cancellation support
+            let cancel_token = self.cancel_token.child_token();
+            let forwarder_handle = tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = cancel_token.cancelled() => {
+                            break;
+                        }
+                        sample = rx.recv() => {
+                            match sample {
+                                Some(s) => {
+                                    if sender.send(s).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                None => break,
+                            }
+                        }
+                    }
+                }
+            });
+            self.leg_tasks
+                .entry(leg_id.clone())
+                .or_default()
+                .push(forwarder_handle);
+        } else {
+            warn!(
+                session_id = %self.id,
+                conf_id = %conf_id,
+                leg_id = %leg_id,
+                "No track sender found, conference audio will not be sent to this leg"
+            );
+        }
+
+        // Create audio receiver for input from peer
+        let audio_receiver = self
+            .create_audio_receiver_from_peer(peer)
+            .await
+            .map_err(|e| anyhow!("Failed to create audio receiver for dynamic leg: {}", e))?;
+
+        // Start full-duplex media bridge
+        let bridge = crate::call::runtime::ConferenceMediaBridge::new(
+            self.server.conference_manager.clone(),
+        );
+        bridge
+            .start_bridge_full_duplex(conf_id, leg_id, tx, audio_receiver)
+            .await
+            .map_err(|e| anyhow!("Failed to start conference media bridge: {}", e))
     }
 
     async fn setup_bridge(&mut self, leg_a: LegId, leg_b: LegId) -> bool {
@@ -3883,12 +6137,18 @@ impl SipSession {
         }
 
         if attended {
-            self.update_leg_state(&leg_id, LegState::Hold);
+            if !target.is_empty() {
+                self.handle_replace_transfer(leg_id, target).await?;
+            } else {
+                self.update_leg_state(&leg_id, LegState::Hold);
 
-            info!("Attended transfer initiated - consultation call should be created externally");
+                info!(
+                    "Attended transfer initiated - consultation call should be created externally"
+                );
 
-            if let Some(ref reporter) = self.reporter {
-                let _ = reporter;
+                if let Some(ref reporter) = self.reporter {
+                    let _ = reporter;
+                }
             }
         } else {
             self.handle_blind_transfer(leg_id, target).await?;
@@ -3898,6 +6158,41 @@ impl SipSession {
     }
 
     async fn handle_blind_transfer(&mut self, leg_id: LegId, target: String) -> Result<()> {
+        // Handle queue: prefix — start queue instead of sending REFER.
+        // The target may carry an optional ?return_ivr= parameter set by IVR
+        // so that when the queue exhausts all agents the call goes back to IVR.
+        if target.starts_with("queue:") {
+            let remainder = target.strip_prefix("queue:").unwrap_or(&target).trim();
+            let (queue_name, return_ivr) =
+                if let Some(pos) = remainder.find("?return_ivr=") {
+                    let q = remainder[..pos].trim();
+                    let ivr = remainder[pos + "?return_ivr=".len()..].to_string();
+                    (q, Some(ivr))
+                } else {
+                    (remainder, None)
+                };
+            if !queue_name.is_empty() {
+                info!(
+                    %leg_id,
+                    queue = %queue_name,
+                    ?return_ivr,
+                    "Handling queue transfer"
+                );
+                return self
+                    .handle_queue_transfer(leg_id, queue_name, return_ivr)
+                    .await;
+            }
+        }
+
+        // Handle ivr: prefix — start an IVR application directly.
+        if target.starts_with("ivr:") {
+            let ivr_name = target.strip_prefix("ivr:").unwrap_or(&target).trim();
+            if !ivr_name.is_empty() {
+                info!(%leg_id, ivr = %ivr_name, "Handling ivr transfer by starting IvrApp");
+                return self.start_ivr_app(ivr_name).await;
+            }
+        }
+
         let refer_to_str = if target.starts_with("sip:") || target.starts_with("tel:") {
             target.clone()
         } else {
@@ -3906,13 +6201,33 @@ impl SipSession {
         let refer_to_uri = rsipstack::sip::Uri::try_from(refer_to_str.as_str())
             .map_err(|e| anyhow!("Invalid transfer target URI: {}", e))?;
 
+        // When blind_transfer_use_refer is false (default), originate B-leg INVITE directly (B2BUA).
+        if !self.server.proxy_config.blind_transfer_use_refer {
+            info!(%leg_id, target = %refer_to_str, "Blind transfer via B-leg INVITE (B2BUA)");
+            let location = crate::call::Location {
+                aor: refer_to_uri,
+                ..Default::default()
+            };
+            let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            return self
+                .try_single_target(&location, &mut rx, None, None)
+                .await
+                .map_err(|(code, reason)| {
+                    anyhow!(
+                        "B-leg transfer failed: {:?} - {}",
+                        code,
+                        reason.unwrap_or_default()
+                    )
+                });
+        }
+
         let referred_by = self
             .context
             .dialplan
             .caller_contact
             .clone()
             .map(|c| c.to_string())
-            .unwrap_or_else(|| format!("sip:rustpbx@localhost"));
+            .unwrap_or_else(|| "sip:rustpbx@localhost".to_string());
         let headers = vec![rsipstack::sip::Header::Other(
             "Referred-By".to_string(),
             format!("<{}>", referred_by),
@@ -3936,9 +6251,21 @@ impl SipSession {
 
                         self.emit_transfer_event(&leg_id, "accepted", None, None)
                             .await;
+                        self.emit_refer_event(
+                            status,
+                            None,
+                            crate::call::domain::ReferNotifyEventType::ReferResponse,
+                        )
+                        .await;
                     }
                     100..=199 => {
                         info!("REFER received provisional response {}", status);
+                        self.emit_refer_event(
+                            status,
+                            None,
+                            crate::call::domain::ReferNotifyEventType::ReferResponse,
+                        )
+                        .await;
                     }
                     405 | 420 | 501 => {
                         warn!(status = %status, "REFER not supported by peer, needs 3PCC fallback");
@@ -3947,6 +6274,12 @@ impl SipSession {
                             "failed",
                             Some(status),
                             Some("refer_not_supported"),
+                        )
+                        .await;
+                        self.emit_refer_event(
+                            status,
+                            Some("refer_not_supported".to_string()),
+                            crate::call::domain::ReferNotifyEventType::ReferResponse,
                         )
                         .await;
                         return Err(anyhow!(
@@ -3963,6 +6296,12 @@ impl SipSession {
                             Some("refer_rejected"),
                         )
                         .await;
+                        self.emit_refer_event(
+                            status,
+                            Some("refer_rejected".to_string()),
+                            crate::call::domain::ReferNotifyEventType::ReferResponse,
+                        )
+                        .await;
                         return Err(anyhow!("REFER rejected with status {}", status));
                     }
                     _ => {
@@ -3974,6 +6313,12 @@ impl SipSession {
                             Some("unexpected_response"),
                         )
                         .await;
+                        self.emit_refer_event(
+                            status,
+                            Some("unexpected_response".to_string()),
+                            crate::call::domain::ReferNotifyEventType::ReferResponse,
+                        )
+                        .await;
                         return Err(anyhow!("Unexpected REFER response: {}", status));
                     }
                 }
@@ -3982,12 +6327,24 @@ impl SipSession {
                 warn!("REFER timed out, no response received");
                 self.emit_transfer_event(&leg_id, "failed", None, Some("timeout"))
                     .await;
+                self.emit_refer_event(
+                    408,
+                    Some("timeout".to_string()),
+                    crate::call::domain::ReferNotifyEventType::ReferResponse,
+                )
+                .await;
                 return Err(anyhow!("REFER timed out"));
             }
             Err(e) => {
                 warn!(error = %e, "Failed to send REFER");
                 self.emit_transfer_event(&leg_id, "failed", None, Some(&e.to_string()))
                     .await;
+                self.emit_refer_event(
+                    500,
+                    Some(e.to_string()),
+                    crate::call::domain::ReferNotifyEventType::ReferResponse,
+                )
+                .await;
                 return Err(anyhow!("Failed to send REFER: {}", e));
             }
         }
@@ -4000,7 +6357,104 @@ impl SipSession {
         Ok(())
     }
 
-    #[allow(dead_code)]
+    /// Handle queue transfer by loading queue config and executing queue plan.
+    /// This is called when a transfer target starts with "queue:".
+    /// `return_ivr` — if set, the queue plan's fallback is overridden to return
+    /// the call to the given IVR when all agents are exhausted.
+    async fn handle_queue_transfer(
+        &mut self,
+        leg_id: LegId,
+        queue_name: &str,
+        return_ivr: Option<String>,
+    ) -> Result<()> {
+        info!(%leg_id, queue = %queue_name, ?return_ivr, "Starting queue transfer");
+
+        // Load queue configuration from data context
+        let queue_config = self
+            .server
+            .data_context
+            .resolve_queue_config(queue_name)
+            .map_err(|e| anyhow!("Failed to resolve queue config: {}", e))?;
+
+        let queue_config = match queue_config {
+            Some(config) => config,
+            None => {
+                return Err(anyhow!("Queue '{}' not found", queue_name));
+            }
+        };
+
+        // Convert to queue plan
+        let mut queue_plan = queue_config
+            .to_queue_plan()
+            .map_err(|e| anyhow!("Invalid queue config: {}", e))?;
+
+        // If return_ivr is specified, override fallback so the queue sends
+        // the caller back to the IVR when all agents are exhausted.
+        if let Some(ref ivr_name) = return_ivr {
+            info!(
+                queue = %queue_name,
+                ivr = %ivr_name,
+                "Queue transfer: will return to IVR on fallback"
+            );
+            let name = ivr_name.clone();
+            queue_plan.fallback = Some(crate::call::QueueFallbackAction::Failure(
+                crate::call::FailureAction::Transfer(crate::call::TransferEndpoint::Ivr(name)),
+            ));
+        }
+
+        // Execute queue plan
+        // Create a channel for callee state (not used in this context)
+        let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        match self.execute_queue(&queue_plan, &mut rx).await {
+            Ok(()) => {
+                info!(queue = %queue_name, "Queue transfer completed successfully");
+                Ok(())
+            }
+            Err((code, reason)) => {
+                warn!(
+                    queue = %queue_name,
+                    ?code,
+                    ?reason,
+                    "Queue transfer failed"
+                );
+                if self.server_dialog.state().is_confirmed() {
+                    self.last_error = Some((code.clone(), reason.clone()));
+                    self.hangup_reason
+                        .get_or_insert(CallRecordHangupReason::Failed);
+                    self.pending_hangup.insert(self.server_dialog.id());
+                    self.cancel_token.cancel();
+                    info!(
+                        queue = %queue_name,
+                        ?code,
+                        ?reason,
+                        "Queue transfer failed after caller was answered; hanging up caller dialog"
+                    );
+                    return Ok(());
+                }
+                Err(anyhow!("Queue transfer failed: {:?} - {:?}", code, reason))
+            }
+        }
+    }
+
+    /// Start an IVR application by name.
+    /// This is used by the queue fallback path when the fallback action
+    /// specifies `TransferEndpoint::Ivr`, and by `handle_blind_transfer`
+    /// when the transfer target has an `ivr:` prefix.
+    async fn start_ivr_app(&self, ivr_name: &str) -> Result<()> {
+        let ivr_file = format!("config/ivr/{}.toml", ivr_name);
+        info!(ivr = %ivr_name, file = %ivr_file, "Starting IVR application");
+        self.app_runtime
+            .start_app(
+                "ivr",
+                Some(serde_json::json!({"file": ivr_file})),
+                true,
+            )
+            .await
+            .map_err(|e| anyhow!("Failed to start IVR '{}': {:?}", ivr_name, e))?;
+        Ok(())
+    }
+
     fn build_replaces_header(&self) -> Option<String> {
         let dialog_id = self.server_dialog.id();
 
@@ -4016,6 +6470,21 @@ impl SipSession {
             "{};to-tag={};from-tag={}",
             call_id, local_tag, remote_tag
         ))
+    }
+
+    async fn handle_replace_transfer(&mut self, leg_id: LegId, target: String) -> Result<()> {
+        let replaces = self
+            .build_replaces_header()
+            .ok_or_else(|| anyhow!("Cannot build Replaces header for current dialog"))?;
+        let encoded_replaces = urlencoding::encode(&replaces).into_owned();
+
+        let refer_target = if target.contains('?') {
+            format!("{}&Replaces={}", target, encoded_replaces)
+        } else {
+            format!("{}?Replaces={}", target, encoded_replaces)
+        };
+
+        self.handle_blind_transfer(leg_id, refer_target).await
     }
 
     async fn emit_transfer_event(
@@ -4035,6 +6504,25 @@ impl SipSession {
         });
 
         info!(?event_data, "Transfer event emitted");
+    }
+
+    /// Emit a REFER-related event to all registered transfer controllers.
+    async fn emit_refer_event(
+        &self,
+        sip_status: u16,
+        reason: Option<String>,
+        event_type: crate::call::domain::ReferNotifyEventType,
+    ) {
+        let event = crate::call::domain::ReferNotifyEvent {
+            call_id: self.id.0.clone(),
+            sip_status,
+            reason,
+            event_type,
+        };
+        let subscribers = self.server.transfer_notify_subscribers.lock().await;
+        for tx in subscribers.iter() {
+            let _ = tx.send(event.clone());
+        }
     }
 
     async fn handle_transfer_complete(&mut self, consult_leg: LegId) -> Result<()> {
@@ -4057,6 +6545,8 @@ impl SipSession {
             {
                 self.update_leg_state(&original_leg, LegState::Connected);
                 self.update_leg_state(&consult_leg, LegState::Connected);
+                // Ensure the original leg is properly unheld after bridge
+                let _ = self.handle_unhold(original_leg.clone()).await;
                 info!("Attended transfer completed successfully");
             } else {
                 return Err(anyhow!("Failed to setup bridge for transfer completion"));
@@ -4085,7 +6575,504 @@ impl SipSession {
 
         if let Some(original_leg) = original_leg {
             self.update_leg_state(&original_leg, LegState::Connected);
+            // Ensure the original leg is properly unheld after cancel
+            let _ = self.handle_unhold(original_leg.clone()).await;
             info!("Attended transfer canceled, original call resumed");
+        }
+
+        Ok(())
+    }
+
+    /// Handle cross-session transfer completion by migrating a leg into a conference.
+    ///
+    /// This is used in the BC -> ABC conference flow where leg_c from session2
+    /// needs to be migrated into a conference that also includes legs from session1.
+    ///
+    /// Flow:
+    /// 1. Locate the leg in from_session
+    /// 2. Add the leg's media to the target conference
+    /// 3. Mark the leg as migrated (don't remove from session yet - session will be cleaned up)
+    async fn handle_transfer_complete_cross_session(
+        &mut self,
+        from_session: String,
+        leg_id: LegId,
+        into_conference: String,
+    ) -> Result<()> {
+        info!(
+            from_session = %from_session,
+            leg_id = %leg_id,
+            into_conference = %into_conference,
+            "Handling cross-session transfer completion"
+        );
+
+        // Check if this is the from_session
+        if self.id.to_string() != from_session {
+            // This session is not the from_session, forward the command to the correct session
+            let registry = &self.server.active_call_registry;
+            if let Some(handle) = registry.get_handle(&from_session) {
+                let from_session_clone = from_session.clone();
+                handle
+                    .send_command(CallCommand::TransferCompleteCrossSession {
+                        from_session,
+                        leg_id,
+                        into_conference,
+                    })
+                    .map_err(|e| anyhow!("Failed to forward cross-session transfer: {}", e))?;
+                info!(
+                    "Forwarded cross-session transfer command to session {}",
+                    from_session_clone
+                );
+                return Ok(());
+            } else {
+                return Err(anyhow!(
+                    "from_session {} not found in registry",
+                    from_session
+                ));
+            }
+        }
+
+        // This is the from_session - find the leg
+        let leg = self
+            .legs
+            .get(&leg_id)
+            .ok_or_else(|| anyhow!("Leg {} not found in session {}", leg_id, from_session))?;
+
+        info!(
+            session_id = %self.id,
+            leg_id = %leg_id,
+            leg_state = ?leg.state,
+            "Found leg for cross-session migration"
+        );
+
+        // Get the conference manager from the server
+        let conference_manager = &self.server.conference_manager;
+        let conf_id = crate::call::runtime::ConferenceId::from(into_conference.as_str());
+
+        // Add the leg to the conference
+        conference_manager
+            .add_participant(&conf_id, LegId::new(format!("{}-{}", from_session, leg_id)))
+            .await
+            .map_err(|e| anyhow!("Failed to add leg to conference: {}", e))?;
+
+        info!(
+            session_id = %self.id,
+            leg_id = %leg_id,
+            conf_id = %into_conference,
+            "Successfully migrated leg into conference"
+        );
+
+        // Start conference media bridge for this leg
+        // This enables the leg to receive mixed audio from all conference participants
+        match self
+            .start_conference_media_bridge(&into_conference, &leg_id)
+            .await
+        {
+            Ok(handle) => {
+                info!(
+                    session_id = %self.id,
+                    leg_id = %leg_id,
+                    "Conference media bridge started"
+                );
+                self.conference_bridge.bridge_handle = Some(handle);
+                self.conference_bridge.conf_id = Some(into_conference);
+            }
+            Err(e) => {
+                warn!(
+                    session_id = %self.id,
+                    leg_id = %leg_id,
+                    error = %e,
+                    "Failed to start conference media bridge"
+                );
+            }
+        }
+
+        // Mark the leg as migrated - the session will be cleaned up separately
+        // (typically by BYE after confirming migration succeeded)
+        self.update_leg_state(&leg_id, LegState::Hold);
+
+        Ok(())
+    }
+
+    /// Create a conference audio track and start full-duplex media bridge.
+    ///
+    /// This creates a rustrtc sample track for output (mixed audio to participant),
+    /// and sets up an audio receiver for input (participant audio to mixer).
+    /// The bridge runs both forward and reverse loops for full-duplex communication.
+    async fn start_conference_media_bridge(
+        &mut self,
+        conf_id: &str,
+        leg_id: &LegId,
+    ) -> Result<crate::call::runtime::ConferenceBridgeHandle> {
+        use rustrtc::RtpCodecParameters;
+        use rustrtc::media::MediaKind;
+        use rustrtc::media::MediaSample;
+        use rustrtc::media::track::sample_track;
+
+        // Determine which peer to use based on leg_id
+        let is_callee = leg_id.0.ends_with("-callee") || leg_id.0 == "callee";
+        if !is_callee {
+            self.stop_caller_ingress_monitor().await;
+        }
+        let (peer, track_id) = if is_callee {
+            (self.callee_peer.clone(), Self::CALLEE_TRACK_ID)
+        } else {
+            (self.caller_peer.clone(), Self::CALLER_TRACK_ID)
+        };
+
+        // Create a sample track pair (sender -> track) for output
+        let (audio_sender, track, _feedback_rx) = sample_track(MediaKind::Audio, 100);
+
+        // Get the existing peer connection from the named RTP track.
+        // We search by track_id to avoid picking up ForwardingTrackHandle entries
+        // (which return None from get_peer_connection).  During REFER/transfer
+        // transitions the track may not be ready yet, so retry briefly.
+        let mut pc = None;
+        for attempt in 0..150 {
+            let tracks = peer.get_tracks().await;
+            // First try: look for the named RTP track
+            for t in &tracks {
+                let guard = t.lock().await;
+                if guard.id() == track_id {
+                    if let Some(found_pc) = guard.get_peer_connection().await {
+                        pc = Some(found_pc);
+                        break;
+                    }
+                }
+            }
+            if pc.is_some() {
+                break;
+            }
+            // Fallback: accept any track that has a peer connection (e.g. after re-INVITE)
+            for t in &tracks {
+                let guard = t.lock().await;
+                if let Some(found_pc) = guard.get_peer_connection().await {
+                    pc = Some(found_pc);
+                    break;
+                }
+            }
+            if pc.is_some() {
+                break;
+            }
+            if attempt % 25 == 0 {
+                let track_ids: Vec<_> = {
+                    let mut ids = Vec::new();
+                    for t in &tracks {
+                        ids.push(t.lock().await.id().to_string());
+                    }
+                    ids
+                };
+                tracing::debug!(
+                    session_id = %self.id,
+                    leg_id = %leg_id,
+                    wanted_track_id = %track_id,
+                    available_tracks = ?track_ids,
+                    attempt = attempt,
+                    "Waiting for peer connection on conference media bridge"
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let pc = pc.ok_or_else(|| {
+            anyhow!(
+                "No peer connection found for conference audio injection (leg={}, track={}, session={})",
+                leg_id,
+                track_id,
+                self.id
+            )
+        })?;
+
+        // Add the sample track to the existing peer connection with PCMU params
+        let params = RtpCodecParameters {
+            payload_type: 0, // PCMU
+            clock_rate: 8000,
+            channels: 1,
+        };
+
+        pc.add_track(track, params)
+            .map_err(|e| anyhow!("Failed to add conference track to peer connection: {}", e))?;
+
+        info!(
+            session_id = %self.id,
+            conf_id = %conf_id,
+            leg_id = %leg_id,
+            "Conference sample track added to existing peer connection"
+        );
+
+        // Create a channel to bridge between ConferenceMediaBridge and audio_sender
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<MediaSample>(100);
+
+        // Spawn a forwarder task with cancellation support
+        let cancel_token = self.cancel_token.child_token();
+        let forwarder_handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel_token.cancelled() => {
+                        break;
+                    }
+                    sample = rx.recv() => {
+                        match sample {
+                            Some(s) => {
+                                if audio_sender.send(s).await.is_err() {
+                                    break;
+                                }
+                            }
+                            None => break,
+                        }
+                    }
+                }
+            }
+        });
+        self.leg_tasks
+            .entry(leg_id.clone())
+            .or_default()
+            .push(forwarder_handle);
+
+        // Create audio receiver for input from SIP track
+        let audio_receiver = if is_callee {
+            self.create_audio_receiver_from_peer(&peer).await
+        } else {
+            self.create_audio_receiver().await
+        }
+        .map_err(|e| anyhow!("Failed to create audio receiver: {}", e))?;
+
+        // Start full-duplex media bridge
+        let bridge = crate::call::runtime::ConferenceMediaBridge::new(
+            self.server.conference_manager.clone(),
+        );
+        bridge
+            .start_bridge_full_duplex(conf_id, leg_id, tx, audio_receiver)
+            .await
+            .map_err(|e| anyhow!("Failed to start conference media bridge: {}", e))
+    }
+
+    /// Create an audio receiver that reads decoded PCM from the session's media track.
+    ///
+    /// This is used to feed participant audio into the conference mixer.
+    /// Uses the same pattern as BridgePeer: reads MediaSample from track, decodes to PCM.
+    async fn create_audio_receiver(
+        &self,
+    ) -> Result<Box<dyn crate::call::runtime::conference_media_bridge::AudioReceiver>> {
+        // Get the caller's peer connection with a short retry loop for transfer transitions.
+        let mut pc = None;
+        for _ in 0..100 {
+            if let Some(found_pc) = self.get_caller_peer_connection().await {
+                pc = Some(found_pc);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let pc = pc.ok_or_else(|| anyhow!("No peer connection found for conference input"))?;
+
+        // Create decoder based on negotiated codec
+        let decoder = self
+            .create_audio_decoder()
+            .ok_or_else(|| anyhow!("Failed to create audio decoder"))?;
+
+        Ok(Box::new(PeerConnectionAudioReceiver::new(pc, decoder)))
+    }
+
+    /// Create an audio receiver from a specific peer.
+    async fn create_audio_receiver_from_peer(
+        &self,
+        peer: &Arc<dyn MediaPeer>,
+    ) -> Result<Box<dyn crate::call::runtime::conference_media_bridge::AudioReceiver>> {
+        // Get peer connection from the given peer with retries during session setup.
+        // Iterate all tracks (not just first) to skip ForwardingTrackHandle entries
+        // which always return None from get_peer_connection().
+        let mut pc = None;
+        for _ in 0..150 {
+            let tracks = peer.get_tracks().await;
+            for t in &tracks {
+                let guard = t.lock().await;
+                if let Some(found_pc) = guard.get_peer_connection().await {
+                    pc = Some(found_pc);
+                    break;
+                }
+            }
+            if pc.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let pc = pc.ok_or_else(|| anyhow!("No peer connection found for conference input"))?;
+
+        // Create decoder based on negotiated codec
+        let decoder = self
+            .create_audio_decoder()
+            .ok_or_else(|| anyhow!("Failed to create audio decoder"))?;
+
+        Ok(Box::new(PeerConnectionAudioReceiver::new(pc, decoder)))
+    }
+
+    /// Get the caller's peer connection
+    async fn get_caller_peer_connection(&self) -> Option<rustrtc::PeerConnection> {
+        // Try to get PC from caller_peer's first track
+        let tracks = self.caller_peer.get_tracks().await;
+        for t in tracks.iter() {
+            let guard = t.lock().await;
+            if let Some(pc) = guard.get_peer_connection().await {
+                return Some(pc);
+            }
+        }
+        None
+    }
+
+    /// Create audio decoder based on negotiated codec from answer SDP.
+    ///
+    /// Extracts the codec from the caller's answer SDP and creates the appropriate decoder.
+    /// Falls back to PCMU if no codec can be determined.
+    fn create_audio_decoder(&self) -> Option<Box<dyn audio_codec::Decoder>> {
+        use crate::media::negotiate::MediaNegotiator;
+        use audio_codec::create_decoder;
+
+        // Try to extract codec from caller's answer SDP
+        let codec = if let Some(ref answer_sdp) = self.answer {
+            let profile = MediaNegotiator::extract_leg_profile(answer_sdp);
+            if let Some(audio) = profile.audio {
+                info!(
+                    session_id = %self.id,
+                    codec = ?audio.codec,
+                    payload_type = audio.payload_type,
+                    "Using negotiated codec for conference decoder"
+                );
+                audio.codec
+            } else {
+                CodecType::PCMU
+            }
+        } else {
+            CodecType::PCMU
+        };
+
+        Some(create_decoder(codec))
+    }
+
+    /// Handle cross-session P2P bridge by creating a conference with both legs.
+    ///
+    /// This is called when a consult transfer completes and only A and C remain.
+    /// Instead of true P2P media bridging, we create a 2-party conference which
+    /// is functionally equivalent but reuses existing infrastructure.
+    async fn handle_bridge_cross_session(
+        &mut self,
+        session_a: String,
+        leg_a: LegId,
+        session_b: String,
+        leg_b: LegId,
+    ) -> Result<()> {
+        let current_session = self.id.to_string();
+
+        info!(
+            current_session = %current_session,
+            session_a = %session_a,
+            session_b = %session_b,
+            "Handling cross-session P2P bridge"
+        );
+
+        // Generate a deterministic conference ID
+        let conf_id = if session_a < session_b {
+            format!("p2p-bridge-{}-{}", session_a, session_b)
+        } else {
+            format!("p2p-bridge-{}-{}", session_b, session_a)
+        };
+        let conf_id_obj = crate::call::runtime::ConferenceId::from(conf_id.as_str());
+
+        // Check if this session is part of the bridge
+        let (my_session, my_leg, other_session, _other_leg) = if current_session == session_a {
+            (
+                session_a.clone(),
+                leg_a.clone(),
+                session_b.clone(),
+                leg_b.clone(),
+            )
+        } else if current_session == session_b {
+            (
+                session_b.clone(),
+                leg_b.clone(),
+                session_a.clone(),
+                leg_a.clone(),
+            )
+        } else {
+            // This session is not part of the bridge, forward to session_a
+            let registry = &self.server.active_call_registry;
+            if let Some(handle) = registry.get_handle(&session_a) {
+                let session_a_clone = session_a.clone();
+                handle
+                    .send_command(CallCommand::BridgeCrossSession {
+                        session_a,
+                        leg_a: leg_a.clone(),
+                        session_b,
+                        leg_b: leg_b.clone(),
+                    })
+                    .map_err(|e| anyhow!("Failed to forward BridgeCrossSession: {}", e))?;
+                info!(
+                    "Forwarded BridgeCrossSession to session_a {}",
+                    session_a_clone
+                );
+            }
+            return Ok(());
+        };
+
+        // Create conference if it doesn't exist (idempotent)
+        if self
+            .server
+            .conference_manager
+            .get_conference(&conf_id_obj)
+            .await
+            .is_none()
+        {
+            info!(conf_id = %conf_id, "Creating P2P bridge conference");
+            self.server
+                .conference_manager
+                .create_conference(conf_id_obj.clone(), None)
+                .await
+                .map_err(|e| anyhow!("Failed to create P2P conference: {}", e))?;
+        }
+
+        // Start conference media bridge for this leg.
+        // The bridge runtime adds the participant to the conference.
+        let participant_leg = LegId::new(format!("{}-{}", my_session, my_leg));
+        match self
+            .start_conference_media_bridge(&conf_id, &participant_leg)
+            .await
+        {
+            Ok(handle) => {
+                info!(
+                    session_id = %current_session,
+                    leg_id = %my_leg,
+                    "P2P conference media bridge started"
+                );
+                self.conference_bridge.bridge_handle = Some(handle);
+                self.conference_bridge.conf_id = Some(conf_id.clone());
+            }
+            Err(e) => {
+                warn!(
+                    session_id = %current_session,
+                    leg_id = %my_leg,
+                    error = %e,
+                    "Failed to start P2P conference media bridge"
+                );
+            }
+        }
+
+        // If this is session_a, notify session_b to also join
+        if current_session == session_a {
+            let registry = &self.server.active_call_registry;
+            if let Some(handle) = registry.get_handle(&other_session) {
+                let _ = handle.send_command(CallCommand::BridgeCrossSession {
+                    session_a: session_a.clone(),
+                    leg_a: leg_a.clone(),
+                    session_b: session_b.clone(),
+                    leg_b: leg_b.clone(),
+                });
+                info!(
+                    session_a = %session_a,
+                    session_b = %session_b,
+                    "Notified session_b to join P2P conference"
+                );
+            }
         }
 
         Ok(())
@@ -4095,13 +7082,40 @@ impl SipSession {
         &mut self,
         supervisor_leg: LegId,
         target_leg: LegId,
+        supervisor_session_id: Option<String>,
     ) -> Result<()> {
+        // Cross-session supervisor: use conference-based mixing when supervisor is in a different session
+        if let Some(ref sup_session_id) = supervisor_session_id
+            && sup_session_id != &self.id.0
+        {
+            return self
+                .handle_cross_session_supervisor_listen(sup_session_id, target_leg)
+                .await;
+        }
+
+        // Same-session supervisor: use existing MediaMixer approach
         if !self.legs.contains_key(&supervisor_leg) {
             return Err(anyhow!("Supervisor leg not found: {}", supervisor_leg));
         }
-        if !self.legs.contains_key(&target_leg) {
+        let resolved_target_leg = if self.legs.contains_key(&target_leg) {
+            target_leg.clone()
+        } else if self.legs.contains_key(&LegId::new("callee")) {
+            warn!(
+                session_id = %self.id,
+                requested_leg = %target_leg,
+                "Supervisor listen target leg not found, falling back to callee"
+            );
+            LegId::new("callee")
+        } else if self.legs.contains_key(&LegId::new("caller")) {
+            warn!(
+                session_id = %self.id,
+                requested_leg = %target_leg,
+                "Supervisor listen target leg not found, falling back to caller"
+            );
+            LegId::new("caller")
+        } else {
             return Err(anyhow!("Target leg not found: {}", target_leg));
-        }
+        };
 
         let mixer = if let Some(ref mixer) = self.supervisor_mixer {
             mixer.clone()
@@ -4115,21 +7129,21 @@ impl SipSession {
         use crate::media::mixer::SupervisorMixerMode;
         mixer.set_mode(SupervisorMixerMode::Listen);
 
-        let (target_peer, supervisor_peer) = if target_leg == LegId::new("caller") {
-            (self.caller_peer.clone(), self.callee_peer.clone())
+        let target_peer = if resolved_target_leg == LegId::new("caller") {
+            self.caller_peer.clone()
         } else {
-            (self.callee_peer.clone(), self.caller_peer.clone())
+            self.callee_peer.clone()
         };
 
         let target_input = crate::media::mixer_input::MixerInput::new(
-            format!("{}-input", target_leg),
+            format!("{}-input", resolved_target_leg),
             target_peer,
             CodecType::PCMU,
         );
 
         let supervisor_output = crate::media::mixer_output::MixerOutput::new(
             format!("{}-output", supervisor_leg),
-            supervisor_peer,
+            self.callee_peer.clone(),
             CodecType::PCMU,
         );
 
@@ -4138,7 +7152,7 @@ impl SipSession {
 
         mixer.set_output_routing(
             &format!("{}-output", supervisor_leg),
-            vec![format!("{}-input", target_leg)],
+            vec![format!("{}-input", resolved_target_leg)],
         );
 
         mixer.start();
@@ -4147,8 +7161,109 @@ impl SipSession {
         info!(
             session_id = %self.id,
             supervisor = %supervisor_leg,
-            target = %target_leg,
+            target = %resolved_target_leg,
             "Supervisor listen mode activated with MediaMixer"
+        );
+        Ok(())
+    }
+
+    /// Handle cross-session supervisor monitoring using conference-based mixing.
+    /// Creates a conference room and adds both the target leg and supervisor session.
+    async fn handle_cross_session_supervisor_listen(
+        &mut self,
+        supervisor_session_id: &str,
+        target_leg: LegId,
+    ) -> Result<()> {
+        let resolved_target_leg = if self.legs.contains_key(&target_leg) {
+            target_leg
+        } else if self.legs.contains_key(&LegId::new("callee")) {
+            warn!(
+                session_id = %self.id,
+                requested_leg = %target_leg,
+                "Cross-session supervisor listen target leg not found, falling back to callee"
+            );
+            LegId::new("callee")
+        } else if self.legs.contains_key(&LegId::new("caller")) {
+            warn!(
+                session_id = %self.id,
+                requested_leg = %target_leg,
+                "Cross-session supervisor listen target leg not found, falling back to caller"
+            );
+            LegId::new("caller")
+        } else {
+            return Err(anyhow!("Target leg not found: {}", target_leg));
+        };
+
+        // Generate a deterministic conference ID for supervisor monitoring
+        let conf_id = format!("supervisor-{}-{}", self.id.0, supervisor_session_id);
+        let conf_id_obj = crate::call::runtime::ConferenceId::from(conf_id.as_str());
+
+        // Create conference if it doesn't exist (idempotent)
+        if self
+            .server
+            .conference_manager
+            .get_conference(&conf_id_obj)
+            .await
+            .is_none()
+        {
+            info!(conf_id = %conf_id, "Creating supervisor conference");
+            self.server
+                .conference_manager
+                .create_conference(conf_id_obj.clone(), Some(3))
+                .await
+                .map_err(|e| anyhow!("Failed to create supervisor conference: {}", e))?;
+        }
+
+        // Start conference media bridge for target session on the resolved target leg.
+        let target_participant_leg = LegId::new(format!("{}-{}", self.id.0, resolved_target_leg));
+        match self
+            .start_conference_media_bridge(&conf_id, &target_participant_leg)
+            .await
+        {
+            Ok(handle) => {
+                info!(
+                    session_id = %self.id,
+                    leg_id = %resolved_target_leg,
+                    "Supervisor conference media bridge started for target"
+                );
+                self.conference_bridge.bridge_handle = Some(handle);
+                self.conference_bridge.conf_id = Some(conf_id.clone());
+            }
+            Err(e) => {
+                return Err(anyhow!(
+                    "Failed to start supervisor conference media bridge for target {}: {}",
+                    resolved_target_leg,
+                    e
+                ));
+            }
+        }
+
+        // Notify supervisor session to join the conference
+        let registry = &self.server.active_call_registry;
+        if let Some(handle) = registry.get_handle(supervisor_session_id) {
+            let join_cmd = CallCommand::JoinMixer {
+                mixer_id: conf_id.clone(),
+            };
+            handle
+                .send_command(join_cmd)
+                .map_err(|e| anyhow!("Failed to notify supervisor session: {}", e))?;
+            info!(
+                supervisor_session = %supervisor_session_id,
+                conf_id = %conf_id,
+                "Notified supervisor session to join conference"
+            );
+        } else {
+            return Err(anyhow!(
+                "Supervisor session {} not found",
+                supervisor_session_id
+            ));
+        }
+
+        info!(
+            session_id = %self.id,
+            supervisor_session = %supervisor_session_id,
+            conf_id = %conf_id,
+            "Cross-session supervisor listen activated via conference"
         );
         Ok(())
     }
@@ -4157,6 +7272,7 @@ impl SipSession {
         &mut self,
         supervisor_leg: LegId,
         target_leg: LegId,
+        _supervisor_session_id: Option<String>,
     ) -> Result<()> {
         if !self.legs.contains_key(&supervisor_leg) {
             return Err(anyhow!("Supervisor leg not found: {}", supervisor_leg));
@@ -4235,6 +7351,7 @@ impl SipSession {
         &mut self,
         supervisor_leg: LegId,
         target_leg: LegId,
+        _supervisor_session_id: Option<String>,
     ) -> Result<()> {
         if !self.legs.contains_key(&supervisor_leg) {
             return Err(anyhow!("Supervisor leg not found: {}", supervisor_leg));
@@ -4315,6 +7432,49 @@ impl SipSession {
         Ok(())
     }
 
+    async fn handle_supervisor_takeover(
+        &mut self,
+        supervisor_leg: LegId,
+        target_leg: LegId,
+        _supervisor_session_id: Option<String>,
+    ) -> Result<()> {
+        if !self.legs.contains_key(&supervisor_leg) {
+            return Err(anyhow!("Supervisor leg not found: {}", supervisor_leg));
+        }
+        if !self.legs.contains_key(&target_leg) {
+            return Err(anyhow!("Target leg not found: {}", target_leg));
+        }
+
+        // Stop any existing supervisor mixer
+        if let Some(ref mixer) = self.supervisor_mixer.take() {
+            mixer.stop();
+            info!(session_id = %self.id, "Stopped existing supervisor mixer for takeover");
+        }
+
+        // Determine the remaining party (the one not being replaced)
+        let other_leg = if target_leg == LegId::new("caller") {
+            LegId::new("callee")
+        } else {
+            LegId::new("caller")
+        };
+
+        // Update bridge to connect supervisor with the remaining party
+        self.bridge = BridgeConfig::bridge(supervisor_leg.clone(), other_leg.clone());
+
+        // Mark target leg as ended and supervisor as connected
+        self.update_leg_state(&target_leg, LegState::Ending);
+        self.update_leg_state(&supervisor_leg, LegState::Connected);
+
+        info!(
+            session_id = %self.id,
+            supervisor = %supervisor_leg,
+            target = %target_leg,
+            other = %other_leg,
+            "Supervisor takeover activated"
+        );
+        Ok(())
+    }
+
     async fn handle_supervisor_stop(&mut self, supervisor_leg: LegId) -> Result<()> {
         if !self.legs.contains_key(&supervisor_leg) {
             return Err(anyhow!("Supervisor leg not found: {}", supervisor_leg));
@@ -4343,6 +7503,11 @@ impl SipSession {
         source: crate::call::domain::MediaSource,
         options: Option<crate::call::domain::PlayOptions>,
     ) -> Result<()> {
+        let await_completion = options
+            .as_ref()
+            .map(|o| o.await_completion)
+            .unwrap_or(false);
+        let loop_playback = options.as_ref().map(|o| o.loop_playback).unwrap_or(false);
         let track_id = options
             .as_ref()
             .and_then(|o| o.track_id.clone())
@@ -4357,43 +7522,81 @@ impl SipSession {
             .caller_offer
             .as_ref()
             .map(|offer| MediaNegotiator::extract_codec_params(offer).audio)
-            .and_then(|codecs| codecs.first().map(|c| c.codec))
-            .unwrap_or(CodecType::PCMU);
+            .and_then(|codecs| codecs.first().cloned())
+            .unwrap_or_else(|| {
+                let codec = CodecType::PCMU;
+                CodecInfo {
+                    payload_type: codec.payload_type(),
+                    codec,
+                    clock_rate: codec.clock_rate(),
+                    channels: codec.channels(),
+                }
+            });
 
         let track = FileTrack::new(track_id.clone())
             .with_path(file_path.clone())
-            .with_codec_preference(vec![caller_codec]);
+            .with_codec_info(caller_codec);
 
-        let caller_pc = {
-            let tracks = self.caller_peer.get_tracks().await;
-            if let Some(t) = tracks.first() {
-                t.lock().await.get_peer_connection().await
-            } else {
-                None
+        let uses_bridge_output = if self.caller_answer_uses_media_bridge {
+            let bridge = self
+                .media_bridge
+                .as_ref()
+                .ok_or_else(|| anyhow!("No media bridge available for playback"))?;
+            bridge
+                .replace_output_with_file(self.caller_bridge_endpoint(), &track)
+                .await?;
+            self.bridge_playback_track_id = Some(track_id.clone());
+            true
+        } else {
+            if let Err(e) = track.start_playback_on(None).await {
+                warn!(error = %e, "Failed to start playback");
             }
+            false
         };
 
-        if let Err(e) = track.start_playback_on(caller_pc).await {
-            warn!(error = %e, "Failed to start playback");
+        if !uses_bridge_output {
+            self.caller_peer
+                .update_track(Box::new(track.clone()), None)
+                .await;
         }
-
-        self.caller_peer.update_track(Box::new(track.clone()), None).await;
-        self.playback_tracks.insert(track_id.clone(), track);
+        self.playback_tracks.insert(track_id.clone(), track.clone());
 
         info!(track_id = %track_id, file = %file_path, "Playback started");
+
+        // Spawn a completion watcher so the IVR/app receives AudioComplete when
+        // the file finishes playing.  Only watch non-looping tracks; a looping
+        // track never self-terminates so AudioComplete is not meaningful.
+        if await_completion && !loop_playback {
+            let app_runtime = self.app_runtime.clone();
+            let track_id_clone = track_id.clone();
+            tokio::spawn(async move {
+                track.wait_for_completion().await;
+                let _ = app_runtime.inject_event(serde_json::json!({
+                    "type": "audio_complete",
+                    "track_id": track_id_clone,
+                    "interrupted": false
+                }));
+            });
+        }
+
         Ok(())
     }
 
     async fn handle_stop_playback(&mut self, leg_id: Option<LegId>) -> Result<()> {
+        if leg_id.is_none() {
+            let track_ids: Vec<String> = self.playback_tracks.keys().cloned().collect();
+            for track_id in track_ids {
+                self.stop_playback_track(&track_id, true).await;
+            }
+            return Ok(());
+        }
+
         let track_id = leg_id
             .as_ref()
             .map(|l| l.to_string())
             .unwrap_or_else(|| "playback".to_string());
 
-        if self.playback_tracks.remove(&track_id).is_some() {
-            self.caller_peer.remove_track(&track_id, true).await;
-            info!(track_id = %track_id, "Playback stopped");
-        }
+        self.stop_playback_track(&track_id, true).await;
         Ok(())
     }
 
@@ -4468,6 +7671,74 @@ impl SipSession {
             .conference_manager
             .destroy_conference(&conf_id.into())
             .await?;
+
+        Ok(())
+    }
+
+    async fn handle_join_mixer(&mut self, mixer_id: String) -> Result<()> {
+        info!(%mixer_id, "Joining mixer/conference");
+
+        let conf_id_obj = crate::call::runtime::ConferenceId::from(mixer_id.as_str());
+
+        // Ensure conference exists
+        if self
+            .server
+            .conference_manager
+            .get_conference(&conf_id_obj)
+            .await
+            .is_none()
+        {
+            return Err(anyhow!("Conference {} not found", mixer_id));
+        }
+
+        // Start conference media bridge for supervisor session.
+        // The bridge runtime adds the participant to the conference.
+        let participant_leg = LegId::new(format!("{}-callee", self.id.0));
+        match self
+            .start_conference_media_bridge(&mixer_id, &participant_leg)
+            .await
+        {
+            Ok(handle) => {
+                info!(
+                    session_id = %self.id,
+                    conf_id = %mixer_id,
+                    "Supervisor conference media bridge started"
+                );
+                self.conference_bridge.bridge_handle = Some(handle);
+                self.conference_bridge.conf_id = Some(mixer_id.clone());
+            }
+            Err(e) => {
+                warn!(
+                    session_id = %self.id,
+                    conf_id = %mixer_id,
+                    error = %e,
+                    "Failed to start supervisor conference media bridge"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_leave_mixer(&mut self) -> Result<()> {
+        info!("Leaving mixer/conference");
+
+        if let Some(conf_id) = self.conference_bridge.conf_id.take() {
+            let conf_id_obj = crate::call::runtime::ConferenceId::from(conf_id.as_str());
+            let participant_leg = LegId::new(format!("{}-callee", self.id.0));
+
+            let _ = self
+                .server
+                .conference_manager
+                .remove_participant(&conf_id_obj, &participant_leg)
+                .await;
+
+            if let Some(ref handle) = self.conference_bridge.bridge_handle {
+                handle.stop();
+            }
+            self.conference_bridge.bridge_handle = None;
+            info!(session_id = %self.id, conf_id = %conf_id, "Left conference");
+        }
 
         Ok(())
     }
@@ -4716,7 +7987,7 @@ impl SipSession {
         info!(event = %event, content_type = %content_type, body_len = body.len(), "Sending SIP NOTIFY");
 
         let headers = vec![
-            rsipstack::sip::Header::Other("Event".into(), event.into()),
+            rsipstack::sip::Header::Other("Event".into(), event),
             rsipstack::sip::Header::ContentType(content_type.into()),
         ];
         let body_bytes = body.into_bytes();
@@ -4751,7 +8022,7 @@ impl SipSession {
         {
             Ok(Some(response)) => {
                 let status_code = u16::from(response.status_code);
-                if status_code >= 200 && status_code < 300 {
+                if (200..300).contains(&status_code) {
                     info!(status = status_code, "SIP OPTIONS ping successful");
                     Ok(())
                 } else {
@@ -4788,13 +8059,11 @@ impl SipSession {
             Ok(_) => {
                 info!(%leg_id, "Hold re-INVITE sent successfully");
 
-                if let Some(media_source) = music {
-                    if let crate::call::domain::MediaSource::File { path } = media_source {
-                        if let Err(e) = self.play_audio_file(&path, false, "hold-music", true).await
-                        {
-                            warn!(error = %e, "Failed to start hold music");
-                        }
-                    }
+                if let Some(media_source) = music
+                    && let crate::call::domain::MediaSource::File { path } = media_source
+                    && let Err(e) = self.play_audio_file(&path, false, "hold-music", true).await
+                {
+                    warn!(error = %e, "Failed to start hold music");
                 }
 
                 Ok(())
@@ -4871,7 +8140,7 @@ impl SipSession {
         {
             Ok(Some(response)) => {
                 let status = response.status_code.code();
-                if status >= 200 && status < 300 {
+                if (200..300).contains(&status) {
                     info!(status = %status, "re-INVITE accepted");
                     Ok(())
                 } else {
@@ -4881,6 +8150,18 @@ impl SipSession {
             Ok(None) => Err(anyhow!("re-INVITE timed out")),
             Err(e) => Err(anyhow!("re-INVITE failed: {}", e)),
         }
+    }
+}
+
+/// Parse a `message/sipfrag` body and extract the SIP status code.
+/// Expected format: `SIP/2.0 <code> <reason>`
+fn parse_sipfrag_status(body: &str) -> Option<u16> {
+    let line = body.lines().next()?;
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() >= 2 && parts[0] == "SIP/2.0" {
+        parts[1].parse().ok()
+    } else {
+        None
     }
 }
 
@@ -4895,6 +8176,7 @@ impl Drop for SipSession {
         self.callee_event_tx = None;
 
         self.callee_dialogs.clear();
+        self.connected_callee_dialog_id = None;
         self.timers.clear();
         self.timer_queue.clear();
         self.timer_keys.clear();
@@ -4905,10 +8187,181 @@ impl Drop for SipSession {
     }
 }
 
+/// Audio receiver that reads from a PeerConnection and decodes to PCM.
+/// Uses the same pattern as BridgePeer: listens for Track events, reads MediaSample, decodes to PCM.
+pub(crate) struct PeerConnectionAudioReceiver {
+    pc: rustrtc::PeerConnection,
+    decoder: Box<dyn audio_codec::Decoder>,
+    audio_track: Option<Arc<dyn rustrtc::media::MediaStreamTrack>>,
+}
+
+impl PeerConnectionAudioReceiver {
+    pub(crate) fn new(pc: rustrtc::PeerConnection, decoder: Box<dyn audio_codec::Decoder>) -> Self {
+        Self {
+            pc,
+            decoder,
+            audio_track: None,
+        }
+    }
+
+    /// Wait for and capture the first audio track from the peer connection
+    async fn capture_audio_track(&mut self) -> Option<Arc<dyn rustrtc::media::MediaStreamTrack>> {
+        // First, check pre-existing transceivers for a receiver track
+        for transceiver in self.pc.get_transceivers() {
+            if transceiver.kind() == rustrtc::MediaKind::Audio
+                && let Some(receiver) = transceiver.receiver()
+            {
+                let track = receiver.track();
+                tracing::info!("Conference audio receiver using pre-existing audio track");
+                return Some(track);
+            }
+        }
+
+        // If no pre-existing track, wait for Track event
+        let mut pc_recv = Box::pin(self.pc.recv());
+
+        loop {
+            match pc_recv.await {
+                Some(rustrtc::PeerConnectionEvent::Track(transceiver)) => {
+                    if transceiver.kind() == rustrtc::MediaKind::Audio
+                        && let Some(receiver) = transceiver.receiver()
+                    {
+                        let track = receiver.track();
+                        tracing::info!("Conference audio receiver captured audio track");
+                        return Some(track);
+                    }
+                    pc_recv = Box::pin(self.pc.recv());
+                }
+                Some(_) => {
+                    pc_recv = Box::pin(self.pc.recv());
+                }
+                None => {
+                    tracing::warn!("PeerConnection closed before audio track was captured");
+                    return None;
+                }
+            }
+        }
+    }
+}
+
+impl crate::call::runtime::conference_media_bridge::AudioReceiver for PeerConnectionAudioReceiver {
+    fn recv(
+        &mut self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Option<crate::call::runtime::conference_media_bridge::PcmAudioFrame>,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
+            loop {
+                // Capture audio track if not already captured.
+                // Track availability can be racy during re-INVITE / transfer windows,
+                // so keep retrying until cancellation closes the bridge.
+                if self.audio_track.is_none() {
+                    self.audio_track = self.capture_audio_track().await;
+                    if self.audio_track.is_none() {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
+                        continue;
+                    }
+                }
+
+                let track = self.audio_track.as_ref().unwrap().clone();
+
+                match track.recv().await {
+                    Ok(rustrtc::media::MediaSample::Audio(audio_frame)) => {
+                        // Decode RTP payload to PCM
+                        let pcm = self.decoder.decode(&audio_frame.data);
+
+                        return Some(
+                            crate::call::runtime::conference_media_bridge::PcmAudioFrame::new(
+                                pcm,
+                                self.decoder.sample_rate(),
+                            ),
+                        );
+                    }
+                    Ok(_) => {
+                        // Ignore non-audio samples and keep waiting for PCM payload.
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::debug!("Track recv failed, re-capturing audio track: {}", e);
+                        self.audio_track = None;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                        continue;
+                    }
+                }
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use rustrtc::{MediaKind, PeerConnection, RtcConfiguration, media::MediaStreamTrack};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct TestTrack {
+        id: String,
+        pc: Option<PeerConnection>,
+    }
+
+    impl TestTrack {
+        fn with_pc(id: &str, pc: Option<PeerConnection>) -> Self {
+            Self {
+                id: id.to_string(),
+                pc,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Track for TestTrack {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        async fn handshake(&self, _remote_offer: String) -> Result<String> {
+            Err(anyhow!("not used in this test"))
+        }
+
+        async fn local_description(&self) -> Result<String> {
+            Err(anyhow!("not used in this test"))
+        }
+
+        async fn set_remote_description(&self, _remote: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn stop(&self) {}
+
+        async fn get_peer_connection(&self) -> Option<PeerConnection> {
+            self.pc.clone()
+        }
+    }
+
+    #[test]
+    fn test_rtp_dtmf_detector_deduplicates_same_event() {
+        let mut detector = RtpDtmfDetector::default();
+
+        assert_eq!(detector.observe(&[1, 0x00, 0x00, 0xa0], 12_345), Some('1'));
+        assert_eq!(detector.observe(&[1, 0x80, 0x01, 0x40], 12_345), None);
+        assert_eq!(detector.observe(&[1, 0x00, 0x00, 0xa0], 12_505), Some('1'));
+    }
+
+    #[test]
+    fn test_rtp_dtmf_detector_maps_special_digits() {
+        let mut detector = RtpDtmfDetector::default();
+
+        assert_eq!(detector.observe(&[10, 0x00, 0x00, 0xa0], 1), Some('*'));
+        assert_eq!(detector.observe(&[11, 0x00, 0x00, 0xa0], 2), Some('#'));
+        assert_eq!(detector.observe(&[12, 0x00, 0x00, 0xa0], 3), Some('A'));
+        assert_eq!(detector.observe(&[16, 0x00, 0x00, 0xa0], 4), None);
+    }
 
     #[test]
     fn test_session_drop_releases_resources() {
@@ -4948,6 +8401,102 @@ mod tests {
         assert!(!SipSession::should_fallback_to_reinvite(
             StatusCode::ServerInternalError
         ));
+    }
+
+    #[test]
+    fn test_route_via_home_proxy_detects_remote_home_proxy() {
+        let destination = SipAddr {
+            r#type: Some(rsipstack::sip::Transport::Udp),
+            addr: rsipstack::sip::HostWithPort::try_from("192.168.1.10:5060").unwrap(),
+        };
+        let home_proxy = SipAddr {
+            r#type: Some(rsipstack::sip::Transport::Tcp),
+            addr: rsipstack::sip::HostWithPort::try_from("10.0.0.2:5070").unwrap(),
+        };
+
+        let target = Location {
+            destination: Some(destination),
+            home_proxy: Some(home_proxy.clone()),
+            ..Default::default()
+        };
+
+        let local_addrs = vec![SipAddr {
+            r#type: Some(rsipstack::sip::Transport::Udp),
+            addr: rsipstack::sip::HostWithPort::try_from("10.0.0.1:5060").unwrap(),
+        }];
+
+        assert!(SipSession::route_via_home_proxy(&target, &local_addrs, true));
+    }
+
+    #[test]
+    fn test_route_via_home_proxy_ignores_local_home_proxy() {
+        let destination = SipAddr {
+            r#type: Some(rsipstack::sip::Transport::Udp),
+            addr: rsipstack::sip::HostWithPort::try_from("192.168.1.10:5060").unwrap(),
+        };
+        let home_proxy = SipAddr {
+            r#type: Some(rsipstack::sip::Transport::Tcp),
+            addr: rsipstack::sip::HostWithPort::try_from("10.0.0.1:5060").unwrap(),
+        };
+
+        let target = Location {
+            destination: Some(destination.clone()),
+            home_proxy: Some(home_proxy),
+            ..Default::default()
+        };
+
+        let local_addrs = vec![SipAddr {
+            r#type: Some(rsipstack::sip::Transport::Udp),
+            addr: rsipstack::sip::HostWithPort::try_from("10.0.0.1:5060").unwrap(),
+        }];
+
+        assert!(!SipSession::route_via_home_proxy(&target, &local_addrs, true));
+    }
+
+    #[test]
+    fn test_resolve_outbound_callee_uri_prefers_registered_aor_via_home_proxy() {
+        let contact_uri =
+            rsipstack::sip::Uri::try_from("sip:lp@172.25.52.29:63647;transport=UDP").unwrap();
+        let registered_aor = rsipstack::sip::Uri::try_from("sip:lp@rustpbx.com").unwrap();
+
+        let target = Location {
+            aor: contact_uri,
+            registered_aor: Some(registered_aor.clone()),
+            ..Default::default()
+        };
+
+        let resolved = SipSession::resolve_outbound_callee_uri(&target, true);
+        assert_eq!(resolved, registered_aor);
+    }
+
+    #[test]
+    fn test_resolve_outbound_callee_uri_falls_back_to_contact_when_no_registered_aor() {
+        let contact_uri =
+            rsipstack::sip::Uri::try_from("sip:lp@172.25.52.29:63647;transport=UDP").unwrap();
+
+        let target = Location {
+            aor: contact_uri.clone(),
+            ..Default::default()
+        };
+
+        let resolved = SipSession::resolve_outbound_callee_uri(&target, true);
+        assert_eq!(resolved, contact_uri);
+    }
+
+    #[test]
+    fn test_resolve_outbound_callee_uri_uses_contact_when_not_via_home_proxy() {
+        let contact_uri =
+            rsipstack::sip::Uri::try_from("sip:lp@172.25.52.29:63647;transport=UDP").unwrap();
+        let registered_aor = rsipstack::sip::Uri::try_from("sip:lp@rustpbx.com").unwrap();
+
+        let target = Location {
+            aor: contact_uri.clone(),
+            registered_aor: Some(registered_aor),
+            ..Default::default()
+        };
+
+        let resolved = SipSession::resolve_outbound_callee_uri(&target, false);
+        assert_eq!(resolved, contact_uri);
     }
 
     #[tokio::test]
@@ -5014,7 +8563,11 @@ mod tests {
             body: Vec::new(),
         };
 
-        session.init_callee_timer(dialog_id.clone(), &response, DEFAULT_SESSION_EXPIRES);
+        session.init_callee_timer(
+            dialog_id.clone(),
+            &response,
+            Duration::from_secs(DEFAULT_SESSION_EXPIRES),
+        );
 
         let timer = session
             .timers
@@ -5027,6 +8580,260 @@ mod tests {
             Duration::from_secs(DEFAULT_SESSION_EXPIRES)
         );
         assert!(!session.timer_keys.contains_key(&dialog_id));
+    }
+
+    #[tokio::test]
+    async fn test_get_local_reinvite_pc_uses_bridge_when_present() {
+        use crate::call::{DialDirection, Dialplan, TransactionCookie};
+        use crate::proxy::proxy_call::test_util::tests::MockMediaPeer;
+        use crate::proxy::tests::common::{
+            create_test_request, create_test_server, create_transaction,
+        };
+
+        let (server, _) = create_test_server().await;
+        let request = create_test_request(
+            rsipstack::sip::Method::Invite,
+            "alice",
+            None,
+            "rustpbx.com",
+            None,
+        );
+        let original_request = request.clone();
+        let (tx, _) = create_transaction(request).await;
+        let (state_tx, _state_rx) = mpsc::unbounded_channel();
+        let server_dialog = server
+            .dialog_layer
+            .get_or_create_server_invite(&tx, state_tx, None, None)
+            .expect("failed to create server dialog");
+
+        let context = CallContext {
+            session_id: "test-session".to_string(),
+            dialplan: Arc::new(Dialplan::new(
+                "test-session".to_string(),
+                original_request,
+                DialDirection::Inbound,
+            )),
+            cookie: TransactionCookie::default(),
+            start_time: Instant::now(),
+            original_caller: "sip:alice@rustpbx.com".to_string(),
+            original_callee: "sip:bob@rustpbx.com".to_string(),
+            max_forwards: 70,
+            dtmf_digits: Vec::new(),
+        };
+
+        let caller_peer = Arc::new(MockMediaPeer::new());
+        let callee_peer = Arc::new(MockMediaPeer::new());
+        let (mut session, _handle, _cmd_rx) = SipSession::new(
+            server.clone(),
+            CancellationToken::new(),
+            None,
+            context,
+            server_dialog,
+            false,
+            caller_peer.clone(),
+            callee_peer.clone(),
+        );
+
+        session.media_bridge = Some(BridgePeerBuilder::new("test-bridge".to_string()).build());
+        session.caller_is_webrtc = true;
+        session.callee_is_webrtc = false;
+
+        let pc = session.get_local_reinvite_pc(DialogSide::Caller).await;
+
+        assert!(pc.is_some(), "bridge-backed caller leg should resolve a PC");
+        assert_eq!(caller_peer.get_tracks_call_count(), 0);
+        assert_eq!(callee_peer.get_tracks_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_prepare_app_caller_media_bridge_routes_playback_through_bridge() {
+        use crate::call::{DialDirection, Dialplan, TransactionCookie};
+        use crate::proxy::proxy_call::test_util::tests::MockMediaPeer;
+        use crate::proxy::tests::common::{
+            create_test_request, create_test_server, create_transaction,
+        };
+
+        let (server, _) = create_test_server().await;
+        let request = create_test_request(
+            rsipstack::sip::Method::Invite,
+            "alice",
+            None,
+            "rustpbx.com",
+            None,
+        );
+        let original_request = request.clone();
+        let (tx, _) = create_transaction(request).await;
+        let (state_tx, _state_rx) = mpsc::unbounded_channel();
+        let server_dialog = server
+            .dialog_layer
+            .get_or_create_server_invite(&tx, state_tx, None, None)
+            .expect("failed to create server dialog");
+
+        let context = CallContext {
+            session_id: "test-session".to_string(),
+            dialplan: Arc::new(Dialplan::new(
+                "test-session".to_string(),
+                original_request,
+                DialDirection::Inbound,
+            )),
+            cookie: TransactionCookie::default(),
+            start_time: Instant::now(),
+            original_caller: "sip:alice@rustpbx.com".to_string(),
+            original_callee: "sip:ivr@rustpbx.com".to_string(),
+            max_forwards: 70,
+            dtmf_digits: Vec::new(),
+        };
+
+        let caller_peer = Arc::new(MockMediaPeer::new());
+        let callee_peer = Arc::new(MockMediaPeer::new());
+        let (mut session, _handle, _cmd_rx) = SipSession::new(
+            server.clone(),
+            CancellationToken::new(),
+            None,
+            context,
+            server_dialog,
+            false,
+            caller_peer.clone(),
+            callee_peer,
+        );
+
+        session.caller_offer = Some(
+            concat!(
+                "v=0\r\n",
+                "o=alice 1 1 IN IP4 192.0.2.10\r\n",
+                "s=Talk\r\n",
+                "c=IN IP4 192.0.2.10\r\n",
+                "t=0 0\r\n",
+                "m=audio 40000 RTP/AVP 0 8 101\r\n",
+                "a=rtpmap:0 PCMU/8000\r\n",
+                "a=rtpmap:8 PCMA/8000\r\n",
+                "a=rtpmap:101 telephone-event/8000\r\n",
+                "a=sendrecv\r\n",
+            )
+            .to_string(),
+        );
+
+        let answer = session
+            .prepare_app_caller_media_bridge()
+            .await
+            .expect("app caller bridge answer should be prepared");
+
+        assert!(answer.contains("RTP/AVP"));
+        assert!(session.media_bridge.is_some());
+        assert!(session.caller_answer_uses_media_bridge);
+        assert_eq!(caller_peer.update_track_call_count(), 0);
+
+        let bridge = session
+            .media_bridge
+            .as_ref()
+            .expect("media bridge should exist")
+            .clone();
+        let rtp_track = bridge
+            .get_rtp_track()
+            .await
+            .expect("RTP bridge output track should exist");
+        let silence_sample =
+            tokio::time::timeout(Duration::from_millis(100), rtp_track.recv())
+                .await
+                .expect("bridge silence source should send promptly")
+                .expect("bridge silence source should produce a sample");
+        assert!(
+            matches!(silence_sample, rustrtc::media::MediaSample::Audio(_)),
+            "caller bridge should send silence before file playback is installed"
+        );
+
+        session
+            .play_audio_file("sounds/phone-calling.wav", false, "caller", true)
+            .await
+            .expect("app playback should install a bridge file source");
+
+        assert_eq!(caller_peer.update_track_call_count(), 0);
+        assert_eq!(caller_peer.get_tracks_call_count(), 0);
+
+        if let Some(bridge) = session.media_bridge.take() {
+            bridge.stop().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_play_audio_file_uses_second_caller_track_pc_when_first_is_none() {
+        use crate::call::{DialDirection, Dialplan, TransactionCookie};
+        use crate::proxy::proxy_call::test_util::tests::MockMediaPeer;
+        use crate::proxy::tests::common::{
+            create_test_request, create_test_server, create_transaction,
+        };
+
+        let (server, _) = create_test_server().await;
+        let request = create_test_request(
+            rsipstack::sip::Method::Invite,
+            "alice",
+            None,
+            "rustpbx.com",
+            None,
+        );
+        let original_request = request.clone();
+        let (tx, _) = create_transaction(request).await;
+        let (state_tx, _state_rx) = mpsc::unbounded_channel();
+        let server_dialog = server
+            .dialog_layer
+            .get_or_create_server_invite(&tx, state_tx, None, None)
+            .expect("failed to create server dialog");
+
+        let context = CallContext {
+            session_id: "test-session".to_string(),
+            dialplan: Arc::new(Dialplan::new(
+                "test-session".to_string(),
+                original_request,
+                DialDirection::Inbound,
+            )),
+            cookie: TransactionCookie::default(),
+            start_time: Instant::now(),
+            original_caller: "sip:alice@rustpbx.com".to_string(),
+            original_callee: "sip:bob@rustpbx.com".to_string(),
+            max_forwards: 70,
+            dtmf_digits: Vec::new(),
+        };
+
+        let caller_peer = Arc::new(MockMediaPeer::new());
+        let callee_peer = Arc::new(MockMediaPeer::new());
+
+        let target_pc = PeerConnection::new(RtcConfiguration::default());
+        assert!(target_pc.get_transceivers().is_empty());
+
+        {
+            let mut tracks = caller_peer.tracks.lock().unwrap();
+            tracks.push(Arc::new(tokio::sync::Mutex::new(Box::new(
+                TestTrack::with_pc("forwarding-without-pc", None),
+            ))));
+            tracks.push(Arc::new(tokio::sync::Mutex::new(Box::new(
+                TestTrack::with_pc("real-caller-track", Some(target_pc.clone())),
+            ))));
+        }
+
+        let (mut session, _handle, _cmd_rx) = SipSession::new(
+            server.clone(),
+            CancellationToken::new(),
+            None,
+            context,
+            server_dialog,
+            false,
+            caller_peer.clone(),
+            callee_peer,
+        );
+
+        session
+            .play_audio_file("sounds/phone-calling.wav", false, "caller", true)
+            .await
+            .expect("queue hold audio should start");
+
+        assert_eq!(caller_peer.update_track_call_count(), 0);
+        assert!(
+            target_pc
+                .get_transceivers()
+                .iter()
+                .any(|t| t.kind() == MediaKind::Audio),
+            "play_audio_file should bind audio to the caller external PC even when the first track has no PC"
+        );
     }
 
     #[tokio::test]
@@ -5253,5 +9060,362 @@ mod tests {
         assert!(matches!(received, Some(CallCommand::UnmuteTrack { .. })));
 
         drop(handle);
+    }
+
+    // ============================================================================
+    // Call forwarding -> queue/ivr tests
+    // ============================================================================
+
+    #[tokio::test]
+    async fn test_handle_blind_transfer_queue_prefix() {
+        use crate::call::{DialDirection, Dialplan, TransactionCookie};
+        use crate::config::ProxyConfig;
+        use crate::proxy::proxy_call::test_util::tests::MockMediaPeer;
+        use crate::proxy::routing::RouteQueueConfig;
+        use crate::proxy::tests::common::{
+            create_test_request, create_test_server_with_config, create_transaction,
+        };
+
+        let mut config = ProxyConfig::default();
+        config.queues.insert(
+            "test-queue".to_string(),
+            RouteQueueConfig {
+                name: Some("test-queue".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let (server, _) = create_test_server_with_config(config).await;
+        let request = create_test_request(
+            rsipstack::sip::Method::Invite,
+            "alice",
+            None,
+            "rustpbx.com",
+            None,
+        );
+        let original_request = request.clone();
+        let (tx, _) = create_transaction(request).await;
+        let (state_tx, _state_rx) = mpsc::unbounded_channel();
+        let server_dialog = server
+            .dialog_layer
+            .get_or_create_server_invite(&tx, state_tx, None, None)
+            .expect("failed to create server dialog");
+
+        let context = CallContext {
+            session_id: "test-session".to_string(),
+            dialplan: Arc::new(Dialplan::new(
+                "test-session".to_string(),
+                original_request,
+                DialDirection::Inbound,
+            )),
+            cookie: TransactionCookie::default(),
+            start_time: Instant::now(),
+            original_caller: "sip:alice@rustpbx.com".to_string(),
+            original_callee: "sip:bob@rustpbx.com".to_string(),
+            max_forwards: 70,
+            dtmf_digits: Vec::new(),
+        };
+
+        let caller_peer = Arc::new(MockMediaPeer::new());
+        let callee_peer = Arc::new(MockMediaPeer::new());
+        let (mut session, _handle, _cmd_rx) = SipSession::new(
+            server.clone(),
+            CancellationToken::new(),
+            None,
+            context,
+            server_dialog,
+            false,
+            caller_peer,
+            callee_peer,
+        );
+
+        let result = session
+            .handle_blind_transfer(LegId::from("caller"), "queue:test-queue".to_string())
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "handle_blind_transfer with queue: prefix should succeed, got: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_blind_transfer_queue_not_found() {
+        use crate::call::{DialDirection, Dialplan, TransactionCookie};
+        use crate::proxy::proxy_call::test_util::tests::MockMediaPeer;
+        use crate::proxy::tests::common::{
+            create_test_request, create_test_server, create_transaction,
+        };
+
+        let (server, _) = create_test_server().await;
+        let request = create_test_request(
+            rsipstack::sip::Method::Invite,
+            "alice",
+            None,
+            "rustpbx.com",
+            None,
+        );
+        let original_request = request.clone();
+        let (tx, _) = create_transaction(request).await;
+        let (state_tx, _state_rx) = mpsc::unbounded_channel();
+        let server_dialog = server
+            .dialog_layer
+            .get_or_create_server_invite(&tx, state_tx, None, None)
+            .expect("failed to create server dialog");
+
+        let context = CallContext {
+            session_id: "test-session".to_string(),
+            dialplan: Arc::new(Dialplan::new(
+                "test-session".to_string(),
+                original_request,
+                DialDirection::Inbound,
+            )),
+            cookie: TransactionCookie::default(),
+            start_time: Instant::now(),
+            original_caller: "sip:alice@rustpbx.com".to_string(),
+            original_callee: "sip:bob@rustpbx.com".to_string(),
+            max_forwards: 70,
+            dtmf_digits: Vec::new(),
+        };
+
+        let caller_peer = Arc::new(MockMediaPeer::new());
+        let callee_peer = Arc::new(MockMediaPeer::new());
+        let (mut session, _handle, _cmd_rx) = SipSession::new(
+            server.clone(),
+            CancellationToken::new(),
+            None,
+            context,
+            server_dialog,
+            false,
+            caller_peer,
+            callee_peer,
+        );
+
+        let result = session
+            .handle_blind_transfer(LegId::from("caller"), "queue:nonexistent".to_string())
+            .await;
+
+        assert!(
+            result.is_err(),
+            "handle_blind_transfer with non-existent queue should fail"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Queue 'nonexistent' not found"),
+            "Error should indicate queue not found, got: {}",
+            err
+        );
+    }
+
+    // ─── is_local_home_proxy unit tests ────────────────────────────────
+
+    #[test]
+    fn test_is_local_home_proxy_detects_matching_address() {
+        let local_addrs = vec![SipAddr {
+            r#type: Some(rsipstack::sip::Transport::Udp),
+            addr: rsipstack::sip::HostWithPort::try_from("10.172.148.121:8060").unwrap(),
+        }];
+        let home_proxy = SipAddr {
+            r#type: None,
+            addr: rsipstack::sip::HostWithPort::try_from("10.172.148.121:8060").unwrap(),
+        };
+        assert!(SipSession::is_local_home_proxy(&local_addrs, &home_proxy));
+    }
+
+    #[test]
+    fn test_is_local_home_proxy_detects_non_matching_address() {
+        let local_addrs = vec![SipAddr {
+            r#type: Some(rsipstack::sip::Transport::Udp),
+            addr: rsipstack::sip::HostWithPort::try_from("10.172.148.121:8060").unwrap(),
+        }];
+        let home_proxy = SipAddr {
+            r#type: None,
+            addr: rsipstack::sip::HostWithPort::try_from("10.172.149.126:8060").unwrap(),
+        };
+        assert!(!SipSession::is_local_home_proxy(&local_addrs, &home_proxy));
+    }
+
+    #[test]
+    fn test_is_local_home_proxy_matches_any_local_address() {
+        let local_addrs = vec![
+            SipAddr {
+                r#type: Some(rsipstack::sip::Transport::Udp),
+                addr: rsipstack::sip::HostWithPort::try_from("127.0.0.1:5060").unwrap(),
+            },
+            SipAddr {
+                r#type: Some(rsipstack::sip::Transport::Tcp),
+                addr: rsipstack::sip::HostWithPort::try_from("10.172.148.121:8060").unwrap(),
+            },
+            SipAddr {
+                r#type: Some(rsipstack::sip::Transport::Ws),
+                addr: rsipstack::sip::HostWithPort::try_from("10.172.148.121:8443").unwrap(),
+            },
+        ];
+        let home_proxy = SipAddr {
+            r#type: None,
+            addr: rsipstack::sip::HostWithPort::try_from("10.172.148.121:8060").unwrap(),
+        };
+        assert!(SipSession::is_local_home_proxy(&local_addrs, &home_proxy));
+    }
+
+    #[test]
+    fn test_is_local_home_proxy_rejects_port_mismatch() {
+        let local_addrs = vec![SipAddr {
+            r#type: Some(rsipstack::sip::Transport::Udp),
+            addr: rsipstack::sip::HostWithPort::try_from("10.172.148.121:8060").unwrap(),
+        }];
+        let home_proxy = SipAddr {
+            r#type: None,
+            addr: rsipstack::sip::HostWithPort::try_from("10.172.148.121:5070").unwrap(),
+        };
+        assert!(!SipSession::is_local_home_proxy(&local_addrs, &home_proxy));
+    }
+
+    #[test]
+    fn test_is_local_home_proxy_compares_addr_string_not_transport() {
+        // Transport type should NOT affect address matching — only host:port matters.
+        let local_addrs = vec![SipAddr {
+            r#type: Some(rsipstack::sip::Transport::Wss),
+            addr: rsipstack::sip::HostWithPort::try_from("10.172.148.121:8060").unwrap(),
+        }];
+        let home_proxy = SipAddr {
+            r#type: Some(rsipstack::sip::Transport::Udp),
+            addr: rsipstack::sip::HostWithPort::try_from("10.172.148.121:8060").unwrap(),
+        };
+        assert!(SipSession::is_local_home_proxy(&local_addrs, &home_proxy));
+    }
+
+    // ─── route_via_home_proxy flag ───────
+
+    #[test]
+    fn test_route_via_home_proxy_false_without_home_proxy() {
+        let destination = SipAddr {
+            r#type: Some(rsipstack::sip::Transport::Udp),
+            addr: rsipstack::sip::HostWithPort::try_from("192.168.1.10:5060").unwrap(),
+        };
+        let target = Location {
+            destination: Some(destination.clone()),
+            home_proxy: None,
+            ..Default::default()
+        };
+        let local_addrs = vec![SipAddr {
+            r#type: Some(rsipstack::sip::Transport::Udp),
+            addr: rsipstack::sip::HostWithPort::try_from("10.0.0.1:5060").unwrap(),
+        }];
+        assert!(!SipSession::route_via_home_proxy(&target, &local_addrs, false));
+    }
+
+    #[test]
+    fn test_route_via_home_proxy_remote_home_proxy_sets_via_flag() {
+        // home_proxy != local -> route_via_home_proxy stays true.
+        let destination = SipAddr {
+            r#type: Some(rsipstack::sip::Transport::Udp),
+            addr: rsipstack::sip::HostWithPort::try_from("10.172.149.126:8060").unwrap(),
+        };
+        let home_proxy = SipAddr {
+            r#type: None,
+            addr: rsipstack::sip::HostWithPort::try_from("10.172.149.126:8060").unwrap(),
+        };
+        let target = Location {
+            destination: Some(destination),
+            home_proxy: Some(home_proxy.clone()),
+            ..Default::default()
+        };
+        let local_addrs = vec![SipAddr {
+            r#type: Some(rsipstack::sip::Transport::Udp),
+            addr: rsipstack::sip::HostWithPort::try_from("10.172.148.121:8060").unwrap(),
+        }];
+        let via_home_proxy = SipSession::route_via_home_proxy(&target, &local_addrs, true);
+        assert!(
+            via_home_proxy,
+            "route_via_home_proxy must be true for remote home_proxy"
+        );
+    }
+
+    #[test]
+    fn test_route_via_home_proxy_local_home_proxy_no_via_flag() {
+        let destination = SipAddr {
+            r#type: Some(rsipstack::sip::Transport::Udp),
+            addr: rsipstack::sip::HostWithPort::try_from("10.172.148.121:8060").unwrap(),
+        };
+        let home_proxy = SipAddr {
+            r#type: None,
+            addr: rsipstack::sip::HostWithPort::try_from("10.172.148.121:8060").unwrap(),
+        };
+        let target = Location {
+            destination: Some(destination.clone()),
+            home_proxy: Some(home_proxy),
+            ..Default::default()
+        };
+        let local_addrs = vec![SipAddr {
+            r#type: Some(rsipstack::sip::Transport::Udp),
+            addr: rsipstack::sip::HostWithPort::try_from("10.172.148.121:8060").unwrap(),
+        }];
+        let via_home_proxy = SipSession::route_via_home_proxy(&target, &local_addrs, true);
+        assert!(
+            !via_home_proxy,
+            "route_via_home_proxy must be false when home_proxy is local"
+        );
+    }
+
+    // ─── Verify no self-referencing Record-Route in INVITE headers ────
+
+    #[test]
+    fn test_route_via_home_proxy_does_not_add_self_referencing_record_route() {
+        // This test validates the architectural fix:
+        // When routing via a remote home_proxy, the INVITE MUST NOT include
+        // a Record-Route header pointing to the local node. Including one
+        // would cause the dialog route_set to contain a self-referencing
+        // Route entry, which makes all subsequent in-dialog requests
+        // (BYE, ACK) loopback to the local node instead of reaching the
+        // remote agent.
+        //
+        // The Contact header in the INVITE already provides the correct
+        // return path for the callee's responses and requests.
+        //
+        // This test exercises is_local_home_proxy and route_via_home_proxy
+        // to ensure the routing logic is correct. The actual INVITE header construction is exercised
+        // by the cluster home_proxy e2e test.
+        //
+        // Verify: home_proxy is recognized as remote -> via_home_proxy=true
+        let destination = SipAddr {
+            r#type: Some(rsipstack::sip::Transport::Udp),
+            addr: rsipstack::sip::HostWithPort::try_from("10.172.149.126:8060").unwrap(),
+        };
+        let home_proxy = SipAddr {
+            r#type: None,
+            addr: rsipstack::sip::HostWithPort::try_from("10.172.149.126:8060").unwrap(),
+        };
+        let target = Location {
+            destination: Some(destination),
+            home_proxy: Some(home_proxy.clone()),
+            ..Default::default()
+        };
+        let local_addrs = vec![SipAddr {
+            r#type: Some(rsipstack::sip::Transport::Udp),
+            addr: rsipstack::sip::HostWithPort::try_from("10.172.148.121:8060").unwrap(),
+        }];
+        let via_home_proxy = SipSession::route_via_home_proxy(&target, &local_addrs, true);
+        assert!(
+            via_home_proxy,
+            "route_via_home_proxy must be true for cross-node routing"
+        );
+
+        // Verify that BOTH local and remote addresses are correctly
+        // distinguished. A local address match → false, remote → true.
+        assert!(
+            !SipSession::is_local_home_proxy(&local_addrs, &home_proxy),
+            "home_proxy at 10.172.149.126 must NOT match local 10.172.148.121"
+        );
+
+        let local_home_proxy = SipAddr {
+            r#type: None,
+            addr: rsipstack::sip::HostWithPort::try_from("10.172.148.121:8060").unwrap(),
+        };
+        assert!(
+            SipSession::is_local_home_proxy(&local_addrs, &local_home_proxy),
+            "home_proxy at 10.172.148.121 must match local 10.172.148.121"
+        );
     }
 }

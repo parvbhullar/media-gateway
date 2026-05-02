@@ -8,12 +8,13 @@ use crate::console::handlers::{bad_request, forms, normalize_optional_string, re
 use crate::console::{ConsoleState, middleware::AuthRequired};
 use crate::proxy::routing::{ConfigOrigin, RouteQueueConfig};
 use axum::{
-    Json, Router,
+    Json, Router, body::Body,
     extract::{Path as AxumPath, State},
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use std::path::PathBuf;
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, EntityTrait, PaginatorTrait,
@@ -22,7 +23,7 @@ use sea_orm::{
 use serde::Deserialize;
 use serde_json::{Map as JsonMap, Value, json};
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{info, warn};
 
 pub fn urls() -> Router<Arc<ConsoleState>> {
     Router::new()
@@ -32,6 +33,9 @@ pub fn urls() -> Router<Arc<ConsoleState>> {
         )
         .route("/queues/new", get(page_queue_create))
         .route("/queues/export", post(export_all_queues))
+        .route("/queues/reload", post(reload_queues_handler))
+        .route("/queues/download-audio", post(download_audio_handler))
+        .route("/queues/sound/{*file_path}", get(serve_sound_handler))
         .route(
             "/queues/{id}",
             get(page_queue_edit)
@@ -118,7 +122,7 @@ pub async fn query_queues(
             warn!("failed to load queue summary: {}", err);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to load queues"})),
+                Json(json!({"message": format!("Failed to load queues: {}", err)})),
             )
                 .into_response();
         }
@@ -139,7 +143,7 @@ pub async fn query_queues(
             warn!("failed to paginate queues: {}", err);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to load queues"})),
+                Json(json!({"message": format!("Failed to load queues: {}", err)})),
             )
                 .into_response();
         }
@@ -153,11 +157,7 @@ pub async fn query_queues(
 
     // Issue #179: collect file-sourced queues from in-memory snapshot
     let file_queues: Vec<Value> = if let Some(app_state) = state.app_state() {
-        let snapshot = app_state
-            .sip_server()
-            .inner
-            .data_context
-            .queues_snapshot();
+        let snapshot = app_state.sip_server().inner.data_context.queues_snapshot();
         let mut file_items: Vec<Value> = snapshot
             .into_iter()
             .filter_map(|(name, queue)| {
@@ -218,6 +218,7 @@ pub async fn page_queue_create(
     headers: HeaderMap,
     AuthRequired(_): AuthRequired,
 ) -> Response {
+    let script_path = format!("{}/queues/new", state.base_path());
     state.render_with_headers(
         "queue_detail.html",
         json!({
@@ -232,6 +233,7 @@ pub async fn page_queue_create(
             "create_url": state.url_for("/queues"),
             "update_url": Value::Null,
             "list_url": state.url_for("/queues"),
+            "addon_scripts": state.get_injected_scripts(&script_path),
         }),
         &headers,
     )
@@ -249,7 +251,11 @@ pub async fn page_queue_edit(
         Ok(None) => return (StatusCode::NOT_FOUND, "Queue not found").into_response(),
         Err(err) => {
             warn!("failed to load queue {} for edit: {}", id, err);
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to load queue").into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load queue: {}", err),
+            )
+                .into_response();
         }
     };
 
@@ -257,6 +263,7 @@ pub async fn page_queue_edit(
     let metadata_text = format_metadata_text(&model.metadata);
     let tags = queue_tags(model.metadata.as_ref());
 
+    let script_path = format!("{}/queues/{}", state.base_path(), model.id);
     state.render_with_headers(
         "queue_detail.html",
         json!({
@@ -275,6 +282,7 @@ pub async fn page_queue_edit(
             "create_url": state.url_for("/queues"),
             "update_url": state.url_for(&format!("/queues/{}", model.id)),
             "list_url": state.url_for("/queues"),
+            "addon_scripts": state.get_injected_scripts(&script_path),
         }),
         &headers,
     )
@@ -302,7 +310,7 @@ pub async fn create_queue(
             warn!("failed to enforce queue uniqueness: {}", err);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to create queue"})),
+                Json(json!({"message": format!("Failed to create queue: {}", err)})),
             )
                 .into_response();
         }
@@ -312,30 +320,31 @@ pub async fn create_queue(
     let tags = normalize_tags_list(payload.tags.clone());
     let metadata = match build_queue_metadata(payload.metadata.clone(), &tags) {
         Ok(value) => value,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     let now = Utc::now();
-    let mut active: QueueActiveModel = Default::default();
-    active.name = Set(name);
-    active.description = Set(normalize_optional_string(&payload.description));
-    active.metadata = Set(metadata);
-    active.spec = Set(json!(spec));
-    active.is_active = Set(payload.is_active.unwrap_or(true));
-    active.created_at = Set(now);
-    active.updated_at = Set(now);
+    let active = QueueActiveModel {
+        name: Set(name),
+        description: Set(normalize_optional_string(&payload.description)),
+        metadata: Set(metadata),
+        spec: Set(json!(spec)),
+        is_active: Set(payload.is_active.unwrap_or(true)),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    };
 
     match active.insert(db).await {
         Ok(model) => {
             export_queue_async(state.as_ref(), model.id).await;
-            state.mark_pending_reload();
             Json(json!({"status": "ok", "id": model.id})).into_response()
         }
         Err(err) => {
             warn!("failed to insert queue: {}", err);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to create queue"})),
+                Json(json!({"message": format!("Failed to create queue: {}", err)})),
             )
                 .into_response()
         }
@@ -362,7 +371,7 @@ pub async fn update_queue(
             warn!("failed to load queue {} for update: {}", id, err);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to update queue"})),
+                Json(json!({"message": format!("Failed to update queue: {}", err)})),
             )
                 .into_response();
         }
@@ -374,28 +383,28 @@ pub async fn update_queue(
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty());
 
-    if let Some(name) = &requested_name {
-        if name != &model.name {
-            match QueueEntity::find()
-                .filter(QueueColumn::Name.eq(name.clone()))
-                .one(db)
-                .await
-            {
-                Ok(Some(other)) if other.id != id => {
-                    return bad_request("Queue name already exists");
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    warn!(
-                        "failed to enforce queue uniqueness on update {}: {}",
-                        id, err
-                    );
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"message": "Failed to update queue"})),
-                    )
-                        .into_response();
-                }
+    if let Some(name) = &requested_name
+        && name != &model.name
+    {
+        match QueueEntity::find()
+            .filter(QueueColumn::Name.eq(name.clone()))
+            .one(db)
+            .await
+        {
+            Ok(Some(other)) if other.id != id => {
+                return bad_request("Queue name already exists");
+            }
+            Ok(_) => {}
+            Err(err) => {
+                warn!(
+                    "failed to enforce queue uniqueness on update {}: {}",
+                    id, err
+                );
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"message": format!("Failed to update queue: {}", err)})),
+                )
+                    .into_response();
             }
         }
     }
@@ -414,21 +423,20 @@ pub async fn update_queue(
     let tags = normalize_tags_list(payload.tags.clone());
     let metadata = match build_queue_metadata(payload.metadata.clone(), &tags) {
         Ok(value) => value,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     active.metadata = Set(metadata);
 
     match active.update(db).await {
         Ok(updated) => {
             export_queue_async(state.as_ref(), updated.id).await;
-            state.mark_pending_reload();
             Json(json!({"status": "ok", "id": updated.id})).into_response()
         }
         Err(err) => {
             warn!("failed to update queue {}: {}", id, err);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to update queue"})),
+                Json(json!({"message": format!("Failed to update queue: {}", err)})),
             )
                 .into_response()
         }
@@ -454,7 +462,7 @@ pub async fn delete_queue(
             warn!("failed to load queue {} for delete: {}", id, err);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to delete queue"})),
+                Json(json!({"message": format!("Failed to delete queue: {}", err)})),
             )
                 .into_response();
         }
@@ -474,7 +482,6 @@ pub async fn delete_queue(
                 if let Some(entry) = export_entry {
                     remove_queue_export(state.as_ref(), entry).await;
                 }
-                state.mark_pending_reload();
                 Json(json!({"status": "ok", "rows_affected": result.rows_affected})).into_response()
             }
         }
@@ -482,7 +489,7 @@ pub async fn delete_queue(
             warn!("failed to delete queue {}: {}", id, err);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to delete queue"})),
+                Json(json!({"message": format!("Failed to delete queue: {}", err)})),
             )
                 .into_response()
         }
@@ -496,7 +503,7 @@ pub async fn export_queue(
 ) -> Response {
     let proxy_cfg = match proxy_config_required(state.as_ref()) {
         Ok(cfg) => cfg,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     let exporter = QueueExporter::new(state.db().clone());
@@ -511,7 +518,7 @@ pub async fn export_queue(
             warn!("failed to export queue {}: {}", id, err);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"status": "error", "message": "Failed to export queue"})),
+                Json(json!({"status": "error", "message": format!("Failed to export queue: {}", err)})),
             )
                 .into_response()
         }
@@ -524,7 +531,7 @@ pub async fn export_all_queues(
 ) -> Response {
     let proxy_cfg = match proxy_config_required(state.as_ref()) {
         Ok(cfg) => cfg,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
 
     let exporter = QueueExporter::new(state.db().clone());
@@ -534,7 +541,7 @@ pub async fn export_all_queues(
             warn!("failed to export queues: {}", err);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"status": "error", "message": "Failed to export queues"})),
+                Json(json!({"status": "error", "message": format!("Failed to export queues: {}", err)})),
             )
                 .into_response()
         }
@@ -596,7 +603,7 @@ fn queue_tags(metadata: Option<&Value>) -> Vec<String> {
 fn build_queue_metadata(
     raw_metadata: Option<String>,
     tags: &[String],
-) -> Result<Option<Value>, Response> {
+) -> Result<Option<Value>, Box<Response>> {
     let mut map = match raw_metadata
         .as_ref()
         .map(|raw| raw.trim())
@@ -609,7 +616,12 @@ fn build_queue_metadata(
                 wrapper.insert("value".to_string(), other);
                 wrapper
             }
-            Err(err) => return Err(bad_request(format!("Metadata must be valid JSON: {}", err))),
+            Err(err) => {
+                return Err(Box::new(bad_request(format!(
+                    "Metadata must be valid JSON: {}",
+                    err
+                ))));
+            }
         },
         None => JsonMap::new(),
     };
@@ -632,22 +644,182 @@ fn format_metadata_text(metadata: &Option<Value>) -> String {
         .unwrap_or_default()
 }
 
-fn proxy_config_optional(state: &ConsoleState) -> Option<ProxyConfig> {
-    state
-        .app_state()
-        .and_then(|app| Some(app.config().proxy.clone()))
+pub async fn reload_queues_handler(
+    State(state): State<Arc<ConsoleState>>,
+    AuthRequired(_): AuthRequired,
+) -> Response {
+    let app_state = match state.app_state() {
+        Some(app) => app,
+        None => {
+            return (StatusCode::FAILED_DEPENDENCY, Json(json!({
+                "status": "error",
+                "message": "PBX is not running; cannot reload queues.",
+            }))).into_response();
+        }
+    };
+
+    let server = app_state.sip_server();
+    info!("Reloading queues via console");
+
+    match server.inner.data_context.reload_queues(true, None).await {
+        Ok(metrics) => {
+            let total = metrics.total;
+            let generated_entries = metrics
+                .generated
+                .as_ref()
+                .map(|g| g.entries)
+                .unwrap_or(0);
+            state.clear_pending_reload();
+            Json(json!({
+                "status": "ok",
+                "queues_reloaded": total,
+                "generated_queue_files": generated_entries,
+                "metrics": metrics,
+            })).into_response()
+        }
+        Err(err) => {
+            warn!("Queue reload failed: {}", err);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({
+                "status": "error",
+                "message": format!("Failed to reload queues: {}", err),
+            }))).into_response()
+        }
+    }
 }
 
-fn proxy_config_required(state: &ConsoleState) -> Result<ProxyConfig, Response> {
+pub async fn download_audio_handler(
+    State(_state): State<Arc<ConsoleState>>,
+    AuthRequired(_): AuthRequired,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    let url = match payload.get("url").and_then(|v| v.as_str()) {
+        Some(u) => u.trim().to_string(),
+        None => {
+            return (StatusCode::BAD_REQUEST, Json(json!({
+                "status": "error", "message": "Missing 'url' field."
+            }))).into_response();
+        }
+    };
+
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return (StatusCode::BAD_REQUEST, Json(json!({
+            "status": "error", "message": "URL must start with http:// or https://"
+        }))).into_response();
+    }
+
+    // Determine sounds directory
+    let sounds_dir = if std::path::Path::new("config/sounds").exists() {
+        PathBuf::from("config/sounds")
+    } else {
+        PathBuf::from("sounds")
+    };
+
+    // Create filename from URL
+    let filename = sanitize_filename(url.split('/').last().unwrap_or("audio.wav"));
+    let dest_path = sounds_dir.join(&filename);
+
+    // Download
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap();
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let bytes = match resp.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    return (StatusCode::BAD_GATEWAY, Json(json!({
+                        "status": "error", "message": format!("Failed to read response: {}", e)
+                    }))).into_response();
+                }
+            };
+            if let Err(e) = tokio::fs::write(&dest_path, &bytes).await {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({
+                    "status": "error", "message": format!("Failed to save file: {}", e)
+                }))).into_response();
+            }
+            let relative_path = format!("sounds/{}", filename);
+            Json(json!({
+                "status": "ok",
+                "path": relative_path,
+                "filename": filename,
+            })).into_response()
+        }
+        Ok(resp) => {
+            (StatusCode::BAD_GATEWAY, Json(json!({
+                "status": "error",
+                "message": format!("Download failed with HTTP {}", resp.status())
+            }))).into_response()
+        }
+        Err(e) => {
+            (StatusCode::BAD_GATEWAY, Json(json!({
+                "status": "error",
+                "message": format!("Download failed: {}", e)
+            }))).into_response()
+        }
+    }
+}
+
+pub async fn serve_sound_handler(
+    AxumPath(file_path): AxumPath<String>,
+) -> Response {
+    let sounds_dir = if std::path::Path::new("config/sounds").exists() {
+        PathBuf::from("config/sounds")
+    } else {
+        PathBuf::from("sounds")
+    };
+    let file_path = file_path.trim_start_matches('/');
+    let full_path = sounds_dir.join(file_path);
+
+    // Security: prevent path traversal
+    let canonical = match full_path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => {
+            return (StatusCode::NOT_FOUND, "Not found").into_response();
+        }
+    };
+    if !canonical.starts_with(&sounds_dir.canonicalize().unwrap_or(sounds_dir)) {
+        return (StatusCode::FORBIDDEN, "Forbidden").into_response();
+    }
+
+    match tokio::fs::read(&full_path).await {
+        Ok(bytes) => {
+            let content_type = if file_path.ends_with(".wav") {
+                "audio/wav"
+            } else if file_path.ends_with(".mp3") {
+                "audio/mpeg"
+            } else {
+                "application/octet-stream"
+            };
+            Response::builder()
+                .header(header::CONTENT_TYPE, content_type)
+                .body(Body::from(bytes))
+                .unwrap()
+        }
+        Err(_) => (StatusCode::NOT_FOUND, "Not found").into_response(),
+    }
+}
+
+fn sanitize_filename(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+        .collect()
+}
+
+fn proxy_config_optional(state: &ConsoleState) -> Option<ProxyConfig> {
+    state.app_state().map(|app| app.config().proxy.clone())
+}
+
+fn proxy_config_required(state: &ConsoleState) -> Result<ProxyConfig, Box<Response>> {
     proxy_config_optional(state).ok_or_else(|| {
-        (
+        Box::new((
             StatusCode::FAILED_DEPENDENCY,
             Json(json!({
                 "status": "error",
                 "message": "Proxy configuration is unavailable; configure proxy.generated_dir or proxy.queue_dir first."
             })),
         )
-            .into_response()
+            .into_response())
     })
 }
 

@@ -21,6 +21,8 @@ mod tests {
             name: "test-ivr".to_string(),
             description: Some("Test IVR".to_string()),
             lang: Some("en".to_string()),
+            default_voice: None,
+            dynamic_build: false,
             business_hours: None,
             tts: None,
             root: MenuNode {
@@ -29,7 +31,11 @@ mod tests {
                 max_retries: 2,
                 invalid_prompt: Some("sounds/invalid.wav".to_string()),
                 timeout_action: Some(EntryAction::Repeat),
-                max_retries_action: Some(EntryAction::Hangup { prompt: None, prompt_text: None, prompt_voice: None }),
+                max_retries_action: Some(EntryAction::Hangup {
+                    prompt: None,
+                    prompt_text: None,
+                    prompt_voice: None,
+                }),
                 entries: vec![
                     MenuEntry {
                         key: "1".to_string(),
@@ -565,6 +571,8 @@ action = { type = "transfer", target = "100" }
             name: "test-collect".to_string(),
             description: None,
             lang: None,
+            default_voice: None,
+            dynamic_build: false,
             business_hours: None,
             tts: None,
             root: MenuNode {
@@ -572,8 +580,16 @@ action = { type = "transfer", target = "100" }
                 timeout_ms: 200,
                 max_retries: 1,
                 invalid_prompt: None,
-                timeout_action: Some(EntryAction::Hangup { prompt: None, prompt_text: None, prompt_voice: None }),
-                max_retries_action: Some(EntryAction::Hangup { prompt: None, prompt_text: None, prompt_voice: None }),
+                timeout_action: Some(EntryAction::Hangup {
+                    prompt: None,
+                    prompt_text: None,
+                    prompt_voice: None,
+                }),
+                max_retries_action: Some(EntryAction::Hangup {
+                    prompt: None,
+                    prompt_text: None,
+                    prompt_voice: None,
+                }),
                 entries: vec![
                     MenuEntry {
                         key: "1".to_string(),
@@ -599,6 +615,7 @@ action = { type = "transfer", target = "100" }
                         label: Some("Queue".to_string()),
                         action: EntryAction::Queue {
                             target: "sales".to_string(),
+                            return_to_ivr: None,
                         },
                     },
                 ],
@@ -757,6 +774,171 @@ action = { type = "transfer", target = "100" }
             .expect("should exit after queue transfer");
     }
 
+    // ── 16. Queue action with return_to_ivr ──
+
+    /// Build an IVR where DTMF "3" sends to queue with return_to_ivr enabled.
+    fn build_queue_return_to_ivr_ivr() -> IvrDefinition {
+        IvrDefinition {
+            name: "test-queue-return".to_string(),
+            description: None,
+            lang: None,
+            default_voice: None,
+            dynamic_build: false,
+            business_hours: None,
+            tts: None,
+            root: MenuNode {
+                greeting: "sounds/queue_menu.wav".to_string(),
+                timeout_ms: 200,
+                max_retries: 1,
+                invalid_prompt: None,
+                timeout_action: Some(EntryAction::Hangup {
+                    prompt: None,
+                    prompt_text: None,
+                    prompt_voice: None,
+                }),
+                max_retries_action: Some(EntryAction::Hangup {
+                    prompt: None,
+                    prompt_text: None,
+                    prompt_voice: None,
+                }),
+                entries: vec![
+                    MenuEntry {
+                        key: "1".to_string(),
+                        label: Some("Queue no return".to_string()),
+                        action: EntryAction::Queue {
+                            target: "normal_queue".to_string(),
+                            return_to_ivr: None,
+                        },
+                    },
+                    MenuEntry {
+                        key: "2".to_string(),
+                        label: Some("Queue with return".to_string()),
+                        action: EntryAction::Queue {
+                            target: "support".to_string(),
+                            return_to_ivr: Some(true),
+                        },
+                    },
+                    MenuEntry {
+                        key: "3".to_string(),
+                        label: Some("Queue return=false".to_string()),
+                        action: EntryAction::Queue {
+                            target: "overflow".to_string(),
+                            return_to_ivr: Some(false),
+                        },
+                    },
+                ],
+                ..Default::default()
+            },
+            menus: HashMap::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ivr_queue_action_default_no_return_to_ivr() {
+        let ivr = build_queue_return_to_ivr_ivr();
+        let mut stack = MockCallStack::run(Box::new(IvrApp::new(ivr)), "caller", "1000");
+
+        stack
+            .assert_cmd(200, "AcceptCall", |c| {
+                matches!(c, SessionAction::AcceptCall { .. })
+            })
+            .await;
+        stack
+            .assert_cmd(200, "PlayPrompt", |c| {
+                matches!(c, SessionAction::PlayPrompt { .. })
+            })
+            .await;
+        stack.audio_complete("default");
+
+        // Press "1" → Queue without return_to_ivr (None) → plain queue: target
+        stack.dtmf("1");
+
+        stack
+            .assert_cmd(
+                300,
+                "TransferTarget-queue-no-return",
+                |c| matches!(c, SessionAction::TransferTarget(t) if t == "queue:normal_queue"),
+            )
+            .await;
+
+        stack
+            .join()
+            .await
+            .expect("should exit after queue transfer");
+    }
+
+    #[tokio::test]
+    async fn test_ivr_queue_action_with_return_to_ivr() {
+        let ivr = build_queue_return_to_ivr_ivr();
+        let mut stack = MockCallStack::run(Box::new(IvrApp::new(ivr)), "caller", "1000");
+
+        stack
+            .assert_cmd(200, "AcceptCall", |c| {
+                matches!(c, SessionAction::AcceptCall { .. })
+            })
+            .await;
+        stack
+            .assert_cmd(200, "PlayPrompt", |c| {
+                matches!(c, SessionAction::PlayPrompt { .. })
+            })
+            .await;
+        stack.audio_complete("default");
+
+        // Press "2" → Queue with return_to_ivr: true
+        // Should encode the IVR name in the transfer target
+        stack.dtmf("2");
+
+        stack
+            .assert_cmd(
+                300,
+                "TransferTarget-queue-with-return",
+                |c| {
+                    matches!(c, SessionAction::TransferTarget(t)
+                        if t == "queue:support?return_ivr=test-queue-return")
+                },
+            )
+            .await;
+
+        stack
+            .join()
+            .await
+            .expect("should exit after queue transfer");
+    }
+
+    #[tokio::test]
+    async fn test_ivr_queue_action_return_to_ivr_false() {
+        let ivr = build_queue_return_to_ivr_ivr();
+        let mut stack = MockCallStack::run(Box::new(IvrApp::new(ivr)), "caller", "1000");
+
+        stack
+            .assert_cmd(200, "AcceptCall", |c| {
+                matches!(c, SessionAction::AcceptCall { .. })
+            })
+            .await;
+        stack
+            .assert_cmd(200, "PlayPrompt", |c| {
+                matches!(c, SessionAction::PlayPrompt { .. })
+            })
+            .await;
+        stack.audio_complete("default");
+
+        // Press "3" → Queue with return_to_ivr: Some(false) → plain queue: target
+        stack.dtmf("3");
+
+        stack
+            .assert_cmd(
+                300,
+                "TransferTarget-queue-return-false",
+                |c| matches!(c, SessionAction::TransferTarget(t) if t == "queue:overflow"),
+            )
+            .await;
+
+        stack
+            .join()
+            .await
+            .expect("should exit after queue transfer");
+    }
+
     // ── Webhook helpers ──────────────────────────────────────────────────────
 
     /// Spawn a one-shot axum HTTP server that always returns `body`.
@@ -791,6 +973,8 @@ action = { type = "transfer", target = "100" }
             name: "webhook-ivr".to_string(),
             description: None,
             lang: None,
+            default_voice: None,
+            dynamic_build: false,
             business_hours: None,
             tts: None,
             root: MenuNode {
@@ -798,8 +982,16 @@ action = { type = "transfer", target = "100" }
                 timeout_ms: 200,
                 max_retries: 1,
                 invalid_prompt: None,
-                timeout_action: Some(EntryAction::Hangup { prompt: None, prompt_text: None, prompt_voice: None }),
-                max_retries_action: Some(EntryAction::Hangup { prompt: None, prompt_text: None, prompt_voice: None }),
+                timeout_action: Some(EntryAction::Hangup {
+                    prompt: None,
+                    prompt_text: None,
+                    prompt_voice: None,
+                }),
+                max_retries_action: Some(EntryAction::Hangup {
+                    prompt: None,
+                    prompt_text: None,
+                    prompt_voice: None,
+                }),
                 entries: vec![MenuEntry {
                     key: "1".to_string(),
                     label: Some("Webhook".to_string()),
@@ -1008,8 +1200,16 @@ action = { type = "transfer", target = "100" }
                 timeout_ms: 200,
                 max_retries: 1,
                 invalid_prompt: None,
-                timeout_action: Some(EntryAction::Hangup { prompt: None, prompt_text: None, prompt_voice: None }),
-                max_retries_action: Some(EntryAction::Hangup { prompt: None, prompt_text: None, prompt_voice: None }),
+                timeout_action: Some(EntryAction::Hangup {
+                    prompt: None,
+                    prompt_text: None,
+                    prompt_voice: None,
+                }),
+                max_retries_action: Some(EntryAction::Hangup {
+                    prompt: None,
+                    prompt_text: None,
+                    prompt_voice: None,
+                }),
                 entries: vec![MenuEntry {
                     key: "1".to_string(),
                     label: Some("Billing".to_string()),
@@ -1358,6 +1558,8 @@ action = { type = "transfer", target = "100" }
             name: "play-and-hangup-ivr".to_string(),
             description: None,
             lang: None,
+            default_voice: None,
+            dynamic_build: false,
             business_hours: None,
             tts: None,
             root: MenuNode {
@@ -1365,8 +1567,16 @@ action = { type = "transfer", target = "100" }
                 timeout_ms: 200,
                 max_retries: 1,
                 invalid_prompt: None,
-                timeout_action: Some(EntryAction::Hangup { prompt: None, prompt_text: None, prompt_voice: None }),
-                max_retries_action: Some(EntryAction::Hangup { prompt: None, prompt_text: None, prompt_voice: None }),
+                timeout_action: Some(EntryAction::Hangup {
+                    prompt: None,
+                    prompt_text: None,
+                    prompt_voice: None,
+                }),
+                max_retries_action: Some(EntryAction::Hangup {
+                    prompt: None,
+                    prompt_text: None,
+                    prompt_voice: None,
+                }),
                 entries: vec![
                     MenuEntry {
                         key: "4".to_string(),
@@ -1386,6 +1596,16 @@ action = { type = "transfer", target = "100" }
                             prompt_text: None,
                             prompt_voice: None,
                             code: Some(503),
+                        },
+                    },
+                    MenuEntry {
+                        key: "6".to_string(),
+                        label: Some("Goodbye no code".to_string()),
+                        action: EntryAction::PlayAndHangup {
+                            prompt: Some("sounds/goodbye.wav".to_string()),
+                            prompt_text: None,
+                            prompt_voice: None,
+                            code: None,
                         },
                     },
                 ],
@@ -1464,6 +1684,48 @@ action = { type = "transfer", target = "100" }
                     c,
                     SessionAction::Hangup {
                         code: Some(503),
+                        ..
+                    }
+                )
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_ivr_play_and_hangup_without_code() {
+        let ivr = build_play_and_hangup_ivr();
+        let mut stack = MockCallStack::run(Box::new(IvrApp::new(ivr)), "caller", "1000");
+
+        stack
+            .assert_cmd(200, "AcceptCall", |c| {
+                matches!(c, SessionAction::AcceptCall { .. })
+            })
+            .await;
+        stack
+            .assert_cmd(200, "PlayPrompt-greeting", |c| {
+                matches!(c, SessionAction::PlayPrompt { audio_file, .. } if audio_file == "sounds/welcome.wav")
+            })
+            .await;
+        stack.audio_complete("default");
+
+        // Press "6" → PlayAndHangup with prompt but NO status code
+        stack.dtmf("6");
+
+        // Should play the goodbye prompt
+        stack
+            .assert_cmd(200, "PlayPrompt-goodbye", |c| {
+                matches!(c, SessionAction::PlayPrompt { audio_file, .. } if audio_file == "sounds/goodbye.wav")
+            })
+            .await;
+
+        // After prompt completes → hangup with code: None (normal hangup)
+        stack.audio_complete("default");
+        stack
+            .assert_cmd(200, "Hangup-no-code", |c| {
+                matches!(
+                    c,
+                    SessionAction::Hangup {
+                        code: None,
                         ..
                     }
                 )
@@ -1568,6 +1830,8 @@ action = { type = "transfer", target = "100" }
             name: "e2e-ivr".to_string(),
             description: None,
             lang: None,
+            default_voice: None,
+            dynamic_build: false,
             business_hours: None,
             tts: None,
             root: MenuNode {
@@ -1575,8 +1839,16 @@ action = { type = "transfer", target = "100" }
                 timeout_ms: 2000,
                 max_retries: 1,
                 invalid_prompt: None,
-                timeout_action: Some(EntryAction::Hangup { prompt: None, prompt_text: None, prompt_voice: None }),
-                max_retries_action: Some(EntryAction::Hangup { prompt: None, prompt_text: None, prompt_voice: None }),
+                timeout_action: Some(EntryAction::Hangup {
+                    prompt: None,
+                    prompt_text: None,
+                    prompt_voice: None,
+                }),
+                max_retries_action: Some(EntryAction::Hangup {
+                    prompt: None,
+                    prompt_text: None,
+                    prompt_voice: None,
+                }),
                 entries: vec![MenuEntry {
                     key: "1".to_string(),
                     label: Some("Transfer".to_string()),
@@ -1632,6 +1904,8 @@ action = { type = "transfer", target = "100" }
             name: "e2e-submenu".to_string(),
             description: None,
             lang: None,
+            default_voice: None,
+            dynamic_build: false,
             business_hours: None,
             tts: None,
             root: MenuNode {
@@ -1639,8 +1913,16 @@ action = { type = "transfer", target = "100" }
                 timeout_ms: 2000,
                 max_retries: 1,
                 invalid_prompt: None,
-                timeout_action: Some(EntryAction::Hangup { prompt: None, prompt_text: None, prompt_voice: None }),
-                max_retries_action: Some(EntryAction::Hangup { prompt: None, prompt_text: None, prompt_voice: None }),
+                timeout_action: Some(EntryAction::Hangup {
+                    prompt: None,
+                    prompt_text: None,
+                    prompt_voice: None,
+                }),
+                max_retries_action: Some(EntryAction::Hangup {
+                    prompt: None,
+                    prompt_text: None,
+                    prompt_voice: None,
+                }),
                 entries: vec![MenuEntry {
                     key: "2".to_string(),
                     label: Some("Support".to_string()),
@@ -1659,8 +1941,16 @@ action = { type = "transfer", target = "100" }
                         timeout_ms: 2000,
                         max_retries: 1,
                         invalid_prompt: None,
-                        timeout_action: Some(EntryAction::Hangup { prompt: None, prompt_text: None, prompt_voice: None }),
-                        max_retries_action: Some(EntryAction::Hangup { prompt: None, prompt_text: None, prompt_voice: None }),
+                        timeout_action: Some(EntryAction::Hangup {
+                            prompt: None,
+                            prompt_text: None,
+                            prompt_voice: None,
+                        }),
+                        max_retries_action: Some(EntryAction::Hangup {
+                            prompt: None,
+                            prompt_text: None,
+                            prompt_voice: None,
+                        }),
                         entries: vec![MenuEntry {
                             key: "1".to_string(),
                             label: Some("Billing".to_string()),
@@ -1726,6 +2016,8 @@ action = { type = "transfer", target = "100" }
             name: "e2e-hangup".to_string(),
             description: None,
             lang: None,
+            default_voice: None,
+            dynamic_build: false,
             business_hours: None,
             tts: None,
             root: MenuNode {
@@ -1733,8 +2025,16 @@ action = { type = "transfer", target = "100" }
                 timeout_ms: 2000,
                 max_retries: 1,
                 invalid_prompt: None,
-                timeout_action: Some(EntryAction::Hangup { prompt: None, prompt_text: None, prompt_voice: None }),
-                max_retries_action: Some(EntryAction::Hangup { prompt: None, prompt_text: None, prompt_voice: None }),
+                timeout_action: Some(EntryAction::Hangup {
+                    prompt: None,
+                    prompt_text: None,
+                    prompt_voice: None,
+                }),
+                max_retries_action: Some(EntryAction::Hangup {
+                    prompt: None,
+                    prompt_text: None,
+                    prompt_voice: None,
+                }),
                 entries: vec![MenuEntry {
                     key: "0".to_string(),
                     label: Some("Hangup".to_string()),
@@ -1793,6 +2093,8 @@ action = { type = "transfer", target = "100" }
             name: "e2e-invalid".to_string(),
             description: None,
             lang: None,
+            default_voice: None,
+            dynamic_build: false,
             business_hours: None,
             tts: None,
             root: MenuNode {
@@ -1801,7 +2103,11 @@ action = { type = "transfer", target = "100" }
                 max_retries: 2,
                 invalid_prompt: Some(invalid_wav.clone()),
                 timeout_action: Some(EntryAction::Repeat),
-                max_retries_action: Some(EntryAction::Hangup { prompt: None, prompt_text: None, prompt_voice: None }),
+                max_retries_action: Some(EntryAction::Hangup {
+                    prompt: None,
+                    prompt_text: None,
+                    prompt_voice: None,
+                }),
                 entries: vec![MenuEntry {
                     key: "1".to_string(),
                     label: Some("Sales".to_string()),
@@ -1860,6 +2166,8 @@ action = { type = "transfer", target = "100" }
             name: "e2e-play".to_string(),
             description: None,
             lang: None,
+            default_voice: None,
+            dynamic_build: false,
             business_hours: None,
             tts: None,
             root: MenuNode {
@@ -1867,8 +2175,16 @@ action = { type = "transfer", target = "100" }
                 timeout_ms: 2000,
                 max_retries: 1,
                 invalid_prompt: None,
-                timeout_action: Some(EntryAction::Hangup { prompt: None, prompt_text: None, prompt_voice: None }),
-                max_retries_action: Some(EntryAction::Hangup { prompt: None, prompt_text: None, prompt_voice: None }),
+                timeout_action: Some(EntryAction::Hangup {
+                    prompt: None,
+                    prompt_text: None,
+                    prompt_voice: None,
+                }),
+                max_retries_action: Some(EntryAction::Hangup {
+                    prompt: None,
+                    prompt_text: None,
+                    prompt_voice: None,
+                }),
                 entries: vec![
                     MenuEntry {
                         key: "3".to_string(),
@@ -1939,6 +2255,8 @@ action = { type = "transfer", target = "100" }
             name: "e2e-bargein".to_string(),
             description: None,
             lang: None,
+            default_voice: None,
+            dynamic_build: false,
             business_hours: None,
             tts: None,
             root: MenuNode {
@@ -1946,8 +2264,16 @@ action = { type = "transfer", target = "100" }
                 timeout_ms: 2000,
                 max_retries: 1,
                 invalid_prompt: None,
-                timeout_action: Some(EntryAction::Hangup { prompt: None, prompt_text: None, prompt_voice: None }),
-                max_retries_action: Some(EntryAction::Hangup { prompt: None, prompt_text: None, prompt_voice: None }),
+                timeout_action: Some(EntryAction::Hangup {
+                    prompt: None,
+                    prompt_text: None,
+                    prompt_voice: None,
+                }),
+                max_retries_action: Some(EntryAction::Hangup {
+                    prompt: None,
+                    prompt_text: None,
+                    prompt_voice: None,
+                }),
                 entries: vec![MenuEntry {
                     key: "1".to_string(),
                     label: Some("Sales".to_string()),
@@ -2004,6 +2330,8 @@ action = { type = "transfer", target = "100" }
             name: "e2e-timeout".to_string(),
             description: None,
             lang: None,
+            default_voice: None,
+            dynamic_build: false,
             business_hours: None,
             tts: None,
             root: MenuNode {
@@ -2012,7 +2340,11 @@ action = { type = "transfer", target = "100" }
                 max_retries: 2,
                 invalid_prompt: None,
                 timeout_action: Some(EntryAction::Repeat),
-                max_retries_action: Some(EntryAction::Hangup { prompt: None, prompt_text: None, prompt_voice: None }),
+                max_retries_action: Some(EntryAction::Hangup {
+                    prompt: None,
+                    prompt_text: None,
+                    prompt_voice: None,
+                }),
                 entries: vec![MenuEntry {
                     key: "1".to_string(),
                     label: Some("Sales".to_string()),
@@ -2070,6 +2402,8 @@ action = { type = "transfer", target = "100" }
             name: "e2e-play-and-hangup".to_string(),
             description: None,
             lang: None,
+            default_voice: None,
+            dynamic_build: false,
             business_hours: None,
             tts: None,
             root: MenuNode {
@@ -2077,8 +2411,16 @@ action = { type = "transfer", target = "100" }
                 timeout_ms: 2000,
                 max_retries: 1,
                 invalid_prompt: None,
-                timeout_action: Some(EntryAction::Hangup { prompt: None, prompt_text: None, prompt_voice: None }),
-                max_retries_action: Some(EntryAction::Hangup { prompt: None, prompt_text: None, prompt_voice: None }),
+                timeout_action: Some(EntryAction::Hangup {
+                    prompt: None,
+                    prompt_text: None,
+                    prompt_voice: None,
+                }),
+                max_retries_action: Some(EntryAction::Hangup {
+                    prompt: None,
+                    prompt_text: None,
+                    prompt_voice: None,
+                }),
                 entries: vec![MenuEntry {
                     key: "4".to_string(),
                     label: Some("Busy".to_string()),
@@ -2197,7 +2539,8 @@ action = { type = "transfer", target = "100" }
                     sample_format: hound::SampleFormat::Int,
                 };
                 let mut writer =
-                    hound::WavWriter::new(std::io::BufWriter::new(tmp.as_file_mut()), spec).unwrap();
+                    hound::WavWriter::new(std::io::BufWriter::new(tmp.as_file_mut()), spec)
+                        .unwrap();
                 for _ in 0..800 {
                     writer.write_sample(0i16).unwrap();
                 }
@@ -2210,7 +2553,9 @@ action = { type = "transfer", target = "100" }
         let app = Router::new().route(
             "/tts",
             get(
-                move |axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>| {
+                move |axum::extract::Query(params): axum::extract::Query<
+                    HashMap<String, String>,
+                >| {
                     let wav = wav_clone.clone();
                     async move {
                         assert_eq!(params.get("text"), Some(&"hello from tts".to_string()));
@@ -2251,6 +2596,8 @@ action = { type = "transfer", target = "100" }
             name: "tts-ivr".to_string(),
             description: None,
             lang: Some("en".to_string()),
+            default_voice: None,
+            dynamic_build: false,
             business_hours: None,
             tts: Some(tts_config),
             root: MenuNode {
@@ -2306,9 +2653,11 @@ action = { type = "transfer", target = "100" }
         // DTMF "1" → transfer
         stack.dtmf("1");
         stack
-            .assert_cmd(200, "Transfer", |c| {
-                matches!(c, SessionAction::TransferTarget(target) if target == "2001")
-            })
+            .assert_cmd(
+                200,
+                "Transfer",
+                |c| matches!(c, SessionAction::TransferTarget(target) if target == "2001"),
+            )
             .await;
     }
 }

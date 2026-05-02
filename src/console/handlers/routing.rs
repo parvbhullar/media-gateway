@@ -105,18 +105,15 @@ impl Default for RouteDocument {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub(crate) enum RouteTargetKind {
+    #[default]
     SipTrunk,
     Queue,
     Voicemail,
     Ivr,
 }
 
-impl Default for RouteTargetKind {
-    fn default() -> Self {
-        Self::SipTrunk
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct RouteActionDocument {
@@ -187,8 +184,8 @@ impl Default for RouteActionDocument {
 }
 impl RouteDocument {
     fn from_model(model: &RoutingModel) -> Self {
-        if let Some(meta) = model.metadata.clone() {
-            if let Ok(mut doc) = serde_json::from_value::<RouteDocument>(meta) {
+        if let Some(meta) = model.metadata.clone()
+            && let Ok(mut doc) = serde_json::from_value::<RouteDocument>(meta) {
                 doc.id = Some(model.id);
                 doc.name = model.name.clone();
                 doc.description = model.description.clone();
@@ -218,7 +215,6 @@ impl RouteDocument {
                 doc.ensure_consistency();
                 return doc;
             }
-        }
 
         let mut doc = RouteDocument {
             id: Some(model.id),
@@ -371,22 +367,20 @@ impl RouteDocument {
     }
 
     fn apply_trunk_context(&mut self, model: &RoutingModel, trunks: &HashMap<i64, SipTrunkModel>) {
-        if self.source_trunk.is_none() {
-            if let Some(source_id) = model.source_trunk_id {
-                if let Some(trunk) = trunks.get(&source_id) {
+        if self.source_trunk.is_none()
+            && let Some(source_id) = model.source_trunk_id
+                && let Some(trunk) = trunks.get(&source_id) {
                     self.source_trunk = Some(trunk.name.clone());
                 }
-            }
-        }
 
         if !matches!(self.action.target_type, RouteTargetKind::SipTrunk) {
             return;
         }
 
         if self.action.trunks.is_empty() {
-            if let Some(default_id) = model.default_trunk_id {
-                if let Some(trunk) = trunks.get(&default_id) {
-                    if !self
+            if let Some(default_id) = model.default_trunk_id
+                && let Some(trunk) = trunks.get(&default_id)
+                    && !self
                         .action
                         .trunks
                         .iter()
@@ -397,8 +391,6 @@ impl RouteDocument {
                             weight: DEFAULT_PRIORITY,
                         });
                     }
-                }
-            }
             self.ensure_consistency();
         }
     }
@@ -704,6 +696,7 @@ fn status_options_value() -> Value {
     ])
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_route_form(
     state: &ConsoleState,
     mode: &str,
@@ -825,6 +818,7 @@ pub async fn page_routing(
         })
         .unwrap_or(false);
 
+    let ami_endpoint = state.config().proxy.ami_path.clone().unwrap_or_else(|| "/ami/v1".to_string());
     state.render_with_headers(
         "console/routing.html",
         json!({
@@ -838,6 +832,7 @@ pub async fn page_routing(
             "create_url": state.url_for("/routing/new"),
             "current_user": current_user,
             "has_file_routes": has_file_routes,
+            "ami_endpoint": ami_endpoint,
         }),
         &headers,
     )
@@ -905,7 +900,7 @@ pub(crate) async fn query_routing(
             warn!("failed to load trunks for routing query: {}", err);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to load routing data"})),
+                Json(json!({"message": format!("Failed to load routing data: {}", err)})),
             )
                 .into_response();
         }
@@ -919,7 +914,7 @@ pub(crate) async fn query_routing(
             warn!("failed to load routes for summary: {}", err);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to load routing data"})),
+                Json(json!({"message": format!("Failed to load routing data: {}", err)})),
             )
                 .into_response();
         }
@@ -933,7 +928,7 @@ pub(crate) async fn query_routing(
             warn!("failed to paginate routing list: {}", err);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to load routing data"})),
+                Json(json!({"message": format!("Failed to load routing data: {}", err)})),
             )
                 .into_response();
         }
@@ -951,16 +946,13 @@ pub(crate) async fn query_routing(
 
     // Issue #179: collect file-sourced routes from in-memory snapshot
     let file_routes: Vec<Value> = if let Some(app_state) = state.app_state() {
-        let snapshot = app_state
-            .sip_server()
-            .inner
-            .data_context
-            .routes_snapshot();
+        let snapshot = app_state.sip_server().inner.data_context.routes_snapshot();
         let mut file_items: Vec<Value> = snapshot
             .into_iter()
             .filter_map(|route| {
                 if let ConfigOrigin::File(ref path) = route.origin {
-                    let action_payload = serde_json::to_value(&route.action).unwrap_or_else(|_| json!({}));
+                    let action_payload =
+                        serde_json::to_value(&route.action).unwrap_or_else(|_| json!({}));
                     Some(json!({
                         "id": null,
                         "name": route.name,
@@ -1021,7 +1013,7 @@ pub async fn page_routing_create(
             warn!("failed to load trunks for route create page: {}", err);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to load routing form",
+                format!("Failed to load routing form: {}", err),
             )
                 .into_response();
         }
@@ -1032,7 +1024,7 @@ pub async fn page_routing_create(
             warn!("failed to load queues for route create page: {}", err);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to load routing form",
+                format!("Failed to load routing form: {}", err),
             )
                 .into_response();
         }
@@ -1070,7 +1062,7 @@ pub async fn page_routing_edit(
             warn!("failed to load route {} for edit: {}", id, err);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to load routing rule",
+                format!("Failed to load routing rule: {}", err),
             )
                 .into_response();
         }
@@ -1082,7 +1074,7 @@ pub async fn page_routing_edit(
             warn!("failed to load trunks for route edit page: {}", err);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to load routing form",
+                format!("Failed to load routing form: {}", err),
             )
                 .into_response();
         }
@@ -1100,7 +1092,7 @@ pub async fn page_routing_edit(
             warn!("failed to load queues for route edit page: {}", err);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to load routing form",
+                format!("Failed to load routing form: {}", err),
             )
                 .into_response();
         }
@@ -1145,7 +1137,7 @@ pub async fn route_detail_data(
             warn!("failed to load route {} detail data: {}", id, err);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to load routing data"})),
+                Json(json!({"message": format!("Failed to load routing data: {}", err)})),
             )
                 .into_response();
         }
@@ -1157,7 +1149,7 @@ pub async fn route_detail_data(
             warn!("failed to load trunks for route detail {}: {}", id, err);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to load routing data"})),
+                Json(json!({"message": format!("Failed to load routing data: {}", err)})),
             )
                 .into_response();
         }
@@ -1169,7 +1161,7 @@ pub async fn route_detail_data(
             warn!("failed to load queues for route detail {}: {}", id, err);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to load routing data"})),
+                Json(json!({"message": format!("Failed to load routing data: {}", err)})),
             )
                 .into_response();
         }
@@ -1220,7 +1212,7 @@ pub async fn clone_routing(
             warn!("failed to load route {} for clone: {}", id, err);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to clone routing rule"})),
+                Json(json!({"message": format!("Failed to clone routing rule: {}", err)})),
             )
                 .into_response();
         }
@@ -1235,7 +1227,7 @@ pub async fn clone_routing(
             warn!("failed to generate clone name for route {}: {}", id, err);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to clone routing rule"})),
+                Json(json!({"message": format!("Failed to clone routing rule: {}", err)})),
             )
                 .into_response();
         }
@@ -1253,7 +1245,7 @@ pub async fn clone_routing(
             warn!("failed to load trunks for route clone {}: {}", id, err);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to clone routing rule"})),
+                Json(json!({"message": format!("Failed to clone routing rule: {}", err)})),
             )
                 .into_response();
         }
@@ -1264,17 +1256,16 @@ pub async fn clone_routing(
         warn!("failed to load queues for route clone {}: {}", id, err);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"message": "Failed to clone routing rule"})),
+            Json(json!({"message": format!("Failed to clone routing rule: {}", err)})),
         )
             .into_response();
     }
 
     doc.source_trunk = sanitize_optional_string(doc.source_trunk.take());
-    if let Some(ref name) = doc.source_trunk {
-        if resolve_trunk_id(&trunk_lookup, Some(name.as_str())).is_none() {
+    if let Some(ref name) = doc.source_trunk
+        && resolve_trunk_id(&trunk_lookup, Some(name.as_str())).is_none() {
             return bad_request(format!("Source trunk \"{}\" was not found", name));
         }
-    }
 
     let tx = match db.begin().await {
         Ok(tx) => tx,
@@ -1285,15 +1276,17 @@ pub async fn clone_routing(
             );
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to clone routing rule"})),
+                Json(json!({"message": format!("Failed to clone routing rule: {}", err)})),
             )
                 .into_response();
         }
     };
 
     let now = Utc::now();
-    let mut active: RoutingActiveModel = Default::default();
-    active.created_at = Set(now);
+    let mut active = RoutingActiveModel {
+        created_at: Set(now),
+        ..Default::default()
+    };
     apply_document_to_active(&mut active, &doc, &trunk_lookup, now);
 
     let new_model = match active.insert(&tx).await {
@@ -1303,7 +1296,7 @@ pub async fn clone_routing(
             let _ = tx.rollback().await;
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to clone routing rule"})),
+                Json(json!({"message": format!("Failed to clone routing rule: {}", err)})),
             )
                 .into_response();
         }
@@ -1313,7 +1306,7 @@ pub async fn clone_routing(
         warn!("failed to commit cloned routing rule from {}: {}", id, err);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"message": "Failed to clone routing rule"})),
+            Json(json!({"message": format!("Failed to clone routing rule: {}", err)})),
         )
             .into_response();
     }
@@ -1340,7 +1333,7 @@ pub async fn toggle_routing(
             warn!("failed to load route {} for toggle: {}", id, err);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to toggle routing rule"})),
+                Json(json!({"message": format!("Failed to toggle routing rule: {}", err)})),
             )
                 .into_response();
         }
@@ -1376,7 +1369,7 @@ pub async fn toggle_routing(
             warn!("failed to toggle routing rule {}: {}", id, err);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to toggle routing rule"})),
+                Json(json!({"message": format!("Failed to toggle routing rule: {}", err)})),
             )
                 .into_response()
         }
@@ -1409,7 +1402,7 @@ pub(crate) async fn create_routing(
             warn!("failed to load trunks for route create: {}", err);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to create routing rule"})),
+                Json(json!({"message": format!("Failed to create routing rule: {}", err)})),
             )
                 .into_response();
         }
@@ -1417,11 +1410,10 @@ pub(crate) async fn create_routing(
 
     let trunk_lookup = build_trunk_name_lookup(&trunks);
     doc.source_trunk = sanitize_optional_string(doc.source_trunk.take());
-    if let Some(ref name) = doc.source_trunk {
-        if resolve_trunk_id(&trunk_lookup, Some(name.as_str())).is_none() {
+    if let Some(ref name) = doc.source_trunk
+        && resolve_trunk_id(&trunk_lookup, Some(name.as_str())).is_none() {
             return bad_request(format!("Source trunk \"{}\" was not found", name));
         }
-    }
 
     let tx = match db.begin().await {
         Ok(tx) => tx,
@@ -1429,7 +1421,7 @@ pub(crate) async fn create_routing(
             warn!("failed to start transaction for route create: {}", err);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to create routing rule"})),
+                Json(json!({"message": format!("Failed to create routing rule: {}", err)})),
             )
                 .into_response();
         }
@@ -1450,15 +1442,17 @@ pub(crate) async fn create_routing(
             let _ = tx.rollback().await;
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to create routing rule"})),
+                Json(json!({"message": format!("Failed to create routing rule: {}", err)})),
             )
                 .into_response();
         }
     }
 
     let now = Utc::now();
-    let mut active: RoutingActiveModel = Default::default();
-    active.created_at = Set(now);
+    let mut active = RoutingActiveModel {
+        created_at: Set(now),
+        ..Default::default()
+    };
     apply_document_to_active(&mut active, &doc, &trunk_lookup, now);
 
     let model = match active.insert(&tx).await {
@@ -1468,7 +1462,7 @@ pub(crate) async fn create_routing(
             let _ = tx.rollback().await;
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to create routing rule"})),
+                Json(json!({"message": format!("Failed to create routing rule: {}", err)})),
             )
                 .into_response();
         }
@@ -1478,7 +1472,7 @@ pub(crate) async fn create_routing(
         warn!("failed to commit routing rule create {}: {}", doc.name, err);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"message": "Failed to create routing rule"})),
+            Json(json!({"message": format!("Failed to create routing rule: {}", err)})),
         )
             .into_response();
     }
@@ -1515,7 +1509,7 @@ pub(crate) async fn update_routing(
             warn!("failed to load route {} for update: {}", id, err);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to update routing rule"})),
+                Json(json!({"message": format!("Failed to update routing rule: {}", err)})),
             )
                 .into_response();
         }
@@ -1527,7 +1521,7 @@ pub(crate) async fn update_routing(
             warn!("failed to load trunks for route update: {}", err);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to update routing rule"})),
+                Json(json!({"message": format!("Failed to update routing rule: {}", err)})),
             )
                 .into_response();
         }
@@ -1543,11 +1537,10 @@ pub(crate) async fn update_routing(
     }
 
     doc.source_trunk = sanitize_optional_string(doc.source_trunk.take());
-    if let Some(ref name) = doc.source_trunk {
-        if resolve_trunk_id(&trunk_lookup, Some(name.as_str())).is_none() {
+    if let Some(ref name) = doc.source_trunk
+        && resolve_trunk_id(&trunk_lookup, Some(name.as_str())).is_none() {
             return bad_request(format!("Source trunk \"{}\" was not found", name));
         }
-    }
 
     let tx = match db.begin().await {
         Ok(tx) => tx,
@@ -1558,7 +1551,7 @@ pub(crate) async fn update_routing(
             );
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to update routing rule"})),
+                Json(json!({"message": format!("Failed to update routing rule: {}", err)})),
             )
                 .into_response();
         }
@@ -1582,7 +1575,7 @@ pub(crate) async fn update_routing(
             let _ = tx.rollback().await;
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to update routing rule"})),
+                Json(json!({"message": format!("Failed to update routing rule: {}", err)})),
             )
                 .into_response();
         }
@@ -1597,7 +1590,7 @@ pub(crate) async fn update_routing(
         let _ = tx.rollback().await;
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"message": "Failed to update routing rule"})),
+            Json(json!({"message": format!("Failed to update routing rule: {}", err)})),
         )
             .into_response();
     }
@@ -1606,7 +1599,7 @@ pub(crate) async fn update_routing(
         warn!("failed to commit routing rule update {}: {}", id, err);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"message": "Failed to update routing rule"})),
+            Json(json!({"message": format!("Failed to update routing rule: {}", err)})),
         )
             .into_response();
     }
@@ -1646,7 +1639,7 @@ pub async fn delete_routing(
             warn!("failed to delete routing rule {}: {}", id, err);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"message": "Failed to delete routing rule"})),
+                Json(json!({"message": format!("Failed to delete routing rule: {}", err)})),
             )
                 .into_response()
         }

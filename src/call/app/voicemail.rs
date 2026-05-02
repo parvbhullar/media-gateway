@@ -1,5 +1,5 @@
 use crate::call::app::{
-    AppAction, CallApp, CallAppType, CallController, ApplicationContext, RecordingInfo,
+    AppAction, ApplicationContext, CallApp, CallAppType, CallController, RecordingInfo,
 };
 use crate::callrecord::CallRecordHangupReason;
 use async_trait::async_trait;
@@ -62,12 +62,21 @@ impl CallApp for VoicemailApp {
         &mut self,
         _track_id: String,
         ctrl: &mut CallController,
-        _ctx: &ApplicationContext,
+        ctx: &ApplicationContext,
     ) -> anyhow::Result<AppAction> {
         if self.state == VoicemailState::Greeting {
             self.state = VoicemailState::Recording;
-            let path = format!("/tmp/voicemail_{}_{}.wav", self.extension, uuid::Uuid::new_v4());
-            info!(path = %path, "Starting voicemail recording");
+            // Use session_id as trace_id for full lifecycle tracking
+            let path = format!(
+                "/tmp/voicemail_{}_{}.wav",
+                self.extension,
+                ctx.call_info.session_id
+            );
+            info!(
+                path = %path,
+                session_id = %ctx.call_info.session_id,
+                "Starting voicemail recording"
+            );
             ctrl.start_recording(&path, Some(Duration::from_secs(300)), true)
                 .await?;
             self.recording_path = Some(path);

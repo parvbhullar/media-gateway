@@ -3,8 +3,12 @@ use crate::call::user::SipUser;
 
 use crate::config::ProxyConfig;
 use crate::proxy::{
-    auth::AuthModule, call::CallModule, locator::{MemoryLocator, Locator}, registrar::RegistrarModule,
-    server::SipServerBuilder, user::MemoryUserBackend,
+    auth::AuthModule,
+    call::CallModule,
+    locator::{Locator, MemoryLocator},
+    registrar::RegistrarModule,
+    server::SipServerBuilder,
+    user::MemoryUserBackend,
 };
 use anyhow::Result;
 use std::net::SocketAddr;
@@ -112,7 +116,7 @@ impl TestProxyServer {
                 Ok(Box::new(RegistrarModule::new(inner, config)))
             })
             .register_module("auth", |inner, _config| {
-                Ok(Box::new(AuthModule::new(inner)))
+                Ok(Box::new(AuthModule::new(inner.clone(), inner.proxy_config.clone())))
             })
             .register_module("call", |inner, config| {
                 Ok(Box::new(CallModule::new(config, inner)))
@@ -132,7 +136,11 @@ impl TestProxyServer {
 
         info!("Test proxy server started on port {}", port);
 
-        Ok(Self { cancel_token, port, server })
+        Ok(Self {
+            cancel_token,
+            port,
+            server,
+        })
     }
 
     pub fn get_locator(&self) -> Arc<Box<dyn Locator>> {
@@ -302,13 +310,12 @@ async fn test_call_success() {
         for _ in 0..50 {
             let events = bob.process_dialog_events().await.unwrap_or_default();
             for event in events {
-                match event {
-                    TestUaEvent::IncomingCall(dialog_id, _) => {
-                        info!("Bob received incoming call: {}", dialog_id);
-                        bob.answer_call(&dialog_id, Some(bob_sdp.clone())).await.unwrap();
-                        return Ok::<_, anyhow::Error>(dialog_id);
-                    }
-                    _ => {}
+                if let TestUaEvent::IncomingCall(dialog_id, _) = event {
+                    info!("Bob received incoming call: {}", dialog_id);
+                    bob.answer_call(&dialog_id, Some(bob_sdp.clone()))
+                        .await
+                        .unwrap();
+                    return Ok::<_, anyhow::Error>(dialog_id);
                 }
             }
             sleep(Duration::from_millis(100)).await;
@@ -415,13 +422,10 @@ async fn test_call_rejection() {
         for _ in 0..50 {
             let events = bob.process_dialog_events().await.unwrap_or_default();
             for event in events {
-                match event {
-                    TestUaEvent::IncomingCall(dialog_id, _) => {
-                        info!("Bob received incoming call: {}", dialog_id);
-                        bob.reject_call(&dialog_id).await.unwrap();
-                        return Ok::<_, anyhow::Error>(());
-                    }
-                    _ => {}
+                if let TestUaEvent::IncomingCall(dialog_id, _) = event {
+                    info!("Bob received incoming call: {}", dialog_id);
+                    bob.reject_call(&dialog_id).await.unwrap();
+                    return Ok::<_, anyhow::Error>(());
                 }
             }
             sleep(Duration::from_millis(100)).await;
@@ -433,9 +437,8 @@ async fn test_call_rejection() {
 
     // call_result is Ok(Result<DialogId, Error>), we need to check the inner result
     assert!(call_result.is_ok(), "Call task should complete");
-    match call_result.unwrap() {
-        Ok(_) => panic!("Call should be rejected, but it succeeded"),
-        Err(_) => {} // This is what we expect - the call was rejected
+    if call_result.unwrap().is_ok() {
+        panic!("Call should be rejected, but it succeeded");
     }
     assert!(reject_result.is_ok(), "Bob should reject the call");
 
@@ -478,17 +481,16 @@ async fn test_call_hangup_flow() {
         for _ in 0..50 {
             let events = bob.process_dialog_events().await.unwrap_or_default();
             for event in events {
-                match event {
-                    TestUaEvent::IncomingCall(dialog_id, _) => {
-                        info!("Bob received incoming call: {}", dialog_id);
-                        bob.answer_call(&dialog_id, Some(bob_sdp.clone())).await.unwrap();
+                if let TestUaEvent::IncomingCall(dialog_id, _) = event {
+                    info!("Bob received incoming call: {}", dialog_id);
+                    bob.answer_call(&dialog_id, Some(bob_sdp.clone()))
+                        .await
+                        .unwrap();
 
-                        // Wait for a while after answering, then hang up
-                        sleep(Duration::from_millis(500)).await;
-                        bob.hangup(&dialog_id).await.unwrap();
-                        return Ok::<_, anyhow::Error>(dialog_id);
-                    }
-                    _ => {}
+                    // Wait for a while after answering, then hang up
+                    sleep(Duration::from_millis(500)).await;
+                    bob.hangup(&dialog_id).await.unwrap();
+                    return Ok::<_, anyhow::Error>(dialog_id);
                 }
             }
             sleep(Duration::from_millis(100)).await;
@@ -503,7 +505,6 @@ async fn test_call_hangup_flow() {
 
     proxy.stop();
 }
-
 
 #[tokio::test]
 async fn test_locator_lookup() {
@@ -531,20 +532,17 @@ async fn test_locator_lookup() {
     let lookup_uri: rsipstack::sip::Uri = format!("sip:testuser@127.0.0.1:{}", proxy.port)
         .try_into()
         .unwrap();
-    
+
     let locations = locator.lookup(&lookup_uri).await;
-    
-    assert!(
-        locations.is_ok(),
-        "Locator lookup should succeed"
-    );
-    
+
+    assert!(locations.is_ok(), "Locator lookup should succeed");
+
     let locations = locations.unwrap();
     assert!(
         !locations.is_empty(),
         "Locator should return at least one location for registered user"
     );
-    
+
     // Verify the location contains the expected information
     let location = &locations[0];
     assert_eq!(
@@ -552,8 +550,11 @@ async fn test_locator_lookup() {
         "testuser",
         "Location AoR should have username 'testuser'"
     );
-    
-    info!("Locator lookup test passed: found {} location(s)", locations.len());
+
+    info!(
+        "Locator lookup test passed: found {} location(s)",
+        locations.len()
+    );
     info!("Location details: {:?}", location);
 
     testuser.stop();

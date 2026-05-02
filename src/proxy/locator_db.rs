@@ -1,6 +1,4 @@
-use super::locator::{
-    Locator, RealmChecker, is_local_realm, sort_locations_by_recency, uri_matches,
-};
+use super::locator::{Locator, RealmChecker, is_local_realm, sort_locations_by_recency};
 use crate::call::Location;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -61,25 +59,38 @@ impl MigrationTrait for Migration {
                     .col(string(Column::Destination).char_len(255).not_null())
                     .col(string(Column::Transport).char_len(32).not_null())
                     .col(integer(Column::LastModified).not_null())
-                    .col(timestamp(Column::CreatedAt).not_null())
-                    .col(timestamp(Column::UpdatedAt).not_null())
+                    .col(
+                        timestamp(Column::CreatedAt)
+                            .not_null()
+                            .default(Expr::current_timestamp()),
+                    )
+                    .col(
+                        timestamp(Column::UpdatedAt)
+                            .not_null()
+                            .default(Expr::current_timestamp()),
+                    )
                     .col(boolean(Column::SupportsWebrtc).not_null().default(false))
                     .col(string_null(Column::UserAgent).char_len(255))
                     .to_owned(),
             )
             .await?;
 
-        // Add index on username+realm
-        manager
-            .create_index(
-                Index::create()
-                    .table(Entity)
-                    .name("idx_locations_realm_username")
-                    .col(Column::Realm)
-                    .col(Column::Username)
-                    .to_owned(),
-            )
-            .await
+        if !manager
+            .has_index("rustpbx_locations", "idx_locations_realm_username")
+            .await?
+        {
+            manager
+                .create_index(
+                    Index::create()
+                        .table(Entity)
+                        .name("idx_locations_realm_username")
+                        .col(Column::Realm)
+                        .col(Column::Username)
+                        .to_owned(),
+                )
+                .await?;
+        }
+        Ok(())
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
@@ -110,7 +121,10 @@ impl MigratorTrait for Migrator {
 impl DbLocator {
     /// Create a new DbLocator with a database connection
     pub async fn new(url: String) -> Result<Self> {
-        // Connect to the database
+        Self::new_with_migrate(url, true).await
+    }
+
+    pub async fn new_with_migrate(url: String, migrate: bool) -> Result<Self> {
         let db = Database::connect(&url)
             .await
             .map_err(|e| anyhow::anyhow!("Database connection error: {}", e))?;
@@ -118,22 +132,178 @@ impl DbLocator {
             db,
             realm_checker: Mutex::new(None),
         };
-        info!("Creating DbLocator");
-        match db_locator.migrate().await {
-            Ok(_) => Ok(db_locator),
-            Err(e) => {
-                warn!("migrate locator fail {}", e);
-                Err(e)
+        if migrate {
+            info!("Creating DbLocator with migration");
+            match db_locator.migrate().await {
+                Ok(_) => Ok(db_locator),
+                Err(e) => {
+                    warn!("migrate locator fail {}", e);
+                    Err(e)
+                }
             }
+        } else {
+            info!("Creating DbLocator without migration");
+            Ok(db_locator)
         }
     }
 
     pub async fn migrate(&self) -> Result<()> {
-        Migrator::up(&self.db, None)
+        let manager = SchemaManager::new(&self.db);
+        Migration
+            .up(&manager)
             .await
             .map_err(|e| anyhow::anyhow!("Migration error: {}", e))?;
         Ok(())
     }
+}
+
+fn parse_transport_token(value: &str) -> Option<rsipstack::sip::transport::Transport> {
+    match value.trim().to_ascii_uppercase().as_str() {
+        "UDP" => Some(rsipstack::sip::transport::Transport::Udp),
+        "TCP" => Some(rsipstack::sip::transport::Transport::Tcp),
+        "TLS" => Some(rsipstack::sip::transport::Transport::Tls),
+        "WS" => Some(rsipstack::sip::transport::Transport::Ws),
+        "WSS" => Some(rsipstack::sip::transport::Transport::Wss),
+        _ => None,
+    }
+}
+
+fn encode_sip_addr(addr: &SipAddr) -> String {
+    addr.to_string()
+}
+
+const HOME_PROXY_MARKER: &str = "|hp=";
+const REGISTERED_AOR_MARKER: &str = "|ra=";
+
+fn decode_sip_addr(value: &str) -> Option<SipAddr> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some((transport_raw, addr_raw)) = trimmed.split_once(' ')
+        && let Some(transport) = parse_transport_token(transport_raw)
+        && let Ok(addr) = rsipstack::sip::HostWithPort::try_from(addr_raw.trim())
+    {
+        return Some(SipAddr {
+            r#type: Some(transport),
+            addr,
+        });
+    }
+
+    if let Ok(uri) = rsipstack::sip::Uri::try_from(trimmed)
+        && let Ok(addr) = SipAddr::try_from(uri)
+    {
+        return Some(addr);
+    }
+
+    rsipstack::sip::HostWithPort::try_from(trimmed)
+        .ok()
+        .map(SipAddr::from)
+}
+
+fn fallback_registered_aor(
+    username: &str,
+    realm: &str,
+    fallback: &rsipstack::sip::Uri,
+) -> rsipstack::sip::Uri {
+    let user = username.trim();
+    let host = realm.trim();
+    if user.is_empty() || host.is_empty() {
+        return fallback.clone();
+    }
+
+    let candidate = format!("sip:{}@{}", user, host);
+    rsipstack::sip::Uri::try_from(candidate.as_str()).unwrap_or_else(|_| fallback.clone())
+}
+
+fn choose_registered_aor(
+    username: &str,
+    realm: &str,
+    contact_aor: &rsipstack::sip::Uri,
+    decoded_registered_aor: Option<rsipstack::sip::Uri>,
+) -> rsipstack::sip::Uri {
+    let fallback = fallback_registered_aor(username, realm, contact_aor);
+    let strict_equals = |a: &rsipstack::sip::Uri, b: &rsipstack::sip::Uri| {
+        a.to_string().eq_ignore_ascii_case(&b.to_string())
+    };
+
+    match decoded_registered_aor {
+        Some(registered)
+            if strict_equals(&registered, contact_aor)
+                && !strict_equals(&fallback, contact_aor) =>
+        {
+            fallback
+        }
+        Some(registered) => registered,
+        None => fallback,
+    }
+}
+
+fn encode_location_metadata(
+    user_agent: Option<&str>,
+    home_proxy: Option<&SipAddr>,
+    registered_aor: Option<&rsipstack::sip::Uri>,
+) -> Option<String> {
+    let mut value = user_agent.unwrap_or("").to_string();
+
+    if let Some(home_proxy) = home_proxy {
+        value.push_str(HOME_PROXY_MARKER);
+        value.push_str(encode_sip_addr(home_proxy).as_str());
+    }
+
+    if let Some(registered_aor) = registered_aor {
+        value.push_str(REGISTERED_AOR_MARKER);
+        value.push_str(registered_aor.to_string().as_str());
+    }
+
+    if value.is_empty() { None } else { Some(value) }
+}
+
+fn decode_location_metadata(
+    value: Option<&str>,
+) -> (Option<String>, Option<SipAddr>, Option<rsipstack::sip::Uri>) {
+    let Some(raw) = value else {
+        return (None, None, None);
+    };
+
+    let mut rest = raw;
+    let mut home_proxy: Option<SipAddr> = None;
+    let mut registered_aor: Option<rsipstack::sip::Uri> = None;
+
+    loop {
+        let Some((prefix, tail)) = rest.rsplit_once('|') else {
+            break;
+        };
+
+        if home_proxy.is_none()
+            && let Some(value) = tail.strip_prefix("hp=")
+            && let Some(parsed) = decode_sip_addr(value)
+        {
+            home_proxy = Some(parsed);
+            rest = prefix;
+            continue;
+        }
+
+        if registered_aor.is_none()
+            && let Some(value) = tail.strip_prefix("ra=")
+            && let Ok(parsed) = rsipstack::sip::Uri::try_from(value)
+        {
+            registered_aor = Some(parsed);
+            rest = prefix;
+            continue;
+        }
+
+        break;
+    }
+
+    let user_agent = if rest.is_empty() {
+        None
+    } else {
+        Some(rest.to_string())
+    };
+
+    (user_agent, home_proxy, registered_aor)
 }
 
 #[async_trait]
@@ -188,11 +358,11 @@ impl Locator for DbLocator {
                 ));
             }
         };
-        // Extract SipAddr components
+        // Persist the actual network transport used by the destination address.
+        // For WebSocket clients this preserves WSS even if Contact uses transport=ws.
         let SipAddr { r#type, addr } = destination;
-        let transport = location
-            .transport
-            .or_else(|| r#type.clone())
+        let transport = r#type
+            .or(location.transport)
             .unwrap_or(rsipstack::sip::transport::Transport::Udp);
         let host = addr.to_string();
 
@@ -234,7 +404,11 @@ impl Locator for DbLocator {
                 active_model.last_modified = Set(now);
                 active_model.updated_at = Set(chrono::Utc::now());
                 active_model.supports_webrtc = Set(location.supports_webrtc);
-                active_model.user_agent = Set(location.user_agent.clone());
+                active_model.user_agent = Set(encode_location_metadata(
+                    location.user_agent.as_deref(),
+                    location.home_proxy.as_ref(),
+                    location.registered_aor.as_ref(),
+                ));
 
                 active_model
                     .update(&self.db)
@@ -257,7 +431,11 @@ impl Locator for DbLocator {
                 active_model.created_at = Set(now_dt);
                 active_model.updated_at = Set(now_dt);
                 active_model.supports_webrtc = Set(location.supports_webrtc);
-                active_model.user_agent = Set(location.user_agent.clone());
+                active_model.user_agent = Set(encode_location_metadata(
+                    location.user_agent.as_deref(),
+                    location.home_proxy.as_ref(),
+                    location.registered_aor.as_ref(),
+                ));
 
                 // Insert without specifying id
                 active_model
@@ -298,7 +476,6 @@ impl Locator for DbLocator {
         for loc in removed_locations {
             let aor = rsipstack::sip::Uri::try_from(loc.aor.as_str())
                 .map_err(|e| anyhow::anyhow!("Error parsing aor: {}", e))?;
-            let registered_aor = aor.clone();
             // Parse transport from string
             let transport = match loc.transport.to_uppercase().as_str() {
                 "UDP" => rsipstack::sip::transport::Transport::Udp,
@@ -318,6 +495,15 @@ impl Locator for DbLocator {
                 addr,
             };
 
+            let (user_agent, home_proxy, decoded_registered_aor) =
+                decode_location_metadata(loc.user_agent.as_deref());
+            let registered_aor = choose_registered_aor(
+                loc.username.as_str(),
+                loc.realm.as_str(),
+                &aor,
+                decoded_registered_aor,
+            );
+
             locations.push(Location {
                 aor,
                 expires: loc.expires as u32,
@@ -325,7 +511,8 @@ impl Locator for DbLocator {
                 supports_webrtc: loc.supports_webrtc,
                 transport: Some(transport),
                 registered_aor: Some(registered_aor),
-                user_agent: loc.user_agent.clone(),
+                user_agent,
+                home_proxy,
                 ..Default::default()
             });
         }
@@ -390,7 +577,7 @@ impl Locator for DbLocator {
             if self.is_local_realm(&realm_key).await {
                 realm_key = "localhost".to_string();
             }
-            let username_raw = uri.user().unwrap_or_else(|| "");
+            let username_raw = uri.user().unwrap_or("");
             let username_trimmed = username_raw.trim();
             let username_key = username_trimmed.to_ascii_lowercase();
 
@@ -432,11 +619,15 @@ impl Locator for DbLocator {
             let aor = rsipstack::sip::Uri::try_from(model.aor.as_str())
                 .map_err(|e| anyhow::anyhow!("Error parsing aor: {}", e))?;
 
-            if !uri_matches(&aor, uri) {
-                continue;
-            }
+            let (user_agent, home_proxy, decoded_registered_aor) =
+                decode_location_metadata(model.user_agent.as_deref());
+            let registered_aor = choose_registered_aor(
+                model.username.as_str(),
+                model.realm.as_str(),
+                &aor,
+                decoded_registered_aor,
+            );
 
-            let registered_aor = aor.clone();
             // Parse transport from string
             let transport = match model.transport.to_uppercase().as_str() {
                 "UDP" => rsipstack::sip::transport::Transport::Udp,
@@ -473,11 +664,61 @@ impl Locator for DbLocator {
                 supports_webrtc: model.supports_webrtc,
                 transport: Some(transport),
                 registered_aor: Some(registered_aor),
-                user_agent: model.user_agent.clone(),
+                user_agent,
+                home_proxy,
                 ..Default::default()
             });
         }
 
         Ok(sort_locations_by_recency(locations))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rsipstack::sip::transport::Transport;
+    use rsipstack::transport::SipAddr;
+
+    #[tokio::test]
+    async fn register_prefers_destination_transport_for_websocket_connections() {
+        let locator = DbLocator::new_with_migrate("sqlite::memory:".to_string(), true)
+            .await
+            .expect("create db locator");
+
+        let aor: rsipstack::sip::Uri = "sip:hvd34mgb@tvuug6sjfcbi.invalid;transport=ws"
+            .try_into()
+            .expect("valid aor");
+
+        let destination = SipAddr {
+            r#type: Some(Transport::Wss),
+            addr: "122.235.198.105:24534"
+                .try_into()
+                .expect("valid destination"),
+        };
+
+        let location = Location {
+            aor: aor.clone(),
+            expires: 600,
+            destination: Some(destination),
+            // Contact transport remains ws, but destination is WSS.
+            transport: Some(Transport::Ws),
+            ..Default::default()
+        };
+
+        locator
+            .register("bob", Some("kefutest.xiaojukeji.com"), location)
+            .await
+            .expect("register location");
+
+        let locations = locator.lookup(&aor).await.expect("lookup location");
+        assert_eq!(locations.len(), 1);
+
+        let stored = &locations[0];
+        assert_eq!(stored.transport, Some(Transport::Wss));
+        assert_eq!(
+            stored.destination.as_ref().and_then(|d| d.r#type),
+            Some(Transport::Wss)
+        );
     }
 }
