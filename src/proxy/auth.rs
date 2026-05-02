@@ -337,6 +337,39 @@ impl ProxyModule for AuthModule {
                     %source,
                     "Authentication failed, sending challenge"
                 );
+                // Phase 10 Plan 10-03 (SEC-03): brute-force auth-failure hook.
+                // D-10: count only when a credential header was actually
+                // presented (not first-challenge requests).
+                let has_credentials = tx.original.headers.iter().any(|h| {
+                    matches!(h, Header::Authorization(_) | Header::ProxyAuthorization(_))
+                });
+                if has_credentials {
+                    if let Ok(via) = tx.original.via_header() {
+                        if let Ok((_, target)) =
+                            rsipstack::transport::SipConnection::parse_target_from_via(via)
+                        {
+                            if let Ok(ip) = std::net::IpAddr::try_from(target.host) {
+                                let threshold_hit = self
+                                    .server
+                                    .security_state
+                                    .record_auth_failure(ip, realm.clone());
+                                if threshold_hit {
+                                    let db = self.server.database.clone();
+                                    let security = self.server.security_state.clone();
+                                    let realm_owned = realm.clone();
+                                    tokio::spawn(async move {
+                                        if let Some(db) = db {
+                                            security
+                                                .write_block(&db, ip, &realm_owned, "brute_force")
+                                                .await
+                                                .ok();
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
                 tx.reply_with(status_code, headers, None).await.ok();
                 Ok(ProxyAction::Abort)
             }
