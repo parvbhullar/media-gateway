@@ -2568,6 +2568,15 @@ impl SipSession {
                 "application/sdp".into(),
             )];
             headers.extend(timer_headers);
+            // Phase 10 D-16/D-18: topology hiding — strip Via and
+            // Record-Route from outbound 200 OK extra-headers when enabled.
+            // Defensive (RISK-04): rsipstack accept() builds responses fresh.
+            if self.server.proxy_config.topology_hiding.unwrap_or(false) {
+                headers.retain(|h| {
+                    !matches!(h, rsipstack::sip::Header::Via(_))
+                        && !matches!(h, rsipstack::sip::Header::RecordRoute(_))
+                });
+            }
             self.server_dialog
                 .accept(Some(headers), Some(answer_sdp.into_bytes()))
                 .map_err(|e| anyhow!("Failed to send answer: {}", e))?;
