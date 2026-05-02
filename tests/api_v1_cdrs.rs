@@ -348,6 +348,292 @@ async fn cdr_recording_returns_501() {
     assert_eq!(body["error"], "recording retrieval not implemented");
 }
 
+// ---------------------------------------------------------------------------
+// GET /api/v1/cdrs/search  (Phase 11, Plan 11-02 — CDR-05)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn search_requires_auth() {
+    let state = test_state_empty().await;
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/cdrs/search")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn search_filters_by_status_and_returns_summary() {
+    let (state, token) = test_state_with_api_key("cdr-search-status").await;
+    seed_cdr(&state, "c1", "inbound", "answered", Some("100"), Some("200")).await;
+    seed_cdr(&state, "c2", "inbound", "answered", Some("100"), Some("201")).await;
+    seed_cdr(&state, "c3", "outbound", "no_answer", Some("200"), Some("300")).await;
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/cdrs/search?status=answered")
+                .header(header::AUTHORIZATION, bearer(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["items"].as_array().unwrap().len(), 2);
+    assert_eq!(body["pagination"]["total"], 2);
+    assert_eq!(body["summary"]["by_status"]["answered"], 2);
+    assert_eq!(body["summary"]["total"], 2);
+}
+
+#[tokio::test]
+async fn search_summary_breakdown_sums_to_total() {
+    let (state, token) = test_state_with_api_key("cdr-search-sum").await;
+    seed_cdr(&state, "s1", "inbound", "answered", None, None).await;
+    seed_cdr(&state, "s2", "inbound", "answered", None, None).await;
+    seed_cdr(&state, "s3", "outbound", "no_answer", None, None).await;
+    seed_cdr(&state, "s4", "outbound", "failed", None, None).await;
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/cdrs/search")
+                .header(header::AUTHORIZATION, bearer(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    let by_status = body["summary"]["by_status"].as_object().unwrap();
+    let sum: u64 = by_status
+        .values()
+        .map(|v| v.as_u64().unwrap_or(0))
+        .sum();
+    // 2 answered + 1 no_answer + 1 failed = 4 (busy = 0; total includes
+    // only the four tracked statuses)
+    assert_eq!(sum, body["summary"]["total"].as_u64().unwrap());
+    assert_eq!(sum, 4);
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/cdrs/recent  (Phase 11, Plan 11-02 — CDR-06)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn recent_requires_auth() {
+    let state = test_state_empty().await;
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/cdrs/recent")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn recent_returns_50_most_recent() {
+    let (state, token) = test_state_with_api_key("cdr-recent-50").await;
+    for i in 0..60 {
+        seed_cdr(
+            &state,
+            &format!("recent-{i:03}"),
+            "inbound",
+            "answered",
+            None,
+            None,
+        )
+        .await;
+    }
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/cdrs/recent")
+                .header(header::AUTHORIZATION, bearer(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["items"].as_array().unwrap().len(), 50);
+}
+
+#[tokio::test]
+async fn recent_honors_limit_param() {
+    let (state, token) = test_state_with_api_key("cdr-recent-limit").await;
+    for i in 0..15 {
+        seed_cdr(
+            &state,
+            &format!("rl-{i:03}"),
+            "inbound",
+            "answered",
+            None,
+            None,
+        )
+        .await;
+    }
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/cdrs/recent?limit=10")
+                .header(header::AUTHORIZATION, bearer(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["items"].as_array().unwrap().len(), 10);
+    assert_eq!(body["page_size"], 10);
+}
+
+#[tokio::test]
+async fn recent_caps_limit_at_500() {
+    let (state, token) = test_state_with_api_key("cdr-recent-cap").await;
+    // Seed only a few rows; we're verifying that the page_size in the
+    // response envelope is clamped to <= 500 even when ?limit=9999.
+    seed_cdr(&state, "rc-1", "inbound", "answered", None, None).await;
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/cdrs/recent?limit=9999")
+                .header(header::AUTHORIZATION, bearer(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["page_size"], 500);
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/cdrs/export  (Phase 11, Plan 11-02 — CDR-07)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn export_requires_auth() {
+    let state = test_state_empty().await;
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/cdrs/export")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn export_streams_csv_with_header_row() {
+    let (state, token) = test_state_with_api_key("cdr-export-csv").await;
+    seed_cdr(&state, "ex-1", "inbound", "answered", Some("100"), Some("200")).await;
+    seed_cdr(&state, "ex-2", "inbound", "answered", Some("101"), Some("201")).await;
+    seed_cdr(&state, "ex-3", "outbound", "failed", Some("102"), Some("202")).await;
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/cdrs/export")
+                .header(header::AUTHORIZATION, bearer(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ct = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let cd = resp
+        .headers()
+        .get(header::CONTENT_DISPOSITION)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(ct, "text/csv; charset=utf-8");
+    assert!(
+        cd.starts_with("attachment; filename=\"cdrs-"),
+        "unexpected content-disposition: {}",
+        cd
+    );
+
+    let bytes = axum::body::to_bytes(resp.into_body(), 10 * 1024 * 1024)
+        .await
+        .unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+    // header + 3 data rows
+    assert_eq!(lines.len(), 4, "expected header + 3 data rows: {:?}", lines);
+    assert!(
+        lines[0].starts_with("call_id,direction,status,"),
+        "header mismatch: {}",
+        lines[0]
+    );
+}
+
+#[tokio::test]
+async fn export_filters_by_status() {
+    let (state, token) = test_state_with_api_key("cdr-export-filter").await;
+    seed_cdr(&state, "ef-1", "inbound", "answered", None, None).await;
+    seed_cdr(&state, "ef-2", "inbound", "answered", None, None).await;
+    seed_cdr(&state, "ef-3", "outbound", "failed", None, None).await;
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/cdrs/export?status=answered")
+                .header(header::AUTHORIZATION, bearer(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 10 * 1024 * 1024)
+        .await
+        .unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+    // header + 2 answered rows
+    assert_eq!(lines.len(), 3, "expected header + 2 data rows: {:?}", lines);
+}
+
 #[tokio::test]
 async fn cdr_sip_flow_returns_501() {
     let (state, token) = test_state_with_api_key("cdr-sipflow").await;
