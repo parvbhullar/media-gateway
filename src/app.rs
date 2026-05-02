@@ -12,6 +12,7 @@ use crate::{
         call::CallModule,
         presence::PresenceModule,
         registrar::RegistrarModule,
+        security::SecurityModule,
         server::{SipServer, SipServerBuilder},
         ws::sip_ws_handler,
     },
@@ -395,6 +396,7 @@ impl AppStateBuilder {
                     .with_sipflow_backend(sipflow_backend_arc.clone())
                     .with_no_bind(self.skip_sip_bind)
                     .with_addon_registry(Some(addon_registry.clone()))
+                    .register_module("security", SecurityModule::create)
                     .register_module("acl", AclModule::create)
                     .register_module("auth", AuthModule::create)
                     .register_module("presence", PresenceModule::create)

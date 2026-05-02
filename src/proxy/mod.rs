@@ -22,6 +22,7 @@ pub mod presence;
 pub mod proxy_call;
 pub mod registrar;
 pub mod routing;
+pub mod security;
 pub mod security_state;
 pub mod server;
 #[cfg(test)]
