@@ -68,3 +68,4 @@ config/voicemail.toml
 config.toml.test
 docs/qrcode.png
 docs/rustpbx-product-brief.zh.html
+.worktrees/
