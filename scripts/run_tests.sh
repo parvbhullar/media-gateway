@@ -18,6 +18,7 @@ MODULES=(
     api_v1_dids
     api_v1_calls
     api_v1_auth
+    api_v1_security
 )
 
 if [[ "${1:-}" == "list" ]]; then
