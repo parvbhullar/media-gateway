@@ -22,7 +22,7 @@ DEPLOY_BRANCH="${DEPLOY_BRANCH:-main}"
 
 SSH_OPTS="-i ${SSH_KEY} -o StrictHostKeyChecking=no"
 
-BINARY="target/release/rustpbx"
+BINARY="target/deploy/rustpbx"
 
 echo "==> Syncing repo on server (branch: ${DEPLOY_BRANCH})..."
 ssh $SSH_OPTS "${SERVER_USER}@${SERVER_HOST}" "
@@ -42,8 +42,8 @@ ssh $SSH_OPTS "${SERVER_USER}@${SERVER_HOST}" "
   fi
 "
 
-echo "==> Building release binary locally..."
-cargo build --release
+echo "==> Building deploy binary locally..."
+cargo build --profile deploy
 
 echo "==> Binary size: $(du -sh $BINARY | cut -f1)"
 
