@@ -1,3 +1,4 @@
+use crate::media::negotiate::CodecSelectionStrategy;
 use crate::rwi::auth::RwiConfig;
 use crate::{
     call::{CallRecordingConfig, DialDirection, QueuePlan, user::SipUser},
@@ -80,6 +81,10 @@ fn default_user_backends() -> Vec<UserBackendConfig> {
     vec![UserBackendConfig::default()]
 }
 
+fn default_enable_latching() -> bool {
+    true
+}
+
 fn default_generated_config_dir() -> String {
     "./config".to_string()
 }
@@ -103,11 +108,30 @@ impl RecordingDirection {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RecordingType {
+    #[default]
+    Local,
+    Http,
+    S3,
+}
+
+fn is_default_recording_type(recording_type: &RecordingType) -> bool {
+    *recording_type == RecordingType::Local
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub struct RecordingPolicy {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(
+        default,
+        rename = "type",
+        skip_serializing_if = "is_default_recording_type"
+    )]
+    pub recording_type: RecordingType,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub directions: Vec<RecordingDirection>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -128,6 +152,24 @@ pub struct RecordingPolicy {
     pub ptime: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub headers: Option<HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor: Option<crate::storage::S3Vendor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
 }
 
 impl RecordingPolicy {
@@ -145,6 +187,14 @@ impl RecordingPolicy {
             .filter(|p| !p.is_empty())
             .map(|p| p.to_string())
             .unwrap_or_else(default_config_recorder_path)
+    }
+
+    pub fn uploads_recording(&self) -> bool {
+        self.enabled
+            && matches!(
+                self.recording_type,
+                RecordingType::Http | RecordingType::S3
+            )
     }
 
     pub fn ensure_defaults(&mut self) -> bool {
@@ -404,13 +454,17 @@ pub enum CallRecordConfig {
         secret_key: String,
         endpoint: String,
         root: String,
+        /// Deprecated and unused. Recording media upload is configured by `[recording]`.
         with_media: Option<bool>,
+        /// Deprecated with `with_media`; accepted for config compatibility.
         keep_media_copy: Option<bool>,
     },
     Http {
         url: String,
         headers: Option<HashMap<String, String>>,
+        /// Deprecated and unused. Recording media upload is configured by `[recording]`.
         with_media: Option<bool>,
+        /// Deprecated with `with_media`; accepted for config compatibility.
         keep_media_copy: Option<bool>,
     },
     Database {
@@ -616,7 +670,7 @@ pub struct ProxyConfig {
     pub queues: HashMap<String, RouteQueueConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queues_files: Vec<String>,
-    #[serde(default)]
+    #[serde(default = "default_enable_latching")]
     pub enable_latching: bool,
     #[serde(default)]
     pub trunks: HashMap<String, TrunkConfig>,
@@ -639,6 +693,11 @@ pub struct ProxyConfig {
     pub dialog_auth_cache: Option<AuthCacheConfig>,
     #[serde(default)]
     pub blind_transfer_use_refer: bool,
+    /// Codec selection strategy for WebRTC endpoints.
+    /// `performance` (default): avoid transcoding, keep caller's codecs only.
+    /// `quality`: prefer Opus > G729 > G722 > G711 (may require transcoding).
+    #[serde(default)]
+    pub codec_strategy: CodecSelectionStrategy,
 }
 
 fn default_auth_cache_size() -> usize {
@@ -863,7 +922,7 @@ impl Default for ProxyConfig {
             max_concurrency: None,
             registrar_expires: Some(60),
             ensure_user: Some(true),
-            enable_latching: false,
+            enable_latching: true,
             user_backends: default_user_backends(),
             locator: LocatorConfig::default(),
             locator_webhook: None,
@@ -894,6 +953,7 @@ impl Default for ProxyConfig {
             passthrough_failure: true,
             dialog_auth_cache: default_dialog_auth_cache(),
             blind_transfer_use_refer: false,
+            codec_strategy: CodecSelectionStrategy::default(),
         }
     }
 }

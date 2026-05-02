@@ -18,6 +18,7 @@ use tracing::{info, warn};
 
 pub mod sipflow;
 pub mod sipflow_upload;
+pub mod recording_upload;
 pub mod storage;
 #[cfg(test)]
 mod tests;
@@ -637,18 +638,9 @@ impl CallRecordManager {
                 CallRecordConfig::Http {
                     url,
                     headers,
-                    with_media,
-                    keep_media_copy,
+                    ..
                 } => {
-                    Self::save_with_http(
-                        formatter.clone(),
-                        url,
-                        headers,
-                        with_media,
-                        keep_media_copy,
-                        &record,
-                    )
-                    .await
+                    Self::save_with_http(formatter.clone(), url, headers, &record).await
                 }
                 CallRecordConfig::Database {
                     database_url,
@@ -696,51 +688,12 @@ impl CallRecordManager {
         formatter: Arc<dyn CallRecordFormatter>,
         url: &String,
         headers: &Option<HashMap<String, String>>,
-        with_media: &Option<bool>,
-        keep_media_copy: &Option<bool>,
         record: &CallRecord,
     ) -> Result<String> {
         let client = reqwest::Client::new();
-        // Serialize call record to JSON
         let call_log_json = formatter.format(record)?;
-        // Create multipart form
-        let mut form = reqwest::multipart::Form::new().text("calllog.json", call_log_json);
+        let form = reqwest::multipart::Form::new().text("calllog.json", call_log_json);
 
-        // Add media files if with_media is true
-        if with_media.unwrap_or(false) {
-            for media in &record.recorder {
-                if std::path::Path::new(&media.path).exists() {
-                    match tokio::fs::read(&media.path).await {
-                        Ok(file_content) => {
-                            let file_name = std::path::Path::new(&media.path)
-                                .file_name()
-                                .unwrap_or_else(|| std::ffi::OsStr::new("unknown"))
-                                .to_string_lossy()
-                                .to_string();
-
-                            let part = match reqwest::multipart::Part::bytes(file_content)
-                                .file_name(file_name.clone())
-                                .mime_str("application/octet-stream")
-                            {
-                                Ok(part) => part,
-                                Err(_) => {
-                                    // Fallback to default MIME type if parsing fails
-                                    reqwest::multipart::Part::bytes(
-                                        tokio::fs::read(&media.path).await?,
-                                    )
-                                    .file_name(file_name)
-                                }
-                            };
-
-                            form = form.part(format!("media_{}", media.track_id), part);
-                        }
-                        Err(e) => {
-                            warn!("Failed to read media file {}: {}", media.path, e);
-                        }
-                    }
-                }
-            }
-        }
         let mut request = client.post(url).multipart(form);
         if let Some(headers_map) = headers {
             for (key, value) in headers_map {
@@ -750,15 +703,6 @@ impl CallRecordManager {
         let response = request.send().await?;
         if response.status().is_success() {
             let response_text = response.text().await.unwrap_or_default();
-
-            if keep_media_copy.unwrap_or(false) {
-                for media in &record.recorder {
-                    let p = Path::new(&media.path);
-                    if p.exists() {
-                        tokio::fs::remove_file(p).await.ok();
-                    }
-                }
-            }
             Ok(format!("HTTP upload successful: {}", response_text))
         } else {
             Err(anyhow::anyhow!(
@@ -939,8 +883,9 @@ impl CallRecordManager {
         }
 
         Ok(format!(
-            "{}/{}",
+            "{}/{}/{}",
             endpoint.trim_end_matches('/'),
+            bucket.trim_matches('/'),
             filename.trim_start_matches('/')
         ))
     }

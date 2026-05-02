@@ -488,7 +488,8 @@ impl CallModule {
             .with_rtp_end_port(self.inner.server.rtp_config.end_port)
             .with_webrtc_start_port(self.inner.server.rtp_config.webrtc_start_port)
             .with_webrtc_end_port(self.inner.server.rtp_config.webrtc_end_port)
-            .with_ice_servers(self.inner.server.rtp_config.ice_servers.clone());
+            .with_ice_servers(self.inner.server.rtp_config.ice_servers.clone())
+            .with_codec_strategy(self.inner.config.codec_strategy);
 
         let caller_is_same_realm = self
             .inner
@@ -835,10 +836,17 @@ impl CallModule {
     }
 
     fn apply_recording_policy(&self, mut dialplan: Dialplan, caller: &SipUser) -> Dialplan {
+        let sipflow_active = self.inner.server.sip_flow.is_some();
         let policy = match self.inner.config.recording.as_ref() {
             Some(policy) if policy.enabled => policy,
             _ => return dialplan,
         };
+
+        if sipflow_active {
+            dialplan.recording.enabled = false;
+            dialplan.recording.option = None;
+            return dialplan;
+        }
 
         if dialplan.recording.enabled && dialplan.recording.option.is_some() {
             return dialplan;
