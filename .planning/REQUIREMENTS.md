@@ -111,12 +111,12 @@ Requirement IDs follow `[CATEGORY]-[NUMBER]`. All v2.0 requirements are user/ope
 
 ### Security Suite (SEC)
 
-- [ ] **SEC-01**: Firewall store is promoted from static file-loaded CIDR to a DB-backed `rustpbx_security_rules` runtime store with `GET /api/v1/security/firewall` and `PATCH /api/v1/security/firewall`
-- [ ] **SEC-02**: Flood tracker maintains a per-IP sliding window and returns 503 for incoming SIP when threshold is breached; stats queryable via `GET /api/v1/security/flood-tracker`
-- [ ] **SEC-03**: Brute-force tracker records auth failures keyed on `(ip, realm)`, returns 403 after threshold, writes blocks to a new `rustpbx_security_blocks` table
-- [ ] **SEC-04**: `GET /api/v1/security/blocks` lists auto-blocked IPs; `DELETE /api/v1/security/blocks/{ip}` unblocks
-- [ ] **SEC-05**: `GET /api/v1/security/auth-failures` exposes recent auth failure stats
-- [ ] **SEC-06**: Topology hiding (strip internal Via/Record-Route) is exposed as a config flag over existing `proxy_call/session.rs` logic, toggleable at runtime
+- [x] **SEC-01**: Firewall store is promoted from static file-loaded CIDR to a DB-backed `rustpbx_security_rules` runtime store with `GET /api/v1/security/firewall` and `PATCH /api/v1/security/firewall` (Phase 10 / 10-01 + 10-02)
+- [x] **SEC-02**: Flood tracker maintains a per-IP sliding window and returns 503 for incoming SIP when threshold is breached; stats queryable via `GET /api/v1/security/flood-tracker` (Phase 10 / 10-02)
+- [x] **SEC-03**: Brute-force tracker records auth failures keyed on `(ip, realm)`, returns 403 after threshold, writes blocks to a new `rustpbx_security_blocks` table (Phase 10 / 10-03)
+- [x] **SEC-04**: `GET /api/v1/security/blocks` lists auto-blocked IPs; `DELETE /api/v1/security/blocks/{ip}` unblocks (Phase 10 / 10-02)
+- [x] **SEC-05**: `GET /api/v1/security/auth-failures` exposes recent auth failure stats (Phase 10 / 10-02)
+- [x] **SEC-06**: Topology hiding (strip internal Via/Record-Route) is exposed as a config flag over existing `proxy_call/session.rs` logic, toggleable at runtime (Phase 10 / 10-04)
 
 ### Active Calls & Mid-Call Control (CALL)
 
@@ -317,12 +317,12 @@ Every v2.0 requirement maps to exactly one phase.
 | MAN-05 | Phase 9 | Satisfied |
 | MAN-06 | Phase 9 | Satisfied |
 | MAN-07 | Phase 9 | Satisfied |
-| SEC-01 | Phase 10 | Pending |
-| SEC-02 | Phase 10 | Pending |
-| SEC-03 | Phase 10 | Pending |
-| SEC-04 | Phase 10 | Pending |
-| SEC-05 | Phase 10 | Pending |
-| SEC-06 | Phase 10 | Pending |
+| SEC-01 | Phase 10 | Done |
+| SEC-02 | Phase 10 | Done |
+| SEC-03 | Phase 10 | Done |
+| SEC-04 | Phase 10 | Done |
+| SEC-05 | Phase 10 | Done |
+| SEC-06 | Phase 10 | Done |
 | CALL-01 | Phase 4 | Pending |
 | CALL-02 | Phase 4 | Pending |
 | CALL-03 | Phase 4 | Complete |
