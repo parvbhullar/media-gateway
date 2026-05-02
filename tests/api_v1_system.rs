@@ -295,3 +295,296 @@ async fn reload_twice_sequentially_both_succeed() {
         .unwrap();
     assert_eq!(resp2.status(), StatusCode::OK);
 }
+
+// ---------------------------------------------------------------------------
+// GET /system/info — Phase 11 SYS-03
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn info_requires_auth() {
+    let state = test_state_empty().await;
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/system/info")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn info_happy_path_shape() {
+    let (state, token) = test_state_with_api_key("sys-info").await;
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/system/info")
+                .header(header::AUTHORIZATION, bearer(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+
+    assert!(body["version"].is_string());
+    assert!(!body["version"].as_str().unwrap().is_empty());
+    assert!(body["build"].is_object());
+    assert!(body["build"]["time"].is_string());
+    assert!(body["build"]["git_commit"].is_string());
+    assert!(body["build"]["git_branch"].is_string());
+    assert!(
+        body["build"]["git_dirty"].is_boolean(),
+        "git_dirty must be a bool: {body}"
+    );
+    assert!(body["full_version_string"].is_string());
+    assert!(
+        body["full_version_string"]
+            .as_str()
+            .unwrap()
+            .contains("rustpbx"),
+        "full_version_string should contain rustpbx: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GET /system/config — Phase 11 SYS-04
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn config_requires_auth() {
+    let state = test_state_empty().await;
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/system/config")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn config_happy_path_shape() {
+    let (state, token) = test_state_with_api_key("sys-config").await;
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/system/config")
+                .header(header::AUTHORIZATION, bearer(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+
+    // SAFE_PROXY_FIELDS positive: addr is exposed.
+    assert!(
+        body["proxy"]["addr"].is_string(),
+        "proxy.addr should be exposed: {body}"
+    );
+
+    // Negative-allowlist proof: sensitive fields must NEVER appear, even if
+    // they exist on ProxyConfig (e.g. ssl_private_key, ssl_certificate).
+    assert!(
+        body["proxy"]["ssl_private_key"].is_null(),
+        "ssl_private_key must NEVER appear in /system/config response: {body}"
+    );
+    assert!(
+        body["proxy"]["ssl_certificate"].is_null(),
+        "ssl_certificate must NEVER appear in /system/config response: {body}"
+    );
+    // jwt_secret is not a ProxyConfig field but the test asserts the
+    // negative invariant for forward-compatibility — any future addition
+    // named jwt_secret would still be excluded by the allowlist.
+    assert!(
+        body["proxy"]["jwt_secret"].is_null(),
+        "jwt_secret must NEVER appear in /system/config response: {body}"
+    );
+    // database_url lives on Config (not ProxyConfig) and must never leak.
+    assert!(
+        body["proxy"]["database_url"].is_null(),
+        "database_url must NEVER appear in /system/config response: {body}"
+    );
+
+    // runtime block must be a (possibly empty) JSON object.
+    assert!(
+        body["runtime"].is_object(),
+        "runtime must be a JSON object: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GET /system/cluster — Phase 11 SYS-06 (constant)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn cluster_requires_auth() {
+    let state = test_state_empty().await;
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/system/cluster")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn cluster_happy_path_constant() {
+    let (state, token) = test_state_with_api_key("sys-cluster").await;
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/system/cluster")
+                .header(header::AUTHORIZATION, bearer(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+
+    assert_eq!(body["mode"], "single_node");
+    let nodes = body["nodes"].as_array().expect("nodes is array");
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0]["id"], "primary");
+    assert_eq!(nodes[0]["role"], "primary");
+    assert_eq!(nodes[0]["healthy"], true);
+    assert!(body["note"].is_string());
+    assert!(!body["note"].as_str().unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// GET /system/stats — Phase 11 SYS-05
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn stats_requires_auth() {
+    let state = test_state_empty().await;
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/system/stats")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn stats_happy_path_shape() {
+    let (state, token) = test_state_with_api_key("sys-stats").await;
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/system/stats")
+                .header(header::AUTHORIZATION, bearer(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+
+    // calls
+    assert!(body["calls"]["active"].is_number());
+    assert!(body["calls"]["total_24h"].is_number());
+    assert!(body["calls"]["failed_24h"].is_number());
+    // proxy
+    assert!(body["proxy"]["uptime_secs"].is_number());
+    assert!(body["proxy"]["active_dialogs"].is_number());
+    assert!(body["proxy"]["registrations"].is_number());
+    // gateways
+    assert!(body["gateways"]["up"].is_number());
+    assert!(body["gateways"]["down"].is_number());
+    assert!(body["gateways"]["total"].is_number());
+    // security
+    assert!(body["security"]["blocks_total"].is_number());
+    assert!(body["security"]["flood_rejected_24h"].is_number());
+    assert!(body["security"]["auth_failures_24h"].is_number());
+}
+
+// ---------------------------------------------------------------------------
+// AMI X-Deprecation header — Phase 11 MIG-04
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn ami_response_carries_deprecation_header() {
+    // Hit the AMI legacy /ami/v1/health endpoint. AMI auth allows
+    // 127.0.0.1 by default — pass that via the X-Forwarded-For header,
+    // which `ClientAddr::from_http_parts` honours when no `ConnectInfo`
+    // is attached (oneshot does not).
+    let state = test_state_empty().await;
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/ami/v1/health")
+                .header("x-forwarded-for", "127.0.0.1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let header_value = resp
+        .headers()
+        .get("x-deprecation")
+        .expect("x-deprecation header must be present on AMI response")
+        .to_str()
+        .expect("x-deprecation header must be ASCII");
+    assert!(
+        header_value.contains("/api/v1/system/"),
+        "x-deprecation header must reference /api/v1/system/: got {header_value:?}"
+    );
+}
+
+#[tokio::test]
+async fn ami_deprecation_header_present_even_when_denied() {
+    // The middleware is layered AFTER auth, so even a 403 from the AMI
+    // gate carries the migration hint. We do this by sending a request
+    // with no client_ip override — default ClientAddr is 0.0.0.0 which
+    // is NOT in the default `AmiConfig` allowlist (127.0.0.1/::1 only).
+    let state = test_state_empty().await;
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/ami/v1/health")
+                .header("x-forwarded-for", "203.0.113.42")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(
+        resp.headers().get("x-deprecation").is_some(),
+        "x-deprecation header must be present even on 403 from AMI auth"
+    );
+}

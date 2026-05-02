@@ -6,9 +6,9 @@ use crate::{
 };
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
-    http::StatusCode,
-    middleware,
+    extract::{Path, Query, Request, State},
+    http::{HeaderValue, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -39,8 +39,29 @@ pub fn ami_router(app_state: AppState) -> Router<AppState> {
         .layer(middleware::from_fn_with_state(
             app_state.clone(),
             crate::handler::middleware::ami_auth::ami_auth_middleware,
-        ));
+        ))
+        // x_deprecation_layer added LAST so it is the OUTERMOST middleware:
+        // every response (including 403 from ami_auth) flows back through it
+        // and receives the X-Deprecation header. Per Phase 11 MIG-04 the
+        // header must appear on every AMI response, not just authorized ones.
+        .layer(middleware::from_fn(x_deprecation_layer));
     Router::new().nest("/ami/v1", r).with_state(app_state)
+}
+
+/// Phase 11 MIG-04 (D-21/D-22): inject `X-Deprecation` header on every
+/// response from a legacy AMI endpoint. The supported surface is
+/// `/api/v1/system/*`; AMI is retained for backwards compatibility only.
+///
+/// Layered AFTER auth (auth runs first; deprecation header is added on the
+/// way back out for both successful and rejected responses, so even 403s
+/// from the AMI auth gate carry the migration hint).
+async fn x_deprecation_layer(req: Request, next: Next) -> Response {
+    let mut resp = next.run(req).await;
+    resp.headers_mut().insert(
+        "x-deprecation",
+        HeaderValue::from_static("Use /api/v1/system/<endpoint> instead"),
+    );
+    resp
 }
 
 pub(super) async fn health_handler(State(state): State<AppState>) -> Response {
