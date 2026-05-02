@@ -256,14 +256,26 @@ impl SipSession {
     pub const CALLEE_FORWARDING_TRACK_ID: &'static str = "callee-forwarding-track";
     const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 
-    /// IP to advertise in caller-side SDP (c=/o= lines). Uses the local
-    /// interface that routes to the caller, falling back to the configured
-    /// external_ip when the caller IP is unknown or routing lookup fails.
+    /// IP to advertise in caller-side SDP (c=/o= lines). For public callers,
+    /// prefer the configured `external_ip` — kernel routing returns the
+    /// host's private source IP on AWS/NAT setups, which the peer can't
+    /// route RTP back to. For private callers, use kernel routing to pick
+    /// the correct local interface on multi-homed hosts.
     fn caller_facing_ip_str(&self) -> Option<String> {
-        self.caller_peer_ip
-            .and_then(crate::proxy::server::local_ip_for_peer)
-            .map(|ip| ip.to_string())
-            .or_else(|| self.server.rtp_config.external_ip.clone())
+        match self.caller_peer_ip {
+            Some(ip) if crate::proxy::server::is_public_ip(ip) => self
+                .server
+                .rtp_config
+                .external_ip
+                .clone()
+                .or_else(|| {
+                    crate::proxy::server::local_ip_for_peer(ip).map(|i| i.to_string())
+                }),
+            Some(ip) => crate::proxy::server::local_ip_for_peer(ip)
+                .map(|i| i.to_string())
+                .or_else(|| self.server.rtp_config.external_ip.clone()),
+            None => self.server.rtp_config.external_ip.clone(),
+        }
     }
 
     pub fn with_handle(id: SessionId) -> (SipSessionHandle, mpsc::UnboundedReceiver<CallCommand>) {

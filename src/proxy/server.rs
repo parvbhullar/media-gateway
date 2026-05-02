@@ -945,6 +945,22 @@ pub fn local_ip_for_peer(peer: IpAddr) -> Option<IpAddr> {
     sock.local_addr().ok().map(|a| a.ip())
 }
 
+pub fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            !v4.is_private()
+                && !v4.is_loopback()
+                && !v4.is_link_local()
+                && !v4.is_broadcast()
+                && !v4.is_documentation()
+                && !v4.is_unspecified()
+        }
+        IpAddr::V6(v6) => {
+            !v6.is_loopback() && !v6.is_unspecified() && !v6.is_unique_local()
+        }
+    }
+}
+
 impl SipServerInner {
     pub fn default_contact_uri(&self) -> Option<rsipstack::sip::Uri> {
         self.contact_uri_for_peer(None)
@@ -960,14 +976,21 @@ impl SipServerInner {
         let addr = self.endpoint.get_addrs().first()?.clone();
         let transport = addr.r#type;
 
-        let host_with_port = match peer.and_then(local_ip_for_peer) {
-            Some(local_ip) => {
-                let port = addr.addr.port.clone();
-                rsipstack::sip::HostWithPort {
+        // For public peers, use the endpoint's advertised address — it
+        // carries `external_ip` when behind NAT. Kernel routing would
+        // return our private source IP (e.g. AWS 172.31/16), which the
+        // peer can't route back to, breaking ACK/BYE.
+        // For private peers, fall back to kernel routing so multi-homed
+        // hosts with a carrier-facing NIC pick the right interface.
+        let host_with_port = match peer {
+            Some(p) if is_public_ip(p) => addr.addr,
+            Some(p) => match local_ip_for_peer(p) {
+                Some(local_ip) => rsipstack::sip::HostWithPort {
                     host: rsipstack::sip::Host::IpAddr(local_ip),
-                    port,
-                }
-            }
+                    port: addr.addr.port.clone(),
+                },
+                None => addr.addr,
+            },
             None => addr.addr,
         };
 
