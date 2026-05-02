@@ -192,7 +192,9 @@ pub struct SipSession {
     callee_offer_uses_media_bridge: bool,
     media_bridge_started: bool,
     bridge_playback_track_id: Option<String>,
+    #[allow(dead_code)]
     pub caller_is_webrtc: bool,
+    #[allow(dead_code)]
     pub callee_is_webrtc: bool,
     /// IP of the caller (from the incoming INVITE's Via/Contact). Used to
     /// pick the correct local interface IP for Contact and SDP so the

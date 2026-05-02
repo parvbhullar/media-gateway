@@ -12,34 +12,46 @@ fi
 # ── Config (override in .env.local) ───────────────────────────────────────────
 SERVER_DIR="${SERVER_DIR:-/opt/rustpbx}"
 SERVICE_NAME="${SERVICE_NAME:-rustpbx}"
+DEPLOY_BRANCH="${DEPLOY_BRANCH:-main}"
 # ──────────────────────────────────────────────────────────────────────────────
 
 : "${SERVER_USER:?SERVER_USER not set in .env.local}"
 : "${SERVER_HOST:?SERVER_HOST not set in .env.local}"
+: "${SSH_KEY:?SSH_KEY not set in .env.local}"
+: "${GIT_REPO:?GIT_REPO not set in .env.local}"
+
+SSH_OPTS="-i ${SSH_KEY} -o StrictHostKeyChecking=no"
 
 BINARY="target/release/rustpbx"
 
-echo "==> Building release binary..."
+echo "==> Syncing repo on server (branch: ${DEPLOY_BRANCH})..."
+ssh $SSH_OPTS "${SERVER_USER}@${SERVER_HOST}" "
+  if [ ! -d '${SERVER_DIR}/.git' ]; then
+    echo 'Initialising repo in existing directory...'
+    cd ${SERVER_DIR}
+    git init
+    git remote add origin ${GIT_REPO}
+    git fetch origin
+    git checkout ${DEPLOY_BRANCH}
+  else
+    echo 'Updating repo...'
+    cd ${SERVER_DIR}
+    git fetch origin
+    git checkout ${DEPLOY_BRANCH}
+    git pull
+  fi
+"
+
+echo "==> Building release binary locally..."
 cargo build --release
 
-echo "==> Binary size before strip: $(du -sh $BINARY | cut -f1)"
+echo "==> Binary size: $(du -sh $BINARY | cut -f1)"
 
 # strip = "symbols" in Cargo.toml handles this automatically in Rust 1.77+
 # but run strip as safety net for older toolchains
 strip "$BINARY" 2>/dev/null || true
 
-echo "==> Binary size after strip:  $(du -sh $BINARY | cut -f1)"
-
-echo "==> Creating deploy directory on server..."
-ssh "${SERVER_USER}@${SERVER_HOST}" "sudo mkdir -p ${SERVER_DIR} && sudo chown ${SERVER_USER}:${SERVER_USER} ${SERVER_DIR}"
-
 echo "==> Uploading binary..."
-rsync -avz --progress "$BINARY" "${SERVER_USER}@${SERVER_HOST}:${SERVER_DIR}/rustpbx"
-
-echo "==> Uploading config (skip if already present)..."
-rsync -avz --ignore-existing config.toml "${SERVER_USER}@${SERVER_HOST}:${SERVER_DIR}/config.toml"
-
-echo "==> Restarting service..."
-ssh "${SERVER_USER}@${SERVER_HOST}" "sudo systemctl restart ${SERVICE_NAME} && sudo systemctl status ${SERVICE_NAME} --no-pager"
+rsync -avz --progress -e "ssh $SSH_OPTS" "$BINARY" "${SERVER_USER}@${SERVER_HOST}:${SERVER_DIR}/rustpbx"
 
 echo "==> Deploy complete."
