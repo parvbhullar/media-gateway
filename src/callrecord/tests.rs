@@ -176,6 +176,8 @@ async fn test_save_with_s3_like_memory_store() {
     let access_key = "minioadmin".to_string();
     let secret_key = "minioadmin".to_string();
     let endpoint = "http://localhost:9000".to_string(); // Local minio endpoint
+    let with_media: Option<bool> = None;
+    let keep_media_copy: Option<bool> = None;
 
     let mut record = CallRecord {
         call_id: "test_s3_call_123".to_string(),
@@ -241,6 +243,9 @@ async fn test_save_with_s3_like_with_media() {
         recorder: vec![media],
         ..Default::default()
     };
+
+    let with_media: Option<bool> = Some(true);
+    let keep_media_copy: Option<bool> = None;
 
     // Test with different S3 vendors
     let test_cases = vec![

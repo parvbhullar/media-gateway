@@ -67,6 +67,22 @@ impl ApiError {
             message: msg.into(),
         }
     }
+
+    pub fn not_supported(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::METHOD_NOT_ALLOWED,
+            code: "not_supported",
+            message: msg.into(),
+        }
+    }
+
+    pub fn not_implemented(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_IMPLEMENTED,
+            code: "not_implemented",
+            message: msg.into(),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {

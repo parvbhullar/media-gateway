@@ -29,6 +29,36 @@ pub struct ActiveCallListQuery {
     limit: Option<usize>,
 }
 
+/// Which leg of a call a command targets (caller = A-leg, callee = B-leg).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Leg {
+    Caller,
+    Callee,
+}
+
+/// Audio source for play commands.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum PlaySource {
+    File { path: String },
+    Url { url: String },
+    Tts { text: String, voice: Option<String> },
+}
+
+/// Optional playback options for play commands.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ApiPlayOptions {
+    #[serde(default)]
+    pub loop_playback: bool,
+    #[serde(default = "default_true")]
+    pub interrupt_on_dtmf: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum CallCommandPayload {
@@ -50,6 +80,49 @@ pub enum CallCommandPayload {
     },
     Unmute {
         track_id: String,
+    },
+    // ── Extended API variants (used by /api/v1/calls handlers) ──────────
+    ApiHangup {
+        reason: Option<String>,
+        code: Option<u16>,
+    },
+    ApiMute {
+        leg: Leg,
+    },
+    ApiUnmute {
+        leg: Leg,
+    },
+    BlindTransfer {
+        target: String,
+        leg: Option<Leg>,
+    },
+    AttendedTransferStart {
+        target: String,
+        leg: Option<Leg>,
+    },
+    AttendedTransferComplete {
+        consult_leg: String,
+    },
+    AttendedTransferCancel {
+        consult_leg: String,
+    },
+    Play {
+        source: PlaySource,
+        leg: Option<Leg>,
+        options: Option<ApiPlayOptions>,
+    },
+    Dtmf {
+        digits: String,
+        duration_ms: Option<u32>,
+        inter_digit_ms: Option<u32>,
+        leg: Option<Leg>,
+    },
+    Record {
+        path: Option<String>,
+        format: Option<String>,
+        beep: Option<bool>,
+        max_duration_secs: Option<u32>,
+        transcribe: Option<bool>,
     },
 }
 

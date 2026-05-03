@@ -18,16 +18,25 @@ use crate::{
     proxy::routing::{ActionType, RouteQueueConfig, RouteRule, SourceTrunk, TrunkConfig},
 };
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct RouteTrace {
     pub matched_rule: Option<String>,
     pub selected_trunk: Option<String>,
+    /// Set when the route dest resolved through a trunk_group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trunk_group_name: Option<String>,
     pub used_default_route: bool,
     pub rewrite_operations: Vec<String>,
     pub abort: Option<RouteAbortTrace>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_record_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_table: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_record_index: Option<i32>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RouteAbortTrace {
     pub code: u16,
     pub reason: Option<String>,

@@ -3,7 +3,9 @@ use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbB
 use sea_orm_migration::MigratorTrait;
 use std::time::Duration;
 
+pub mod add_did_trunk_group_name_column;
 pub mod add_leg_timeline_column;
+pub mod add_media_config_column;
 pub mod add_metadata_column;
 pub mod add_rewrite_columns;
 pub mod add_sip_trunk_health_columns;
@@ -28,11 +30,19 @@ pub mod policy;
 pub mod presence;
 pub mod rbac;
 pub mod routing;
+pub mod routing_tables;
 pub mod sip_trunk;
 pub mod system_config;
 pub mod system_notification;
 pub mod pending_upload;
+pub mod trunk_acl_entries;
+pub mod trunk_capacity;
+pub mod trunk_credentials;
+pub mod trunk_group;
+pub mod trunk_group_member;
+pub mod trunk_origination_uris;
 pub mod user;
+pub mod webhooks;
 
 pub fn prepare_sqlite_database(database_url: &str) -> Result<()> {
     let Some(path_part) = database_url.strip_prefix("sqlite://") else {

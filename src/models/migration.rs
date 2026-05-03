@@ -31,6 +31,16 @@ impl MigratorTrait for Migrator {
             Box::new(super::did::Migration),
             Box::new(super::api_key::Migration),
             Box::new(super::add_sip_trunk_health_columns::Migration),
+            Box::new(super::trunk_group::Migration),
+            Box::new(super::trunk_group_member::Migration),
+            Box::new(super::add_did_trunk_group_name_column::Migration),
+            Box::new(super::trunk_credentials::Migration),
+            Box::new(super::trunk_origination_uris::Migration),
+            Box::new(super::add_media_config_column::Migration),
+            Box::new(super::trunk_capacity::Migration),
+            Box::new(super::trunk_acl_entries::Migration),
+            Box::new(super::routing_tables::Migration),
+            Box::new(super::webhooks::Migration),
         ]
     }
 }

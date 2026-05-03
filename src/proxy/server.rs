@@ -91,6 +91,10 @@ pub struct SipServerInner {
     pub cluster_event_hub: Option<Arc<ClusterEventHub>>,
     /// SIP peer IPs for cluster auth bypass.
     pub cluster_peer_ips: Vec<IpAddr>,
+    /// Phase 7 — broadcast channel for webhook events.
+    pub webhook_sender: crate::proxy::webhook::WebhookEventSender,
+    /// Phase 7 — in-memory cancel registry for in-flight webhook retries.
+    pub webhook_cancel_registry: Arc<crate::proxy::webhook::WebhookCancelRegistry>,
 }
 
 pub type SipServerRef = Arc<SipServerInner>;
@@ -635,6 +639,26 @@ impl SipServerBuilder {
         // Create conference manager with in-server audio mixing
         let conference_manager = Arc::new(crate::call::runtime::ConferenceManager::new());
 
+        // Phase 7 — webhook broadcast channel (capacity 1024).
+        let (webhook_sender, _) =
+            tokio::sync::broadcast::channel::<crate::proxy::webhook::WebhookEvent>(1024);
+        let webhook_cancel_registry =
+            Arc::new(crate::proxy::webhook::WebhookCancelRegistry::new());
+        // Spawn webhook delivery processor if DB is available.
+        if let Some(db_for_processor) = database.clone() {
+            let sender_for_processor = webhook_sender.clone();
+            let registry_for_processor = webhook_cancel_registry.clone();
+            let generated_dir = self.config.generated_dir.clone();
+            let cancel_for_processor = cancel_token.child_token();
+            tokio::spawn(crate::proxy::webhook::run_webhook_processor(
+                db_for_processor,
+                sender_for_processor,
+                registry_for_processor,
+                generated_dir,
+                cancel_for_processor,
+            ));
+        }
+
         let inner = Arc::new(SipServerInner {
             rtp_config,
             proxy_config: self.config.clone(),
@@ -668,6 +692,8 @@ impl SipServerBuilder {
             transfer_notify_subscribers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             cluster_event_hub,
             cluster_peer_ips,
+            webhook_sender,
+            webhook_cancel_registry,
         });
 
         let inner_weak = Arc::downgrade(&inner);
@@ -856,6 +882,18 @@ impl SipServer {
 
     pub fn get_cancel_token(&self) -> CancellationToken {
         self.inner.cancel_token.clone()
+    }
+
+    /// Phase 7 — accessor for the webhook broadcast sender.
+    pub fn webhook_sender(&self) -> crate::proxy::webhook::WebhookEventSender {
+        self.inner.webhook_sender.clone()
+    }
+
+    /// Phase 7 — accessor for the webhook cancel registry.
+    pub fn webhook_cancel_registry(
+        &self,
+    ) -> Arc<crate::proxy::webhook::WebhookCancelRegistry> {
+        self.inner.webhook_cancel_registry.clone()
     }
 
     async fn handle_incoming(&self, mut incoming: TransactionReceiver) -> Result<()> {

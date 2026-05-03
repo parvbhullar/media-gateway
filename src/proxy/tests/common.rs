@@ -107,6 +107,11 @@ pub async fn create_test_server_with_config(
         transfer_notify_subscribers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         cluster_event_hub: None,
         cluster_peer_ips: vec![],
+        webhook_sender: {
+            let (tx, _) = tokio::sync::broadcast::channel::<crate::proxy::webhook::WebhookEvent>(8);
+            tx
+        },
+        webhook_cancel_registry: std::sync::Arc::new(crate::proxy::webhook::WebhookCancelRegistry::new()),
     });
 
     // Add test users

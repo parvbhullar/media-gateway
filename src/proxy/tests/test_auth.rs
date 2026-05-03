@@ -509,6 +509,11 @@ async fn test_guest_call_allowed_extension() {
         transfer_notify_subscribers: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         cluster_event_hub: None,
         cluster_peer_ips: vec![],
+        webhook_sender: {
+            let (tx, _) = tokio::sync::broadcast::channel::<crate::proxy::webhook::WebhookEvent>(8);
+            tx
+        },
+        webhook_cancel_registry: std::sync::Arc::new(crate::proxy::webhook::WebhookCancelRegistry::new()),
     });
 
     let module = AuthModule::new(server_inner.clone(), server_inner.proxy_config.clone());

@@ -25,6 +25,8 @@ pub struct SessionSnapshot {
     pub answer_sdp: Option<String>,
     #[serde(skip)]
     pub callee_dialogs: Vec<DialogId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_consult_leg_id: Option<String>,
 }
 use crate::call::domain::SessionPolicy;
 use crate::call::sip::{ClientDialogGuard, ServerDialogGuard};
@@ -995,6 +997,7 @@ impl SipSession {
             media_path: self.media_profile.path,
             answer_sdp: self.answer.clone(),
             callee_dialogs,
+            pending_consult_leg_id: None,
         };
 
         *self.snapshot_cache.write() = Some(snapshot);

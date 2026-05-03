@@ -65,6 +65,7 @@ pub struct Model {
     pub enabled: bool,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
+    pub trunk_group_name: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -96,6 +97,7 @@ impl Model {
             enabled: Set(new.enabled),
             created_at: Set(now),
             updated_at: Set(now),
+            ..Default::default()   // trunk_group_name stays NotSet → NULL
         };
         Entity::insert(active)
             .on_conflict(

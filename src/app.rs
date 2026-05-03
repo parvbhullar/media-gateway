@@ -132,6 +132,18 @@ impl AppStateInner {
         &self.sip_server
     }
 
+    /// Phase 7 — webhook broadcast sender, delegated to SipServer.
+    pub fn webhook_sender(&self) -> crate::proxy::webhook::WebhookEventSender {
+        self.sip_server().webhook_sender()
+    }
+
+    /// Phase 7 — webhook cancel registry, delegated to SipServer.
+    pub fn webhook_cancel_registry(
+        &self,
+    ) -> std::sync::Arc<crate::proxy::webhook::WebhookCancelRegistry> {
+        self.sip_server().webhook_cancel_registry()
+    }
+
     pub fn skip_migrate(&self) -> bool {
         self.skip_migrate
     }

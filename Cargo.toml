@@ -20,7 +20,7 @@ addon-archive = ["flate2"]
 addon-endpoint-manager = []
 addon-enterprise-auth = ["dep:ldap3", "flate2", "dep:ring"]
 addon-transcript = []
-addon-voicemail = ["dep:url"]
+addon-voicemail = []
 addon-ivr-editor = []
 addon-jsonrpc-router = ["dep:minijinja", "dep:evalexpr"]
 addon-cc = []
@@ -91,7 +91,7 @@ tokio-util = "0.7.18"
 tracing = "0.1.43"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tracing-appender = "0.2.5"
-url = { version = "2.5.8", optional = true }
+url = { version = "2.5.8" }
 uuid = { version = "1.23.1", features = ["v4"] }
 clap = { version = "4.6.1", features = ["derive"] }
 toml = "1.1.2"
@@ -193,6 +193,7 @@ portpicker = "0.1.1"
 tower = { version = "0.5", features = ["util"] }
 sipbot = { version = "=0.2.30", default-features = false }
 serde_urlencoded = "0.7"
+http-body-util = "0.1.3"
 
 [build-dependencies]
 chrono = "0.4"

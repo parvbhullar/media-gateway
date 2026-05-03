@@ -53,7 +53,6 @@ impl DidIndex {
     }
 }
 
-#[cfg(any(test, feature = "integration-test"))]
 impl DidIndex {
     /// Construct a `DidIndex` from a raw map. Exposed for integration tests
     /// and call-path unit tests that need to synthesize a snapshot without
