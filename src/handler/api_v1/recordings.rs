@@ -11,7 +11,7 @@ use axum::{
     body::Body,
     extract::{Path, Query, State},
     http::{HeaderValue, StatusCode, header},
-    response::{IntoResponse, Redirect, Response},
+    response::Response,
     routing::get,
 };
 use chrono::{DateTime, Utc};
@@ -193,9 +193,17 @@ async fn handle_download(
         .recording_url
         .ok_or_else(|| ApiError::not_found(format!("CDR {id} has no recording")))?;
 
-    // Remote recordings: 302 redirect -- never proxy bandwidth (D-12).
+    // Remote recordings: 302 Found redirect -- never proxy bandwidth (D-12).
+    // axum 0.8 Redirect has no 302 constructor (to()=303, temporary()=307).
+    // Build a raw 302 response so the Location header behaviour is transparent
+    // to clients that distinguish 302 from 307.
     if url.starts_with("http") || url.starts_with("s3://") {
-        return Ok(Redirect::to(&url).into_response());
+        let location = HeaderValue::try_from(url.as_str())
+            .map_err(|e| ApiError::internal(format!("invalid redirect URL: {e}")))?;
+        let mut resp = Response::new(Body::empty());
+        *resp.status_mut() = StatusCode::FOUND;
+        resp.headers_mut().insert(header::LOCATION, location);
+        return Ok(resp);
     }
 
     // Local recordings: resolve storage and stream from disk.
