@@ -27,6 +27,8 @@ pub mod translations;             // Phase 8 — TRN-01
 pub mod manipulations;            // Phase 9 — MAN-01
 pub mod security;                 // Phase 10 — SEC-01..SEC-05
 pub mod webhooks;                 // Phase 7 — WH-01
+pub mod listeners;                // Phase 12 — LSTN-01..04
+pub mod recordings;               // Phase 12 — REC-01..07
 
 use axum::{Router, middleware};
 
@@ -59,6 +61,8 @@ pub fn api_v1_router(state: AppState) -> Router {
         .merge(translations::router())             // Phase 8 — TRN-01
         .merge(manipulations::router())            // Phase 9 — MAN-01
         .merge(security::router())                 // Phase 10 — SEC-01..SEC-05
+        .merge(listeners::router())                // Phase 12 — LSTN-01..04
+        .merge(recordings::router())               // Phase 12 — REC-01..07
         ;
 
     let protected = protected.layer(middleware::from_fn_with_state(
