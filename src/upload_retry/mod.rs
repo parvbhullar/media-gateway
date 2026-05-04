@@ -15,7 +15,7 @@
 //! always have a chance to recover the data manually.
 
 use crate::app::AppState;
-use crate::config::CallRecordConfig;
+use crate::config::{CallRecordConfig, RecordingType};
 use crate::models::pending_upload;
 use crate::storage::{Storage, StorageConfig};
 use chrono::{DateTime, Utc};
@@ -57,11 +57,29 @@ async fn run(state: AppState) {
 /// Pull pending rows and retry them. Public so a future "Retry now"
 /// endpoint can invoke it on demand.
 pub async fn sweep(state: &AppState, max_attempts: i32) -> anyhow::Result<()> {
-    // We need an S3 callrecord config to do anything useful.
-    let s3_config = match state.config().callrecord.as_ref() {
-        Some(cfg @ CallRecordConfig::S3 { .. }) => cfg.clone(),
-        _ => return Ok(()),
-    };
+    // Re-read the generated config file on every sweep so that config changes
+    // applied via the console (DB → reload) are picked up without a full
+    // process restart. Falls back to the startup snapshot if the file is gone.
+    let current = load_current_config(state);
+
+    // We need at least one S3 config (callrecord or recording) to do anything.
+    let callrecord_s3 = current
+        .as_ref()
+        .and_then(|c| c.callrecord.as_ref())
+        .or_else(|| state.config().callrecord.as_ref())
+        .and_then(|c| matches!(c, CallRecordConfig::S3 { .. }).then_some(c))
+        .cloned();
+
+    let recording_s3 = current
+        .as_ref()
+        .and_then(|c| c.recording.as_ref())
+        .or_else(|| state.config().recording.as_ref())
+        .filter(|p| p.enabled && p.recording_type == RecordingType::S3)
+        .cloned();
+
+    if callrecord_s3.is_none() && recording_s3.is_none() {
+        return Ok(());
+    }
 
     let db = state.db().clone();
     let rows = pending_upload::Model::list_pending(&db, BATCH_SIZE).await?;
@@ -69,23 +87,85 @@ pub async fn sweep(state: &AppState, max_attempts: i32) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Build the storage client once per sweep.
-    let storage = match build_storage(&s3_config) {
-        Some(s) => s,
-        None => {
-            warn!("upload_retry: failed to build storage client; skipping sweep");
-            return Ok(());
-        }
-    };
-
     let now = Utc::now();
     for row in rows {
         if !ready_for_retry(&row, now) {
             continue;
         }
-        retry_one(&db, &storage, &s3_config, &row, max_attempts).await;
+
+        // Choose the storage config based on which pipeline created the row.
+        // KIND_RECORDING_MEDIA rows come from RecordingUploadHook and use the
+        // [recording] S3 config. All other rows use the [callrecord] S3 config.
+        let config_for_row = if row.kind == pending_upload::KIND_RECORDING_MEDIA {
+            recording_s3
+                .as_ref()
+                .map(StorageSource::Recording)
+                .or_else(|| callrecord_s3.as_ref().map(StorageSource::Callrecord))
+        } else {
+            callrecord_s3
+                .as_ref()
+                .map(StorageSource::Callrecord)
+                .or_else(|| recording_s3.as_ref().map(StorageSource::Recording))
+        };
+
+        let Some(source) = config_for_row else {
+            debug!(id = row.id, kind = %row.kind, "upload_retry: no matching S3 config, skipping row");
+            continue;
+        };
+
+        let (storage, bucket) = match build_storage_from_source(&source) {
+            Some(pair) => pair,
+            None => {
+                warn!("upload_retry: failed to build storage client for row {}; skipping", row.id);
+                continue;
+            }
+        };
+
+        retry_one(&db, &storage, &bucket, &row, max_attempts).await;
     }
     Ok(())
+}
+
+/// Re-reads the generated config file from disk. Returns `None` if the path
+/// is unset or the file cannot be parsed — callers fall back to startup snapshot.
+fn load_current_config(state: &AppState) -> Option<crate::config::Config> {
+    let path = state.config_path.as_deref()?;
+    crate::config::Config::load(path).ok()
+}
+
+enum StorageSource<'a> {
+    Callrecord(&'a CallRecordConfig),
+    Recording(&'a crate::config::RecordingPolicy),
+}
+
+fn build_storage_from_source(source: &StorageSource<'_>) -> Option<(Storage, String)> {
+    match source {
+        StorageSource::Callrecord(cfg) => {
+            let storage = build_storage(cfg)?;
+            let bucket = match cfg {
+                CallRecordConfig::S3 { bucket, .. } => bucket.clone(),
+                _ => return None,
+            };
+            Some((storage, bucket))
+        }
+        StorageSource::Recording(policy) => {
+            let bucket = policy.bucket.clone().filter(|b| !b.is_empty())?;
+            let region = policy.region.clone().filter(|r| !r.is_empty())?;
+            let access_key = policy.access_key.clone().filter(|k| !k.is_empty())?;
+            let secret_key = policy.secret_key.clone().filter(|k| !k.is_empty())?;
+            let storage = Storage::new(&StorageConfig::S3 {
+                vendor: policy.vendor.clone().unwrap_or_default(),
+                bucket: bucket.clone(),
+                region,
+                access_key,
+                secret_key,
+                endpoint: policy.endpoint.clone(),
+                prefix: None,
+            })
+            .ok()?;
+            Some((storage, bucket))
+        }
+    }
 }
 
 /// Per-row exponential backoff. Doubles every attempt up to a 24h cap.
@@ -141,12 +221,12 @@ fn build_storage(callrecord: &CallRecordConfig) -> Option<Storage> {
 }
 
 /// Attempt one row. On success, delete the row (and the local file when
-/// `keep_media_copy = false`). On failure, bump attempts; once attempts
+/// the row is a media file). On failure, bump attempts; once attempts
 /// reach `max_attempts` mark the row `failed_permanent`.
 async fn retry_one(
     db: &DatabaseConnection,
     storage: &Storage,
-    callrecord: &CallRecordConfig,
+    bucket: &str,
     row: &pending_upload::Model,
     max_attempts: i32,
 ) {
@@ -188,31 +268,30 @@ async fn retry_one(
                 attempts = row.attempts + 1,
                 "upload_retry: success"
             );
-            // Update the call_record row's recording_url to point at the
-            // S3 object so the playback handler can stream it. Only meaningful
-            // for media kind — CDR JSON isn't what the UI plays back.
-            if row.kind == pending_upload::KIND_MEDIA {
-                if let CallRecordConfig::S3 { bucket, .. } = callrecord {
-                    let s3_url = format!(
-                        "s3://{}/{}",
-                        bucket,
-                        row.target_key.trim_start_matches('/')
+            // Update recording_url for media kinds so the playback handler
+            // can stream the file. CDR JSON is not played back.
+            let is_media = row.kind == pending_upload::KIND_MEDIA
+                || row.kind == pending_upload::KIND_RECORDING_MEDIA;
+            if is_media {
+                let s3_url = format!(
+                    "s3://{}/{}",
+                    bucket,
+                    row.target_key.trim_start_matches('/')
+                );
+                if let Err(e) =
+                    crate::models::call_record::update_recording_url_by_call_id(
+                        db,
+                        &row.call_id,
+                        &s3_url,
+                    )
+                    .await
+                {
+                    warn!(
+                        id = row.id,
+                        call_id = %row.call_id,
+                        "upload_retry: failed to update call_record.recording_url after retry: {}",
+                        e
                     );
-                    if let Err(e) =
-                        crate::models::call_record::update_recording_url_by_call_id(
-                            db,
-                            &row.call_id,
-                            &s3_url,
-                        )
-                        .await
-                    {
-                        warn!(
-                            id = row.id,
-                            call_id = %row.call_id,
-                            "upload_retry: failed to update call_record.recording_url after retry: {}",
-                            e
-                        );
-                    }
                 }
             }
             // Delete the row first so a crash mid-cleanup doesn't make
@@ -221,22 +300,15 @@ async fn retry_one(
                 warn!(id = row.id, "upload_retry: delete row failed: {}", e);
                 return;
             }
-            // Optionally remove the local file. Always keep it for CDR
-            // (the local CDR file is a side effect, not the source of
-            // truth) and only remove media when keep_media_copy=false.
-            if row.kind == pending_upload::KIND_MEDIA {
-                let keep = matches!(
-                    callrecord,
-                    CallRecordConfig::S3 { keep_media_copy, .. } if keep_media_copy.unwrap_or(false)
-                );
-                if !keep {
-                    if let Err(e) = tokio::fs::remove_file(local_path).await {
-                        warn!(
-                            local = %row.local_path,
-                            "upload_retry: failed to delete local media after upload: {}",
-                            e
-                        );
-                    }
+            // Remove the local media file after a successful retry. Local CDR
+            // JSON files are always kept as a side-copy.
+            if is_media {
+                if let Err(e) = tokio::fs::remove_file(local_path).await {
+                    warn!(
+                        local = %row.local_path,
+                        "upload_retry: failed to delete local media after upload: {}",
+                        e
+                    );
                 }
             }
         }

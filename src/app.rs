@@ -298,10 +298,14 @@ impl AppStateBuilder {
                 crate::config::SipFlowConfig::Local { upload, .. } => upload.clone(),
                 _ => None,
             });
+        // uploads_recording() is true only when enabled AND type is S3/Http.
+        // We allow RecordingUploadHook to coexist with sipflow: local sipflow
+        // captures SIP+RTP packets; the hook uploads WAV audio to S3. These
+        // are different outputs and don't conflict.
         let recording_upload_policy = config
             .recording
             .as_ref()
-            .filter(|policy| policy.uploads_recording() && sipflow_backend_arc.is_none())
+            .filter(|policy| policy.uploads_recording())
             .cloned();
 
         let callrecord_formatter = if let Some(formatter) = self.callrecord_formatter {
@@ -356,7 +360,9 @@ impl AppStateBuilder {
             }
 
             if let Some(policy) = recording_upload_policy.as_ref() {
-                builder = builder.with_hook(Box::new(RecordingUploadHook::new(policy.clone())));
+                builder = builder.with_hook(Box::new(
+                    RecordingUploadHook::new(policy.clone()).with_db(db_conn.clone()),
+                ));
             }
 
             builder = builder.with_hook(Box::new(DatabaseHook {

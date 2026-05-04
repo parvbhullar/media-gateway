@@ -842,7 +842,15 @@ impl CallModule {
             _ => return dialplan,
         };
 
-        if sipflow_active {
+        // When sipflow is active AND the recording policy only wants local files,
+        // let sipflow be the sole recording mechanism. But when recording is
+        // explicitly configured for S3/Http upload (uploads_recording() = true),
+        // the user wants WAV files pushed to cloud — allow both to coexist.
+        if sipflow_active && !policy.uploads_recording() {
+            warn!(
+                "sipflow active and recording.type is local — recording disabled for this call; \
+                 set recording.type = \"s3\" or \"http\" to enable recording alongside sipflow"
+            );
             dialplan.recording.enabled = false;
             dialplan.recording.option = None;
             return dialplan;

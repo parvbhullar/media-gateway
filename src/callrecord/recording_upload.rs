@@ -10,16 +10,23 @@ use tracing::{info, warn};
 use crate::{
     callrecord::{CallRecord, CallRecordHook},
     config::{RecordingPolicy, RecordingType},
+    models::pending_upload,
     storage::{Storage, StorageConfig},
 };
 
 pub struct RecordingUploadHook {
     policy: RecordingPolicy,
+    db: Option<sea_orm::DatabaseConnection>,
 }
 
 impl RecordingUploadHook {
     pub fn new(policy: RecordingPolicy) -> Self {
-        Self { policy }
+        Self { policy, db: None }
+    }
+
+    pub fn with_db(mut self, db: sea_orm::DatabaseConnection) -> Self {
+        self.db = Some(db);
+        self
     }
 
     fn required(value: &Option<String>, name: &str) -> Result<String> {
@@ -143,8 +150,22 @@ impl RecordingUploadHook {
 impl CallRecordHook for RecordingUploadHook {
     async fn on_record_completed(&self, record: &mut CallRecord) -> anyhow::Result<()> {
         if !self.policy.uploads_recording() {
+            info!(
+                call_id = %record.call_id,
+                recording_type = ?self.policy.recording_type,
+                enabled = self.policy.enabled,
+                "RecordingUploadHook: skipping — policy does not upload (type must be s3 or http and enabled=true)"
+            );
             return Ok(());
         }
+
+        info!(
+            call_id = %record.call_id,
+            recorder_count = record.recorder.len(),
+            recording_type = ?self.policy.recording_type,
+            "RecordingUploadHook: starting upload for {} media file(s)",
+            record.recorder.len()
+        );
 
         let mut first_uploaded_url = None;
         for index in 0..record.recorder.len() {
@@ -206,6 +227,22 @@ impl CallRecordHook for RecordingUploadHook {
                         path,
                         "recording upload failed: {err}"
                     );
+                    // Queue for retry if we have a DB connection. Uses
+                    // KIND_RECORDING_MEDIA so the retry scheduler knows to use
+                    // the [recording] S3 config rather than [callrecord].
+                    if self.policy.recording_type == RecordingType::S3 {
+                        if let Some(db) = self.db.as_ref() {
+                            let _ = pending_upload::Model::upsert_failure(
+                                db,
+                                &record.call_id,
+                                pending_upload::KIND_RECORDING_MEDIA,
+                                &path,
+                                &key,
+                                &err.to_string(),
+                            )
+                            .await;
+                        }
+                    }
                 }
             }
         }

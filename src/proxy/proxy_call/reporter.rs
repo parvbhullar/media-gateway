@@ -159,12 +159,23 @@ impl CallReporter {
                         extra: None,
                     });
                 }
-        tracing::info!(
-            recording = ?self.context.dialplan.recording,
-            has_sipflow_backend = ?has_sipflow_backend,
-            "Call recording files collected: {:?}",
-            recorder
-        );
+        if recorder.is_empty() {
+            tracing::warn!(
+                recording_enabled = self.context.dialplan.recording.enabled,
+                has_recorder_option = self.context.dialplan.recording.option.is_some(),
+                recorder_file = self.context.dialplan.recording.option
+                    .as_ref().map(|o| o.recorder_file.as_str()).unwrap_or(""),
+                has_sipflow_backend,
+                "reporter: no media files collected — recording WAV will NOT be uploaded"
+            );
+        } else {
+            tracing::info!(
+                has_sipflow_backend,
+                count = recorder.len(),
+                "reporter: collected {} media file(s) for upload",
+                recorder.len()
+            );
+        }
         // Copy values from cookie to extras_map
         // (Removed as TransactionCookie no longer has values)
 

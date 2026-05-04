@@ -50,6 +50,8 @@ pub const STATUS_FAILED_MISSING_SOURCE: &str = "failed_missing_source";
 
 pub const KIND_CDR: &str = "cdr";
 pub const KIND_MEDIA: &str = "media";
+/// Media uploaded via the `[recording]` pipeline (uses recording S3 config, not callrecord).
+pub const KIND_RECORDING_MEDIA: &str = "recording_media";
 
 impl Model {
     /// Insert (or refresh on conflict) a pending upload row.

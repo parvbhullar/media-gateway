@@ -786,12 +786,30 @@ impl CallRecordManager {
             // (recording_url) don't fight the borrow checker.
             let call_id_owned = record.call_id.clone();
             let mut media_files = vec![];
+            info!(
+                call_id = %record.call_id,
+                recorder_count = record.recorder.len(),
+                "callrecord: with_media=true, scanning recorder entries"
+            );
             for media in &record.recorder {
-                if Path::new(&media.path).exists() {
+                let exists = Path::new(&media.path).exists();
+                info!(
+                    call_id = %record.call_id,
+                    track_id = %media.track_id,
+                    path = %media.path,
+                    exists,
+                    "callrecord: media file check"
+                );
+                if exists {
                     let media_path = formatter.format_media_path(record, media);
                     media_files.push((media.path.clone(), media_path));
                 }
             }
+            info!(
+                call_id = %record.call_id,
+                media_to_upload = media_files.len(),
+                "callrecord: starting media upload"
+            );
             for (local_path, s3_path) in &media_files {
                 let start_time = Instant::now();
                 let file_content = match tokio::fs::read(local_path).await {
