@@ -187,7 +187,7 @@ Requirement IDs follow `[CATEGORY]-[NUMBER]`. All v2.0 requirements are user/ope
 ### Migration Safety (MIG)
 
 - [x] **MIG-01**: All new tables ship with backward-compatible migrations that run on existing databases without data loss
-- [ ] **MIG-02**: Every migration has a documented rollback path (or is explicitly documented as forward-only)
+- [x] **MIG-02**: Every migration has a documented rollback path (or is explicitly documented as forward-only)
 - [ ] **MIG-03**: Console UI routes render identically on every page touched by a refactor (sip_trunks, dids, call_records, routing, settings, diagnostics) — verified by spot check before phase merge
 - [x] **MIG-04**: Existing `ami.rs` endpoints continue to respond until their `/api/v1/system/*` equivalents are documented as the supported surface
 
@@ -369,7 +369,7 @@ Every v2.0 requirement maps to exactly one phase.
 | IT-04 | Phase 13 | Pending |
 | IT-05 | Phase 13 | Pending |
 | MIG-01 | Phase 2 | Complete |
-| MIG-02 | Phase 12 | Pending |
+| MIG-02 | Phase 12 | Complete |
 | MIG-03 | Phase 1 | Pending |
 | MIG-04 | Phase 11 | Done |
 
