@@ -300,12 +300,20 @@ impl AppStateBuilder {
             });
         // uploads_recording() is true only when enabled AND type is S3/Http.
         // We allow RecordingUploadHook to coexist with sipflow: local sipflow
-        // captures SIP+RTP packets; the hook uploads WAV audio to S3. These
-        // are different outputs and don't conflict.
+        // captures SIP+RTP packets; the hook uploads WAV audio to S3.
+        //
+        // BUT we skip the hook when [callrecord] is S3 with with_media=true —
+        // the callrecord saver already uploads the WAV (and deletes the local
+        // file when keep_media_copy=false), so the hook would just fail with
+        // "missing local media" warnings.
+        let callrecord_handles_media = matches!(
+            config.callrecord.as_ref(),
+            Some(crate::config::CallRecordConfig::S3 { with_media: Some(true), .. })
+        );
         let recording_upload_policy = config
             .recording
             .as_ref()
-            .filter(|policy| policy.uploads_recording())
+            .filter(|policy| policy.uploads_recording() && !callrecord_handles_media)
             .cloned();
 
         let callrecord_formatter = if let Some(formatter) = self.callrecord_formatter {

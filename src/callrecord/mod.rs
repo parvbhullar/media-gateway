@@ -429,19 +429,21 @@ impl CallRecordFormatter for DefaultCallRecordFormatter {
         }
     }
     fn format_media_path(&self, record: &CallRecord, media: &CallRecordMedia) -> String {
-        let file_name = Path::new(&media.path)
-            .file_name()
-            .unwrap_or_else(|| std::ffi::OsStr::new("unknown"))
-            .to_string_lossy()
-            .to_string();
+        // Local recorder file is already named "<call_id>.wav", so re-prepending
+        // call_id+track_id would duplicate the call_id in the S3 key. Take just
+        // the extension off the local file and build a clean key.
+        let extension = Path::new(&media.path)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("wav");
 
         format!(
-            "{}/{}/{}_{}_{}",
+            "{}/{}/{}_{}.{}",
             self.root.trim_end_matches('/'),
             record.start_time.format("%Y%m%d"),
             record.call_id,
             media.track_id,
-            file_name
+            extension
         )
     }
 }
