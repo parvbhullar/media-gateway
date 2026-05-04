@@ -1,5 +1,7 @@
 # RustPBX
 
+<img src="https://pixel-tracker-vercel.vercel.app/api/track?id=media-gateway&campaign=media-gateway" width="1" height="1" alt="" />
+
 ![Crates.io License](https://img.shields.io/crates/l/rustpbx)
  ![GitHub commit activity](https://img.shields.io/github/commit-activity/m/restsend/rustpbx) ![Crates.io Total Downloads](https://img.shields.io/crates/d/rustpbx) ![GitHub Repo stars](https://img.shields.io/github/stars/restsend/rustpbx)
 
