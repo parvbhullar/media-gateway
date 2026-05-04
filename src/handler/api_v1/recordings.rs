@@ -6,20 +6,22 @@
 //! Route ordering: literal segments (/export, /bulk) must be registered
 //! BEFORE the {id} capture. /export and /bulk are added in 12-03.
 
+use async_zip::base::write::ZipFileWriter;
+use async_zip::{Compression, ZipEntryBuilder};
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path, Query, State},
+    extract::{Json as ExtractJson, Path, Query, State},
     http::{HeaderValue, StatusCode, header},
-    response::Response,
-    routing::get,
+    response::{IntoResponse, Response},
+    routing::{delete, get, post},
 };
 use chrono::{DateTime, Utc};
 use sea_orm::{
-    ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
+    ColumnTrait, Condition, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
 };
 use sea_orm::sea_query::Expr;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio_util::io::ReaderStream;
 use tracing::warn;
 
@@ -112,8 +114,10 @@ pub struct RecordingListResponse {
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        // Literal segments first -- /export and /bulk added by 12-03.
+        // Literal segments registered before {id} capture (axum routing requirement).
         .route("/recordings", get(list_recordings))
+        .route("/recordings/export", post(handle_export))       // REC-05, D-17
+        .route("/recordings/bulk",   delete(handle_bulk_delete)) // REC-06, D-22
         .route("/recordings/{id}", get(get_recording).delete(delete_recording))
         .route("/recordings/{id}/download", get(handle_download))
 }
@@ -241,6 +245,293 @@ async fn handle_download(
     Ok(resp)
 }
 
+// ---------------------------------------------------------------------------
+// Constants and structs for export (REC-05) and bulk delete (REC-06)
+// ---------------------------------------------------------------------------
+
+/// D-19: hard cap on recordings per export call. Exceeding this returns
+/// 400 -- operator must narrow filters. Same DoS-guard pattern as CDR
+/// export (CDR_EXPORT_HARD_CAP = 1_000_000 in cdrs.rs).
+const RECORDINGS_EXPORT_HARD_CAP: u64 = 10_000;
+
+/// D-24 bulk delete guardrail message. Wording is part of the operator UX contract.
+const BULK_DELETE_CONFIRM_MSG: &str =
+    "Add ?confirm=true to execute. Without it this is a dry-run preview. \
+     WARNING: bulk delete with no filters + confirm=true will wipe ALL recordings.";
+
+/// Optional JSON body for /recordings/export (D-18).
+/// When `ids` is non-empty it overrides filter query params (mutually exclusive).
+#[derive(Debug, Deserialize, Default)]
+struct ExportBody {
+    #[serde(default)]
+    ids: Vec<i64>,
+}
+
+/// Query struct for DELETE /recordings/bulk (D-22/D-24).
+#[derive(Debug, Deserialize)]
+struct BulkDeleteQuery {
+    #[serde(flatten)]
+    filters: CdrListQuery,
+    #[serde(default)]
+    confirm: Option<bool>,
+}
+
+#[derive(Serialize)]
+struct BulkDeletePreview {
+    matched: u64,
+    would_delete: u64,
+}
+
+#[derive(Serialize)]
+struct BulkDeletePreviewResponse {
+    preview: BulkDeletePreview,
+    message: &'static str,
+}
+
+#[derive(Serialize)]
+struct BulkDeleteResult {
+    deleted: u64,
+}
+
+/// D-19: pre-flight cap check for export. Pure function -- testable without DB.
+fn check_recordings_export_cap(total: u64) -> ApiResult<()> {
+    if total > RECORDINGS_EXPORT_HARD_CAP {
+        Err(ApiError::bad_request(format!(
+            "export exceeds {} recording limit; narrow filters (date range, trunk, status) and retry",
+            RECORDINGS_EXPORT_HARD_CAP
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+/// REC-05: stream a ZIP archive of recordings matching the filter set.
+///
+/// D-17: each local file -> "<cdr_id>_<call_id>.<ext>" in the ZIP.
+/// D-18: optional JSON body { "ids": [...] } overrides filter query params.
+/// D-19: hard cap of 10,000 rows; returns 400 if exceeded.
+/// D-20: Content-Type: application/zip, Content-Disposition with ISO date.
+/// D-21: remote recordings are skipped; their ids/urls go in MANIFEST.json.
+///
+/// Implementation note: uses Vec<u8> accumulation (bounded by 10k cap).
+/// async_zip 0.0.17 API: ZipFileWriter::with_tokio(cursor) where cursor is
+/// std::io::Cursor<Vec<u8>> (implements tokio::io::AsyncWrite). close() returns
+/// the inner cursor; use .into_inner() twice to recover the Vec<u8>.
+async fn handle_export(
+    State(state): State<AppState>,
+    Query(q): Query<CdrListQuery>,
+    body: Option<ExtractJson<ExportBody>>,
+) -> Result<Response, ApiError> {
+    let db = state.db();
+
+    // Build condition: explicit ids override filter params (D-18).
+    let ids: Vec<i64> = body.map(|b| b.0.ids).unwrap_or_default();
+    let conds = if !ids.is_empty() {
+        Condition::all().add(CdrColumn::Id.is_in(ids))
+    } else {
+        build_cdr_filter(&q).add(CdrColumn::RecordingUrl.is_not_null())
+    };
+
+    // D-19: pre-flight count.
+    let total = CdrEntity::find()
+        .filter(conds.clone())
+        .count(db)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    check_recordings_export_cap(total)?;
+
+    // Fetch all matched rows (bounded by cap).
+    let rows = CdrEntity::find()
+        .filter(conds)
+        .order_by_desc(CdrColumn::StartedAt)
+        .all(db)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    // Build ZIP in memory using std::io::Cursor<Vec<u8>> as the backing store.
+    // async_zip 0.0.17: with_tokio() takes a T: tokio::io::AsyncWrite + Unpin;
+    // Cursor<Vec<u8>> satisfies this. close() consumes the writer and returns
+    // Result<Cursor<Vec<u8>>>; .into_inner() recovers the Vec<u8>.
+    let cursor = std::io::Cursor::new(Vec::<u8>::new());
+    let mut zip = ZipFileWriter::with_tokio(cursor);
+
+    let cdr_storage = storage::resolve_storage(state.config().callrecord.as_ref())
+        .map_err(|e| ApiError::internal(format!("storage config error: {e}")))?;
+
+    let mut exported: Vec<String> = Vec::new();
+    let mut skipped_remote: Vec<serde_json::Value> = Vec::new();
+
+    for row in rows {
+        let url = match &row.recording_url {
+            Some(u) => u.clone(),
+            None => continue,
+        };
+
+        // D-21: skip remote recordings -- add to manifest.
+        if url.starts_with("http") || url.starts_with("s3://") {
+            skipped_remote.push(serde_json::json!({
+                "id": row.id,
+                "url": url,
+            }));
+            continue;
+        }
+
+        // Local recording: read bytes and add to ZIP entry.
+        let ext = std::path::Path::new(&url)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("bin");
+        let zip_name = format!("{}_{}.{}", row.id, row.call_id, ext);
+
+        let path = match cdr_storage.as_ref().and_then(|s| s.local_full_path(&url)) {
+            Some(p) => p,
+            None => {
+                warn!(recording_id = row.id, "cannot resolve local path for export; skipping");
+                continue;
+            }
+        };
+
+        let file_bytes = match tokio::fs::read(&path).await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    recording_id = row.id,
+                    path = %path.display(),
+                    "cannot read file for export: {e}; skipping"
+                );
+                continue;
+            }
+        };
+
+        let entry = ZipEntryBuilder::new(zip_name.clone().into(), Compression::Deflate);
+        zip.write_entry_whole(entry, &file_bytes)
+            .await
+            .map_err(|e| ApiError::internal(format!("zip write error: {e}")))?;
+        exported.push(zip_name);
+    }
+
+    // D-21: MANIFEST.json as the final ZIP entry.
+    let manifest = serde_json::json!({
+        "exported": exported,
+        "skipped_remote": skipped_remote,
+    });
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest)
+        .map_err(|e| ApiError::internal(format!("manifest serialize: {e}")))?;
+    let manifest_entry = ZipEntryBuilder::new("MANIFEST.json".into(), Compression::Deflate);
+    zip.write_entry_whole(manifest_entry, &manifest_bytes)
+        .await
+        .map_err(|e| ApiError::internal(format!("manifest zip write: {e}")))?;
+
+    // close() consumes zip and returns Result<Compat<Cursor<Vec<u8>>>>.
+    // with_tokio() wraps the writer in tokio_util::compat::Compat, so we need
+    // two .into_inner() calls: first to unwrap Compat, then to unwrap Cursor.
+    let compat_out = zip
+        .close()
+        .await
+        .map_err(|e| ApiError::internal(format!("zip close: {e}")))?;
+    let buf = compat_out.into_inner().into_inner();
+
+    // D-20: response headers.
+    let date_str = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let filename = format!("recordings-{}.zip", date_str);
+    let body = Body::from(buf);
+    let mut resp = Response::new(body);
+    resp.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/zip"),
+    );
+    resp.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!("attachment; filename=\"{}\"", filename))
+            .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
+    );
+    Ok(resp)
+}
+
+/// REC-06: bulk delete recordings matching the filter set.
+///
+/// D-22: same filter params as /recordings list.
+/// D-23: hard delete semantics (same as single delete D-15/D-16).
+/// D-24: ?confirm=true required. Without it: return 400 with dry-run preview.
+/// D-25: no row cap -- BULK_DELETE_CONFIRM_MSG warns operators of the risk.
+/// WARNING: issuing this with no filters and ?confirm=true wipes ALL recordings.
+async fn handle_bulk_delete(
+    State(state): State<AppState>,
+    Query(q): Query<BulkDeleteQuery>,
+) -> Result<Response, ApiError> {
+    let db = state.db();
+
+    let conds = build_cdr_filter(&q.filters)
+        .add(CdrColumn::RecordingUrl.is_not_null());
+
+    let matched = CdrEntity::find()
+        .filter(conds.clone())
+        .count(db)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    // D-24: dry-run guardrail.
+    if q.confirm != Some(true) {
+        let preview_resp = Json(BulkDeletePreviewResponse {
+            preview: BulkDeletePreview {
+                matched,
+                would_delete: matched,
+            },
+            message: BULK_DELETE_CONFIRM_MSG,
+        });
+        return Ok((StatusCode::BAD_REQUEST, preview_resp).into_response());
+    }
+
+    // Confirmed: execute delete. Fetch all matched rows for file cleanup.
+    let rows = CdrEntity::find()
+        .filter(conds.clone())
+        .all(db)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    let cdr_storage = storage::resolve_storage(state.config().callrecord.as_ref())
+        .map_err(|e| ApiError::internal(format!("storage error: {e}")))?;
+
+    let mut deleted: u64 = 0;
+    for row in &rows {
+        let url = match &row.recording_url {
+            Some(u) => u.clone(),
+            None => continue,
+        };
+
+        if url.starts_with("http") || url.starts_with("s3://") {
+            // Remote: log WARN, skip file delete (D-16).
+            warn!(
+                recording_id = row.id,
+                url = %url,
+                "bulk delete: remote recording; skipping file delete (D-16)"
+            );
+        } else if let Some(ref storage) = cdr_storage {
+            if let Some(path) = storage.local_full_path(&url) {
+                if let Err(e) = tokio::fs::remove_file(&path).await {
+                    warn!(
+                        recording_id = row.id,
+                        path = %path.display(),
+                        "bulk delete: best-effort file removal failed: {e}"
+                    );
+                }
+            }
+        }
+        deleted += 1;
+    }
+
+    // Clear recording_url in one UPDATE for all matched rows (D-23).
+    CdrEntity::update_many()
+        .col_expr(CdrColumn::RecordingUrl, Expr::value(None::<String>))
+        .col_expr(CdrColumn::UpdatedAt, Expr::value(chrono::Utc::now()))
+        .filter(conds)
+        .exec(db)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    Ok(Json(BulkDeleteResult { deleted }).into_response())
+}
+
 /// REC-04: hard delete.
 ///
 /// Steps (D-15/D-16):
@@ -355,6 +646,23 @@ mod tests {
         assert_eq!(
             mime_for_ext(Path::new("noextension")),
             "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn check_recordings_export_cap_allows_at_limit() {
+        assert!(check_recordings_export_cap(0).is_ok());
+        assert!(check_recordings_export_cap(10_000).is_ok());
+    }
+
+    #[test]
+    fn check_recordings_export_cap_rejects_over_limit() {
+        let err = check_recordings_export_cap(10_001).expect_err("must reject");
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(
+            err.message.contains("10000"),
+            "message must reference cap, got: {}",
+            err.message
         );
     }
 }
