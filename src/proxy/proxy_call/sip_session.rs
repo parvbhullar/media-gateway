@@ -4601,9 +4601,10 @@ impl SipSession {
         _max_duration: Option<Duration>,
         beep: bool,
     ) -> Result<()> {
-        if self.server.sip_flow.is_some() {
-            return Err(anyhow!("Live recording is disabled when SipFlow is enabled"));
-        }
+        // Whether recording should run alongside sipflow is decided by
+        // apply_recording_policy() in proxy::call (gates dialplan.recording.enabled
+        // on policy.uploads_recording()). If we got here, the policy already
+        // approved recording — don't double-gate on sip_flow presence.
         let mut recorder = Recorder::new(path, CodecType::PCMU)?;
         if let Some(forwarding) =
             Self::get_forwarding_track(&self.caller_peer, Self::CALLER_FORWARDING_TRACK_ID).await
