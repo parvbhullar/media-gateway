@@ -83,6 +83,37 @@ pub async fn test_state_with_api_key(name: &str) -> (AppState, String) {
     (state, plaintext)
 }
 
+/// Build an `AppState` with a config mutator applied before construction, plus one API key.
+///
+/// The closure receives a mutable `Config` and may change any field — e.g.
+/// `|c| c.proxy.tls_port = None` for disabled-port listener tests.
+pub async fn test_state_with_config_mut<F>(name: &str, mutate: F) -> (AppState, String)
+where
+    F: FnOnce(&mut Config),
+{
+    let mut cfg = test_config();
+    mutate(&mut cfg);
+    let state = AppStateBuilder::new()
+        .with_config(cfg)
+        .with_skip_sip_bind()
+        .build()
+        .await
+        .expect("failed to build test AppState with config_mut");
+
+    let IssuedKey { plaintext, hash } = issue_api_key();
+    let am = api_key::ActiveModel {
+        name: Set(name.to_string()),
+        hash_sha256: Set(hash),
+        description: Set(None),
+        created_at: Set(Utc::now()),
+        ..Default::default()
+    };
+    am.insert(state.db())
+        .await
+        .expect("failed to insert test api_key");
+    (state, plaintext)
+}
+
 /// Build an `AppState` with a custom absolute recorder root, plus one API key.
 ///
 /// Returns `(state, token, recorder_root_path)`.  The caller is responsible
