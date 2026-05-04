@@ -91,6 +91,19 @@ impl ApiError {
             message: msg.into(),
         }
     }
+
+    /// 410 Gone with `code: "recording_missing"`.
+    ///
+    /// Phase 12 D-14: returned by `/api/v1/recordings/{id}/download` when
+    /// the CDR row says `recording_url` is local but the file is absent
+    /// from disk. The CDR exists; the file does not — distinct from 404.
+    pub fn gone(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::GONE,
+            code: "recording_missing",
+            message: msg.into(),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -108,5 +121,17 @@ pub type ApiResult<T> = Result<T, ApiError>;
 impl From<crate::handler::api_v1::reload_steps::ReloadStepError> for ApiError {
     fn from(err: crate::handler::api_v1::reload_steps::ReloadStepError) -> Self {
         ApiError::internal(err.to_string())
+    }
+}
+
+#[cfg(test)]
+mod gone_tests {
+    use super::*;
+    #[test]
+    fn gone_constructs_410_with_recording_missing_code() {
+        let e = ApiError::gone("file deleted");
+        assert_eq!(e.status, StatusCode::GONE);
+        assert_eq!(e.code, "recording_missing");
+        assert_eq!(e.message, "file deleted");
     }
 }

@@ -36,9 +36,9 @@ Requirement IDs follow `[CATEGORY]-[NUMBER]`. All v2.0 requirements are user/ope
 - [ ] **CDR-02**: Operator can retrieve a single CDR by id
 - [ ] **CDR-03**: Operator can delete a CDR by id
 - [ ] **CDR-04**: Recording and sip-flow sub-resources return `501 Not Implemented` in Phase 1, promoted to real handlers in the Recordings phase
-- [ ] **CDR-05**: CDR search returns a filter summary alongside results (Vobiz parity)
-- [ ] **CDR-06**: CDR recent returns the N most recent CDRs without requiring a date range
-- [ ] **CDR-07**: CDR export streams results as CSV with all documented columns
+- [x] **CDR-05**: CDR search returns a filter summary alongside results (Vobiz parity)
+- [x] **CDR-06**: CDR recent returns the N most recent CDRs without requiring a date range
+- [x] **CDR-07**: CDR export streams results as CSV with all documented columns
 
 ### Diagnostics (DIAG)
 
@@ -52,10 +52,10 @@ Requirement IDs follow `[CATEGORY]-[NUMBER]`. All v2.0 requirements are user/ope
 
 - [ ] **SYS-01**: `GET /api/v1/system/health` returns uptime, db status, active call count, version
 - [ ] **SYS-02**: `POST /api/v1/system/reload` collapses existing AMI reload endpoints (trunks, routes, acl, app) into one call and returns the elapsed time
-- [ ] **SYS-03**: `GET /api/v1/system/info` returns version + build info from `version.rs`
-- [ ] **SYS-04**: `GET /api/v1/system/config` returns a non-sensitive subset of effective `ProxyConfig` + `system_config` rows
-- [ ] **SYS-05**: `GET /api/v1/system/stats` returns JSON stats derived from the existing `metrics.rs` Prometheus registry
-- [ ] **SYS-06**: `GET /api/v1/system/cluster` returns a hardcoded single-node response documented as intentional
+- [x] **SYS-03**: `GET /api/v1/system/info` returns version + build info from `version.rs`
+- [x] **SYS-04**: `GET /api/v1/system/config` returns a non-sensitive subset of effective `ProxyConfig` + `system_config` rows
+- [x] **SYS-05**: `GET /api/v1/system/stats` returns JSON stats derived from the existing `metrics.rs` Prometheus registry
+- [x] **SYS-06**: `GET /api/v1/system/cluster` returns a hardcoded single-node response documented as intentional
 
 ### Endpoints — SIP Listeners (LSTN)
 
@@ -189,7 +189,7 @@ Requirement IDs follow `[CATEGORY]-[NUMBER]`. All v2.0 requirements are user/ope
 - [x] **MIG-01**: All new tables ship with backward-compatible migrations that run on existing databases without data loss
 - [ ] **MIG-02**: Every migration has a documented rollback path (or is explicitly documented as forward-only)
 - [ ] **MIG-03**: Console UI routes render identically on every page touched by a refactor (sip_trunks, dids, call_records, routing, settings, diagnostics) — verified by spot check before phase merge
-- [ ] **MIG-04**: Existing `ami.rs` endpoints continue to respond until their `/api/v1/system/*` equivalents are documented as the supported surface
+- [x] **MIG-04**: Existing `ami.rs` endpoints continue to respond until their `/api/v1/system/*` equivalents are documented as the supported surface
 
 ## v2.1 Requirements (Deferred — Production Hardening milestone)
 
@@ -269,9 +269,9 @@ Every v2.0 requirement maps to exactly one phase.
 | CDR-02 | Phase 1 | Pending |
 | CDR-03 | Phase 1 | Pending |
 | CDR-04 | Phase 1 | Pending |
-| CDR-05 | Phase 11 | Pending |
-| CDR-06 | Phase 11 | Pending |
-| CDR-07 | Phase 11 | Pending |
+| CDR-05 | Phase 11 | Done |
+| CDR-06 | Phase 11 | Done |
+| CDR-07 | Phase 11 | Done |
 | DIAG-01 | Phase 1 | Pending |
 | DIAG-02 | Phase 1 | Pending |
 | DIAG-03 | Phase 1 | Pending |
@@ -279,10 +279,10 @@ Every v2.0 requirement maps to exactly one phase.
 | DIAG-05 | Phase 1 | Pending |
 | SYS-01 | Phase 1 | Pending |
 | SYS-02 | Phase 1 | Pending |
-| SYS-03 | Phase 11 | Pending |
-| SYS-04 | Phase 11 | Pending |
-| SYS-05 | Phase 11 | Pending |
-| SYS-06 | Phase 11 | Pending |
+| SYS-03 | Phase 11 | Done |
+| SYS-04 | Phase 11 | Done |
+| SYS-05 | Phase 11 | Done |
+| SYS-06 | Phase 11 | Done |
 | LSTN-01 | Phase 12 | Pending |
 | LSTN-02 | Phase 12 | Pending |
 | LSTN-03 | Phase 12 | Pending |
@@ -371,7 +371,7 @@ Every v2.0 requirement maps to exactly one phase.
 | MIG-01 | Phase 2 | Complete |
 | MIG-02 | Phase 12 | Pending |
 | MIG-03 | Phase 1 | Pending |
-| MIG-04 | Phase 11 | Pending |
+| MIG-04 | Phase 11 | Done |
 
 **Coverage:**
 - v2.0 requirements: 120 total

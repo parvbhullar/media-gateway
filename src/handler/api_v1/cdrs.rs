@@ -204,7 +204,9 @@ pub fn router() -> Router<AppState> {
 
 /// Build the SeaORM `Condition` for the shared CDR filter set. Used by
 /// `list_cdrs`, `search_cdrs`, and `handle_export` (DRY).
-fn build_cdr_filter(q: &CdrListQuery) -> Condition {
+/// Phase 12: widened to `pub(super)` so `handler::api_v1::recordings`
+/// can reuse the same filter set (D-10).
+pub(super) fn build_cdr_filter(q: &CdrListQuery) -> Condition {
     let mut conds = Condition::all();
     if let Some(v) = q.direction.as_ref().filter(|s| !s.is_empty()) {
         conds = conds.add(CdrColumn::Direction.eq(v.clone()));

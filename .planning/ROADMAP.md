@@ -24,7 +24,7 @@ v2.0 closes the gap between media-gateway's rich data plane (rsipstack proxy, Se
 - [ ] **Phase 8: Translations Engine** - Number rewrite before routing
 - [x] **Phase 9: Manipulations Engine** - SIP header rewrite after routing (completed 2026-05-01)
 - [x] **Phase 10: Security Suite** - Runtime firewall, flood, brute-force, auto-blocks, topology hiding (completed 2026-05-01)
-- [ ] **Phase 11: System Polish & CDR Export** - `/system/info|config|stats|cluster` + CDR search/recent/export
+- [x] **Phase 11: System Polish & CDR Export** - `/system/info|config|stats|cluster` + CDR search/recent/export (completed 2026-05-03)
 - [ ] **Phase 12: Listeners Projection & Recordings First-Class** - Read-only listeners, recordings CRUD/download/export
 - [ ] **Phase 13: CPaaS Layer (Endpoints, Applications, Sub-Accounts)** - Vobiz-shaped user-agent endpoints, XML routing, multi-tenancy
 
@@ -190,6 +190,12 @@ Plans:
   2. `GET /api/v1/cdrs` supports search-with-filter-summary, recent-without-date-range, and CSV export streaming with all documented columns
   3. `handler/ami.rs` endpoints continue responding but `/api/v1/system/*` is documented as the supported surface going forward
 
+**Plans:** 2 plans
+
+Plans:
+- [x] 11-01-PLAN.md — SYS-03/04/05/06 + MIG-04: /system/{info,config,stats,cluster} + AMI X-Deprecation header
+- [x] 11-02-PLAN.md — CDR-05/06/07: /cdrs/{search,recent,export} with filter summary + 1M-row CSV streaming guard
+
 ### Phase 12: Listeners Projection & Recordings First-Class
 **Goal**: Expose SIP transports as a read-only projection and promote recordings from CDR placeholders to first-class `/api/v1/recordings` resource.
 **Depends on**: Phase 1
@@ -228,7 +234,7 @@ Phases execute in numeric order: 1 → 2 → 3 → ... → 13
 | 8. Translations Engine | 0/TBD | Not started | - |
 | 9. Manipulations Engine | 4/4 | Complete   | 2026-05-01 |
 | 10. Security Suite | 0/TBD | Not started | - |
-| 11. System Polish & CDR Export | 0/TBD | Not started | - |
+| 11. System Polish & CDR Export | 2/2 | Complete   | 2026-05-03 |
 | 12. Listeners Projection & Recordings First-Class | 0/TBD | Not started | - |
 | 13. CPaaS Layer | 0/TBD | Not started | - |
 
