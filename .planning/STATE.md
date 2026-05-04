@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: milestone
 status: verifying
-stopped_at: Completed 12-04-PLAN.md (MIG-02 migration audit)
-last_updated: "2026-05-04T16:36:14.758Z"
+stopped_at: "Completed 12-02-PLAN.md (recordings core: list/get/download/delete + 8 integration tests)"
+last_updated: "2026-05-04T16:45:50.560Z"
 last_activity: 2026-05-04
 progress:
   total_phases: 13
   completed_phases: 11
   total_plans: 50
-  completed_plans: 48
-  percent: 96
+  completed_plans: 49
+  percent: 98
 ---
 
 # Project State
@@ -52,6 +52,7 @@ Progress: [█████████░] 85%  (11 of 13 phases)
 | 9. Manipulations Engine | 4 | 4 | Done (MAN-01..07 + IT-02) -- see 09-0{1..4}-SUMMARY.md |
 | Phase 04 P02 | ~8 min | 3 tasks | 3 files |
 | Phase 08 P04 | ~10 min | 3 tasks | 2 files |
+| Phase 12-listeners-recordings P02 | 10 | 2 tasks | 2 files |
 
 ## Phase 2 Verification (2026-04-16)
 
@@ -127,6 +128,8 @@ Decisions are logged in PROJECT.md Key Decisions table. Recent decisions affecti
 - [Phase 04]: map_command_result helper owns D-07 dispatch-to-HTTP mapping; shared entry point for plans 04-03/04/05 (accepts optional extra fields for response body enrichment)
 - [Phase 04]: leg->track_id resolved via compile-time SipSession::CALLER_TRACK_ID/CALLEE_TRACK_ID constants in the adapter layer; handler never accepts client-supplied track_id (mitigates T-04-02-02)
 - [Phase 04]: mute_missing_leg_returns_400 accepts either 400 or 422 status — axum 0.8 Json extractor surfaces missing-required-field as 422; validate_leg still returns 400 for invalid values
+- [Phase 12-02]: axum 0.8 has no 302 constructor — built manual 302 response for remote recording redirect
+- [Phase 12-02]: recording_storage derived per-row from URL shape (not global CdrStorage::is_local()) for mixed-storage accuracy
 
 ### Roadmap Evolution
 
@@ -147,7 +150,7 @@ Decisions are logged in PROJECT.md Key Decisions table. Recent decisions affecti
 
 ## Session Continuity
 
-Last session: 2026-05-04T16:36:14.754Z
-Stopped at: Completed 12-04-PLAN.md (MIG-02 migration audit)
+Last session: 2026-05-04T16:45:50.557Z
+Stopped at: Completed 12-02-PLAN.md (recordings core: list/get/download/delete + 8 integration tests)
 Resume file: None
 Next: Phase 5 — Trunk Enforcement (independent of Phase 4)
