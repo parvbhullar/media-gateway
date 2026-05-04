@@ -3,15 +3,15 @@ gsd_state_version: 1.0
 milestone: v2.0
 milestone_name: milestone
 status: verifying
-stopped_at: "Completed 12-02-PLAN.md (recordings core: list/get/download/delete + 8 integration tests)"
-last_updated: "2026-05-04T16:45:50.560Z"
+stopped_at: Completed 12-03-PLAN.md (recordings export + bulk delete + 5 integration tests)
+last_updated: "2026-05-04T17:05:59.714Z"
 last_activity: 2026-05-04
 progress:
   total_phases: 13
-  completed_phases: 11
+  completed_phases: 12
   total_plans: 50
-  completed_plans: 49
-  percent: 98
+  completed_plans: 50
+  percent: 100
 ---
 
 # Project State
@@ -53,6 +53,7 @@ Progress: [█████████░] 85%  (11 of 13 phases)
 | Phase 04 P02 | ~8 min | 3 tasks | 3 files |
 | Phase 08 P04 | ~10 min | 3 tasks | 2 files |
 | Phase 12-listeners-recordings P02 | 10 | 2 tasks | 2 files |
+| Phase 12-listeners-recordings P03 | 20 | 2 tasks | 2 files |
 
 ## Phase 2 Verification (2026-04-16)
 
@@ -130,6 +131,8 @@ Decisions are logged in PROJECT.md Key Decisions table. Recent decisions affecti
 - [Phase 04]: mute_missing_leg_returns_400 accepts either 400 or 422 status — axum 0.8 Json extractor surfaces missing-required-field as 422; validate_leg still returns 400 for invalid values
 - [Phase 12-02]: axum 0.8 has no 302 constructor — built manual 302 response for remote recording redirect
 - [Phase 12-02]: recording_storage derived per-row from URL shape (not global CdrStorage::is_local()) for mixed-storage accuracy
+- [Phase 12-03]: async_zip 0.0.17 with_tokio() takes Cursor<Vec<u8>> ownership; close() returns Compat<Cursor<Vec<u8>>> requiring two into_inner() calls
+- [Phase 12-03]: Option<Json<ExportBody>> extractor rejects empty body when Content-Type:application/json set; tests omit Content-Type for empty-body POSTs
 
 ### Roadmap Evolution
 
@@ -150,7 +153,7 @@ Decisions are logged in PROJECT.md Key Decisions table. Recent decisions affecti
 
 ## Session Continuity
 
-Last session: 2026-05-04T16:45:50.557Z
-Stopped at: Completed 12-02-PLAN.md (recordings core: list/get/download/delete + 8 integration tests)
+Last session: 2026-05-04T17:05:59.710Z
+Stopped at: Completed 12-03-PLAN.md (recordings export + bulk delete + 5 integration tests)
 Resume file: None
 Next: Phase 5 — Trunk Enforcement (independent of Phase 4)

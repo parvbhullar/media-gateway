@@ -163,8 +163,8 @@ Requirement IDs follow `[CATEGORY]-[NUMBER]`. All v2.0 requirements are user/ope
 - [x] **REC-02**: `GET /api/v1/recordings/{id}` returns recording metadata
 - [x] **REC-03**: `GET /api/v1/recordings/{id}/download` streams the recording file
 - [x] **REC-04**: `DELETE /api/v1/recordings/{id}` deletes a recording (file + DB row)
-- [ ] **REC-05**: `POST /api/v1/recordings/export` exports multiple recordings as an archive
-- [ ] **REC-06**: `DELETE /api/v1/recordings/bulk` deletes recordings matching criteria (date range, trunk, status)
+- [x] **REC-05**: `POST /api/v1/recordings/export` exports multiple recordings as an archive
+- [x] **REC-06**: `DELETE /api/v1/recordings/bulk` deletes recordings matching criteria (date range, trunk, status)
 - [x] **REC-07**: Recording endpoints wrap existing `callrecord/storage.rs` and `callrecord/sipflow.rs` — no new storage layer
 
 ### Sub-Accounts & Multi-Tenancy (TEN)
@@ -354,8 +354,8 @@ Every v2.0 requirement maps to exactly one phase.
 | REC-02 | Phase 12 | Complete |
 | REC-03 | Phase 12 | Complete |
 | REC-04 | Phase 12 | Complete |
-| REC-05 | Phase 12 | Pending |
-| REC-06 | Phase 12 | Pending |
+| REC-05 | Phase 12 | Complete |
+| REC-06 | Phase 12 | Complete |
 | REC-07 | Phase 12 | Complete |
 | TEN-01 | Phase 13 | Pending |
 | TEN-02 | Phase 13 | Pending |

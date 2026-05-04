@@ -25,7 +25,7 @@ v2.0 closes the gap between media-gateway's rich data plane (rsipstack proxy, Se
 - [x] **Phase 9: Manipulations Engine** - SIP header rewrite after routing (completed 2026-05-01)
 - [x] **Phase 10: Security Suite** - Runtime firewall, flood, brute-force, auto-blocks, topology hiding (completed 2026-05-01)
 - [x] **Phase 11: System Polish & CDR Export** - `/system/info|config|stats|cluster` + CDR search/recent/export (completed 2026-05-03)
-- [ ] **Phase 12: Listeners Projection & Recordings First-Class** - Read-only listeners, recordings CRUD/download/export
+- [x] **Phase 12: Listeners Projection & Recordings First-Class** - Read-only listeners, recordings CRUD/download/export (completed 2026-05-04)
 - [ ] **Phase 13: CPaaS Layer (Endpoints, Applications, Sub-Accounts)** - Vobiz-shaped user-agent endpoints, XML routing, multi-tenancy
 
 ## Phase Details
@@ -206,12 +206,12 @@ Plans:
   3. Operator can export multiple recordings as an archive via `POST /api/v1/recordings/export` and bulk-delete via criteria (date range, trunk, status)
   4. Every new table shipped in this milestone has a documented rollback path (or is explicitly marked forward-only)
 
-**Plans:** 3/4 plans executed
+**Plans:** 4/4 plans complete
 
 Plans:
 - [x] 12-01-PLAN.md — Wave 1: shared infrastructure (ApiError::gone, build_cdr_filter pub(super), async_zip dep, listeners.rs full LSTN-01..04, recordings.rs stub, mod.rs registration)
 - [x] 12-02-PLAN.md — Wave 2A: recordings core (list/get/download/delete) — REC-01..04, REC-07
-- [ ] 12-03-PLAN.md — Wave 3: recordings export + bulk delete — REC-05, REC-06 (depends on 12-02)
+- [x] 12-03-PLAN.md — Wave 3: recordings export + bulk delete — REC-05, REC-06 (depends on 12-02)
 - [x] 12-04-PLAN.md — Wave 2B (parallel): migration audit docs/MIGRATIONS.md — MIG-02
 
 ### Phase 13: CPaaS Layer (Endpoints, Applications, Sub-Accounts)
@@ -243,7 +243,7 @@ Phases execute in numeric order: 1 → 2 → 3 → ... → 13
 | 9. Manipulations Engine | 4/4 | Complete   | 2026-05-01 |
 | 10. Security Suite | 0/TBD | Not started | - |
 | 11. System Polish & CDR Export | 2/2 | Complete   | 2026-05-03 |
-| 12. Listeners Projection & Recordings First-Class | 3/4 | In Progress|  |
+| 12. Listeners Projection & Recordings First-Class | 4/4 | Complete   | 2026-05-04 |
 | 13. CPaaS Layer | 0/TBD | Not started | - |
 
 ---
