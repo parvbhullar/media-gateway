@@ -889,6 +889,7 @@ fn maybe_drop_transcribe_marker(path: &str, transcribe: bool, session_id: &str) 
     let _ = session_id; // suppress unused warning
 }
 
+#[allow(dead_code)]
 async fn build_recording_completed_event(
     session_id: &str,
     recording_path: &str,
