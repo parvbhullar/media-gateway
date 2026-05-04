@@ -255,16 +255,6 @@ async fn resolve_route(
             selected_gateway: None,
             trace: trace_vec,
         },
-        _ => ResolveRouteResponse {
-            result: "unhandled".into(),
-            matched_table: None,
-            matched_record_index: None,
-            matched_record_id: None,
-            match_reason: None,
-            target: None,
-            selected_gateway: None,
-            trace: trace_vec,
-        },
     };
 
     Ok(Json(response))
