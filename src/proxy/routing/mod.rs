@@ -14,13 +14,17 @@ use std::{
 };
 use tokio::net::lookup_host;
 
+pub mod codec_normalize;
 pub mod did_index;
 pub mod http;
 #[cfg(test)]
 mod http_tests;
+pub mod match_types;
 pub mod matcher;
+pub mod table_matcher;
 #[cfg(test)]
 mod tests;
+pub mod trunk_group_resolver;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[derive(Default)]

@@ -27,6 +27,8 @@ pub mod routing;
 pub mod server;
 #[cfg(test)]
 pub mod tests;
+pub mod trunk_acl_eval;
+pub mod trunk_capacity_state;
 pub mod trunk_registrar;
 pub mod user;
 pub mod user_db;
