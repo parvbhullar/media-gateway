@@ -1399,6 +1399,16 @@ async fn route_evaluate(
                 rewrites,
             )
         }
+        RouteResult::Reject { code, reason, .. } => (
+            RouteOutcomeView::Abort(RouteAbortOutcome {
+                code,
+                reason: Some(reason.clone()),
+            }),
+            original_option.caller.to_string(),
+            original_option.callee.to_string(),
+            request.uri.to_string(),
+            Vec::new(),
+        ),
     };
 
     Json(RouteEvaluationResponse {

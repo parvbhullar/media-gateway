@@ -28,6 +28,12 @@ pub struct ActiveProxyCallEntry {
     pub started_at: DateTime<Utc>,
     pub answered_at: Option<DateTime<Utc>>,
     pub status: ActiveProxyCallStatus,
+    /// Phase R-full/T — name of the trunk-group whose capacity Permit
+    /// is held for this call. None when enforcement is off, when the
+    /// call did not route through a trunk-group, or when no capacity
+    /// row was configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trunk_group_name: Option<String>,
 }
 
 #[derive(Default)]
@@ -37,6 +43,11 @@ struct RegistryState {
     handles_by_dialog: HashMap<String, SipSessionHandle>,
     // session_id -> all registered dialog_ids (multiple dialogs per session during failover)
     dialog_by_session: HashMap<String, Vec<String>>,
+    /// Phase R-full/T — capacity Permits held for active calls. Lives
+    /// in a sibling map (not on `ActiveProxyCallEntry`) because Permit
+    /// is neither Clone nor Serialize. Removed when the session is
+    /// removed; Drop releases the trunk-capacity slot.
+    permits: HashMap<String, crate::proxy::trunk_capacity_state::Permit>,
 }
 
 pub struct ActiveProxyCallRegistry {
@@ -103,12 +114,27 @@ impl ActiveProxyCallRegistry {
         let mut guard = self.inner.lock().unwrap();
         guard.entries.remove(session_id);
         guard.handles.remove(session_id);
+        // Phase R-full/T — drop the capacity Permit (if held). Drop fires
+        // here releasing the trunk-capacity slot.
+        guard.permits.remove(session_id);
         // Remove all dialog handles registered for this session
         if let Some(dialog_ids) = guard.dialog_by_session.remove(session_id) {
             for dialog_id in dialog_ids {
                 guard.handles_by_dialog.remove(&dialog_id);
             }
         }
+    }
+
+    /// Phase R-full/T — store a trunk-capacity Permit for the session.
+    /// The Permit lives in the registry so that `remove()` triggers Drop
+    /// → `TrunkCapacityGate::release()` automatically when the call ends.
+    pub fn store_permit(
+        &self,
+        session_id: &str,
+        permit: crate::proxy::trunk_capacity_state::Permit,
+    ) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.permits.insert(session_id.to_string(), permit);
     }
 
     pub fn count(&self) -> usize {
@@ -164,6 +190,7 @@ impl ActiveProxyCallRegistry {
             started_at: Utc::now(),
             answered_at: None,
             status: ActiveProxyCallStatus::Ringing,
+            trunk_group_name: None,
         };
         self.upsert(entry, handle);
     }
@@ -232,6 +259,7 @@ mod tests {
             started_at: chrono::Utc::now(),
             answered_at: None,
             status: ActiveProxyCallStatus::Ringing,
+            trunk_group_name: None,
         }
     }
 

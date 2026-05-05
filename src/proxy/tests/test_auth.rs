@@ -514,6 +514,7 @@ async fn test_guest_call_allowed_extension() {
             tx
         },
         webhook_cancel_registry: std::sync::Arc::new(crate::proxy::webhook::WebhookCancelRegistry::new()),
+        trunk_capacity: std::sync::Arc::new(crate::proxy::trunk_capacity_state::TrunkCapacityState::new()),
     });
 
     let module = AuthModule::new(server_inner.clone(), server_inner.proxy_config.clone());

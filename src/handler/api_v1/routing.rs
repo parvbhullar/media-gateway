@@ -255,6 +255,16 @@ async fn resolve_route(
             selected_gateway: None,
             trace: trace_vec,
         },
+        RouteResult::Reject { code, reason, .. } => ResolveRouteResponse {
+            result: "reject".into(),
+            matched_table: trace.matched_table.clone(),
+            matched_record_index: trace.matched_record_index,
+            matched_record_id: trace.matched_record_id.clone(),
+            match_reason: Some(format!("{} ({})", reason, code)),
+            target: None,
+            selected_gateway: None,
+            trace: trace_vec,
+        },
     };
 
     Ok(Json(response))

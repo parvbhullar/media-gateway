@@ -131,6 +131,7 @@ impl SessionRegistry for RegistryAdapter {
             started_at: entry.started_at,
             answered_at: entry.answered_at,
             status: proxy_status,
+            trunk_group_name: None,
         };
 
         // Note: We can't call upsert here because that requires a handle

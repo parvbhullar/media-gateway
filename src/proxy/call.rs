@@ -456,6 +456,12 @@ impl CallModule {
                 Some(Arc::new(crate::call::policy::PolicyGuard::new(limiter)));
         }
 
+        // Phase R-full/T — attach DB so the runtime matcher / trunk-group
+        // resolver / capacity check can query the supersip_* tables.
+        if let Some(db) = server.database.clone() {
+            routing_state = routing_state.with_db(db);
+        }
+
         let inner = Arc::new(CallModuleInner {
             config,
             server,
@@ -728,6 +734,18 @@ impl CallModule {
                     auto_answer,
                     ..
                 } => (None, None, Some((app_name, app_params, auto_answer)), None),
+                RouteResult::Reject {
+                    code,
+                    reason,
+                    retry_after_secs: _,
+                } => {
+                    // Trunk-enforcement reject during preview. Map to a SIP
+                    // error response. The Retry-After header is not yet
+                    // plumbed through RouteError; reason carries the cause.
+                    let status = rsipstack::sip::StatusCode::from(code);
+                    let err = anyhow::anyhow!(reason);
+                    return Err(RouteError::from((err, Some(status))));
+                }
             }
         };
 
@@ -1885,6 +1903,7 @@ impl CallModule {
             started_at: chrono::Utc::now(),
             answered_at: None,
             status: ActiveProxyCallStatus::Ringing,
+            trunk_group_name: None,
         };
         registry.upsert(entry, new_handle.clone());
 

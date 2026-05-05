@@ -263,6 +263,42 @@ pub struct Config {
     pub rwi: Option<RwiConfig>,
     #[serde(default)]
     pub cluster: Option<ClusterConfig>,
+    /// Trunk-enforcement gates (Phase 5/T). Default: OFF — call routing
+    /// behavior is unchanged unless `[trunk.enforcement] enabled = true`.
+    #[serde(default)]
+    pub trunk: TrunkConfigSection,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct TrunkConfigSection {
+    #[serde(default)]
+    pub enforcement: TrunkEnforcementConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TrunkEnforcementConfig {
+    /// Master switch. When `false` (default) all 3 INVITE-path gates
+    /// (ACL, capacity, CPS) short-circuit and the proxy behaves as it
+    /// did before Phase 5/T landed.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Fallback per-trunk-group concurrent-call cap when no row exists
+    /// in `supersip_trunk_capacity`. None = unlimited (allow).
+    #[serde(default)]
+    pub default_max_calls: Option<u32>,
+    /// Fallback per-trunk-group calls-per-second cap. None = unlimited.
+    #[serde(default)]
+    pub default_max_cps: Option<u32>,
+}
+
+impl Default for TrunkEnforcementConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_max_calls: None,
+            default_max_cps: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -782,6 +818,15 @@ pub enum RouteResult {
     },
     NotHandled(InviteOption, Option<DialplanHints>),
     Abort(StatusCode, Option<String>),
+    /// Phase 5/T — Trunk-enforcement reject. Distinct from `Abort` because
+    /// it carries a structured reason code (e.g. `trunk_capacity_exhausted`,
+    /// `trunk_cps_exhausted`, `trunk_acl_blocked`) and an optional
+    /// `Retry-After` value that maps to the SIP 503 header.
+    Reject {
+        code: u16,
+        reason: String,
+        retry_after_secs: Option<u32>,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize, Default)]
@@ -1007,6 +1052,7 @@ impl Default for Config {
             #[cfg(feature = "commerce")]
             licenses: None,
             cluster: None,
+            trunk: TrunkConfigSection::default(),
         }
     }
 }

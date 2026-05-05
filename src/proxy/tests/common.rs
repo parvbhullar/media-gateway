@@ -112,6 +112,7 @@ pub async fn create_test_server_with_config(
             tx
         },
         webhook_cancel_registry: std::sync::Arc::new(crate::proxy::webhook::WebhookCancelRegistry::new()),
+        trunk_capacity: std::sync::Arc::new(crate::proxy::trunk_capacity_state::TrunkCapacityState::new()),
     });
 
     // Add test users

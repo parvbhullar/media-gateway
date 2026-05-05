@@ -1089,6 +1089,10 @@ pub struct RoutingState {
     /// Round-robin counters for each destination group
     round_robin_counters: Arc<Mutex<HashMap<String, usize>>>,
     pub policy_guard: Option<Arc<crate::call::policy::PolicyGuard>>,
+    /// Optional DB connection — populated by the proxy boot path so the
+    /// matcher / trunk-group resolver / capacity check can query the
+    /// supersip_* tables. None for embedded / standalone test paths.
+    db: Option<sea_orm::DatabaseConnection>,
 }
 
 impl Default for RoutingState {
@@ -1102,7 +1106,22 @@ impl RoutingState {
         Self {
             round_robin_counters: Arc::new(Mutex::new(HashMap::new())),
             policy_guard: None,
+            db: None,
         }
+    }
+
+    /// Builder — attach a DB connection. Used by the proxy boot path so
+    /// the runtime matcher can query supersip_routing_tables, trunk
+    /// capacity, and ACL tables.
+    pub fn with_db(mut self, db: sea_orm::DatabaseConnection) -> Self {
+        self.db = Some(db);
+        self
+    }
+
+    /// Borrow the optional DB connection. Returns `None` when running
+    /// in a path that hasn't been wired with persistence (tests, etc.).
+    pub fn db(&self) -> Option<&sea_orm::DatabaseConnection> {
+        self.db.as_ref()
     }
 
     /// Get the next trunk index for round-robin selection

@@ -95,6 +95,10 @@ pub struct SipServerInner {
     pub webhook_sender: crate::proxy::webhook::WebhookEventSender,
     /// Phase 7 — in-memory cancel registry for in-flight webhook retries.
     pub webhook_cancel_registry: Arc<crate::proxy::webhook::WebhookCancelRegistry>,
+    /// Phase R-full/T — trunk capacity bookkeeping (concurrent calls + CPS).
+    /// Constructed at boot, queried by the INVITE-path enforcement gates
+    /// (which only fire when `[trunk.enforcement] enabled = true`).
+    pub trunk_capacity: Arc<crate::proxy::trunk_capacity_state::TrunkCapacityState>,
 }
 
 pub type SipServerRef = Arc<SipServerInner>;
@@ -644,6 +648,12 @@ impl SipServerBuilder {
             tokio::sync::broadcast::channel::<crate::proxy::webhook::WebhookEvent>(1024);
         let webhook_cancel_registry =
             Arc::new(crate::proxy::webhook::WebhookCancelRegistry::new());
+
+        // Phase R-full/T — trunk capacity bookkeeping. Queried only by the
+        // INVITE-path enforcement gates, which are gated by
+        // `[trunk.enforcement] enabled` (default false).
+        let trunk_capacity =
+            Arc::new(crate::proxy::trunk_capacity_state::TrunkCapacityState::new());
         // Spawn webhook delivery processor if DB is available.
         if let Some(db_for_processor) = database.clone() {
             let sender_for_processor = webhook_sender.clone();
@@ -694,6 +704,7 @@ impl SipServerBuilder {
             cluster_peer_ips,
             webhook_sender,
             webhook_cancel_registry,
+            trunk_capacity,
         });
 
         let inner_weak = Arc::downgrade(&inner);
