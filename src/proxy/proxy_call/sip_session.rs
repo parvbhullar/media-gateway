@@ -81,6 +81,50 @@ enum TimerAction {
     Expired,
 }
 
+// Phase 7 D-06: webhook event builders for the two emit sites in this file.
+// `call.started` fires from `accept_call` after 200 OK; `call.failed` fires
+// from `cleanup` when no answer was ever observed.
+pub(crate) fn build_call_started_event(
+    session_id: &str,
+    caller_number: Option<&str>,
+    destination_number: Option<&str>,
+    direction: &str,
+) -> crate::proxy::webhook::WebhookEvent {
+    crate::proxy::webhook::WebhookEvent {
+        event_id: crate::proxy::webhook::new_event_id(),
+        event: "call.started".to_string(),
+        timestamp: crate::proxy::webhook::current_unix_timestamp(),
+        data: serde_json::json!({
+            "session_id": session_id,
+            "caller_number": caller_number,
+            "destination_number": destination_number,
+            "started_at": crate::proxy::webhook::current_unix_timestamp(),
+            "direction": direction,
+        }),
+    }
+}
+
+pub(crate) fn build_call_failed_event(
+    session_id: &str,
+    caller_number: Option<&str>,
+    destination_number: Option<&str>,
+    failure_reason: &str,
+    sip_code: Option<u16>,
+) -> crate::proxy::webhook::WebhookEvent {
+    crate::proxy::webhook::WebhookEvent {
+        event_id: crate::proxy::webhook::new_event_id(),
+        event: "call.failed".to_string(),
+        timestamp: crate::proxy::webhook::current_unix_timestamp(),
+        data: serde_json::json!({
+            "session_id": session_id,
+            "caller_number": caller_number,
+            "destination_number": destination_number,
+            "failure_reason": failure_reason,
+            "sip_code": sip_code,
+        }),
+    }
+}
+
 enum UpdateRefreshOutcome {
     Refreshed,
     Retry,
@@ -3918,8 +3962,8 @@ impl SipSession {
                 .with_cancel_token(self.callee_peer.cancel_token())
                 .with_enable_latching(self.server.proxy_config.enable_latching);
 
-            if let Some(ref external_ip) = self.server.rtp_config.external_ip {
-                track_builder = track_builder.with_external_ip(external_ip.clone());
+            if let Some(ip) = self.caller_facing_ip_str() {
+                track_builder = track_builder.with_external_ip(ip);
             }
             if let Some(ref bind_ip) = self.server.rtp_config.bind_ip {
                 track_builder = track_builder.with_bind_ip(bind_ip.clone());
@@ -4177,6 +4221,15 @@ impl SipSession {
                     entry.callee = callee.clone();
                 }
             });
+
+        // Phase 7 D-06: emit call.started after 200 OK accept. Non-fatal.
+        let started_event = build_call_started_event(
+            &session_id,
+            caller.as_deref(),
+            callee.as_deref(),
+            "inbound",
+        );
+        let _ = self.server.webhook_sender.send(started_event);
 
         // Auto-start recording when the call is answered if configured.
         if self.context.dialplan.recording.enabled
@@ -4674,6 +4727,20 @@ impl SipSession {
 
     async fn cleanup(&mut self) {
         debug!(session_id = %self.context.session_id, "Cleaning up session");
+
+        // Phase 7 D-06: emit call.failed when no answer was ever observed
+        // (suppressed when the call answered — in that case call.started has
+        // already fired and the lifecycle is closed by call.completed).
+        if self.answer_time.is_none() {
+            let failed_event = build_call_failed_event(
+                &self.context.session_id,
+                Some(self.context.original_caller.as_str()),
+                Some(self.context.original_callee.as_str()),
+                "no_answer",
+                None,
+            );
+            let _ = self.server.webhook_sender.send(failed_event);
+        }
 
         self.stop_caller_ingress_monitor().await;
 

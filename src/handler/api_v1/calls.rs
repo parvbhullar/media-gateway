@@ -877,36 +877,63 @@ fn resolve_recording_path(
 ///
 /// Failures are logged as warnings — a missing marker is never fatal.
 ///
-fn maybe_drop_transcribe_marker(path: &str, transcribe: bool, session_id: &str) {
+/// Phase 4 D-18: transcribe marker → Phase 7 transcribe.requested event.
+/// When the marker WRITE succeeds AND a webhook sender is wired, emit a
+/// `transcribe.requested` event (D-07 envelope).
+fn maybe_drop_transcribe_marker(
+    path: &str,
+    transcribe: bool,
+    session_id: &str,
+    webhook_sender: Option<&crate::proxy::webhook::WebhookEventSender>,
+) {
     if !transcribe {
         return;
     }
     let marker = format!("{}.transcribe.marker", path);
     match std::fs::File::create(&marker) {
-        Ok(_) => tracing::info!("dropped transcribe marker: {}", marker),
+        Ok(_) => {
+            tracing::info!("dropped transcribe marker: {}", marker);
+            if let Some(sender) = webhook_sender {
+                let event = crate::proxy::webhook::WebhookEvent {
+                    event_id: crate::proxy::webhook::new_event_id(),
+                    event: "transcribe.requested".to_string(),
+                    timestamp: crate::proxy::webhook::current_unix_timestamp(),
+                    data: serde_json::json!({
+                        "session_id": session_id,
+                        "recording_path": path,
+                        "marker_path": marker,
+                    }),
+                };
+                let _ = sender.send(event);
+            }
+        }
         Err(e) => tracing::warn!("failed to drop transcribe marker '{}': {}", marker, e),
     }
-    let _ = session_id; // suppress unused warning
 }
 
-#[allow(dead_code)]
+/// Build the `recording.completed` envelope (D-07). Best-effort metadata —
+/// `size_bytes` reads the file metadata; failure → 0.
 async fn build_recording_completed_event(
     session_id: &str,
     recording_path: &str,
     format: &str,
-) -> serde_json::Value {
+) -> crate::proxy::webhook::WebhookEvent {
     let size_bytes = tokio::fs::metadata(recording_path)
         .await
         .map(|m| m.len())
         .unwrap_or(0);
-    serde_json::json!({
-        "event": "recording.completed",
-        "session_id": session_id,
-        "recording_path": recording_path,
-        "format": format,
-        "duration_secs": 0,
-        "size_bytes": size_bytes,
-    })
+    crate::proxy::webhook::WebhookEvent {
+        event_id: crate::proxy::webhook::new_event_id(),
+        event: "recording.completed".to_string(),
+        timestamp: crate::proxy::webhook::current_unix_timestamp(),
+        data: serde_json::json!({
+            "session_id": session_id,
+            "recording_path": recording_path,
+            "format": format,
+            "duration_secs": 0,
+            "size_bytes": size_bytes,
+        }),
+    }
 }
 
 async fn record_call(
@@ -923,7 +950,18 @@ async fn record_call(
     let resolved =
         resolve_recording_path(req.path.as_deref(), &id, &format, &recorder_path)?;
 
-    maybe_drop_transcribe_marker(&resolved, req.transcribe.unwrap_or(false), &id);
+    let webhook_sender = state.webhook_sender();
+    maybe_drop_transcribe_marker(
+        &resolved,
+        req.transcribe.unwrap_or(false),
+        &id,
+        Some(&webhook_sender),
+    );
+
+    // Phase 7 D-06: emit recording.completed after dispatch returns success.
+    let recording_event =
+        build_recording_completed_event(&id, &resolved, &format).await;
+    let _ = webhook_sender.send(recording_event);
 
     let payload = CallCommandPayload::Record {
         path: Some(resolved.clone()),
@@ -1231,9 +1269,9 @@ mod tests {
             "wav",
         )
         .await;
-        assert_eq!(ev["event"], "recording.completed");
-        assert_eq!(ev["session_id"], "sess-r");
-        assert_eq!(ev["format"], "wav");
-        assert_eq!(ev["size_bytes"], 5);
+        assert_eq!(ev.event, "recording.completed");
+        assert_eq!(ev.data["session_id"], "sess-r");
+        assert_eq!(ev.data["format"], "wav");
+        assert_eq!(ev.data["size_bytes"], 5);
     }
 }
