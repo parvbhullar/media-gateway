@@ -1,4 +1,5 @@
 use crate::call::user::SipUser;
+use crate::models::supersip_endpoints::{Column as EpColumn, Entity as EpEndpointEntity};
 use crate::models::{department, extension};
 use crate::proxy::auth::AuthError;
 use anyhow::Result;
@@ -29,6 +30,47 @@ impl ExtensionUserBackend {
     pub async fn connect(database_url: &str, ttl_secs: u64) -> Result<Self> {
         let db = crate::models::create_db(database_url).await?;
         Ok(Self::new(db, ttl_secs))
+    }
+
+    /// Query `supersip_endpoints` for a username.
+    ///
+    /// Returns `Some(SipUser)` when a matching, enabled endpoint is found.
+    /// The `password` field carries the stored HA1 digest so that callers
+    /// which perform pre-hashed verification can use it directly.
+    ///
+    /// TODO(13-05): rsipstack's `verify_digest` expects plaintext and
+    /// recomputes HA1 internally.  Until the auth layer gains an HA1-aware
+    /// verification path, SIP REGISTER/INVITE for supersip_endpoints users
+    /// will fail credential checks.  Phase 13-05 must either:
+    ///   (a) add `SipUser.ha1: Option<String>` and branch in `verify_credentials`, or
+    ///   (b) expose a `verify_digest_ha1` variant in rsipstack.
+    async fn fetch_endpoint_user(
+        &self,
+        username: &str,
+        realm: Option<&str>,
+    ) -> Result<Option<SipUser>> {
+        let mut query = EpEndpointEntity::find()
+            .filter(EpColumn::Username.eq(username))
+            .filter(EpColumn::Enabled.eq(true));
+
+        // Filter by realm when provided
+        if let Some(r) = realm {
+            if !r.is_empty() {
+                query = query.filter(EpColumn::Realm.eq(r));
+            }
+        }
+
+        let row = query.one(&self.db).await?;
+        Ok(row.map(|ep| SipUser {
+            username: ep.username,
+            // HA1 stored in password field.
+            // TODO(13-05): auth layer needs HA1-aware verify path.
+            password: Some(ep.ha1),
+            enabled: ep.enabled,
+            realm: Some(ep.realm),
+            display_name: ep.alias,
+            ..Default::default()
+        }))
     }
 
     async fn fetch_extension(
@@ -104,15 +146,23 @@ impl UserBackend for ExtensionUserBackend {
             }
         }
 
-        let result = self
-            .fetch_extension(username)
-            .await
-            .map_err(AuthError::from)?;
-        let user = if let Some((model, departments)) = result {
-            Some(Self::build_sip_user(model, departments, realm))
-        } else {
-            None
-        };
+        // D-13: try supersip_endpoints first, fall back to legacy rustpbx_extensions.
+        let user =
+            if let Some(ep_user) = self
+                .fetch_endpoint_user(username, realm)
+                .await
+                .map_err(AuthError::from)?
+            {
+                Some(ep_user)
+            } else {
+                let result = self
+                    .fetch_extension(username)
+                    .await
+                    .map_err(AuthError::from)?;
+                result.map(|(model, departments)| {
+                    Self::build_sip_user(model, departments, realm)
+                })
+            };
 
         // Update cache
         if self.ttl.as_secs() > 0 {
