@@ -30,6 +30,7 @@ pub mod security;                 // Phase 10 — SEC-01..SEC-05
 pub mod webhooks;                 // Phase 7 — WH-01
 pub mod listeners;                // Phase 12 — LSTN-01..04
 pub mod recordings;               // Phase 12 — REC-01..07
+pub mod endpoints;                // Phase 13 — EPUA-01..05
 pub mod sub_accounts;             // Phase 13 — TEN-02
 
 use axum::{Router, middleware};
@@ -65,6 +66,7 @@ pub fn api_v1_router(state: AppState) -> Router {
         .merge(security::router())                 // Phase 10 — SEC-01..SEC-05
         .merge(listeners::router())                // Phase 12 — LSTN-01..04
         .merge(recordings::router())               // Phase 12 — REC-01..07
+        .merge(endpoints::router())                // Phase 13 — EPUA-01..05
         .merge(sub_accounts::router())             // Phase 13 — TEN-02
         ;
 
