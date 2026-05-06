@@ -114,6 +114,30 @@ where
     (state, plaintext)
 }
 
+/// Build an `AppState` with one freshly-issued API key scoped to `account_id`.
+///
+/// Useful for testing tenant isolation: pass `account_id = "acme"` to get a
+/// sub-account bearer token, or `account_id = "root"` for a master token.
+pub async fn test_state_with_api_key_for_account(
+    name: &str,
+    account_id: &str,
+) -> (AppState, String) {
+    let state = test_state_empty().await;
+    let IssuedKey { plaintext, hash } = issue_api_key();
+    let am = api_key::ActiveModel {
+        name: Set(name.to_string()),
+        hash_sha256: Set(hash),
+        description: Set(None),
+        created_at: Set(Utc::now()),
+        account_id: Set(account_id.to_string()),
+        ..Default::default()
+    };
+    am.insert(state.db())
+        .await
+        .expect("failed to insert test api_key");
+    (state, plaintext)
+}
+
 /// Build an `AppState` with a custom absolute recorder root, plus one API key.
 ///
 /// Returns `(state, token, recorder_root_path)`.  The caller is responsible
