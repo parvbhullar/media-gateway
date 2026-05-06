@@ -437,6 +437,64 @@ async fn match_invite_impl(
 ) -> Result<(RouteResult, Option<Permit>)> {
     let mut option = option;
 
+    // ── Phase 13 Plan 13-04 — DID→Application short-circuit ─────────────────
+    // Before consulting routing tables or rules, check whether the callee number
+    // belongs to an application.  Errors are swallowed with `.ok().flatten()` so
+    // that DB absence or missing rows fall through to normal routing unchanged.
+    if let Some(db) = routing_state.db() {
+        let callee_user = option.callee.user().unwrap_or_default().to_string();
+        let app_id_opt: Option<String> = async {
+            use crate::models::did::{Column as DidColumn, Entity as DidEntity};
+            use crate::models::supersip_application_numbers::{
+                Column as AppNumColumn, Entity as AppNumEntity,
+            };
+            use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+            // Step 1: look up the DID row by normalized number.
+            // We try the callee user as-is (may already be E.164) and also
+            // with a leading '+' stripped, falling back on no match.
+            let did_row = DidEntity::find()
+                .filter(DidColumn::Number.eq(callee_user.clone()))
+                .one(db)
+                .await
+                .ok()
+                .flatten();
+
+            let did_number = match did_row {
+                Some(row) => row.number,
+                None => return None,
+            };
+
+            // Step 2: look up the application_id via the join table.
+            let app_num = AppNumEntity::find()
+                .filter(AppNumColumn::DidId.eq(did_number))
+                .one(db)
+                .await
+                .ok()
+                .flatten()?;
+
+            Some(app_num.application_id)
+        }
+        .await;
+
+        if let Some(app_id) = app_id_opt {
+            tracing::info!(
+                callee = %callee_user,
+                app_id = %app_id,
+                "DID→Application short-circuit matched"
+            );
+            return Ok((
+                RouteResult::Application {
+                    option,
+                    app_name: "twiml".to_string(),
+                    app_params: Some(serde_json::json!({ "application_id": app_id })),
+                    auto_answer: true,
+                },
+                None,
+            ));
+        }
+    }
+
     // ── Phase 6 Plan 06-04 (D-06) — consult supersip_routing_tables ──
     // Fresh DB read per INVITE (D-29). Only runs when a DB connection is
     // available; tests + dry-run paths without a populated routing-tables
