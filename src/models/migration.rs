@@ -87,6 +87,12 @@ impl MigratorTrait for Migrator {
             // HA1 = md5(username:realm:password) per D-10.
             // MUST run AFTER add_account_id_to_all_tables.
             Box::new(super::supersip_endpoints::Migration),
+            // Phase 13 Plan 13-03 — APP-01..03 application registry + DID attach.
+            // Order is load-bearing: supersip_applications must run before
+            // supersip_application_numbers (FK dependency).
+            // MUST run AFTER supersip_endpoints.
+            Box::new(super::supersip_applications::Migration),
+            Box::new(super::supersip_application_numbers::Migration),
         ]
     }
 }

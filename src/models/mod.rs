@@ -36,6 +36,8 @@ pub mod routing_tables;
 pub mod security_blocks;
 pub mod security_rules;
 pub mod sip_trunk;
+pub mod supersip_application_numbers;
+pub mod supersip_applications;
 pub mod supersip_endpoints;
 pub mod supersip_sub_accounts;
 pub mod system_config;

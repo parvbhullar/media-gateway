@@ -5,6 +5,7 @@
 //! sub-routers into (gateway health, routing, security, DIDs, etc.).
 
 pub mod account_scope;
+pub mod applications;             // Phase 13 — APP-01..03
 pub mod auth;
 pub mod calls;                    // Phase 4 Plan 04-01 — CALL-01, CALL-02
 pub mod cdrs;
@@ -68,6 +69,7 @@ pub fn api_v1_router(state: AppState) -> Router {
         .merge(recordings::router())               // Phase 12 — REC-01..07
         .merge(endpoints::router())                // Phase 13 — EPUA-01..05
         .merge(sub_accounts::router())             // Phase 13 — TEN-02
+        .merge(applications::router())             // Phase 13 — APP-01..03
         ;
 
     let protected = protected.layer(middleware::from_fn_with_state(
