@@ -30,19 +30,20 @@ use std::net::IpAddr;
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     routing::get,
 };
 use chrono::{DateTime, Utc};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set,
+    ActiveModelTrait, ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, Set,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::app::AppState;
+use crate::handler::api_v1::account_scope::AccountScope;
 use crate::handler::api_v1::error::{ApiError, ApiResult};
 use crate::models::webhooks::{
     self, Column as WhColumn, Entity as WhEntity, Model as WhModel,
@@ -312,9 +313,12 @@ pub fn router() -> Router<AppState> {
 
 async fn list_webhooks(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
 ) -> ApiResult<Json<Vec<WebhookView>>> {
     let db = state.db();
+    let cond = Condition::all().add(WhColumn::AccountId.eq(scope.account_id.clone()));
     let rows = WhEntity::find()
+        .filter(cond)
         .order_by_asc(WhColumn::Name)
         .all(db)
         .await
@@ -324,6 +328,7 @@ async fn list_webhooks(
 
 async fn create_webhook(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Json(req): Json<CreateWebhookRequest>,
 ) -> ApiResult<(StatusCode, Json<CreateWebhookResponse>)> {
     let db = state.db();
@@ -341,6 +346,7 @@ async fn create_webhook(
     // Pre-check duplicate name → 409.
     let dup = WhEntity::find()
         .filter(WhColumn::Name.eq(req.name.clone()))
+        .filter(WhColumn::AccountId.eq(scope.account_id.clone()))
         .one(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -370,7 +376,7 @@ async fn create_webhook(
         timeout_ms: Set(timeout_ms),
         created_at: Set(now),
         updated_at: Set(now),
-        account_id: Set("root".to_string()),
+        account_id: Set(scope.account_id.clone()),
     };
     let inserted = am
         .insert(db)
@@ -429,10 +435,13 @@ async fn create_webhook(
 
 async fn get_webhook(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<WebhookView>> {
     let db = state.db();
-    let row = WhEntity::find_by_id(id.clone())
+    let row = WhEntity::find()
+        .filter(WhColumn::Id.eq(id.clone()))
+        .filter(WhColumn::AccountId.eq(scope.account_id.clone()))
         .one(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?
@@ -444,6 +453,7 @@ async fn get_webhook(
 
 async fn update_webhook(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(id): Path<String>,
     Json(req): Json<UpdateWebhookRequest>,
 ) -> ApiResult<Json<WebhookView>> {
@@ -454,7 +464,9 @@ async fn update_webhook(
     // old delivery against the new row state (T-07-05-06).
     state.webhook_cancel_registry().cancel(&id);
 
-    let existing = WhEntity::find_by_id(id.clone())
+    let existing = WhEntity::find()
+        .filter(WhColumn::Id.eq(id.clone()))
+        .filter(WhColumn::AccountId.eq(scope.account_id.clone()))
         .one(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?
@@ -485,6 +497,7 @@ async fn update_webhook(
         if new_name != &existing.name {
             let dup = WhEntity::find()
                 .filter(WhColumn::Name.eq(new_name.clone()))
+                .filter(WhColumn::AccountId.eq(scope.account_id.clone()))
                 .one(db)
                 .await
                 .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -542,6 +555,7 @@ async fn update_webhook(
 
 async fn delete_webhook(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
     let db = state.db();
@@ -551,7 +565,9 @@ async fn delete_webhook(
     // disappearance.
     state.webhook_cancel_registry().cancel(&id);
 
-    let existing = WhEntity::find_by_id(id.clone())
+    let existing = WhEntity::find()
+        .filter(WhColumn::Id.eq(id.clone()))
+        .filter(WhColumn::AccountId.eq(scope.account_id.clone()))
         .one(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?

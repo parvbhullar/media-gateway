@@ -11,7 +11,7 @@
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     routing::get,
 };
 use chrono::Utc;
@@ -21,6 +21,7 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 
 use crate::app::AppState;
+use crate::handler::api_v1::account_scope::AccountScope;
 use crate::handler::api_v1::error::{ApiError, ApiResult};
 use crate::models::trunk_group::{
     self, Column as TrunkGroupColumn, Entity as TrunkGroupEntity,
@@ -159,9 +160,11 @@ pub fn router() -> Router<AppState> {
 async fn load_trunk_group(
     db: &sea_orm::DatabaseConnection,
     name: &str,
+    account_id: &str,
 ) -> ApiResult<trunk_group::Model> {
     TrunkGroupEntity::find()
         .filter(TrunkGroupColumn::Name.eq(name))
+        .filter(TrunkGroupColumn::AccountId.eq(account_id))
         .one(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?
@@ -177,10 +180,11 @@ async fn load_trunk_group(
 /// existing trunk_group). If populated, deserialize and return.
 async fn get_media(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(name): Path<String>,
 ) -> ApiResult<Json<TrunkMediaConfig>> {
     let db = state.db();
-    let group = load_trunk_group(db, &name).await?;
+    let group = load_trunk_group(db, &name, &scope.account_id).await?;
 
     let cfg = match group.media_config {
         None => TrunkMediaConfig::defaults(),
@@ -202,12 +206,13 @@ async fn get_media(
 /// enum validation failure.
 async fn put_media(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(name): Path<String>,
     Json(cfg): Json<TrunkMediaConfig>,
 ) -> ApiResult<Json<TrunkMediaConfig>> {
     let db = state.db();
     validate_media_config(&cfg)?;
-    let group = load_trunk_group(db, &name).await?;
+    let group = load_trunk_group(db, &name, &scope.account_id).await?;
 
     let stored_json = serde_json::to_value(&cfg)
         .map_err(|e| ApiError::internal(e.to_string()))?;

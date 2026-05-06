@@ -11,7 +11,7 @@ use async_zip::{Compression, ZipEntryBuilder};
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Json as ExtractJson, Path, Query, State},
+    extract::{Extension, Json as ExtractJson, Path, Query, State},
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -27,7 +27,9 @@ use tracing::warn;
 
 use crate::app::AppState;
 use crate::callrecord::storage;
+use crate::handler::api_v1::account_scope::AccountScope;
 use crate::handler::api_v1::cdrs::{CdrListQuery, PageInfo, build_cdr_filter};
+use crate::handler::api_v1::common::{CommonScopeQuery, build_account_filter};
 use crate::handler::api_v1::error::{ApiError, ApiResult};
 use crate::models::call_record::{Column as CdrColumn, Entity as CdrEntity, Model as CdrModel};
 
@@ -126,14 +128,18 @@ pub fn router() -> Router<AppState> {
 /// Defaults: page=1, page_size=50, max 200. Shares CdrListQuery filter set (D-10).
 async fn list_recordings(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
+    Query(scope_q): Query<CommonScopeQuery>,
     Query(q): Query<CdrListQuery>,
 ) -> ApiResult<Json<RecordingListResponse>> {
     let db = state.db();
     let page_no = q.page.unwrap_or(1).max(1);
     let page_size = q.page_size.unwrap_or(50).clamp(1, 200);
 
+    let account_cond = build_account_filter(&scope, CdrColumn::AccountId, &scope_q, Condition::all())?;
     let conds = build_cdr_filter(&q)
-        .add(CdrColumn::RecordingUrl.is_not_null());
+        .add(CdrColumn::RecordingUrl.is_not_null())
+        .add(account_cond);
 
     let paginator = CdrEntity::find()
         .filter(conds)
@@ -159,10 +165,13 @@ async fn list_recordings(
 /// Returns 404 when row missing OR recording_url IS NULL.
 async fn get_recording(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(id): Path<i64>,
 ) -> ApiResult<Json<RecordingView>> {
     let db = state.db();
-    let row = CdrEntity::find_by_id(id)
+    let row = CdrEntity::find()
+        .filter(CdrColumn::Id.eq(id))
+        .filter(CdrColumn::AccountId.eq(scope.account_id.clone()))
         .one(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?
@@ -184,10 +193,13 @@ async fn get_recording(
 /// - No Range support in v2.0 (D-13, deferred to v2.1).
 async fn handle_download(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(id): Path<i64>,
 ) -> Result<Response, ApiError> {
     let db = state.db();
-    let row = CdrEntity::find_by_id(id)
+    let row = CdrEntity::find()
+        .filter(CdrColumn::Id.eq(id))
+        .filter(CdrColumn::AccountId.eq(scope.account_id.clone()))
         .one(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?
@@ -319,17 +331,25 @@ fn check_recordings_export_cap(total: u64) -> ApiResult<()> {
 /// the inner cursor; use .into_inner() twice to recover the Vec<u8>.
 async fn handle_export(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
+    Query(scope_q): Query<CommonScopeQuery>,
     Query(q): Query<CdrListQuery>,
     body: Option<ExtractJson<ExportBody>>,
 ) -> Result<Response, ApiError> {
     let db = state.db();
 
+    let account_cond = build_account_filter(&scope, CdrColumn::AccountId, &scope_q, Condition::all())?;
+
     // Build condition: explicit ids override filter params (D-18).
     let ids: Vec<i64> = body.map(|b| b.0.ids).unwrap_or_default();
     let conds = if !ids.is_empty() {
-        Condition::all().add(CdrColumn::Id.is_in(ids))
+        Condition::all()
+            .add(CdrColumn::Id.is_in(ids))
+            .add(account_cond)
     } else {
-        build_cdr_filter(&q).add(CdrColumn::RecordingUrl.is_not_null())
+        build_cdr_filter(&q)
+            .add(CdrColumn::RecordingUrl.is_not_null())
+            .add(account_cond)
     };
 
     // D-19: pre-flight count.
@@ -457,12 +477,15 @@ async fn handle_export(
 /// WARNING: issuing this with no filters and ?confirm=true wipes ALL recordings.
 async fn handle_bulk_delete(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Query(q): Query<BulkDeleteQuery>,
 ) -> Result<Response, ApiError> {
     let db = state.db();
 
+    let account_cond = Condition::all().add(CdrColumn::AccountId.eq(scope.account_id.clone()));
     let conds = build_cdr_filter(&q.filters)
-        .add(CdrColumn::RecordingUrl.is_not_null());
+        .add(CdrColumn::RecordingUrl.is_not_null())
+        .add(account_cond);
 
     let matched = CdrEntity::find()
         .filter(conds.clone())
@@ -542,10 +565,13 @@ async fn handle_bulk_delete(
 /// 4. Return 204 No Content.
 async fn delete_recording(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(id): Path<i64>,
 ) -> ApiResult<StatusCode> {
     let db = state.db();
-    let row = CdrEntity::find_by_id(id)
+    let row = CdrEntity::find()
+        .filter(CdrColumn::Id.eq(id))
+        .filter(CdrColumn::AccountId.eq(scope.account_id.clone()))
         .one(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?

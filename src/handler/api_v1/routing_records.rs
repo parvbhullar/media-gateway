@@ -21,7 +21,7 @@ use std::net::IpAddr;
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     routing::get,
 };
@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::app::AppState;
+use crate::handler::api_v1::account_scope::AccountScope;
 use crate::handler::api_v1::error::{ApiError, ApiResult};
 use crate::models::routing_tables;
 
@@ -325,9 +326,11 @@ pub fn router() -> Router<AppState> {
 async fn load_table(
     db: &sea_orm::DatabaseConnection,
     name: &str,
+    account_id: &str,
 ) -> ApiResult<routing_tables::Model> {
     routing_tables::Entity::find()
         .filter(routing_tables::Column::Name.eq(name))
+        .filter(routing_tables::Column::AccountId.eq(account_id))
         .one(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?
@@ -382,10 +385,11 @@ fn check_default_uniqueness(records: &[RoutingRecord]) -> Result<(), ApiError> {
 /// GET /routing/tables/{name}/records — list records ordered by position ASC.
 async fn list_records(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(name): Path<String>,
 ) -> ApiResult<Json<Vec<RoutingRecord>>> {
     let db = state.db();
-    let model = load_table(db, &name).await?;
+    let model = load_table(db, &name, &scope.account_id).await?;
     let mut records = parse_records(&model)?;
     records.sort_by_key(|r| r.position);
     Ok(Json(records))
@@ -395,11 +399,12 @@ async fn list_records(
 /// Server generates `record_id` (UUID v4 per D-02).
 async fn create_record(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(name): Path<String>,
     Json(req): Json<CreateRecordRequest>,
 ) -> ApiResult<(StatusCode, Json<RoutingRecord>)> {
     let db = state.db();
-    let model = load_table(db, &name).await?;
+    let model = load_table(db, &name, &scope.account_id).await?;
     let mut records = parse_records(&model)?;
 
     if records.len() >= MAX_RECORDS_PER_TABLE {
@@ -450,10 +455,11 @@ async fn create_record(
 /// GET /routing/tables/{name}/records/{record_id}
 async fn get_record(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path((name, record_id)): Path<(String, String)>,
 ) -> ApiResult<Json<RoutingRecord>> {
     let db = state.db();
-    let model = load_table(db, &name).await?;
+    let model = load_table(db, &name, &scope.account_id).await?;
     let records = parse_records(&model)?;
     let rec = records
         .into_iter()
@@ -471,11 +477,12 @@ async fn get_record(
 /// `record_id` and `position` (D-04, D-28).
 async fn update_record(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path((name, record_id)): Path<(String, String)>,
     Json(req): Json<UpdateRecordRequest>,
 ) -> ApiResult<Json<RoutingRecord>> {
     let db = state.db();
-    let model = load_table(db, &name).await?;
+    let model = load_table(db, &name, &scope.account_id).await?;
     let mut records = parse_records(&model)?;
 
     let idx = records
@@ -512,10 +519,11 @@ async fn update_record(
 /// surviving records are NOT renumbered (gaps acceptable).
 async fn delete_record(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path((name, record_id)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
     let db = state.db();
-    let model = load_table(db, &name).await?;
+    let model = load_table(db, &name, &scope.account_id).await?;
     let mut records = parse_records(&model)?;
 
     let before = records.len();

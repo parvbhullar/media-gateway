@@ -22,21 +22,27 @@
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     routing::get,
 };
 use chrono::{DateTime, Utc};
-use sea_orm::{ColumnTrait, Condition, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, Condition, EntityTrait, PaginatorTrait,
+    QueryFilter, QueryOrder, Set,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::app::AppState;
 use crate::config_merge::read_default_country;
-use crate::handler::api_v1::common::{Pagination, PaginatedResponse};
+use crate::handler::api_v1::account_scope::AccountScope;
+use crate::handler::api_v1::common::{
+    CommonScopeQuery, Pagination, PaginatedResponse, build_account_filter,
+};
 use crate::handler::api_v1::error::{ApiError, ApiResult};
 use crate::models::did::{
-    self, Column as DidColumn, DidError, Entity as DidEntity, Model as DidModel, NewDid,
-    normalize_did,
+    self, ActiveModel as DidActiveModel, Column as DidColumn, DidError,
+    Entity as DidEntity, Model as DidModel, normalize_did,
 };
 
 // ---------------------------------------------------------------------------
@@ -172,6 +178,8 @@ pub fn router() -> Router<AppState> {
 
 async fn list_dids(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
+    Query(scope_q): Query<CommonScopeQuery>,
     Query(q): Query<DidListQuery>,
 ) -> ApiResult<Json<PaginatedResponse<DidView>>> {
     let db = state.db();
@@ -179,8 +187,9 @@ async fn list_dids(
     let page_no = pagination.page.max(1);
     let page_size = pagination.limit();
 
-    // Build filter once; reuse it for both count and rows via clone.
-    let mut conds = Condition::all();
+    // Build filter with account scope first, then apply additional filters.
+    let mut conds =
+        build_account_filter(&scope, DidColumn::AccountId, &scope_q, Condition::all())?;
     if q.unassigned.unwrap_or(false) {
         conds = conds.add(DidColumn::TrunkName.is_null());
     } else if let Some(trunk) = q
@@ -225,6 +234,7 @@ async fn list_dids(
 
 async fn create_did(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Json(req): Json<CreateDidRequest>,
 ) -> ApiResult<(StatusCode, Json<DidView>)> {
     let db = state.db();
@@ -242,16 +252,20 @@ async fn create_did(
         Err(e) => return Err(ApiError::internal(e.to_string())),
     }
 
-    let new = NewDid {
-        number: normalized.clone(),
-        trunk_name: normalize_optional_string(&req.trunk_name),
-        extension_number: normalize_optional_string(&req.extension_number),
-        failover_trunk: normalize_optional_string(&req.failover_trunk),
-        label: normalize_optional_string(&req.label),
-        enabled: req.enabled,
+    let now = Utc::now();
+    let am = DidActiveModel {
+        number: Set(normalized.clone()),
+        trunk_name: Set(normalize_optional_string(&req.trunk_name)),
+        extension_number: Set(normalize_optional_string(&req.extension_number)),
+        failover_trunk: Set(normalize_optional_string(&req.failover_trunk)),
+        label: Set(normalize_optional_string(&req.label)),
+        enabled: Set(req.enabled),
+        account_id: Set(scope.account_id.clone()),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
     };
-
-    DidModel::upsert(db, new)
+    am.insert(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
@@ -265,6 +279,7 @@ async fn create_did(
 
 async fn get_did(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(number): Path<String>,
 ) -> ApiResult<Json<DidView>> {
     let db = state.db();
@@ -272,7 +287,10 @@ async fn get_did(
     let normalized = normalize_did(&number, region.as_deref())
         .map_err(|_| ApiError::not_found(format!("DID {number} not found")))?;
 
-    let row = DidModel::get(db, &normalized)
+    let row = DidEntity::find()
+        .filter(DidColumn::Number.eq(normalized.clone()))
+        .filter(DidColumn::AccountId.eq(scope.account_id.clone()))
+        .one(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?
         .ok_or_else(|| ApiError::not_found(format!("DID {normalized} not found")))?;
@@ -282,6 +300,7 @@ async fn get_did(
 
 async fn update_did(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(number): Path<String>,
     Json(req): Json<UpdateDidRequest>,
 ) -> ApiResult<Json<DidView>> {
@@ -290,7 +309,10 @@ async fn update_did(
     let normalized = normalize_did(&number, region.as_deref())
         .map_err(|_| ApiError::not_found(format!("DID {number} not found")))?;
 
-    let existing = DidModel::get(db, &normalized)
+    let existing = DidEntity::find()
+        .filter(DidColumn::Number.eq(normalized.clone()))
+        .filter(DidColumn::AccountId.eq(scope.account_id.clone()))
+        .one(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?
         .ok_or_else(|| ApiError::not_found(format!("DID {normalized} not found")))?;
@@ -299,29 +321,25 @@ async fn update_did(
     // None (not left as-is). Callers that only want to change one field
     // should read the current state first, then PUT the full desired state.
     // PATCH semantics (merge) can be added later if needed.
-    let new = NewDid {
-        number: normalized.clone(),
-        trunk_name: normalize_optional_string(&req.trunk_name),
-        extension_number: normalize_optional_string(&req.extension_number),
-        failover_trunk: normalize_optional_string(&req.failover_trunk),
-        label: normalize_optional_string(&req.label),
-        enabled: req.enabled.unwrap_or(existing.enabled),
-    };
+    let mut am: DidActiveModel = existing.clone().into();
+    am.trunk_name = Set(normalize_optional_string(&req.trunk_name));
+    am.extension_number = Set(normalize_optional_string(&req.extension_number));
+    am.failover_trunk = Set(normalize_optional_string(&req.failover_trunk));
+    am.label = Set(normalize_optional_string(&req.label));
+    am.enabled = Set(req.enabled.unwrap_or(existing.enabled));
+    am.updated_at = Set(Utc::now());
 
-    DidModel::upsert(db, new)
+    let updated = am
+        .update(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    let row = DidModel::get(db, &normalized)
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?
-        .ok_or_else(|| ApiError::internal("row vanished after update"))?;
-
-    Ok(Json(DidView::from(row)))
+    Ok(Json(DidView::from(updated)))
 }
 
 async fn delete_did(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(number): Path<String>,
 ) -> ApiResult<StatusCode> {
     let db = state.db();
@@ -332,17 +350,16 @@ async fn delete_did(
     let normalized = normalize_did(&number, region.as_deref())
         .map_err(|_| ApiError::not_found(format!("DID {number} not found")))?;
 
-    match DidModel::get(db, &normalized).await {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            return Err(ApiError::not_found(format!(
-                "DID {normalized} not found"
-            )));
-        }
-        Err(e) => return Err(ApiError::internal(e.to_string())),
-    }
+    let row = DidEntity::find()
+        .filter(DidColumn::Number.eq(normalized.clone()))
+        .filter(DidColumn::AccountId.eq(scope.account_id.clone()))
+        .one(db)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .ok_or_else(|| ApiError::not_found(format!("DID {normalized} not found")))?;
 
-    did::Model::delete(db, &normalized)
+    did::Entity::delete_by_id(row.number)
+        .exec(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
 

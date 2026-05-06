@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use axum::{
     Json, Router,
     body::{Body, Bytes},
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::{HeaderValue, StatusCode, header},
     response::Response,
     routing::get,
@@ -22,7 +22,8 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 
 use crate::app::AppState;
-use crate::handler::api_v1::common::PaginatedResponse;
+use crate::handler::api_v1::account_scope::AccountScope;
+use crate::handler::api_v1::common::{CommonScopeQuery, PaginatedResponse, build_account_filter};
 use crate::handler::api_v1::error::{ApiError, ApiResult};
 use crate::models::call_record::{
     self, Column as CdrColumn, Entity as CdrEntity, Model as CdrModel,
@@ -206,6 +207,7 @@ pub fn router() -> Router<AppState> {
 /// `list_cdrs`, `search_cdrs`, and `handle_export` (DRY).
 /// Phase 12: widened to `pub(super)` so `handler::api_v1::recordings`
 /// can reuse the same filter set (D-10).
+/// Phase 13: account_id scope is applied separately via `build_account_filter`.
 pub(super) fn build_cdr_filter(q: &CdrListQuery) -> Condition {
     let mut conds = Condition::all();
     if let Some(v) = q.direction.as_ref().filter(|s| !s.is_empty()) {
@@ -246,13 +248,20 @@ fn check_export_cap(total: u64) -> ApiResult<()> {
 
 async fn list_cdrs(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
+    Query(scope_q): Query<CommonScopeQuery>,
     Query(q): Query<CdrListQuery>,
 ) -> ApiResult<Json<PaginatedResponse<CdrView>>> {
     let db = state.db();
     let page_no = q.page.unwrap_or(1).max(1);
     let page_size = q.page_size.unwrap_or(20).clamp(1, 200);
 
-    let conds = build_cdr_filter(&q);
+    let conds = build_account_filter(
+        &scope,
+        CdrColumn::AccountId,
+        &scope_q,
+        build_cdr_filter(&q),
+    )?;
 
     let paginator = CdrEntity::find()
         .filter(conds)
@@ -278,10 +287,12 @@ async fn list_cdrs(
 
 async fn get_cdr(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(id): Path<i64>,
 ) -> ApiResult<Json<CdrView>> {
     let db = state.db();
     let row = CdrEntity::find_by_id(id)
+        .filter(CdrColumn::AccountId.eq(scope.account_id.clone()))
         .one(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?
@@ -291,29 +302,40 @@ async fn get_cdr(
 
 async fn delete_cdr(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(id): Path<i64>,
 ) -> ApiResult<StatusCode> {
     let db = state.db();
-    let outcome = call_record::Entity::delete_by_id(id)
+    let row = CdrEntity::find_by_id(id)
+        .filter(CdrColumn::AccountId.eq(scope.account_id.clone()))
+        .one(db)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .ok_or_else(|| ApiError::not_found(format!("CDR {id} not found")))?;
+    call_record::Entity::delete_by_id(row.id)
         .exec(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    if outcome.rows_affected == 0 {
-        return Err(ApiError::not_found(format!("CDR {id} not found")));
-    }
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// CDR-05: filter + paginated results + status breakdown summary.
 async fn search_cdrs(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
+    Query(scope_q): Query<CommonScopeQuery>,
     Query(q): Query<CdrListQuery>,
 ) -> ApiResult<Json<SearchResponse>> {
     let db = state.db();
     let page_no = q.page.unwrap_or(1).max(1);
     let page_size = q.page_size.unwrap_or(50).clamp(1, 200);
 
-    let conds = build_cdr_filter(&q);
+    let conds = build_account_filter(
+        &scope,
+        CdrColumn::AccountId,
+        &scope_q,
+        build_cdr_filter(&q),
+    )?;
 
     let paginator = CdrEntity::find()
         .filter(conds.clone())
@@ -373,12 +395,14 @@ async fn search_cdrs(
 /// CDR-06: most-recent CDRs ordered by `created_at DESC`. No filters.
 async fn recent_cdrs(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Query(q): Query<CdrRecentQuery>,
 ) -> ApiResult<Json<PaginatedResponse<CdrView>>> {
     let db = state.db();
     let limit = q.limit.unwrap_or(50).clamp(1, 500);
 
     let rows = CdrEntity::find()
+        .filter(CdrColumn::AccountId.eq(scope.account_id.clone()))
         .order_by_desc(CdrColumn::CreatedAt)
         .limit(limit)
         .all(db)
@@ -394,10 +418,17 @@ async fn recent_cdrs(
 /// most 500 rows resident at once via `paginate(db, 500).fetch_page(n)`.
 async fn handle_export(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
+    Query(scope_q): Query<CommonScopeQuery>,
     Query(q): Query<CdrListQuery>,
 ) -> Result<Response, ApiError> {
     let db = state.db().clone();
-    let conds = build_cdr_filter(&q);
+    let conds = build_account_filter(
+        &scope,
+        CdrColumn::AccountId,
+        &scope_q,
+        build_cdr_filter(&q),
+    )?;
 
     // D-20: pre-flight count with the same filter set.
     let total = CdrEntity::find()

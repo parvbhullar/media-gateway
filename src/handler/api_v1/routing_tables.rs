@@ -23,19 +23,21 @@
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     routing::get,
 };
 use chrono::{DateTime, Utc};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder,
+    ActiveModelTrait, ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder,
     Set,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::app::AppState;
+use crate::handler::api_v1::account_scope::AccountScope;
+use crate::handler::api_v1::common::{CommonScopeQuery, build_account_filter};
 use crate::handler::api_v1::error::{ApiError, ApiResult};
 use crate::models::routing_tables::{
     self, Column as RtColumn, Entity as RtEntity, Model as RtModel,
@@ -217,9 +219,13 @@ pub fn router() -> Router<AppState> {
 
 async fn list_tables(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
+    axum::extract::Query(scope_q): axum::extract::Query<CommonScopeQuery>,
 ) -> ApiResult<Json<Vec<RoutingTableView>>> {
     let db = state.db();
+    let cond = build_account_filter(&scope, RtColumn::AccountId, &scope_q, Condition::all())?;
     let rows = RtEntity::find()
+        .filter(cond)
         .order_by_asc(RtColumn::Name)
         .all(db)
         .await
@@ -230,6 +236,7 @@ async fn list_tables(
 
 async fn create_table(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Json(req): Json<CreateRoutingTableRequest>,
 ) -> ApiResult<(StatusCode, Json<RoutingTableView>)> {
     let db = state.db();
@@ -253,6 +260,7 @@ async fn create_table(
     // avoids dialect-specific SQLSTATE parsing.)
     let dup = RtEntity::find()
         .filter(RtColumn::Name.eq(req.name.clone()))
+        .filter(RtColumn::AccountId.eq(scope.account_id.clone()))
         .one(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -271,6 +279,7 @@ async fn create_table(
         priority: Set(priority),
         is_active: Set(is_active),
         records: Set(records_json),
+        account_id: Set(scope.account_id.clone()),
         created_at: Set(now),
         updated_at: Set(now),
         ..Default::default()
@@ -285,11 +294,13 @@ async fn create_table(
 
 async fn get_table(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(name): Path<String>,
 ) -> ApiResult<Json<RoutingTableView>> {
     let db = state.db();
     let row = RtEntity::find()
         .filter(RtColumn::Name.eq(name.clone()))
+        .filter(RtColumn::AccountId.eq(scope.account_id.clone()))
         .one(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?
@@ -304,6 +315,7 @@ async fn get_table(
 
 async fn update_table(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(name): Path<String>,
     Json(raw): Json<Value>,
 ) -> ApiResult<Json<RoutingTableView>> {
@@ -318,6 +330,7 @@ async fn update_table(
 
     let existing = RtEntity::find()
         .filter(RtColumn::Name.eq(name.clone()))
+        .filter(RtColumn::AccountId.eq(scope.account_id.clone()))
         .one(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?
@@ -360,11 +373,13 @@ async fn update_table(
 
 async fn delete_table(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(name): Path<String>,
 ) -> ApiResult<StatusCode> {
     let db = state.db();
     let existing = RtEntity::find()
         .filter(RtColumn::Name.eq(name.clone()))
+        .filter(RtColumn::AccountId.eq(scope.account_id.clone()))
         .one(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?

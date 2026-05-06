@@ -20,20 +20,21 @@
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     routing::get,
 };
 use chrono::{DateTime, Utc};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter,
+    ActiveModelTrait, ColumnTrait, Condition, EntityTrait, PaginatorTrait, QueryFilter,
     QueryOrder, Set,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::app::AppState;
-use crate::handler::api_v1::common::{PaginatedResponse, Pagination};
+use crate::handler::api_v1::account_scope::AccountScope;
+use crate::handler::api_v1::common::{CommonScopeQuery, PaginatedResponse, Pagination, build_account_filter};
 use crate::handler::api_v1::error::{ApiError, ApiResult};
 use crate::models::manipulations::{
     self, Column as ManColumn, Entity as ManEntity, Model as ManModel,
@@ -352,13 +353,18 @@ pub fn router() -> Router<AppState> {
 
 async fn list(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
+    Query(scope_q): Query<CommonScopeQuery>,
     Query(pagination): Query<Pagination>,
 ) -> ApiResult<Json<PaginatedResponse<ManipulationView>>> {
     let db = state.db();
     let page_no = pagination.page.max(1);
     let page_size = pagination.limit();
 
+    let conds = build_account_filter(&scope, ManColumn::AccountId, &scope_q, Condition::all())?;
+
     let paginator = ManEntity::find()
+        .filter(conds)
         .order_by_asc(ManColumn::Priority)
         .order_by_asc(ManColumn::Name)
         .paginate(db, page_size);
@@ -385,6 +391,7 @@ async fn list(
 
 async fn create(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Json(raw): Json<serde_json::Value>,
 ) -> ApiResult<(StatusCode, Json<ManipulationView>)> {
     // Parse manually so serde deserialization errors (unknown enum variants, etc.)
@@ -405,6 +412,7 @@ async fn create(
     // Pre-check duplicate name → 409.
     let dup = ManEntity::find()
         .filter(ManColumn::Name.eq(req.name.clone()))
+        .filter(ManColumn::AccountId.eq(scope.account_id.clone()))
         .one(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -430,7 +438,7 @@ async fn create(
         rules: Set(rules_json),
         created_at: Set(now),
         updated_at: Set(now),
-        account_id: Set("root".to_string()),
+        account_id: Set(scope.account_id.clone()),
     };
     let inserted = am
         .insert(db)
@@ -443,11 +451,13 @@ async fn create(
 
 async fn fetch(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(name): Path<String>,
 ) -> ApiResult<Json<ManipulationView>> {
     let db = state.db();
     let row = ManEntity::find()
         .filter(ManColumn::Name.eq(name.clone()))
+        .filter(ManColumn::AccountId.eq(scope.account_id.clone()))
         .one(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?
@@ -459,6 +469,7 @@ async fn fetch(
 
 async fn replace(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(name): Path<String>,
     Json(raw): Json<serde_json::Value>,
 ) -> ApiResult<Json<ManipulationView>> {
@@ -478,6 +489,7 @@ async fn replace(
 
     let existing = ManEntity::find()
         .filter(ManColumn::Name.eq(name.clone()))
+        .filter(ManColumn::AccountId.eq(scope.account_id.clone()))
         .one(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?
@@ -489,6 +501,7 @@ async fn replace(
     if req.name != existing.name {
         let dup = ManEntity::find()
             .filter(ManColumn::Name.eq(req.name.clone()))
+            .filter(ManColumn::AccountId.eq(scope.account_id.clone()))
             .one(db)
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -530,12 +543,14 @@ async fn replace(
 
 async fn remove(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(name): Path<String>,
 ) -> ApiResult<StatusCode> {
     let db = state.db();
 
     let existing = ManEntity::find()
         .filter(ManColumn::Name.eq(name.clone()))
+        .filter(ManColumn::AccountId.eq(scope.account_id.clone()))
         .one(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?

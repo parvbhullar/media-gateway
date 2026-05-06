@@ -15,7 +15,7 @@
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     routing::{delete, get},
 };
@@ -26,6 +26,7 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 
 use crate::app::AppState;
+use crate::handler::api_v1::account_scope::AccountScope;
 use crate::handler::api_v1::error::{ApiError, ApiResult};
 use crate::models::trunk_credentials::{
     self, Column as TcColumn, Entity as TcEntity, Model as TcModel,
@@ -100,9 +101,11 @@ fn validate_credential_fields(req: &AddTrunkCredentialRequest) -> ApiResult<()> 
 async fn lookup_trunk_group_id(
     db: &sea_orm::DatabaseConnection,
     name: &str,
+    account_id: &str,
 ) -> ApiResult<i64> {
     let group = TrunkGroupEntity::find()
         .filter(TrunkGroupColumn::Name.eq(name))
+        .filter(TrunkGroupColumn::AccountId.eq(account_id))
         .one(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?
@@ -133,10 +136,11 @@ pub fn router() -> Router<AppState> {
 /// trunk returns `[]`. Missing trunk returns 404.
 async fn list_credentials(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(name): Path<String>,
 ) -> ApiResult<Json<Vec<TrunkCredentialView>>> {
     let db = state.db();
-    let trunk_group_id = lookup_trunk_group_id(db, &name).await?;
+    let trunk_group_id = lookup_trunk_group_id(db, &name, &scope.account_id).await?;
 
     let rows = TcEntity::find()
         .filter(TcColumn::TrunkGroupId.eq(trunk_group_id))
@@ -156,12 +160,13 @@ async fn list_credentials(
 /// as 500, rare and operator-driven).
 async fn add_credential(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(name): Path<String>,
     Json(req): Json<AddTrunkCredentialRequest>,
 ) -> ApiResult<(StatusCode, Json<TrunkCredentialView>)> {
     let db = state.db();
     validate_credential_fields(&req)?;
-    let trunk_group_id = lookup_trunk_group_id(db, &name).await?;
+    let trunk_group_id = lookup_trunk_group_id(db, &name, &scope.account_id).await?;
 
     // Pre-check duplicate (UNIQUE (trunk_group_id, realm) per D-01).
     let dup = TcEntity::find()
@@ -203,10 +208,11 @@ async fn add_credential(
 /// reaches this handler.
 async fn delete_credential(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path((name, realm)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
     let db = state.db();
-    let trunk_group_id = lookup_trunk_group_id(db, &name).await?;
+    let trunk_group_id = lookup_trunk_group_id(db, &name, &scope.account_id).await?;
 
     let row = TcEntity::find()
         .filter(TcColumn::TrunkGroupId.eq(trunk_group_id))

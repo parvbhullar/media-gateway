@@ -23,7 +23,7 @@
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     routing::get,
 };
 use chrono::Utc;
@@ -33,6 +33,7 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 
 use crate::app::AppState;
+use crate::handler::api_v1::account_scope::AccountScope;
 use crate::handler::api_v1::error::{ApiError, ApiResult};
 use crate::models::trunk_capacity::{
     self, Column as TcapColumn, Entity as TcapEntity, Model as TcapModel,
@@ -110,9 +111,11 @@ fn validate_capacity(req: &PutTrunkCapacityRequest) -> ApiResult<()> {
 async fn lookup_trunk_group_id(
     db: &sea_orm::DatabaseConnection,
     name: &str,
+    account_id: &str,
 ) -> ApiResult<i64> {
     let group = TrunkGroupEntity::find()
         .filter(TrunkGroupColumn::Name.eq(name))
+        .filter(TrunkGroupColumn::AccountId.eq(account_id))
         .one(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?
@@ -149,10 +152,11 @@ pub fn router() -> Router<AppState> {
 /// (all-null + zeros) when no row exists yet.
 async fn get_capacity(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(name): Path<String>,
 ) -> ApiResult<Json<TrunkCapacityView>> {
     let db = state.db();
-    let trunk_group_id = lookup_trunk_group_id(db, &name).await?;
+    let trunk_group_id = lookup_trunk_group_id(db, &name, &scope.account_id).await?;
 
     // Phase 5 Plan 05-04 (D-02, D-04, TSUB-07):
     // current_active counts entries in the registry whose trunk_group_name
@@ -182,12 +186,13 @@ async fn get_capacity(
 /// the response is the post-write view (round-trip in one call).
 async fn put_capacity(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(name): Path<String>,
     Json(req): Json<PutTrunkCapacityRequest>,
 ) -> ApiResult<Json<TrunkCapacityView>> {
     let db = state.db();
     validate_capacity(&req)?;
-    let trunk_group_id = lookup_trunk_group_id(db, &name).await?;
+    let trunk_group_id = lookup_trunk_group_id(db, &name, &scope.account_id).await?;
 
     // u32 → i32 cast: domain max for max_calls/max_cps is well below i32::MAX.
     // Cap defensively so a malicious 2^31..2^32-1 input doesn't wrap negative.

@@ -23,7 +23,7 @@
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     routing::{delete, get},
 };
@@ -34,6 +34,7 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 
 use crate::app::AppState;
+use crate::handler::api_v1::account_scope::AccountScope;
 use crate::handler::api_v1::error::{ApiError, ApiResult};
 use crate::models::trunk_acl_entries::{
     self, Column as AclColumn, Entity as AclEntity, Model as AclModel,
@@ -128,9 +129,11 @@ pub fn validate_acl_rule(rule: &str) -> Result<(), String> {
 async fn lookup_trunk_group_id(
     db: &sea_orm::DatabaseConnection,
     name: &str,
+    account_id: &str,
 ) -> ApiResult<i64> {
     let group = TrunkGroupEntity::find()
         .filter(TrunkGroupColumn::Name.eq(name))
+        .filter(TrunkGroupColumn::AccountId.eq(account_id))
         .one(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?
@@ -154,10 +157,11 @@ pub fn router() -> Router<AppState> {
 /// by `position` ASC. Empty trunk returns `[]`. Missing trunk returns 404.
 async fn list_acl(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(name): Path<String>,
 ) -> ApiResult<Json<Vec<TrunkAclEntryView>>> {
     let db = state.db();
-    let trunk_group_id = lookup_trunk_group_id(db, &name).await?;
+    let trunk_group_id = lookup_trunk_group_id(db, &name, &scope.account_id).await?;
 
     let rows = AclEntity::find()
         .filter(AclColumn::TrunkGroupId.eq(trunk_group_id))
@@ -178,12 +182,13 @@ async fn list_acl(
 /// writes — races surface as 500 (acceptable; operator workflow).
 async fn add_acl_entry(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(name): Path<String>,
     Json(req): Json<AddTrunkAclEntryRequest>,
 ) -> ApiResult<(StatusCode, Json<TrunkAclEntryView>)> {
     let db = state.db();
     validate_acl_rule(&req.rule).map_err(ApiError::bad_request)?;
-    let trunk_group_id = lookup_trunk_group_id(db, &name).await?;
+    let trunk_group_id = lookup_trunk_group_id(db, &name, &scope.account_id).await?;
 
     // Pre-check duplicate (UNIQUE (trunk_group_id, rule) per D-10).
     let dup = AclEntity::find()
@@ -235,10 +240,11 @@ async fn add_acl_entry(
 /// renumbered on delete — gaps are acceptable.
 async fn delete_acl_entry(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path((name, rule)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
     let db = state.db();
-    let trunk_group_id = lookup_trunk_group_id(db, &name).await?;
+    let trunk_group_id = lookup_trunk_group_id(db, &name, &scope.account_id).await?;
 
     let row = AclEntity::find()
         .filter(AclColumn::TrunkGroupId.eq(trunk_group_id))

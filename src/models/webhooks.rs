@@ -125,6 +125,12 @@ impl MigrationTrait for Migration {
                             .not_null()
                             .default(Expr::current_timestamp()),
                     )
+                    .col(
+                        ColumnDef::new(Column::AccountId)
+                            .string_len(64)
+                            .not_null()
+                            .default("root"),
+                    )
                     .to_owned(),
             )
             .await?;

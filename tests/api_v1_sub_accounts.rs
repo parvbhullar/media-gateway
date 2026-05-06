@@ -332,7 +332,6 @@ async fn rotate_key_issues_new_key_and_revokes_old() {
 }
 
 #[tokio::test]
-#[ignore = "depends on 13-01d handler retrofit — gateways.rs not yet scoped by account_id"]
 async fn sub_account_cannot_list_root_gateways() {
     // After 13-01d lands, a sub-account bearer should see an empty list when
     // the root account owns all the gateways.

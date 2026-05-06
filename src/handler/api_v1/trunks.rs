@@ -9,7 +9,7 @@
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     routing::get,
 };
@@ -21,7 +21,8 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 
 use crate::app::AppState;
-use crate::handler::api_v1::common::{Pagination, PaginatedResponse};
+use crate::handler::api_v1::account_scope::AccountScope;
+use crate::handler::api_v1::common::{CommonScopeQuery, Pagination, PaginatedResponse, build_account_filter};
 use crate::handler::api_v1::error::{ApiError, ApiResult};
 use crate::models::trunk_group::{
     self, Column as TrunkGroupColumn, Entity as TrunkGroupEntity,
@@ -334,6 +335,8 @@ pub fn router() -> Router<AppState> {
 
 async fn list_trunks(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
+    Query(scope_q): Query<CommonScopeQuery>,
     Query(q): Query<TrunkListQuery>,
 ) -> ApiResult<Json<PaginatedResponse<TrunkView>>> {
     let db = state.db();
@@ -341,7 +344,7 @@ async fn list_trunks(
     let page_no = pagination.page.max(1);
     let page_size = pagination.limit();
 
-    let mut conds = Condition::all();
+    let mut conds = build_account_filter(&scope, TrunkGroupColumn::AccountId, &scope_q, Condition::all())?;
     if let Some(dir) = q
         .direction
         .as_ref()
@@ -390,11 +393,13 @@ async fn list_trunks(
 
 async fn get_trunk(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(name): Path<String>,
 ) -> ApiResult<Json<TrunkView>> {
     let db = state.db();
     let group = TrunkGroupEntity::find()
         .filter(TrunkGroupColumn::Name.eq(name.clone()))
+        .filter(TrunkGroupColumn::AccountId.eq(scope.account_id.clone()))
         .one(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?
@@ -420,6 +425,7 @@ async fn get_trunk(
 
 async fn create_trunk(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Json(req): Json<CreateTrunkRequest>,
 ) -> ApiResult<(StatusCode, Json<TrunkView>)> {
     let db = state.db();
@@ -444,6 +450,7 @@ async fn create_trunk(
     // 6. duplicate trunk_group check
     let dup = TrunkGroupEntity::find()
         .filter(TrunkGroupColumn::Name.eq(req.name.clone()))
+        .filter(TrunkGroupColumn::AccountId.eq(scope.account_id.clone()))
         .one(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -472,6 +479,7 @@ async fn create_trunk(
         media_config: Set(None),
         is_active: Set(req.is_active),
         metadata: Set(None),
+        account_id: Set(scope.account_id.clone()),
         created_at: Set(now),
         updated_at: Set(now),
         ..Default::default()
@@ -519,6 +527,7 @@ async fn create_trunk(
 
 async fn update_trunk(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(name): Path<String>,
     Json(req): Json<UpdateTrunkRequest>,
 ) -> ApiResult<Json<TrunkView>> {
@@ -527,6 +536,7 @@ async fn update_trunk(
     // Load existing
     let existing = TrunkGroupEntity::find()
         .filter(TrunkGroupColumn::Name.eq(name.clone()))
+        .filter(TrunkGroupColumn::AccountId.eq(scope.account_id.clone()))
         .one(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?
@@ -684,6 +694,7 @@ async fn engagement_check_trunk_group(
 
 async fn delete_trunk(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(name): Path<String>,
 ) -> ApiResult<StatusCode> {
     let db = state.db();
@@ -691,6 +702,7 @@ async fn delete_trunk(
     // Load existing
     let existing = TrunkGroupEntity::find()
         .filter(TrunkGroupColumn::Name.eq(name.clone()))
+        .filter(TrunkGroupColumn::AccountId.eq(scope.account_id.clone()))
         .one(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?

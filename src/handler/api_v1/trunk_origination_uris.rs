@@ -17,7 +17,7 @@
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     routing::{delete, get},
 };
@@ -28,6 +28,7 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 
 use crate::app::AppState;
+use crate::handler::api_v1::account_scope::AccountScope;
 use crate::handler::api_v1::error::{ApiError, ApiResult};
 use crate::models::trunk_group::{
     Column as TrunkGroupColumn, Entity as TrunkGroupEntity,
@@ -99,9 +100,11 @@ fn validate_sip_uri(uri: &str) -> ApiResult<()> {
 async fn lookup_trunk_group_id(
     db: &sea_orm::DatabaseConnection,
     name: &str,
+    account_id: &str,
 ) -> ApiResult<i64> {
     let group = TrunkGroupEntity::find()
         .filter(TrunkGroupColumn::Name.eq(name))
+        .filter(TrunkGroupColumn::AccountId.eq(account_id))
         .one(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?
@@ -133,10 +136,11 @@ pub fn router() -> Router<AppState> {
 /// Missing trunk returns 404.
 async fn list_uris(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(name): Path<String>,
 ) -> ApiResult<Json<Vec<TrunkOriginationUriView>>> {
     let db = state.db();
-    let trunk_group_id = lookup_trunk_group_id(db, &name).await?;
+    let trunk_group_id = lookup_trunk_group_id(db, &name, &scope.account_id).await?;
 
     let rows = TouEntity::find()
         .filter(TouColumn::TrunkGroupId.eq(trunk_group_id))
@@ -157,12 +161,13 @@ async fn list_uris(
 /// concurrent writes (races surface as 500 — acceptable per T-03-URI-03).
 async fn add_uri(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(name): Path<String>,
     Json(req): Json<AddTrunkOriginationUriRequest>,
 ) -> ApiResult<(StatusCode, Json<TrunkOriginationUriView>)> {
     let db = state.db();
     validate_sip_uri(&req.uri)?;
-    let trunk_group_id = lookup_trunk_group_id(db, &name).await?;
+    let trunk_group_id = lookup_trunk_group_id(db, &name, &scope.account_id).await?;
 
     // Pre-check duplicate (UNIQUE (trunk_group_id, uri) per D-06).
     let dup = TouEntity::find()
@@ -220,10 +225,11 @@ async fn add_uri(
 /// and gaps are acceptable.
 async fn delete_uri(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path((name, uri)): Path<(String, String)>,
 ) -> ApiResult<StatusCode> {
     let db = state.db();
-    let trunk_group_id = lookup_trunk_group_id(db, &name).await?;
+    let trunk_group_id = lookup_trunk_group_id(db, &name, &scope.account_id).await?;
 
     let row = TouEntity::find()
         .filter(TouColumn::TrunkGroupId.eq(trunk_group_id))

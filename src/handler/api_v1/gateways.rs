@@ -13,17 +13,19 @@ use std::time::Duration;
 
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{Extension, Path, Query, State},
     http::StatusCode,
     routing::{get, post},
 };
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set,
+    ActiveModelTrait, ColumnTrait, Condition, EntityTrait, QueryFilter, Set,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::app::AppState;
+use crate::handler::api_v1::account_scope::AccountScope;
+use crate::handler::api_v1::common::{CommonScopeQuery, build_account_filter};
 use crate::handler::api_v1::error::{ApiError, ApiResult};
 use crate::models::did::{Column as DidColumn, Entity as DidEntity};
 use crate::models::sip_trunk::{
@@ -79,9 +81,15 @@ pub fn router() -> Router<AppState> {
         .route("/diagnostics/trunk-test", post(trunk_test))
 }
 
-async fn list_gateways(State(state): State<AppState>) -> ApiResult<Json<Vec<GatewayView>>> {
+async fn list_gateways(
+    State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
+    Query(scope_q): Query<CommonScopeQuery>,
+) -> ApiResult<Json<Vec<GatewayView>>> {
     let db = state.db();
+    let cond = build_account_filter(&scope, TrunkColumn::AccountId, &scope_q, Condition::all())?;
     let rows = TrunkEntity::find()
+        .filter(cond)
         .all(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -90,10 +98,12 @@ async fn list_gateways(State(state): State<AppState>) -> ApiResult<Json<Vec<Gate
 
 async fn get_gateway(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(name): Path<String>,
 ) -> ApiResult<Json<GatewayView>> {
     let db = state.db();
     let row = TrunkEntity::find()
+        .filter(TrunkColumn::AccountId.eq(scope.account_id.clone()))
         .filter(TrunkColumn::Name.eq(name.clone()))
         .one(db)
         .await
@@ -116,14 +126,12 @@ pub struct TrunkTestResp {
 
 async fn trunk_test(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Json(req): Json<TrunkTestReq>,
 ) -> ApiResult<Json<TrunkTestResp>> {
     let db = state.db();
-    let row = TrunkEntity::find()
-        .filter(TrunkColumn::Name.eq(req.name.clone()))
-        .one(db)
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?
+    let row = trunk_by_name(db, &scope.account_id, &req.name)
+        .await?
         .ok_or_else(|| ApiError::not_found(format!("gateway '{}' not found", req.name)))?;
     let endpoint_inner = state.sip_server().inner.endpoint.inner.clone();
     let outcome = probe_trunk(&endpoint_inner, &row, Duration::from_secs(5)).await;
@@ -216,9 +224,11 @@ fn validate_name(name: &str) -> ApiResult<()> {
 
 async fn trunk_by_name(
     db: &sea_orm::DatabaseConnection,
+    account_id: &str,
     name: &str,
 ) -> ApiResult<Option<TrunkModel>> {
     TrunkEntity::find()
+        .filter(TrunkColumn::AccountId.eq(account_id))
         .filter(TrunkColumn::Name.eq(name))
         .one(db)
         .await
@@ -227,12 +237,13 @@ async fn trunk_by_name(
 
 async fn create_gateway(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Json(req): Json<CreateGatewayRequest>,
 ) -> ApiResult<(StatusCode, Json<GatewayView>)> {
     validate_name(&req.name)?;
     let db = state.db();
 
-    if trunk_by_name(db, &req.name).await?.is_some() {
+    if trunk_by_name(db, &scope.account_id, &req.name).await?.is_some() {
         return Err(ApiError::conflict(format!(
             "gateway '{}' already exists",
             req.name
@@ -242,6 +253,7 @@ async fn create_gateway(
     let now = Utc::now();
     let am = TrunkActiveModel {
         name: Set(req.name.clone()),
+        account_id: Set(scope.account_id.clone()),
         display_name: Set(normalize_optional_string(req.display_name)),
         direction: Set(req.direction.unwrap_or_default()),
         status: Set(SipTrunkStatus::default()),
@@ -272,11 +284,12 @@ async fn create_gateway(
 
 async fn update_gateway(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(name): Path<String>,
     Json(req): Json<UpdateGatewayRequest>,
 ) -> ApiResult<Json<GatewayView>> {
     let db = state.db();
-    let existing = trunk_by_name(db, &name)
+    let existing = trunk_by_name(db, &scope.account_id, &name)
         .await?
         .ok_or_else(|| ApiError::not_found(format!("gateway '{}' not found", name)))?;
 
@@ -325,10 +338,11 @@ async fn update_gateway(
 
 async fn delete_gateway(
     State(state): State<AppState>,
+    Extension(scope): Extension<AccountScope>,
     Path(name): Path<String>,
 ) -> ApiResult<StatusCode> {
     let db = state.db();
-    let existing = trunk_by_name(db, &name)
+    let existing = trunk_by_name(db, &scope.account_id, &name)
         .await?
         .ok_or_else(|| ApiError::not_found(format!("gateway '{}' not found", name)))?;
 
