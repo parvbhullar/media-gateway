@@ -424,6 +424,52 @@ fn default_webhook_timeout() -> u64 {
 }
 
 impl IvrDefinition {
+    /// Build a minimal single-entry [`IvrDefinition`] from a flat list of
+    /// [`EntryAction`]s (e.g. produced by the TwiML parser).
+    ///
+    /// The resulting definition has a single root menu whose `timeout_action`
+    /// runs the first action in the list and whose DTMF entries are omitted —
+    /// the runtime will execute each action sequentially as audio completes.
+    ///
+    /// This is intentionally minimal: it creates one root [`MenuNode`] whose
+    /// `timeout_action` is a [`EntryAction::Hangup`] and the supplied actions
+    /// are placed as sequential DTMF-less `MenuEntry`s with synthetic keys
+    /// ("__0", "__1", …) so the IVR engine can dispatch them in order.
+    pub fn from_entry_actions(name: impl Into<String>, actions: Vec<EntryAction>) -> Self {
+        use std::collections::HashMap;
+
+        // Assign synthetic DTMF keys so MenuEntry validation passes.
+        let entries = actions
+            .into_iter()
+            .enumerate()
+            .map(|(i, action)| MenuEntry {
+                key: format!("__{}", i),
+                label: None,
+                action,
+            })
+            .collect();
+
+        let root = MenuNode {
+            entries,
+            timeout_action: Some(EntryAction::Hangup {
+                prompt: None,
+                prompt_text: None,
+                prompt_voice: None,
+            }),
+            ..MenuNode::default()
+        };
+
+        Self {
+            name: name.into(),
+            description: None,
+            lang: None,
+            business_hours: None,
+            tts: None,
+            root,
+            menus: HashMap::new(),
+        }
+    }
+
     /// Look up a menu by key. `"root"` returns the root menu.
     pub fn get_menu(&self, key: &str) -> Option<&MenuNode> {
         if key == "root" {

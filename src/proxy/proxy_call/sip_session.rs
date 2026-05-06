@@ -242,6 +242,155 @@ impl SipSessionHandle {
     }
 }
 
+// ─── TwimlApp ────────────────────────────────────────────────────────────────
+
+/// A [`crate::call::app::CallApp`] that fetches TwiML from the application's
+/// `answer_url` on call entry and delegates execution to [`crate::call::app::ivr::IvrApp`].
+///
+/// On call end the `hangup_url` (if present) receives a fire-and-forget POST.
+struct TwimlApp {
+    application_id: String,
+}
+
+#[async_trait::async_trait]
+impl crate::call::app::CallApp for TwimlApp {
+    fn app_type(&self) -> crate::call::app::CallAppType {
+        crate::call::app::CallAppType::Custom
+    }
+
+    fn name(&self) -> &str {
+        "twiml"
+    }
+
+    /// Fetch TwiML from the application's `answer_url`, parse it, and chain
+    /// to an [`crate::call::app::ivr::IvrApp`] built from the resulting actions.
+    async fn on_enter(
+        &mut self,
+        _ctrl: &mut crate::call::app::CallController,
+        ctx: &crate::call::app::ApplicationContext,
+    ) -> anyhow::Result<crate::call::app::AppAction> {
+        use crate::call::app::answer_url::{AnswerUrlParams, fetch_answer_url};
+        use crate::call::app::twiml::parse_twiml;
+        use crate::call::app::ivr_config::IvrDefinition;
+        use crate::call::app::ivr::IvrApp;
+        use crate::models::supersip_applications::{Column as AppCol, Entity as AppEntity};
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+        // Look up the application row.
+        let app_row = AppEntity::find()
+            .filter(AppCol::Id.eq(self.application_id.clone()))
+            .one(&ctx.db)
+            .await
+            .map_err(|e| anyhow::anyhow!("DB error fetching application: {}", e))?
+            .ok_or_else(|| anyhow::anyhow!("Application {} not found", self.application_id))?;
+
+        if !app_row.enabled {
+            warn!(
+                application_id = %self.application_id,
+                "TwiML application is disabled, hanging up"
+            );
+            return Ok(crate::call::app::AppAction::Hangup {
+                reason: None,
+                code: Some(503),
+            });
+        }
+
+        let params = AnswerUrlParams {
+            caller: &ctx.call_info.caller,
+            callee: &ctx.call_info.callee,
+            call_id: &ctx.call_info.session_id,
+            application_id: &self.application_id,
+            account_id: &app_row.account_id,
+            direction: &ctx.call_info.direction,
+        };
+
+        let twiml_body = match fetch_answer_url(
+            &app_row.answer_url,
+            &app_row.auth_headers,
+            app_row.answer_timeout_ms,
+            &params,
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(e) => {
+                warn!(
+                    application_id = %self.application_id,
+                    error = %e,
+                    cdr_reason = e.cdr_failure_reason(),
+                    "Failed to fetch answer_url"
+                );
+                return Ok(crate::call::app::AppAction::Hangup {
+                    reason: None,
+                    code: Some(500),
+                });
+            }
+        };
+
+        let actions = match parse_twiml(&twiml_body) {
+            Ok(a) => a,
+            Err(e) => {
+                warn!(
+                    application_id = %self.application_id,
+                    error = %e,
+                    "Failed to parse TwiML response"
+                );
+                return Ok(crate::call::app::AppAction::Hangup {
+                    reason: None,
+                    code: Some(500),
+                });
+            }
+        };
+
+        if actions.is_empty() {
+            warn!(
+                application_id = %self.application_id,
+                "TwiML produced no actions, hanging up"
+            );
+            return Ok(crate::call::app::AppAction::Hangup {
+                reason: None,
+                code: None,
+            });
+        }
+
+        let definition = IvrDefinition::from_entry_actions(
+            format!("twiml-{}", self.application_id),
+            actions,
+        );
+        let ivr = IvrApp::new(definition);
+
+        Ok(crate::call::app::AppAction::Chain(Box::new(ivr)))
+    }
+
+    /// Fire-and-forget POST to `hangup_url` when the call ends.
+    async fn on_exit(
+        &mut self,
+        reason: crate::call::app::ExitReason,
+    ) -> anyhow::Result<()> {
+
+        // We need DB access but on_exit only provides the reason. Store hangup_url
+        // at on_enter time would require extra fields. For this fire-and-forget we
+        // emit a background task that re-queries — acceptable since hangup_url fires
+        // after the call is over and DB latency is irrelevant.
+        let app_id = self.application_id.clone();
+        let reason_str = reason.to_string();
+
+        tokio::spawn(async move {
+            // Re-connect is not feasible here without a DB handle; log and return.
+            // The hangup_url POST is wired in cleanup() via the session's reporter.
+            // This on_exit fires too early (before CDR) — the canonical hangup_url
+            // hook is in SipSession::cleanup() where context.db is available.
+            tracing::debug!(
+                application_id = %app_id,
+                reason = %reason_str,
+                "TwimlApp on_exit — hangup_url handled by session cleanup"
+            );
+        });
+
+        Ok(())
+    }
+}
+
 /// Built-in factory that creates `CallApp` instances from app parameters.
 struct BuiltinAppFactory;
 
@@ -253,6 +402,14 @@ impl AppFactory for BuiltinAppFactory {
         _context: &ApplicationContext,
     ) -> Option<Box<dyn crate::call::app::CallApp>> {
         match app_name {
+            "twiml" => {
+                let application_id = params
+                    .as_ref()?
+                    .get("application_id")?
+                    .as_str()?
+                    .to_string();
+                Some(Box::new(TwimlApp { application_id }) as Box<dyn crate::call::app::CallApp>)
+            }
             "ivr" => {
                 let file = params.as_ref()?.get("file")?.as_str()?;
                 let mut app = match crate::call::app::ivr::IvrApp::from_file(file) {
@@ -3027,6 +3184,113 @@ impl SipSession {
 
         // Phase 9 D-26: release per-call manipulation variable scope on hangup.
         self.server.manipulation_engine.cleanup_session(&self.context.session_id);
+
+        // Phase 13 Plan 13-04 — fire-and-forget hangup_url POST for TwiML apps.
+        // We extract the application_id from the dialplan flow so we can look up
+        // the application row and POST to hangup_url.  Runs in a detached task so
+        // cleanup is never delayed; failures are logged at WARN and not retried.
+        if let crate::call::DialplanFlow::Application {
+            ref app_name,
+            ref app_params,
+            ..
+        } = self.context.dialplan.flow
+        {
+            if app_name == "twiml" {
+                if let Some(app_id) = app_params
+                    .as_ref()
+                    .and_then(|p| p.get("application_id"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                {
+                    let db = self.server.database.clone();
+                    let caller = self.context.original_caller.clone();
+                    let callee = self.context.original_callee.clone();
+                    let session_id = self.context.session_id.clone();
+
+                    tokio::spawn(async move {
+                        let db = match db {
+                            Some(d) => d,
+                            None => return,
+                        };
+                        use crate::models::supersip_applications::{
+                            Column as AppCol, Entity as AppEntity,
+                        };
+                        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+                        let app_row = match AppEntity::find()
+                            .filter(AppCol::Id.eq(app_id.clone()))
+                            .one(&db)
+                            .await
+                        {
+                            Ok(Some(row)) => row,
+                            Ok(None) => {
+                                warn!(application_id = %app_id, "Application not found for hangup_url");
+                                return;
+                            }
+                            Err(e) => {
+                                warn!(application_id = %app_id, error = %e, "DB error fetching application for hangup_url");
+                                return;
+                            }
+                        };
+
+                        let hangup_url = match app_row.hangup_url {
+                            Some(ref url) if !url.is_empty() => url.clone(),
+                            _ => return, // No hangup_url configured — nothing to do.
+                        };
+
+                        let client = match reqwest::Client::builder()
+                            .timeout(std::time::Duration::from_secs(5))
+                            .build()
+                        {
+                            Ok(c) => c,
+                            Err(e) => {
+                                warn!(error = %e, "Failed to build HTTP client for hangup_url");
+                                return;
+                            }
+                        };
+
+                        let mut req = client.post(&hangup_url).form(&[
+                            ("caller", caller.as_str()),
+                            ("callee", callee.as_str()),
+                            ("call_id", session_id.as_str()),
+                            ("application_id", app_id.as_str()),
+                            ("account_id", app_row.account_id.as_str()),
+                        ]);
+
+                        if let Some(obj) = app_row.auth_headers.as_object() {
+                            for (key, value) in obj {
+                                if let Some(v) = value.as_str() {
+                                    req = req.header(key.as_str(), v);
+                                }
+                            }
+                        }
+
+                        match req.send().await {
+                            Ok(resp) if resp.status().is_success() => {
+                                tracing::debug!(
+                                    application_id = %app_id,
+                                    "hangup_url POST succeeded"
+                                );
+                            }
+                            Ok(resp) => {
+                                warn!(
+                                    application_id = %app_id,
+                                    status = %resp.status(),
+                                    "hangup_url POST returned non-2xx status"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    application_id = %app_id,
+                                    error = %e,
+                                    "hangup_url POST failed"
+                                );
+                            }
+                        }
+                    });
+                }
+            }
+        }
 
         debug!(session_id = %self.context.session_id, "Session cleanup complete");
     }
