@@ -5,6 +5,7 @@
 //! `.planning/phases/01-api-shell-cheap-wrappers/01-CONTEXT.md` §"Pagination
 //! envelope (SHELL-02)" and must not drift.
 
+use sea_orm::{ColumnTrait, Condition};
 use serde::{Deserialize, Serialize};
 
 fn default_page() -> u64 {
@@ -75,6 +76,33 @@ impl<T: Serialize> PaginatedResponse<T> {
             total,
         }
     }
+}
+
+/// Query parameters for tenant scope: `?account_id=<slug>` and `?include=all`.
+///
+/// Accepted by every list endpoint after the handler retrofit in 13-01d.
+#[derive(Debug, Default, Deserialize)]
+pub struct CommonScopeQuery {
+    pub account_id: Option<String>,
+    pub include: Option<String>,
+}
+
+/// Build the tenant `Condition` fragment for a list query.
+///
+/// Calls `scope.check_query_access` (returns 403 for scope violations) then
+/// applies the appropriate `account_id` equality filter. Returns the base
+/// `Condition` unmodified when the master uses `?include=all`.
+pub(crate) fn build_account_filter<C: ColumnTrait>(
+    scope: &crate::handler::api_v1::account_scope::AccountScope,
+    column: C,
+    q: &CommonScopeQuery,
+    base: Condition,
+) -> crate::handler::api_v1::error::ApiResult<Condition> {
+    scope.check_query_access(q)?;
+    Ok(match scope.effective_filter(q) {
+        Some(acct) => base.add(column.eq(acct)),
+        None => base,
+    })
 }
 
 #[cfg(test)]

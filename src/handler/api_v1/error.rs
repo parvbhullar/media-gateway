@@ -92,6 +92,14 @@ impl ApiError {
         }
     }
 
+    pub fn forbidden(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "forbidden_cross_account",
+            message: msg.into(),
+        }
+    }
+
     /// 410 Gone with `code: "recording_missing"`.
     ///
     /// Phase 12 D-14: returned by `/api/v1/recordings/{id}/download` when

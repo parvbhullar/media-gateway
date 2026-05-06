@@ -4,6 +4,7 @@
 //! middleware, and the root router that Plans 1+ will nest feature
 //! sub-routers into (gateway health, routing, security, DIDs, etc.).
 
+pub mod account_scope;
 pub mod auth;
 pub mod calls;                    // Phase 4 Plan 04-01 — CALL-01, CALL-02
 pub mod cdrs;

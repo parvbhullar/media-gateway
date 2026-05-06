@@ -21,6 +21,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use crate::app::AppState;
+use crate::handler::api_v1::account_scope::AccountScope;
 use crate::handler::api_v1::error::ApiError;
 use crate::models::api_key;
 
@@ -65,7 +66,7 @@ pub fn verify_api_key_hash(plaintext: &str, stored_hash: &str) -> bool {
 /// `ApiError` JSON envelope with the appropriate HTTP status.
 pub async fn api_v1_auth_middleware(
     State(state): State<AppState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     let Some(token) = extract_bearer(request.headers()) else {
@@ -84,6 +85,9 @@ pub async fn api_v1_auth_middleware(
         Ok(None) => return ApiError::unauthorized("invalid api key").into_response(),
         Err(_) => return ApiError::internal("auth lookup failed").into_response(),
     };
+
+    let scope = AccountScope::from_account_id(row.account_id.clone());
+    request.extensions_mut().insert(scope);
 
     // Fire-and-forget `last_used_at` touch; never blocks the request.
     let db_clone = db.clone();
