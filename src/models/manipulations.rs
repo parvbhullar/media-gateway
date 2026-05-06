@@ -49,6 +49,9 @@ pub struct Model {
     pub rules: serde_json::Value,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
+    /// Phase 13 Plan 01a (TEN-01) — owning sub-account; defaults to 'root'.
+    #[sea_orm(default_value = "root")]
+    pub account_id: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -197,6 +200,7 @@ mod tests {
             rules: Set(serde_json::json!([])),
             created_at: Set(now),
             updated_at: Set(now),
+            account_id: Set("root".to_string()),
         };
         let inserted = am.insert(&db).await.expect("insert manipulation row");
         assert_eq!(inserted.name, "strip-pai");
@@ -230,6 +234,7 @@ mod tests {
             rules: Set(serde_json::json!([])),
             created_at: Set(now),
             updated_at: Set(now),
+            account_id: Set("root".to_string()),
         };
         make("a").insert(&db).await.expect("first row inserts");
         let dup_err = make("b").insert(&db).await;
@@ -252,6 +257,7 @@ mod tests {
             rules: serde_json::json!([]),
             created_at: now,
             updated_at: now,
+            account_id: "root".to_string(),
         };
         assert_eq!(
             inbound.direction_enum(),
@@ -299,6 +305,7 @@ mod tests {
             rules: Set(payload.clone()),
             created_at: Set(now),
             updated_at: Set(now),
+            account_id: Set("root".to_string()),
         };
         let inserted = am.insert(&db).await.expect("insert");
         assert_eq!(inserted.rules, payload);

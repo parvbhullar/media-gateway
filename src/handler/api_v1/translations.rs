@@ -343,6 +343,7 @@ async fn create(
         is_active: Set(req.is_active.unwrap_or(true)),
         created_at: Set(now),
         updated_at: Set(now),
+        account_id: Set("root".to_string()),
     };
     let inserted = am
         .insert(db)

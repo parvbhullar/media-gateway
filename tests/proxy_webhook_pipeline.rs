@@ -166,6 +166,7 @@ async fn seed_webhook_direct(
         timeout_ms: Set(timeout_ms),
         created_at: Set(now),
         updated_at: Set(now),
+        account_id: Set("root".to_string()),
     };
     am.insert(state.db()).await.expect("insert webhook");
     id
@@ -373,6 +374,7 @@ async fn it_wh_deliver_test_event_success() {
         timeout_ms: 2000,
         created_at: now,
         updated_at: now,
+        account_id: "root".to_string(),
     };
     let event = rustpbx::proxy::webhook::WebhookEvent {
         event_id: rustpbx::proxy::webhook::new_event_id(),
@@ -415,6 +417,7 @@ async fn it_wh_deliver_test_event_failure() {
         timeout_ms: 2000,
         created_at: now,
         updated_at: now,
+        account_id: "root".to_string(),
     };
     let event = rustpbx::proxy::webhook::WebhookEvent {
         event_id: rustpbx::proxy::webhook::new_event_id(),

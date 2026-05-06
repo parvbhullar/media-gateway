@@ -1029,6 +1029,7 @@ async fn delete_trunk_blocked_by_did_reference_returns_409() {
         created_at: Set(now),
         updated_at: Set(now),
         trunk_group_name: Set(Some("tg-did-block".to_string())),
+        account_id: Set("root".to_string()),
     };
     did_am.insert(state.db()).await.expect("insert DID");
 

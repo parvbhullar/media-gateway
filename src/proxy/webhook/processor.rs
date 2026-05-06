@@ -506,6 +506,7 @@ mod tests {
             timeout_ms: 5000,
             created_at: now,
             updated_at: now,
+            account_id: "root".to_string(),
         }
     }
 
@@ -767,6 +768,7 @@ mod tests {
             timeout_ms: Set(timeout_ms),
             created_at: Set(now),
             updated_at: Set(now),
+            account_id: Set("root".to_string()),
         };
         am.insert(db).await.expect("insert webhook")
     }

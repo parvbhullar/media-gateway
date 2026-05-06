@@ -71,6 +71,9 @@ pub struct Model {
     /// touch this column (the `NewDid` struct does not carry it and the
     /// upsert `update_columns(...)` list deliberately excludes it).
     pub trunk_group_name: Option<String>,
+    /// Phase 13 Plan 01a (TEN-01) — owning sub-account; defaults to 'root'.
+    #[sea_orm(default_value = "root")]
+    pub account_id: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

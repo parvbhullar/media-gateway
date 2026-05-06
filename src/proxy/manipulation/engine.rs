@@ -707,6 +707,7 @@ mod tests {
             rules: Set(serde_json::to_value(&rules).expect("rules to json")),
             created_at: Set(now),
             updated_at: Set(now),
+            account_id: Set("root".to_string()),
         };
         am.insert(db).await.expect("insert manipulation row");
     }

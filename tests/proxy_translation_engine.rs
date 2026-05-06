@@ -75,6 +75,7 @@ async fn seed_translation(
         is_active: Set(true),
         created_at: Set(now),
         updated_at: Set(now),
+        account_id: Set("root".to_string()),
     };
     let inserted = am.insert(db).await.expect("insert translation row");
     inserted.id

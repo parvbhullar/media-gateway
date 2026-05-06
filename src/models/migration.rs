@@ -75,6 +75,13 @@ impl MigratorTrait for Migrator {
             // Forward-only. No FK dependencies; standalone global-state tables.
             Box::new(super::security_rules::Migration),
             Box::new(super::security_blocks::Migration),
+            // Phase 13 Plan 01a — TEN-01 / TEN-06 big-bang multi-tenancy.
+            // Reversible: creates supersip_sub_accounts (seeded 'root') and
+            // adds account_id + idx_<table>_account_id to all 17 existing
+            // CRUD tables. Skips legacy rustpbx_routes per Phase 6 D-05.
+            // MUST run AFTER every preceding migration so each touched table
+            // already exists.
+            Box::new(super::add_account_id_to_all_tables::Migration),
         ]
     }
 }

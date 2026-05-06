@@ -609,6 +609,7 @@ impl FrequencyLimiter for InMemoryFrequencyLimiter {
                     Some(chrono::DateTime::from_timestamp(*window_end, 0).unwrap_or_default())
                 },
                 updated_at: Utc::now(),
+                account_id: "root".to_string(),
             });
         }
         Ok(results)

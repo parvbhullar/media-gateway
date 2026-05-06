@@ -23,6 +23,9 @@ pub struct Model {
     pub weight: i32,
     pub priority: i32,
     pub position: i32,
+    /// Phase 13 Plan 01a (TEN-01) — owning sub-account; defaults to 'root'.
+    #[sea_orm(default_value = "root")]
+    pub account_id: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

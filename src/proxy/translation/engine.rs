@@ -271,6 +271,7 @@ mod tests {
             is_active: Set(is_active),
             created_at: Set(now),
             updated_at: Set(now),
+            account_id: Set("root".to_string()),
         };
         let inserted = am.insert(db).await.expect("insert translation row");
         inserted.id

@@ -430,6 +430,7 @@ async fn create(
         rules: Set(rules_json),
         created_at: Set(now),
         updated_at: Set(now),
+        account_id: Set("root".to_string()),
     };
     let inserted = am
         .insert(db)

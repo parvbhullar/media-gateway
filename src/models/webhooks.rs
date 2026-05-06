@@ -52,6 +52,9 @@ pub struct Model {
     pub timeout_ms: i32,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
+    /// Phase 13 Plan 01a (TEN-01) — owning sub-account; defaults to 'root'.
+    #[sea_orm(default_value = "root")]
+    pub account_id: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -195,6 +198,7 @@ mod tests {
             timeout_ms: Set(5000),
             created_at: Set(now),
             updated_at: Set(now),
+            account_id: Set("root".to_string()),
         };
         let inserted = am.insert(&db).await.expect("insert webhook row");
         assert_eq!(inserted.name, "primary");
@@ -228,6 +232,7 @@ mod tests {
             timeout_ms: Set(5000),
             created_at: Set(now),
             updated_at: Set(now),
+            account_id: Set("root".to_string()),
         };
 
         make("a").insert(&db).await.expect("first row inserts");

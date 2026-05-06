@@ -21,6 +21,9 @@ pub struct Model {
     pub created_at: DateTimeUtc,
     pub last_used_at: Option<DateTimeUtc>,
     pub revoked_at: Option<DateTimeUtc>,
+    /// Phase 13 Plan 01a (TEN-01) — owning sub-account; defaults to 'root'.
+    #[sea_orm(default_value = "root")]
+    pub account_id: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -203,6 +203,10 @@ required-features = ["opus"]
 name = "verify-i18n"
 path = "tools/verify_i18n.rs"
 
+[[test]]
+name = "did_index"
+required-features = ["integration-test"]
+
 [[bin]]
 name = "dump-mysql-schema"
 path = "src/bin/dump_mysql_schema.rs"

@@ -370,6 +370,7 @@ async fn create_webhook(
         timeout_ms: Set(timeout_ms),
         created_at: Set(now),
         updated_at: Set(now),
+        account_id: Set("root".to_string()),
     };
     let inserted = am
         .insert(db)

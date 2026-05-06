@@ -33,6 +33,9 @@ pub struct Model {
     pub unblocked_at: Option<DateTimeUtc>,
     #[sea_orm(nullable)]
     pub auto_unblock_at: Option<DateTimeUtc>,
+    /// Phase 13 Plan 01a (TEN-01) — owning sub-account; defaults to 'root'.
+    #[sea_orm(default_value = "root")]
+    pub account_id: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

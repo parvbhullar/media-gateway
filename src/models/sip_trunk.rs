@@ -141,6 +141,9 @@ pub struct Model {
     pub consecutive_failures: i32,
     #[sea_orm(default_value = "0")]
     pub consecutive_successes: i32,
+    /// Phase 13 Plan 01a (TEN-01) — owning sub-account; defaults to 'root'.
+    #[sea_orm(default_value = "root")]
+    pub account_id: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

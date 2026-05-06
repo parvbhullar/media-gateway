@@ -84,6 +84,7 @@ async fn seed_manipulation(
         rules: Set(rules),
         created_at: Set(now),
         updated_at: Set(now),
+        account_id: Set("root".to_string()),
     };
     am.insert(db).await.expect("insert manipulation row");
     id
@@ -116,6 +117,7 @@ async fn seed_translation(
         is_active: Set(true),
         created_at: Set(now),
         updated_at: Set(now),
+        account_id: Set("root".to_string()),
     };
     am.insert(db).await.expect("insert translation row");
     id
