@@ -82,6 +82,11 @@ impl MigratorTrait for Migrator {
             // MUST run AFTER every preceding migration so each touched table
             // already exists.
             Box::new(super::add_account_id_to_all_tables::Migration),
+            // Phase 13 Plan 13-02 — EPUA-01 endpoint registry.
+            // UUID PK; UNIQUE (account_id, username) per D-09.
+            // HA1 = md5(username:realm:password) per D-10.
+            // MUST run AFTER add_account_id_to_all_tables.
+            Box::new(super::supersip_endpoints::Migration),
         ]
     }
 }
