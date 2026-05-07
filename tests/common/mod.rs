@@ -138,6 +138,55 @@ pub async fn test_state_with_api_key_for_account(
     (state, plaintext)
 }
 
+/// Build an `AppState` and insert three freshly-issued API keys for three
+/// different tenant accounts: `root` (master), `acme`, and `globex`.
+///
+/// Returns `(state, root_token, acme_token, globex_token)`.
+pub async fn test_state_with_three_accounts() -> (AppState, String, String, String) {
+    let state = test_state_empty().await;
+
+    let IssuedKey { plaintext: root_token, hash: root_hash } = issue_api_key();
+    api_key::ActiveModel {
+        name: Set("iso-root".to_string()),
+        hash_sha256: Set(root_hash),
+        description: Set(None),
+        created_at: Set(Utc::now()),
+        account_id: Set("root".to_string()),
+        ..Default::default()
+    }
+    .insert(state.db())
+    .await
+    .expect("failed to insert root api_key");
+
+    let IssuedKey { plaintext: acme_token, hash: acme_hash } = issue_api_key();
+    api_key::ActiveModel {
+        name: Set("iso-acme".to_string()),
+        hash_sha256: Set(acme_hash),
+        description: Set(None),
+        created_at: Set(Utc::now()),
+        account_id: Set("acme".to_string()),
+        ..Default::default()
+    }
+    .insert(state.db())
+    .await
+    .expect("failed to insert acme api_key");
+
+    let IssuedKey { plaintext: globex_token, hash: globex_hash } = issue_api_key();
+    api_key::ActiveModel {
+        name: Set("iso-globex".to_string()),
+        hash_sha256: Set(globex_hash),
+        description: Set(None),
+        created_at: Set(Utc::now()),
+        account_id: Set("globex".to_string()),
+        ..Default::default()
+    }
+    .insert(state.db())
+    .await
+    .expect("failed to insert globex api_key");
+
+    (state, root_token, acme_token, globex_token)
+}
+
 /// Build an `AppState` with a custom absolute recorder root, plus one API key.
 ///
 /// Returns `(state, token, recorder_root_path)`.  The caller is responsible
