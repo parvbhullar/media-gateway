@@ -457,7 +457,7 @@
                     this.displayError = null;
                     this.displaySaved = false;
                     try {
-                        const res = await fetch(`${window.__consoleApiPrefix}/settings/config/display`, {
+                        const res = await fetch(`{{ base_path | default('/console') }}/settings/config/display`, {
                             method: 'PATCH',
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({ display_timezone: this.displayDraft.timezone }),
