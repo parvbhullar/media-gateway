@@ -670,14 +670,17 @@
                     return value;
                 },
                 formatDate(value) {
-                    if (!value) {
-                        return '—';
-                    }
+                    if (!value) return '—';
                     const date = new Date(value);
-                    if (Number.isNaN(date.getTime())) {
-                        return value;
-                    }
-                    return date.toLocaleString();
+                    if (Number.isNaN(date.getTime())) return value;
+                    try {
+                        return new Intl.DateTimeFormat(undefined, {
+                            timeZone: window.DISPLAY_TIMEZONE || 'Asia/Kolkata',
+                            year: 'numeric', month: '2-digit', day: '2-digit',
+                            hour: '2-digit', minute: '2-digit', second: '2-digit',
+                            hour12: false,
+                        }).format(date);
+                    } catch (_) { return date.toLocaleString(); }
                 },
                 loginAllowed(extension) {
                     return !(extension?.login_disabled);
@@ -820,14 +823,10 @@
                     return `Until ${this.formatDateInput(to)}`;
                 },
                 formatDateInput(value) {
-                    if (!value) {
-                        return '—';
-                    }
+                    if (!value) return '—';
                     const parsed = new Date(value);
-                    if (Number.isNaN(parsed.getTime())) {
-                        return value;
-                    }
-                    return parsed.toLocaleString();
+                    if (Number.isNaN(parsed.getTime())) return value;
+                    return this.formatDate(value);
                 },
                 addFilter(event) {
                     const key = event?.target?.value;

@@ -8,6 +8,7 @@ use axum::{
     response::Response,
 };
 use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
+use chrono_tz::Tz;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, FromQueryResult, PaginatorTrait,
     QueryFilter, QuerySelect, sea_query,
@@ -83,7 +84,7 @@ impl DashboardPayload {
         let bucket_seconds = (total_seconds as f64 / bucket_count as f64)
             .ceil()
             .max(60.0) as i64;
-        let (timeline, labels) = build_timeline_from_buckets(Vec::new(), &range, bucket_seconds);
+        let (timeline, labels) = build_timeline_from_buckets(Vec::new(), &range, bucket_seconds, chrono_tz::UTC);
         Self {
             range: range.descriptor(),
             metrics: DashboardMetrics {
@@ -195,6 +196,13 @@ impl TimeRange {
 pub struct TimelineBucket {
     bucket: i64,
     count: i64,
+}
+
+fn resolve_display_tz(state: &ConsoleState) -> Tz {
+    state
+        .display_timezone()
+        .parse::<Tz>()
+        .unwrap_or(chrono_tz::Asia::Kolkata)
 }
 
 async fn build_dashboard_payload(
@@ -371,8 +379,9 @@ async fn build_dashboard_payload(
         None
     };
 
+    let display_tz = resolve_display_tz(state);
     let (timeline, timeline_labels) =
-        build_timeline_from_buckets(timeline_buckets, range, bucket_seconds);
+        build_timeline_from_buckets(timeline_buckets, range, bucket_seconds, display_tz);
     let trend = calc_trend_string(total_recent, previous_count as u32);
     let asr_string = if total_recent > 0 {
         format!(
@@ -429,6 +438,7 @@ fn build_timeline_from_buckets(
     buckets: Vec<TimelineBucket>,
     range: &TimeRange,
     bucket_seconds: i64,
+    tz: Tz,
 ) -> (Vec<i64>, Vec<String>) {
     let bucket_count = range.bucket_count.max(1);
     let mut series = vec![0i64; bucket_count];
@@ -449,20 +459,21 @@ fn build_timeline_from_buckets(
         } else {
             bucket_end
         };
-        labels.push(format_timeline_label(range, clamped_end));
+        labels.push(format_timeline_label(range, clamped_end, tz));
     }
 
     (series, labels)
 }
 
-fn format_timeline_label(range: &TimeRange, timestamp: DateTime<Utc>) -> String {
+fn format_timeline_label(range: &TimeRange, timestamp: DateTime<Utc>, tz: Tz) -> String {
+    let local = timestamp.with_timezone(&tz);
     let total_seconds = range.duration().num_seconds();
     if total_seconds <= 3600 {
-        timestamp.format("%H:%M").to_string()
+        local.format("%H:%M").to_string()
     } else if total_seconds <= 172_800 {
-        timestamp.format("%d %H:%M").to_string()
+        local.format("%d %H:%M").to_string()
     } else {
-        timestamp.format("%m-%d").to_string()
+        local.format("%m-%d").to_string()
     }
 }
 
@@ -488,7 +499,8 @@ async fn active_call_stats(state: &ConsoleState, limit: usize) -> (usize, Vec<Ac
                 };
 
                 let start_time = call.started_at;
-                let started_at = start_time.format("%H:%M").to_string();
+                let display_tz = resolve_display_tz(state);
+                let started_at = start_time.with_timezone(&display_tz).format("%H:%M").to_string();
                 let duration_secs = if let Some(answered_at) = call.answered_at {
                     (Utc::now() - answered_at).num_seconds().max(0)
                 } else {
