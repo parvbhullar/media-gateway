@@ -475,7 +475,7 @@ fn format_timeline_label(range: &TimeRange, timestamp: DateTime<Utc>, tz: Tz) ->
         local.format("%H:%M").to_string()
     } else if total_seconds <= 7 * 86_400 {
         // multi-day ranges up to a week: show day + time
-        local.format("%d %H:%M").to_string()
+        local.format("%d/%m - %H:%M").to_string()
     } else {
         // longer ranges: show month-day only
         local.format("%m-%d").to_string()
