@@ -1466,12 +1466,21 @@
                     return value || '—';
                 }
                 const date = new Date(timestamp);
+                const tz = window.DISPLAY_TIMEZONE || 'Asia/Kolkata';
                 const pad = (num, len = 2) => String(num).padStart(len, '0');
-                const hours = pad(date.getHours());
-                const minutes = pad(date.getMinutes());
-                const seconds = pad(date.getSeconds());
-                const milliseconds = pad(date.getMilliseconds(), 3);
-                return `${hours}:${minutes}:${seconds}.${milliseconds}`;
+                try {
+                    const parts = new Intl.DateTimeFormat('en', {
+                        timeZone: tz,
+                        hour: '2-digit',
+                        minute: '2-digit',
+                        second: '2-digit',
+                        hour12: false,
+                    }).formatToParts(date);
+                    const get = (type) => (parts.find(p => p.type === type) || {}).value || '00';
+                    return `${get('hour')}:${get('minute')}:${get('second')}.${pad(date.getMilliseconds(), 3)}`;
+                } catch (_) {
+                    return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}`;
+                }
             },
             getSipInfoClass(value) {
                 const original = (value || '').toString().trim();
@@ -2141,6 +2150,7 @@
                         return typeof input === 'string' ? input : '—';
                     }
                     return new Intl.DateTimeFormat(undefined, {
+                        timeZone: window.DISPLAY_TIMEZONE || 'Asia/Kolkata',
                         year: 'numeric',
                         month: '2-digit',
                         day: '2-digit',

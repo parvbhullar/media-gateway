@@ -404,7 +404,7 @@ default('RustPBX') }}{% endblock %}
                                 <dt class="font-medium text-slate-500">{{ "sip_trunk_detail.reg_last_register" | t }}
                                 </dt>
                                 <dd class="text-slate-700"
-                                    x-text="regStatus.last_register_at ? new Date(regStatus.last_register_at).toLocaleString() : '—'">
+                                    x-text="regStatus.last_register_at ? formatDate(regStatus.last_register_at) : '—'">
                                 </dd>
                             </div>
                             <template x-if="regStatus.error">
@@ -613,7 +613,20 @@ default('RustPBX') }}{% endblock %}
                 if (!value) return '—';
                 const date = new Date(value);
                 if (Number.isNaN(date.getTime())) return value;
-                return date.toLocaleString();
+                try {
+                    return new Intl.DateTimeFormat(undefined, {
+                        timeZone: window.DISPLAY_TIMEZONE || 'Asia/Kolkata',
+                        year: 'numeric',
+                        month: '2-digit',
+                        day: '2-digit',
+                        hour: '2-digit',
+                        minute: '2-digit',
+                        second: '2-digit',
+                        hour12: false,
+                    }).format(date);
+                } catch (_) {
+                    return date.toLocaleString();
+                }
             },
             formatMultilineList(value, preferredKeys = []) {
                 const keys = Array.isArray(preferredKeys) ? preferredKeys : [];

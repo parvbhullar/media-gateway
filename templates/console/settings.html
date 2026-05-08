@@ -429,6 +429,83 @@
 
         </section>
 
+        <!-- ── Display settings ───────────────────────────────────────────────── -->
+        <section x-show="activeTab === 'display'" x-cloak x-transition.opacity class="space-y-6"
+            id="settings-tab-display" role="tabpanel" tabindex="0"
+            x-data="{
+                displayDraft: { timezone: (rawSettings?.display?.timezone || window.DISPLAY_TIMEZONE || 'Asia/Kolkata') },
+                displayProcessing: false,
+                displaySaved: false,
+                displayError: null,
+                timezones: [
+                    { value: 'Asia/Kolkata', label: 'India Standard Time (IST, UTC+5:30)' },
+                    { value: 'UTC', label: 'UTC (Coordinated Universal Time)' },
+                    { value: 'America/New_York', label: 'Eastern Time (ET, UTC-5/−4)' },
+                    { value: 'America/Chicago', label: 'Central Time (CT, UTC-6/−5)' },
+                    { value: 'America/Denver', label: 'Mountain Time (MT, UTC-7/−6)' },
+                    { value: 'America/Los_Angeles', label: 'Pacific Time (PT, UTC-8/−7)' },
+                    { value: 'Europe/London', label: 'Greenwich Mean Time (GMT/BST)' },
+                    { value: 'Europe/Paris', label: 'Central European Time (CET, UTC+1/+2)' },
+                    { value: 'Europe/Berlin', label: 'Central European Time (CET, UTC+1/+2)' },
+                    { value: 'Asia/Dubai', label: 'Gulf Standard Time (GST, UTC+4)' },
+                    { value: 'Asia/Singapore', label: 'Singapore Time (SGT, UTC+8)' },
+                    { value: 'Asia/Tokyo', label: 'Japan Standard Time (JST, UTC+9)' },
+                    { value: 'Australia/Sydney', label: 'Australian Eastern Time (AEST, UTC+10/+11)' },
+                ],
+                async saveDisplaySettings() {
+                    this.displayProcessing = true;
+                    this.displayError = null;
+                    this.displaySaved = false;
+                    try {
+                        const res = await fetch(`${window.__consoleApiPrefix}/settings/config/display`, {
+                            method: 'PATCH',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ display_timezone: this.displayDraft.timezone }),
+                        });
+                        const body = await res.json();
+                        if (!res.ok) {
+                            this.displayError = body.message || 'Failed to save';
+                        } else {
+                            window.DISPLAY_TIMEZONE = this.displayDraft.timezone;
+                            this.displaySaved = true;
+                            setTimeout(() => { this.displaySaved = false; }, 3000);
+                        }
+                    } catch (e) {
+                        this.displayError = e.message || 'Network error';
+                    } finally {
+                        this.displayProcessing = false;
+                    }
+                }
+            }">
+            <div class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
+                <h2 class="text-base font-semibold text-slate-900">Display settings</h2>
+                <p class="mt-1 text-sm text-slate-500">Timestamps are stored in UTC. This setting controls how they are displayed in the console.</p>
+
+                <form class="mt-6 space-y-5" @submit.prevent="saveDisplaySettings">
+                    <div>
+                        <label for="display_timezone" class="block text-sm font-medium text-slate-700">Display timezone</label>
+                        <p class="mt-1 text-xs text-slate-500">All timestamps in call records, CDRs, and diagnostic views will be shown in this timezone.</p>
+                        <select id="display_timezone" x-model="displayDraft.timezone"
+                            class="mt-2 block w-full max-w-md rounded-md border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500">
+                            <template x-for="tz in timezones" :key="tz.value">
+                                <option :value="tz.value" x-text="tz.label"></option>
+                            </template>
+                        </select>
+                    </div>
+
+                    <div class="flex items-center gap-3">
+                        <button type="submit"
+                            class="rounded-md bg-sky-600 px-4 py-2 text-sm font-medium text-white hover:bg-sky-700 disabled:opacity-50"
+                            :disabled="displayProcessing">
+                            <span x-text="displayProcessing ? 'Saving…' : 'Save'"></span>
+                        </button>
+                        <span x-show="displaySaved" x-cloak class="text-sm text-emerald-600">Saved</span>
+                        <span x-show="displayError" x-cloak class="text-sm text-rose-600" x-text="displayError"></span>
+                    </div>
+                </form>
+            </div>
+        </section>
+
         <section x-show="activeTab === 'logs'" x-cloak x-transition.opacity class="space-y-6" id="settings-tab-logs"
             role="tabpanel" tabindex="0">
             <div class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
@@ -1488,7 +1565,7 @@
                                     <td class="px-3 py-2 font-mono break-all" x-text="entry.target_key"></td>
                                     <td class="px-3 py-2 text-right tabular-nums" x-text="entry.attempts"></td>
                                     <td class="px-3 py-2 text-slate-500" x-text="entry.last_error || ''"></td>
-                                    <td class="px-3 py-2 text-slate-500" x-text="entry.last_attempt_at ? new Date(entry.last_attempt_at).toLocaleString() : '—'"></td>
+                                    <td class="px-3 py-2 text-slate-500" x-text="entry.last_attempt_at ? formatDateTime(entry.last_attempt_at) : '—'"></td>
                                 </tr>
                             </template>
                         </tbody>
@@ -2956,6 +3033,7 @@
                 const tt = options?.t || {};
                 return [
                     { id: 'platform', label: tget(tt, 'settings_page.platform_overview') || 'Platform overview' },
+                    { id: 'display', label: 'Display' },
                     { id: 'proxy', label: tget(tt, 'settings_page.proxy_settings') || 'Proxy settings' },
                     { id: 'sipflow', label: tget(tt, 'settings_page.sipflow_recording') || 'SipFlow recording' },
                     { id: 'storage', label: tget(tt, 'settings_page.storage_destinations') || 'Storage' },
@@ -3495,7 +3573,16 @@
                     if (Number.isNaN(date.getTime())) {
                         return value;
                     }
-                    return date.toLocaleString();
+                    return new Intl.DateTimeFormat(undefined, {
+                        timeZone: window.DISPLAY_TIMEZONE || 'Asia/Kolkata',
+                        year: 'numeric',
+                        month: '2-digit',
+                        day: '2-digit',
+                        hour: '2-digit',
+                        minute: '2-digit',
+                        second: '2-digit',
+                        hour12: false,
+                    }).format(date);
                 } catch (err) {
                     return value;
                 }

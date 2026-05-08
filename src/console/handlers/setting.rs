@@ -203,6 +203,7 @@ pub fn urls() -> Router<Arc<ConsoleState>> {
             post(test_user_backend),
         )
         .route("/settings/config/security", patch(update_security_settings))
+        .route("/settings/config/display", patch(update_display_settings))
         .route("/settings/config/rwi", patch(update_rwi_settings))
         // Failed S3 upload retry queue (read + ops)
         .route(
@@ -526,6 +527,11 @@ async fn build_settings_payload(state: &ConsoleState) -> JsonValue {
                 .unwrap_or(JsonValue::Null),
         );
     }
+
+    data.insert(
+        "display".to_string(),
+        json!({ "timezone": state.display_timezone() }),
+    );
 
     JsonValue::Object(data)
 }
@@ -2452,6 +2458,54 @@ struct RwiContextPayload {
     no_answer_timeout_secs: Option<u32>,
     no_answer_action: Option<String>,
     no_answer_transfer_target: Option<String>,
+}
+
+const ALLOWED_TIMEZONES: &[&str] = &[
+    "Asia/Kolkata",
+    "UTC",
+    "America/New_York",
+    "America/Chicago",
+    "America/Denver",
+    "America/Los_Angeles",
+    "Europe/London",
+    "Europe/Paris",
+    "Europe/Berlin",
+    "Asia/Dubai",
+    "Asia/Singapore",
+    "Asia/Tokyo",
+    "Australia/Sydney",
+];
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct DisplaySettingsPayload {
+    pub display_timezone: String,
+}
+
+pub(crate) async fn update_display_settings(
+    State(state): State<Arc<ConsoleState>>,
+    AuthRequired(user): AuthRequired,
+    Json(payload): Json<DisplaySettingsPayload>,
+) -> Response {
+    if !user.is_superuser && !state.has_permission(&user, "system", "write").await {
+        return (StatusCode::FORBIDDEN, Json(json!({"message": "Permission denied"}))).into_response();
+    }
+    let tz = payload.display_timezone.trim();
+    if !ALLOWED_TIMEZONES.contains(&tz) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"message": format!("Invalid timezone '{}'. Must be one of the supported IANA timezone names.", tz)})),
+        )
+            .into_response();
+    }
+    if let Err(e) = state.set_display_timezone(tz).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"message": format!("Failed to save timezone: {}", e)})),
+        )
+            .into_response();
+    }
+    Json(json!({"message": "Display settings saved", "display_timezone": state.display_timezone()}))
+        .into_response()
 }
 
 pub(crate) async fn update_rwi_settings(
