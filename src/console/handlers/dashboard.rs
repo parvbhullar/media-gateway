@@ -7,7 +7,7 @@ use axum::{
     http::HeaderMap,
     response::Response,
 };
-use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
 use chrono_tz::Tz;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, FromQueryResult, PaginatorTrait,
@@ -24,7 +24,8 @@ pub async fn dashboard(
     headers: HeaderMap,
     AuthRequired(user): AuthRequired,
 ) -> Response {
-    let range = resolve_time_range(None);
+    let tz = resolve_display_tz(&state);
+    let range = resolve_time_range(None, tz);
     let payload = match build_dashboard_payload(&state, &range).await {
         Ok(payload) => payload,
         Err(err) => {
@@ -59,7 +60,8 @@ pub async fn dashboard_data(
     AuthRequired(_): AuthRequired,
     Query(query): Query<DashboardDataQuery>,
 ) -> Result<Json<DashboardPayload>, Response> {
-    let range = resolve_time_range(query.range.as_deref());
+    let tz = resolve_display_tz(&state);
+    let range = resolve_time_range(query.range.as_deref(), tz);
     match build_dashboard_payload(&state, &range).await {
         Ok(payload) => Ok(Json(payload)),
         Err(err) => {
@@ -297,7 +299,7 @@ async fn build_dashboard_payload(
         .count(db)
         .await?;
 
-    let today_start = start_of_day(Utc::now());
+    let today_start = start_of_day_in_tz(Utc::now(), resolve_display_tz(state));
 
     #[derive(Debug, FromQueryResult)]
     struct TodayStats {
@@ -623,11 +625,11 @@ fn ensure_direction_defaults(map: &mut BTreeMap<String, i64>) {
     }
 }
 
-fn resolve_time_range(input: Option<&str>) -> TimeRange {
+fn resolve_time_range(input: Option<&str>, tz: Tz) -> TimeRange {
     let now = Utc::now();
     match input.unwrap_or("10m") {
         "today" => {
-            let start = start_of_day(now);
+            let start = start_of_day_in_tz(now, tz);
             let previous_start = start - Duration::days(1);
             TimeRange {
                 key: "today".to_string(),
@@ -643,7 +645,7 @@ fn resolve_time_range(input: Option<&str>) -> TimeRange {
             }
         }
         "yesterday" => {
-            let today_start = start_of_day(now);
+            let today_start = start_of_day_in_tz(now, tz);
             let start = today_start - Duration::days(1);
             let end = today_start;
             TimeRange {
@@ -660,7 +662,7 @@ fn resolve_time_range(input: Option<&str>) -> TimeRange {
             }
         }
         "week" => {
-            let start = start_of_week(now);
+            let start = start_of_week_in_tz(now, tz);
             TimeRange {
                 key: "week".to_string(),
                 label: "This week".to_string(),
@@ -722,18 +724,22 @@ fn resolve_time_range(input: Option<&str>) -> TimeRange {
     }
 }
 
-fn start_of_day(now: DateTime<Utc>) -> DateTime<Utc> {
-    let naive = now
+/// Returns midnight of the current day in the given display timezone, as UTC.
+fn start_of_day_in_tz(now: DateTime<Utc>, tz: Tz) -> DateTime<Utc> {
+    let local = now.with_timezone(&tz);
+    let midnight = local
         .date_naive()
         .and_hms_opt(0, 0, 0)
-        .expect("valid start of day");
-    Utc.from_utc_datetime(&naive)
+        .expect("valid midnight");
+    tz.from_local_datetime(&midnight)
+        .earliest()
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(|| Utc.from_utc_datetime(&midnight))
 }
 
-fn start_of_week(now: DateTime<Utc>) -> DateTime<Utc> {
-    let weekday = now.weekday();
-    let days_from_monday = weekday.num_days_from_monday() as i64;
-    let seconds = now.time().num_seconds_from_midnight() as i64;
-    let midnight = now - Duration::seconds(seconds);
-    start_of_day(midnight - Duration::days(days_from_monday))
+fn start_of_week_in_tz(now: DateTime<Utc>, tz: Tz) -> DateTime<Utc> {
+    let local = now.with_timezone(&tz);
+    let days_from_monday = local.weekday().num_days_from_monday() as i64;
+    let day_start = start_of_day_in_tz(now, tz);
+    day_start - Duration::days(days_from_monday)
 }
