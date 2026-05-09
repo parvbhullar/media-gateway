@@ -40,6 +40,10 @@ impl E2eTestServer {
         let port = portpicker::pick_unused_port().unwrap_or(15060);
         let proxy_addr = format!("127.0.0.1:{}", port).parse()?;
 
+        // Use an isolated temp dir so tests never load generated trunks/routes
+        // from the project's ./config/ directory (which may contain production data).
+        let generated_dir = format!("/tmp/rustpbx-test-{}", port);
+
         let config = Arc::new(ProxyConfig {
             addr: "127.0.0.1".to_string(),
             udp_port: Some(port),
@@ -54,6 +58,7 @@ impl E2eTestServer {
             ]),
             media_proxy: mode,
             ensure_user: Some(false),
+            generated_dir,
             ..Default::default()
         });
 
@@ -139,6 +144,8 @@ impl E2eTestServer {
             "call".to_string(),
         ]);
         proxy_config.ensure_user = Some(false);
+        // Isolate from project's ./config/ dir to prevent loading production generated files.
+        proxy_config.generated_dir = format!("/tmp/rustpbx-test-{}", port);
 
         let config = Arc::new(proxy_config);
         let mode = config.media_proxy;

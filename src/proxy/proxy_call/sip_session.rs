@@ -2527,8 +2527,8 @@ impl SipSession {
                 .with_cancel_token(self.callee_peer.cancel_token())
                 .with_enable_latching(self.server.proxy_config.enable_latching);
 
-            if let Some(ref external_ip) = self.server.rtp_config.external_ip {
-                track_builder = track_builder.with_external_ip(external_ip.clone());
+            if let Some(ip) = self.caller_facing_ip_str() {
+                track_builder = track_builder.with_external_ip(ip);
             }
 
             let (start_port, end_port) = if callee_is_webrtc {

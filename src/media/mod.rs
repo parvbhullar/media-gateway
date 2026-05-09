@@ -603,6 +603,10 @@ impl RtpTrackBuilder {
             rtp_start_port: self.rtp_start_port,
             rtp_end_port: self.rtp_end_port,
             external_ip: self.external_ip,
+            // Bind RTP socket to all interfaces so we receive on both the LAN
+            // address advertised in SDP and on loopback. Without this, rustrtc
+            // binds to get_local_ip() only, which excludes 127.0.0.1 traffic.
+            bind_ip: Some("0.0.0.0".to_string()),
             enable_latching: self.enable_latching,
             media_capabilities: Some(rustrtc::config::MediaCapabilities {
                 audio: audio_capabilities,
