@@ -60,13 +60,23 @@ pub async fn dashboard_data(
     AuthRequired(_): AuthRequired,
     Query(query): Query<DashboardDataQuery>,
 ) -> Result<Json<DashboardPayload>, Response> {
-    let tz = resolve_display_tz(&state);
-    let range = resolve_time_range(query.range.as_deref(), tz);
-    match build_dashboard_payload(&state, &range).await {
-        Ok(payload) => Ok(Json(payload)),
+    Ok(Json(fetch_dashboard_payload(&state, query.range.as_deref()).await))
+}
+
+/// Public, auth-free entry point that reuses the same payload logic as
+/// `dashboard_data`. Used by `api_v1::dashboard` so the v1 API and the
+/// console UI return identical shapes for a given `range` key.
+pub async fn fetch_dashboard_payload(
+    state: &ConsoleState,
+    range_key: Option<&str>,
+) -> DashboardPayload {
+    let tz = resolve_display_tz(state);
+    let range = resolve_time_range(range_key, tz);
+    match build_dashboard_payload(state, &range).await {
+        Ok(payload) => payload,
         Err(err) => {
             warn!(error = %err, "failed to build dashboard payload");
-            Ok(Json(DashboardPayload::empty(range)))
+            DashboardPayload::empty(range)
         }
     }
 }

@@ -69,6 +69,9 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/system/health", get(handle_health))
         .route("/system/reload", post(handle_reload))
+        .route("/system/reload/trunks", post(handle_reload_trunks))
+        .route("/system/reload/routes", post(handle_reload_routes))
+        .route("/system/reload/acl", post(handle_reload_acl))
 }
 
 // ---------------------------------------------------------------------------
@@ -179,4 +182,56 @@ pub(crate) async fn reload_all(state: &AppState) -> ApiResult<ReloadResponse> {
         steps,
         elapsed_ms: overall_start.elapsed().as_millis() as u64,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Granular reload — single-subsystem variants. Same 409-Conflict serialization
+// as `reload_all` so a granular reload can't race the full reload or another
+// granular reload. Response shape mirrors `ReloadResponse` with a single step.
+// ---------------------------------------------------------------------------
+
+async fn handle_reload_trunks(State(state): State<AppState>) -> ApiResult<Json<ReloadResponse>> {
+    let _guard = acquire_reload_guard(&state)?;
+    let overall_start = Instant::now();
+    let outcome = reload_steps::reload_trunks_step(&state)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(single_step_response(outcome, overall_start)))
+}
+
+async fn handle_reload_routes(State(state): State<AppState>) -> ApiResult<Json<ReloadResponse>> {
+    let _guard = acquire_reload_guard(&state)?;
+    let overall_start = Instant::now();
+    let outcome = reload_steps::reload_routes_step(&state)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(single_step_response(outcome, overall_start)))
+}
+
+async fn handle_reload_acl(State(state): State<AppState>) -> ApiResult<Json<ReloadResponse>> {
+    let _guard = acquire_reload_guard(&state)?;
+    let overall_start = Instant::now();
+    let outcome = reload_steps::reload_acl_step(&state)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(single_step_response(outcome, overall_start)))
+}
+
+fn acquire_reload_guard(state: &AppState) -> ApiResult<ReloadGuard<'_>> {
+    if state
+        .reload_requested
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err(ApiError::conflict("reload already in progress"));
+    }
+    Ok(ReloadGuard(&state.reload_requested))
+}
+
+fn single_step_response(outcome: ReloadStepOutcome, overall_start: Instant) -> ReloadResponse {
+    ReloadResponse {
+        reloaded: vec![outcome.step],
+        steps: vec![outcome],
+        elapsed_ms: overall_start.elapsed().as_millis() as u64,
+    }
 }
