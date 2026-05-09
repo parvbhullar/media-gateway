@@ -3010,6 +3010,134 @@
                 </div>
             </div>
         </section>
+
+        <!-- API Keys tab -->
+        <section x-show="activeTab === 'api_keys' && currentUser?.is_superuser" x-cloak x-transition.opacity
+            class="space-y-6" id="settings-tab-api-keys" role="tabpanel" tabindex="0">
+
+            <!-- New token reveal modal -->
+            <div x-show="apiKeyNewTokenModal !== null" x-cloak
+                class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+                <div class="w-full max-w-lg rounded-xl bg-white p-6 shadow-xl">
+                    <h3 class="mb-1 text-base font-semibold text-slate-900">API key created</h3>
+                    <p class="mb-4 text-xs text-slate-500">Copy this token now — it will not be shown again.</p>
+                    <div class="flex items-center gap-2 rounded-lg bg-slate-100 px-3 py-2">
+                        <code class="flex-1 break-all text-xs font-mono text-slate-800" x-text="apiKeyNewTokenModal"></code>
+                        <button type="button" @click="copyApiKeyToken()"
+                            class="shrink-0 rounded px-2 py-1 text-xs font-medium text-sky-700 hover:bg-sky-50">Copy</button>
+                    </div>
+                    <div class="mt-4 flex justify-end">
+                        <button type="button" @click="apiKeyNewTokenModal = null"
+                            class="rounded-lg bg-sky-600 px-4 py-2 text-sm font-medium text-white hover:bg-sky-700">Done</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
+                <div class="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+                    <div>
+                        <h2 class="text-base font-semibold text-slate-900">API Keys</h2>
+                        <p class="text-xs text-slate-500">Bearer tokens used to authenticate requests to the API V1
+                            endpoints. Only the key hash is stored — the plaintext is shown once at creation.</p>
+                    </div>
+                    <button type="button" @click="fetchApiKeys()"
+                        class="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 hover:border-sky-300 hover:text-sky-700">
+                        <svg class="h-3.5 w-3.5" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8">
+                            <path stroke-linecap="round" stroke-linejoin="round"
+                                d="M4 4v5h5M16 16v-5h-5M4 9a8 8 0 0114 0M16 11a8 8 0 01-14 0" />
+                        </svg>
+                        Refresh
+                    </button>
+                </div>
+
+                <!-- Create form -->
+                <div class="mt-5 rounded-lg border border-dashed border-slate-300 bg-slate-50 p-4">
+                    <p class="mb-3 text-xs font-semibold text-slate-700">Create new API key</p>
+                    <div class="flex flex-col gap-3 sm:flex-row">
+                        <input type="text" x-model="apiKeyNewName" placeholder="Key name (unique)"
+                            class="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm placeholder-slate-400 focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500"
+                            :disabled="apiKeyProcessing" @keydown.enter="createApiKey()" />
+                        <input type="text" x-model="apiKeyNewDescription" placeholder="Description (optional)"
+                            class="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm placeholder-slate-400 focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500"
+                            :disabled="apiKeyProcessing" @keydown.enter="createApiKey()" />
+                        <button type="button" @click="createApiKey()"
+                            :disabled="apiKeyProcessing || !apiKeyNewName.trim()"
+                            class="inline-flex items-center gap-2 rounded-lg bg-sky-600 px-4 py-2 text-sm font-medium text-white hover:bg-sky-700 disabled:opacity-50">
+                            <svg x-show="!apiKeyProcessing" class="h-4 w-4" viewBox="0 0 20 20" fill="none"
+                                stroke="currentColor" stroke-width="1.8">
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M10 4v12m6-6H4" />
+                            </svg>
+                            <svg x-show="apiKeyProcessing" class="h-4 w-4 animate-spin" viewBox="0 0 24 24"
+                                fill="none">
+                                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor"
+                                    stroke-width="4" />
+                                <path class="opacity-75" fill="currentColor"
+                                    d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                            </svg>
+                            <span x-text="apiKeyProcessing ? 'Creating…' : 'Create'"></span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Key list -->
+                <div class="mt-5">
+                    <template x-if="apiKeysLoading">
+                        <div class="py-8 text-center text-xs text-slate-400">Loading…</div>
+                    </template>
+                    <template x-if="apiKeysError && !apiKeysLoading">
+                        <div class="rounded-lg bg-red-50 px-4 py-3 text-xs text-red-700" x-text="apiKeysError"></div>
+                    </template>
+                    <template x-if="!apiKeysLoading && !apiKeysError && apiKeys.length === 0">
+                        <div class="py-8 text-center text-xs text-slate-400">No API keys yet.</div>
+                    </template>
+                    <template x-if="!apiKeysLoading && apiKeys.length > 0">
+                        <div class="overflow-x-auto rounded-lg border border-slate-200">
+                            <table class="w-full text-sm">
+                                <thead class="bg-slate-50 text-xs text-slate-500">
+                                    <tr>
+                                        <th class="px-4 py-2.5 text-left font-medium">Name</th>
+                                        <th class="px-4 py-2.5 text-left font-medium">Description</th>
+                                        <th class="px-4 py-2.5 text-left font-medium">Status</th>
+                                        <th class="px-4 py-2.5 text-left font-medium">Created</th>
+                                        <th class="px-4 py-2.5 text-left font-medium">Last used</th>
+                                        <th class="px-4 py-2.5 text-right font-medium">Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="divide-y divide-slate-100">
+                                    <template x-for="key in apiKeys" :key="key.id">
+                                        <tr class="hover:bg-slate-50">
+                                            <td class="px-4 py-3 font-mono text-xs text-slate-800" x-text="key.name"></td>
+                                            <td class="px-4 py-3 text-xs text-slate-500"
+                                                x-text="key.description || '—'"></td>
+                                            <td class="px-4 py-3">
+                                                <span :class="key.is_active
+                                                    ? 'bg-emerald-100 text-emerald-700'
+                                                    : 'bg-red-100 text-red-600'"
+                                                    class="inline-flex rounded-full px-2 py-0.5 text-xs font-medium"
+                                                    x-text="key.is_active ? 'Active' : 'Revoked'"></span>
+                                            </td>
+                                            <td class="px-4 py-3 text-xs text-slate-500"
+                                                x-text="formatDateTime(key.created_at)"></td>
+                                            <td class="px-4 py-3 text-xs text-slate-500"
+                                                x-text="key.last_used_at ? formatDateTime(key.last_used_at) : 'Never'"></td>
+                                            <td class="px-4 py-3 text-right">
+                                                <button x-show="key.is_active" type="button"
+                                                    @click="revokeApiKey(key.id, key.name)"
+                                                    class="rounded px-2 py-1 text-xs font-medium text-red-600 hover:bg-red-50">
+                                                    Revoke
+                                                </button>
+                                                <span x-show="!key.is_active"
+                                                    class="text-xs text-slate-400">—</span>
+                                            </td>
+                                        </tr>
+                                    </template>
+                                </tbody>
+                            </table>
+                        </div>
+                    </template>
+                </div>
+            </div>
+        </section>
     </div>
 </div>
 
@@ -3046,6 +3174,7 @@
                     { id: 'departments', label: tget(tt, 'settings_page.departments') || 'Departments' },
                     { id: 'users', label: tget(tt, 'settings_page.users_title') || 'Users', requiresPermission: 'users:manage' },
                     { id: 'roles', label: tget(tt, 'settings_page.roles_title') || 'Roles', requiresPermission: 'users:manage' },
+                    { id: 'api_keys', label: 'API Keys', requiresSuperuser: true },
                 ];
             })(),
             activeTab: 'platform',
@@ -3060,6 +3189,13 @@
             },
             pendingUploadsLoading: false,
             pendingUploadsBusy: false,
+            apiKeys: [],
+            apiKeysLoading: false,
+            apiKeysError: null,
+            apiKeyNewName: '',
+            apiKeyNewDescription: '',
+            apiKeyProcessing: false,
+            apiKeyNewTokenModal: null,
             platform: {},
             proxyConfig: {},
             stats: {},
@@ -3393,6 +3529,7 @@
                 this.fetchDepartments();
                 this.fetchUsers();
                 this.fetchRoles();
+                this.fetchApiKeys();
                 this.resetAclReloadModal();
                 this.resetReloadModal();
                 window.addEventListener('roles:create', () => this.openRoleCreate());
@@ -5557,6 +5694,67 @@
                 } finally {
                     this.storageProcessing = false;
                 }
+            },
+            // API Keys tab functions
+            async fetchApiKeys() {
+                if (!this.currentUser?.is_superuser) return;
+                this.apiKeysLoading = true;
+                this.apiKeysError = null;
+                try {
+                    const r = await fetch(this.basePath + '/settings/api-keys', {
+                        headers: { Accept: 'application/json' },
+                    });
+                    const d = await r.json().catch(() => ({}));
+                    if (!r.ok) throw new Error(d.message || 'Failed to load API keys');
+                    this.apiKeys = Array.isArray(d.items) ? d.items : [];
+                } catch (e) {
+                    this.apiKeysError = e.message;
+                } finally {
+                    this.apiKeysLoading = false;
+                }
+            },
+            async createApiKey() {
+                const name = this.apiKeyNewName.trim();
+                if (!name) return;
+                this.apiKeyProcessing = true;
+                try {
+                    const r = await fetch(this.basePath + '/settings/api-keys', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+                        body: JSON.stringify({ name, description: this.apiKeyNewDescription.trim() || null }),
+                    });
+                    const d = await r.json().catch(() => ({}));
+                    if (!r.ok) throw new Error(d.message || 'Failed to create API key');
+                    this.apiKeyNewName = '';
+                    this.apiKeyNewDescription = '';
+                    this.apiKeyNewTokenModal = d.plaintext;
+                    await this.fetchApiKeys();
+                } catch (e) {
+                    this.$dispatch('toast', { title: 'Error', message: e.message });
+                } finally {
+                    this.apiKeyProcessing = false;
+                }
+            },
+            async revokeApiKey(id, name) {
+                if (!confirm(`Revoke API key "${name}"? This cannot be undone.`)) return;
+                try {
+                    const r = await fetch(this.basePath + '/settings/api-keys/' + id + '/revoke', {
+                        method: 'POST',
+                        headers: { Accept: 'application/json' },
+                    });
+                    const d = await r.json().catch(() => ({}));
+                    if (!r.ok) throw new Error(d.message || 'Failed to revoke API key');
+                    await this.fetchApiKeys();
+                    this.$dispatch('toast', { title: 'Revoked', message: `Key "${name}" revoked.` });
+                } catch (e) {
+                    this.$dispatch('toast', { title: 'Error', message: e.message });
+                }
+            },
+            copyApiKeyToken() {
+                if (!this.apiKeyNewTokenModal) return;
+                navigator.clipboard.writeText(this.apiKeyNewTokenModal).then(() => {
+                    this.$dispatch('toast', { title: 'Copied', message: 'Token copied to clipboard.' });
+                });
             },
             async fetchSipFlowSettings() {
                 try {

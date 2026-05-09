@@ -1,4 +1,8 @@
 use crate::app::AppStateInner;
+use crate::handler::api_v1::auth::issue_api_key;
+use crate::models::api_key::{
+    ActiveModel as ApiKeyActiveModel, Column as ApiKeyColumn, Entity as ApiKeyEntity,
+};
 use crate::models::system_config;
 use crate::config::{
     CallRecordConfig, Config, HttpRouterConfig, LocatorWebhookConfig, ProxyConfig,
@@ -249,6 +253,11 @@ pub fn urls() -> Router<Arc<ConsoleState>> {
         .route(
             "/settings/roles/{id}",
             get(get_role).patch(update_role).delete(delete_role_handler),
+        )
+        .route("/settings/api-keys", get(list_api_keys).post(create_api_key))
+        .route(
+            "/settings/api-keys/{id}/revoke",
+            post(revoke_api_key),
         )
 }
 
@@ -3960,6 +3969,170 @@ pub(crate) async fn clear_pending_failures(
         "cleared": cleared,
     }))
     .into_response()
+}
+
+// ── API key management (superuser / system:write only) ───────────────────────
+
+#[derive(Debug, Deserialize)]
+struct CreateApiKeyPayload {
+    pub name: String,
+    pub description: Option<String>,
+}
+
+fn is_authorized_for_api_keys(state: &ConsoleState, user: &UserModel) -> bool {
+    user.is_superuser
+}
+
+async fn list_api_keys(
+    State(state): State<Arc<ConsoleState>>,
+    AuthRequired(user): AuthRequired,
+) -> Response {
+    if !is_authorized_for_api_keys(&state, &user) {
+        return (StatusCode::FORBIDDEN, Json(json!({ "message": "Forbidden" }))).into_response();
+    }
+
+    let db = state.db();
+
+    match ApiKeyEntity::find()
+        .order_by_desc(ApiKeyColumn::CreatedAt)
+        .all(db)
+        .await
+    {
+        Ok(keys) => {
+            let items: Vec<JsonValue> = keys
+                .into_iter()
+                .map(|k| {
+                    json!({
+                        "id": k.id,
+                        "name": k.name,
+                        "description": k.description,
+                        "created_at": k.created_at.to_rfc3339(),
+                        "last_used_at": k.last_used_at.map(|t| t.to_rfc3339()),
+                        "revoked_at": k.revoked_at.map(|t| t.to_rfc3339()),
+                        "is_active": k.revoked_at.is_none(),
+                    })
+                })
+                .collect();
+            Json(json!({ "items": items })).into_response()
+        }
+        Err(e) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to list API keys: {e}"),
+        ),
+    }
+}
+
+async fn create_api_key(
+    State(state): State<Arc<ConsoleState>>,
+    AuthRequired(user): AuthRequired,
+    Json(payload): Json<CreateApiKeyPayload>,
+) -> Response {
+    if !is_authorized_for_api_keys(&state, &user) {
+        return (StatusCode::FORBIDDEN, Json(json!({ "message": "Forbidden" }))).into_response();
+    }
+
+    let name = payload.name.trim().to_string();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "message": "name is required" })),
+        )
+            .into_response();
+    }
+
+    let db = state.db();
+    let issued = issue_api_key();
+    let plaintext = issued.plaintext.clone();
+    let am = ApiKeyActiveModel {
+        name: Set(name.clone()),
+        hash_sha256: Set(issued.hash),
+        description: Set(payload.description.and_then(|d| {
+            let t = d.trim().to_string();
+            if t.is_empty() { None } else { Some(t) }
+        })),
+        created_at: Set(Utc::now()),
+        ..Default::default()
+    };
+
+    match am.insert(db).await {
+        Ok(key) => Json(json!({
+            "id": key.id,
+            "name": key.name,
+            "description": key.description,
+            "created_at": key.created_at.to_rfc3339(),
+            "plaintext": plaintext,
+            "is_active": true,
+        }))
+        .into_response(),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("UNIQUE") || msg.contains("unique") {
+                (
+                    StatusCode::CONFLICT,
+                    Json(json!({ "message": "An API key with this name already exists" })),
+                )
+                    .into_response()
+            } else {
+                json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to create API key: {e}"),
+                )
+            }
+        }
+    }
+}
+
+async fn revoke_api_key(
+    State(state): State<Arc<ConsoleState>>,
+    AuthRequired(user): AuthRequired,
+    AxumPath(id): AxumPath<i64>,
+) -> Response {
+    if !is_authorized_for_api_keys(&state, &user) {
+        return (StatusCode::FORBIDDEN, Json(json!({ "message": "Forbidden" }))).into_response();
+    }
+
+    let db = state.db();
+
+    let key = match ApiKeyEntity::find_by_id(id).one(db).await {
+        Ok(Some(k)) => k,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "message": "API key not found" })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to fetch API key: {e}"),
+            );
+        }
+    };
+
+    if key.revoked_at.is_some() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "message": "API key is already revoked" })),
+        )
+            .into_response();
+    }
+
+    let mut am: ApiKeyActiveModel = key.into();
+    am.revoked_at = Set(Some(Utc::now()));
+    match am.update(db).await {
+        Ok(updated) => Json(json!({
+            "id": updated.id,
+            "name": updated.name,
+            "revoked_at": updated.revoked_at.map(|t| t.to_rfc3339()),
+            "is_active": false,
+        }))
+        .into_response(),
+        Err(e) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to revoke API key: {e}"),
+        ),
+    }
 }
 
 #[cfg(test)]
