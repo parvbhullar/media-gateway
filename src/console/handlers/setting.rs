@@ -3979,7 +3979,7 @@ struct CreateApiKeyPayload {
     pub description: Option<String>,
 }
 
-fn is_authorized_for_api_keys(state: &ConsoleState, user: &UserModel) -> bool {
+fn is_authorized_for_api_keys(_state: &ConsoleState, user: &UserModel) -> bool {
     user.is_superuser
 }
 
