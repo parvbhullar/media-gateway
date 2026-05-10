@@ -21,6 +21,11 @@ use crate::handler::api_v1::error::{ApiError, ApiResult};
 #[derive(Debug, Deserialize)]
 pub struct DashboardQuery {
     pub range: Option<String>,
+    /// Substring match against from_number OR to_number on call records,
+    /// and caller OR callee on the active-calls preview.
+    pub number: Option<String>,
+    /// Exact direction filter (case-insensitive): inbound | outbound | internal.
+    pub direction: Option<String>,
 }
 
 pub fn router() -> Router<AppState> {
@@ -36,9 +41,14 @@ async fn handle_dashboard(
         .console
         .as_ref()
         .ok_or_else(|| ApiError::unavailable("console state not initialized"))?;
+    let filters = crate::console::handlers::dashboard::DashboardFilters {
+        number: query.number,
+        direction: query.direction,
+    };
     let payload = crate::console::handlers::dashboard::fetch_dashboard_payload(
         console,
         query.range.as_deref(),
+        filters,
     )
     .await;
     Ok(Json(payload))

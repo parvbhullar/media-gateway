@@ -1080,10 +1080,11 @@ fn build_condition(filters: &Option<QueryCallRecordFilters>) -> Condition {
         if let Some(q_raw) = filters.q.as_ref() {
             let trimmed = q_raw.trim();
             if !trimmed.is_empty() {
+                let pat = format!("%{}%", trimmed);
                 let mut q_condition = Condition::any();
-                q_condition = q_condition.add(CallRecordColumn::CallId.eq(trimmed));
-                q_condition = q_condition.add(CallRecordColumn::ToNumber.eq(trimmed));
-                q_condition = q_condition.add(CallRecordColumn::FromNumber.eq(trimmed));
+                q_condition = q_condition.add(CallRecordColumn::CallId.like(pat.clone()));
+                q_condition = q_condition.add(CallRecordColumn::ToNumber.like(pat.clone()));
+                q_condition = q_condition.add(CallRecordColumn::FromNumber.like(pat));
                 condition = condition.add(q_condition);
             }
         }

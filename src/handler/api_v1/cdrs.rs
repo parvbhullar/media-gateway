@@ -74,6 +74,11 @@ pub struct CdrListQuery {
     pub from_number: Option<String>,
     #[serde(default)]
     pub to_number: Option<String>,
+    /// Substring match against either from_number or to_number.
+    /// Mutually inclusive with `from_number`/`to_number` — all provided
+    /// filters AND together. Use this when you don't care which side.
+    #[serde(default)]
+    pub number: Option<String>,
     #[serde(default)]
     pub start_date: Option<DateTime<Utc>>,
     #[serde(default)]
@@ -114,10 +119,20 @@ async fn list_cdrs(
         conds = conds.add(CdrColumn::Status.eq(v.clone()));
     }
     if let Some(v) = q.from_number.as_ref().filter(|s| !s.is_empty()) {
-        conds = conds.add(CdrColumn::FromNumber.eq(v.clone()));
+        // Prefix match — matches Postman doc ("Filter by caller number prefix").
+        conds = conds.add(CdrColumn::FromNumber.like(format!("{}%", v)));
     }
     if let Some(v) = q.to_number.as_ref().filter(|s| !s.is_empty()) {
-        conds = conds.add(CdrColumn::ToNumber.eq(v.clone()));
+        // Prefix match — matches Postman doc ("Filter by callee number prefix").
+        conds = conds.add(CdrColumn::ToNumber.like(format!("{}%", v)));
+    }
+    if let Some(v) = q.number.as_ref().filter(|s| !s.is_empty()) {
+        let pat = format!("%{}%", v);
+        conds = conds.add(
+            Condition::any()
+                .add(CdrColumn::FromNumber.like(pat.clone()))
+                .add(CdrColumn::ToNumber.like(pat)),
+        );
     }
     if let Some(v) = q.start_date {
         conds = conds.add(CdrColumn::StartedAt.gte(v));

@@ -42,6 +42,8 @@ use crate::handler::api_v1::reload_steps::{self, ReloadStepOutcome};
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
     pub uptime_secs: u64,
+    pub uptime_hours: u64,
+    pub uptime_days: u64,
     pub db_ok: bool,
     pub active_calls: u64,
     pub version: String,
@@ -117,6 +119,8 @@ pub(crate) async fn health_snapshot(state: &AppState) -> HealthResponse {
 
     HealthResponse {
         uptime_secs,
+        uptime_hours: uptime_secs / 3600,
+        uptime_days: uptime_secs / 86_400,
         db_ok,
         active_calls,
         version,

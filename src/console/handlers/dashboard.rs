@@ -10,8 +10,8 @@ use axum::{
 use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
 use chrono_tz::Tz;
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, FromQueryResult, PaginatorTrait,
-    QueryFilter, QuerySelect, sea_query,
+    ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, EntityTrait, FromQueryResult,
+    PaginatorTrait, QueryFilter, QuerySelect, sea_query,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -26,7 +26,8 @@ pub async fn dashboard(
 ) -> Response {
     let tz = resolve_display_tz(&state);
     let range = resolve_time_range(None, tz);
-    let payload = match build_dashboard_payload(&state, &range).await {
+    let filters = DashboardFilters::default();
+    let payload = match build_dashboard_payload(&state, &range, &filters).await {
         Ok(payload) => payload,
         Err(err) => {
             warn!(error = %err, "failed to build dashboard payload");
@@ -53,6 +54,48 @@ pub async fn dashboard(
 #[derive(Deserialize)]
 pub struct DashboardDataQuery {
     range: Option<String>,
+    /// Substring match against from_number OR to_number.
+    number: Option<String>,
+    /// Exact direction filter (case-insensitive): inbound | outbound | internal.
+    direction: Option<String>,
+}
+
+/// Optional filters applied to every call-record query inside
+/// `build_dashboard_payload` AND the active-calls preview.
+#[derive(Clone, Default)]
+pub struct DashboardFilters {
+    pub number: Option<String>,
+    pub direction: Option<String>,
+}
+
+impl DashboardFilters {
+    fn normalized(mut self) -> Self {
+        self.number = self.number.filter(|s| !s.trim().is_empty()).map(|s| s.trim().to_string());
+        self.direction = self
+            .direction
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_lowercase());
+        self
+    }
+
+    /// Build a sea_orm `Condition` that ANDs the active filters together.
+    /// Empty/None filters contribute nothing, so an unfiltered call returns
+    /// `Condition::all()` which is a no-op when added to a query.
+    fn to_condition(&self) -> Condition {
+        let mut cond = Condition::all();
+        if let Some(ref num) = self.number {
+            let pat = format!("%{}%", num);
+            cond = cond.add(
+                Condition::any()
+                    .add(CallRecordColumn::FromNumber.like(pat.clone()))
+                    .add(CallRecordColumn::ToNumber.like(pat)),
+            );
+        }
+        if let Some(ref dir) = self.direction {
+            cond = cond.add(CallRecordColumn::Direction.eq(dir.clone()));
+        }
+        cond
+    }
 }
 
 pub async fn dashboard_data(
@@ -60,7 +103,13 @@ pub async fn dashboard_data(
     AuthRequired(_): AuthRequired,
     Query(query): Query<DashboardDataQuery>,
 ) -> Result<Json<DashboardPayload>, Response> {
-    Ok(Json(fetch_dashboard_payload(&state, query.range.as_deref()).await))
+    let filters = DashboardFilters {
+        number: query.number,
+        direction: query.direction,
+    };
+    Ok(Json(
+        fetch_dashboard_payload(&state, query.range.as_deref(), filters).await,
+    ))
 }
 
 /// Public, auth-free entry point that reuses the same payload logic as
@@ -69,10 +118,12 @@ pub async fn dashboard_data(
 pub async fn fetch_dashboard_payload(
     state: &ConsoleState,
     range_key: Option<&str>,
+    filters: DashboardFilters,
 ) -> DashboardPayload {
     let tz = resolve_display_tz(state);
     let range = resolve_time_range(range_key, tz);
-    match build_dashboard_payload(state, &range).await {
+    let filters = filters.normalized();
+    match build_dashboard_payload(state, &range, &filters).await {
         Ok(payload) => payload,
         Err(err) => {
             warn!(error = %err, "failed to build dashboard payload");
@@ -220,8 +271,10 @@ fn resolve_display_tz(state: &ConsoleState) -> Tz {
 async fn build_dashboard_payload(
     state: &ConsoleState,
     range: &TimeRange,
+    filters: &DashboardFilters,
 ) -> Result<DashboardPayload> {
     let db = state.db();
+    let filter_cond = filters.to_condition();
 
     #[derive(Debug, FromQueryResult)]
     struct RecentStats {
@@ -233,6 +286,7 @@ async fn build_dashboard_payload(
     let recent_stats = CallRecordEntity::find()
         .filter(CallRecordColumn::StartedAt.gte(range.start))
         .filter(CallRecordColumn::StartedAt.lt(range.end))
+        .filter(filter_cond.clone())
         .select_only()
         .column_as(CallRecordColumn::Id.count(), "total")
         .column_as(
@@ -295,6 +349,7 @@ async fn build_dashboard_payload(
     let timeline_buckets = CallRecordEntity::find()
         .filter(CallRecordColumn::StartedAt.gte(range.start))
         .filter(CallRecordColumn::StartedAt.lt(range.end))
+        .filter(filter_cond.clone())
         .select_only()
         .column_as(time_expr, "bucket")
         .column_as(CallRecordColumn::Id.count(), "count")
@@ -306,6 +361,7 @@ async fn build_dashboard_payload(
     let previous_count = CallRecordEntity::find()
         .filter(CallRecordColumn::StartedAt.gte(range.previous_start))
         .filter(CallRecordColumn::StartedAt.lt(range.previous_end))
+        .filter(filter_cond.clone())
         .count(db)
         .await?;
 
@@ -319,6 +375,7 @@ async fn build_dashboard_payload(
 
     let today_stats = CallRecordEntity::find()
         .filter(CallRecordColumn::StartedAt.gte(today_start))
+        .filter(filter_cond.clone())
         .select_only()
         .column_as(
             sea_query::SimpleExpr::from(sea_query::Func::sum(
@@ -361,6 +418,7 @@ async fn build_dashboard_payload(
     let direction_stats = CallRecordEntity::find()
         .filter(CallRecordColumn::StartedAt.gte(range.start))
         .filter(CallRecordColumn::StartedAt.lt(range.end))
+        .filter(filter_cond.clone())
         .select_only()
         .column(CallRecordColumn::Direction)
         .column_as(CallRecordColumn::Id.count(), "count")
@@ -369,7 +427,7 @@ async fn build_dashboard_payload(
         .all(db)
         .await?;
 
-    let (active_total, active_preview) = active_call_stats(state, 10).await;
+    let (active_total, active_preview) = active_call_stats(state, 10, filters).await;
 
     let capacity = state
         .sip_server()
@@ -492,14 +550,42 @@ fn format_timeline_label(range: &TimeRange, timestamp: DateTime<Utc>, tz: Tz) ->
     }
 }
 
-async fn active_call_stats(state: &ConsoleState, limit: usize) -> (usize, Vec<ActiveCallPreview>) {
+async fn active_call_stats(
+    state: &ConsoleState,
+    limit: usize,
+    filters: &DashboardFilters,
+) -> (usize, Vec<ActiveCallPreview>) {
     let mut previews = Vec::new();
     let mut active_count = 0;
     // 2. Proxy Calls (including Wholesale)
     if let Ok(guard) = state.sip_server.read()
         && let Some(server) = guard.as_ref() {
-            active_count += server.active_call_registry.count();
-            let proxy_calls = server.active_call_registry.list_recent(limit);
+            let has_filter = filters.number.is_some() || filters.direction.is_some();
+            // Pull all when filtering so post-filter we don't truncate; pull
+            // all when unfiltered too, since `count()` is the SOT — using
+            // `list_recent(limit)` here previously capped active_count at limit.
+            let proxy_calls_all = server.active_call_registry.list_recent(usize::MAX);
+            let proxy_calls: Vec<_> = proxy_calls_all
+                .into_iter()
+                .filter(|call| {
+                    if let Some(ref dir) = filters.direction {
+                        if !call.direction.eq_ignore_ascii_case(dir) {
+                            return false;
+                        }
+                    }
+                    if let Some(ref num) = filters.number {
+                        let needle = num.to_lowercase();
+                        let caller = call.caller.as_deref().unwrap_or("").to_lowercase();
+                        let callee = call.callee.as_deref().unwrap_or("").to_lowercase();
+                        if !caller.contains(&needle) && !callee.contains(&needle) {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .collect();
+            // Filtered: count = filtered subset; unfiltered: count = registry total.
+            active_count += if has_filter { proxy_calls.len() } else { server.active_call_registry.count() };
             for call in proxy_calls {
                 let status = call.status.to_string();
                 // Capitalize status

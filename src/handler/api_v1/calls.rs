@@ -78,6 +78,10 @@ pub struct CallListQuery {
     pub caller: Option<String>,
     #[serde(default)]
     pub callee: Option<String>,
+    /// Substring match against either caller or callee.
+    /// ANDed with `caller`/`callee` if all are supplied.
+    #[serde(default)]
+    pub number: Option<String>,
     /// RFC-3339 timestamp parsed by the handler (not serde) so we can
     /// return a uniform `ApiError::bad_request` on unparseable values
     /// rather than a serde rejection with a different envelope shape.
@@ -267,8 +271,9 @@ fn parse_direction_filter(raw: &str) -> ApiResult<String> {
     match raw.to_ascii_lowercase().as_str() {
         "inbound" => Ok("inbound".to_string()),
         "outbound" => Ok("outbound".to_string()),
+        "internal" => Ok("internal".to_string()),
         _ => Err(ApiError::bad_request(format!(
-            "invalid direction filter '{}' (expected 'inbound' or 'outbound')",
+            "invalid direction filter '{}' (expected 'inbound', 'outbound', or 'internal')",
             raw
         ))),
     }
@@ -484,6 +489,13 @@ async fn list_active_calls(
         }
         if let Some(ref needle) = q.callee {
             if !substring_matches_ci(&e.callee, needle) {
+                return false;
+            }
+        }
+        if let Some(ref needle) = q.number {
+            if !substring_matches_ci(&e.caller, needle)
+                && !substring_matches_ci(&e.callee, needle)
+            {
                 return false;
             }
         }
@@ -999,6 +1011,8 @@ mod tests {
     fn parse_direction_filter_accepts_mixed_case() {
         assert_eq!(parse_direction_filter("Inbound").unwrap(), "inbound");
         assert_eq!(parse_direction_filter("OUTBOUND").unwrap(), "outbound");
+        assert_eq!(parse_direction_filter("Internal").unwrap(), "internal");
+        assert!(parse_direction_filter("sideways").is_err());
     }
 
     #[test]
