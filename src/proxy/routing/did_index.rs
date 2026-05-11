@@ -11,6 +11,10 @@ pub struct DidEntry {
     pub trunk_name: Option<String>,
     pub extension_number: Option<String>,
     pub failover_trunk: Option<String>,
+    /// `false` means the row exists but the operator has soft-disabled the
+    /// number. The matcher uses this to actively `Reject` calls instead of
+    /// silently falling through to rule-based routing.
+    pub enabled: bool,
 }
 
 /// Immutable DID snapshot. Rebuilt on every refresh.
@@ -24,9 +28,11 @@ impl DidIndex {
         let rows = did::Model::list_all(db).await?;
         let mut by_number = HashMap::with_capacity(rows.len());
         for row in rows {
-            if !row.enabled {
-                continue;
-            }
+            // Keep disabled rows in the index — the matcher needs to see
+            // them to actively reject calls with 403 "Number is disabled".
+            // Previously these were filtered out which caused fall-through
+            // to rule-based routing and calls would still complete.
+            let enabled = row.enabled;
             by_number.insert(
                 row.number.clone(),
                 DidEntry {
@@ -34,6 +40,7 @@ impl DidIndex {
                     trunk_name: row.trunk_name,
                     extension_number: row.extension_number,
                     failover_trunk: row.failover_trunk,
+                    enabled,
                 },
             );
         }

@@ -1259,6 +1259,16 @@ pub fn did_lookup_result(
         return DidLookup::FallThrough;
     };
 
+    // Soft-disabled numbers must reject inbound traffic outright rather
+    // than fall through to rule-based routing. Returning Reject here
+    // produces 403 Forbidden with "Number is disabled" reason.
+    if !entry.enabled {
+        return DidLookup::Reject(format!(
+            "Number is disabled: {}",
+            normalized
+        ));
+    }
+
     let Some(owner_trunk) = entry.trunk_name.as_deref() else {
         tracing::debug!(
             did = %normalized,

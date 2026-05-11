@@ -260,7 +260,23 @@ async fn create_did(
         .map_err(|e| ApiError::internal(e.to_string()))?
         .ok_or_else(|| ApiError::internal("row vanished after insert"))?;
 
+    refresh_did_index(&state).await;
+
     Ok((StatusCode::CREATED, Json(DidView::from(row))))
+}
+
+/// Refresh the in-memory DID index after a DB mutation so the routing
+/// matcher sees the change immediately. Mirrors the auto-reload behavior
+/// of the console handlers (`src/console/handlers/did.rs`). Logs a warning
+/// on failure but never errors the parent request — the DB write succeeded
+/// and the worst case is a stale index until the next manual reload.
+async fn refresh_did_index(state: &AppState) {
+    state
+        .sip_server()
+        .inner
+        .data_context
+        .reload_did_index()
+        .await;
 }
 
 async fn get_did(
@@ -317,6 +333,8 @@ async fn update_did(
         .map_err(|e| ApiError::internal(e.to_string()))?
         .ok_or_else(|| ApiError::internal("row vanished after update"))?;
 
+    refresh_did_index(&state).await;
+
     Ok(Json(DidView::from(row)))
 }
 
@@ -345,6 +363,8 @@ async fn delete_did(
     did::Model::delete(db, &normalized)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    refresh_did_index(&state).await;
 
     Ok(StatusCode::NO_CONTENT)
 }

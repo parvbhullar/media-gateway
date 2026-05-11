@@ -5,6 +5,7 @@
         basePath: {{ (base_path | default("/console")) | tojson }},
         listUrl: {{ list_url | tojson }},
         bulkUrl: {{ bulk_url | tojson }},
+        reloadUrl: {{ reload_url | tojson }},
         trunksUrl: {{ trunks_url | tojson }}
     })' x-init="init()">
     <div class="mx-auto max-w-7xl space-y-6">
@@ -12,7 +13,16 @@
             <div class="space-y-0.5">
                 <p class="text-[11px] font-semibold uppercase tracking-wide text-sky-600">Inbound routing</p>
                 <h1 class="text-2xl font-semibold text-slate-900">Numbers (DIDs)</h1>
-                <p class="text-sm text-slate-500 sm:max-w-xl">Manage direct inward dial numbers attached to SIP trunks and extensions.</p>
+                <p class="text-sm text-slate-500 sm:max-w-xl">Manage direct inward dial numbers attached to SIP trunks and extensions. Changes auto-reload the routing index; use <span class="font-medium">Reload index</span> if you suspect drift.</p>
+            </div>
+            <div class="flex items-center gap-2">
+                <button type="button" @click="reloadIndex()" :disabled="reloading"
+                    class="inline-flex items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60">
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="h-4 w-4" :class="reloading ? 'animate-spin' : ''">
+                        <path fill-rule="evenodd" d="M15.312 11.424a5.5 5.5 0 01-9.201 2.466l-.312-.311h2.433a.75.75 0 000-1.5H3.989a.75.75 0 00-.75.75v4.242a.75.75 0 001.5 0v-2.43l.31.31a7 7 0 0011.712-3.138.75.75 0 00-1.449-.39zm1.23-3.723a.75.75 0 00.219-.53V2.929a.75.75 0 00-1.5 0V5.36l-.31-.31A7 7 0 003.239 8.188a.75.75 0 101.448.389A5.5 5.5 0 0113.89 6.11l.311.31h-2.432a.75.75 0 000 1.5h4.243a.75.75 0 00.53-.219z" clip-rule="evenodd" />
+                    </svg>
+                    <span x-text="reloading ? 'Reloading…' : 'Reload index'"></span>
+                </button>
             </div>
         </header>
 
@@ -305,10 +315,12 @@
                 basePath: options.basePath || '/console',
                 listUrl: options.listUrl || `${options.basePath || '/console'}/dids`,
                 bulkUrl: options.bulkUrl || `${options.basePath || '/console'}/dids/bulk`,
+                reloadUrl: options.reloadUrl || `${options.basePath || '/console'}/dids/reload`,
                 trunksUrl: options.trunksUrl || `${options.basePath || '/console'}/sip-trunk`,
                 dids: [],
                 trunks: [],
                 loading: false,
+                reloading: false,
                 error: null,
                 flash: null,
                 keyword: '',
@@ -327,6 +339,25 @@
                 async init() {
                     await this.loadTrunks();
                     await this.fetchDids();
+                },
+                async reloadIndex() {
+                    if (this.reloading) return;
+                    this.reloading = true;
+                    this.error = null;
+                    this.flash = null;
+                    try {
+                        const resp = await fetch(this.reloadUrl, {
+                            method: 'POST',
+                            headers: { 'Accept': 'application/json' },
+                        });
+                        if (!resp.ok) throw new Error(`Reload failed: ${resp.status}`);
+                        this.flash = 'Routing index reloaded.';
+                        setTimeout(() => { this.flash = null; }, 3000);
+                    } catch (err) {
+                        this.error = err.message || String(err);
+                    } finally {
+                        this.reloading = false;
+                    }
                 },
                 async loadTrunks() {
                     try {

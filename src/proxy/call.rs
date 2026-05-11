@@ -262,6 +262,53 @@ impl RouteInvite for DefaultRouteInvite {
                 }
             }
         }
+
+        // Disabled-DID guard for BOTH directions: a soft-disabled DID must
+        // not be usable as caller-id (outbound) or destination (any side).
+        // Inbound destination is already covered by did_lookup_result above;
+        // this block adds the caller-id check (covers inbound spoofing too)
+        // and the outbound destination check.
+        {
+            let did_index = self.data_context.did_index();
+            let default_country = self.data_context.did_default_country();
+            let from_user = extract_from_user(origin).unwrap_or_default();
+            let to_user = extract_to_user(origin).unwrap_or_default();
+            for (party, raw) in [("caller", &from_user), ("callee", &to_user)] {
+                if raw.is_empty() {
+                    continue;
+                }
+                let region_upper = default_country.as_deref().map(|c| c.to_ascii_uppercase());
+                let normalized = match crate::models::did::normalize_did(raw, region_upper.as_deref()) {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                };
+                if let Some(entry) = did_index.lookup(&normalized)
+                    && !entry.enabled
+                {
+                    // Skip the inbound-callee case — already handled above
+                    // (would otherwise double-log and never reach here since
+                    // the inbound branch returned). Outbound callee, and
+                    // either-direction caller, both flow through here.
+                    let detail = format!("Number is disabled: {}", normalized);
+                    let reason = q850_reason_value(
+                        &rsipstack::sip::StatusCode::Forbidden,
+                        Some(&detail),
+                    );
+                    warn!(
+                        direction = ?direction,
+                        party = %party,
+                        number = %normalized,
+                        reason = %reason,
+                        "rejecting INVITE — {} number is disabled", party,
+                    );
+                    return Ok(RouteResult::Abort(
+                        rsipstack::sip::StatusCode::Forbidden,
+                        Some(reason),
+                    ));
+                }
+            }
+        }
+
         let resource_lookup = self.data_context.as_ref() as &dyn RouteResourceLookup;
         match_invite(
             if trunks_snapshot.is_empty() {

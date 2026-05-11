@@ -21,10 +21,22 @@ pub fn urls() -> Router<Arc<ConsoleState>> {
         .route("/dids", get(list_dids).put(create_did))
         .route("/dids/page", get(page_dids))
         .route("/dids/bulk", post(bulk_create_dids))
+        .route("/dids/reload", post(reload_did_index_handler))
         .route(
             "/dids/{number}",
             get(get_did).patch(update_did).delete(delete_did),
         )
+}
+
+/// Manual DID-index reload triggered from the console "Reload index" button.
+/// Mutations already auto-reload, so this is only for explicit confidence /
+/// drift recovery. Returns 200 with `{ "reloaded": true }`.
+async fn reload_did_index_handler(
+    State(state): State<Arc<ConsoleState>>,
+    AuthRequired(_user): AuthRequired,
+) -> Response {
+    reload_did_index(&state).await;
+    (StatusCode::OK, Json(json!({ "reloaded": true }))).into_response()
 }
 
 async fn page_dids(
@@ -40,6 +52,7 @@ async fn page_dids(
             "current_user": current_user,
             "list_url": state.url_for("/dids"),
             "bulk_url": state.url_for("/dids/bulk"),
+            "reload_url": state.url_for("/dids/reload"),
             "trunks_url": state.url_for("/sip-trunk"),
         }),
         &headers,
