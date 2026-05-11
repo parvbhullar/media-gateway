@@ -2064,6 +2064,13 @@
                                     <span class="rounded-full bg-slate-200 px-2 py-0.5 text-[11px] font-medium text-slate-600"
                                         x-text="group.entries.length"></span>
                                 </div>
+                                <button type="button"
+                                    class="text-xs font-medium text-red-600 hover:text-red-700 disabled:text-slate-400"
+                                    @click="dbConfigDeleteGroup(group)"
+                                    :disabled="dbConfig.processing"
+                                    :title="'Delete every row in ' + (group.name === 'general' ? 'the general group' : group.name + '.*')">
+                                    Delete group
+                                </button>
                             </div>
                             <table class="min-w-full divide-y divide-slate-200 text-sm">
                                 <thead class="bg-slate-50">
@@ -6267,6 +6274,35 @@
                         type: 'success',
                         title: 'Deleted',
                         message: `Removed "${key}". Restart to apply.`,
+                    });
+                    await this.loadDbConfig();
+                } catch (err) {
+                    this.$dispatch('toast', { type: 'error', title: 'Error', message: err?.message || 'Delete failed' });
+                } finally {
+                    this.dbConfig.processing = false;
+                }
+            },
+            async dbConfigDeleteGroup(group) {
+                const count = group.entries.length;
+                const displayName = this.prettyGroup(group.name);
+                const detail = group.name === 'general'
+                    ? `${count} top-level key${count === 1 ? '' : 's'}`
+                    : `${count} ${group.name}.* row${count === 1 ? '' : 's'}`;
+                if (!confirm(`Delete the entire "${displayName}" group?\n\nThis removes ${detail} in one go. Effective values revert to config.toml on next restart.`)) {
+                    return;
+                }
+                this.dbConfig.processing = true;
+                try {
+                    const response = await fetch(`${this.basePath}/settings/config/group/${encodeURIComponent(group.name)}`, {
+                        method: 'DELETE',
+                        headers: { Accept: 'application/json' },
+                    });
+                    const data = await response.json();
+                    if (!response.ok) throw new Error(data?.error || 'Delete failed');
+                    this.$dispatch('toast', {
+                        type: 'success',
+                        title: 'Group deleted',
+                        message: `Removed ${data.deleted} row(s) from "${displayName}". Restart to apply.`,
                     });
                     await this.loadDbConfig();
                 } catch (err) {

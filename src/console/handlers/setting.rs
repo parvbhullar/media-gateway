@@ -184,6 +184,7 @@ pub fn urls() -> Router<Arc<ConsoleState>> {
         .route("/settings/config", get(get_effective_config))
         .route("/settings/config/entry", patch(upsert_config_entry))
         .route("/settings/config/entry/{key}", delete(delete_config_entry))
+        .route("/settings/config/group/{prefix}", delete(delete_config_group))
         .route("/settings/logs/recent", get(fetch_recent_logs))
         .route("/settings/logs/follow", get(follow_logs))
         .route("/settings/logs/stream", get(stream_logs))
@@ -1721,6 +1722,88 @@ pub(crate) async fn delete_config_entry(
         Err(e) => json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to delete entry: {e}"),
+        ),
+    }
+}
+
+/// DELETE /settings/config/group/{prefix} — remove every row in a namespace.
+///
+/// Deletes both the exact `prefix` key (if it exists as a single top-level
+/// row) AND every row whose key starts with `prefix.`. This matches the
+/// atomic-wipe semantics used by the typed settings handlers (e.g. SipFlow),
+/// so that namespaced sections like `[sipflow]` can be fully cleared in one
+/// call instead of one row at a time.
+///
+/// Special case: prefix `"general"` (the synthetic group used in the UI for
+/// keys without a dot) deletes only top-level keys that have no dot.
+pub(crate) async fn delete_config_group(
+    State(state): State<Arc<ConsoleState>>,
+    AuthRequired(user): AuthRequired,
+    AxumPath(prefix): AxumPath<String>,
+) -> Response {
+    if !state.has_permission(&user, "system", "write").await {
+        return json_error(StatusCode::FORBIDDEN, "Permission denied");
+    }
+
+    let prefix = prefix.trim();
+    if prefix.is_empty() {
+        return json_error(StatusCode::UNPROCESSABLE_ENTITY, "prefix must not be empty");
+    }
+
+    let db = match get_db(&state) {
+        Ok(db) => db,
+        Err(r) => return r,
+    };
+
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+    if prefix == "general" {
+        // Top-level keys only: those without a dot. SQLite's `NOT LIKE '%.%'`
+        // captures them. We avoid deleting `database_url` here defensively
+        // since it should never have been seeded anyway.
+        let result = system_config::Entity::delete_many()
+            .filter(system_config::Column::Key.not_like("%.%"))
+            .filter(system_config::Column::Key.ne("database_url"))
+            .exec(&db)
+            .await;
+        return match result {
+            Ok(res) => Json(json!({
+                "status": "ok",
+                "deleted": res.rows_affected,
+                "group": "general",
+                "requires_restart": true,
+            }))
+            .into_response(),
+            Err(e) => json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to delete group: {e}"),
+            ),
+        };
+    }
+
+    // Section group: delete both the exact prefix row (legacy single-object
+    // form) and every `prefix.*` row in one go.
+    let dotted = format!("{prefix}.");
+    let result = system_config::Entity::delete_many()
+        .filter(
+            system_config::Column::Key
+                .eq(prefix.to_string())
+                .or(system_config::Column::Key.starts_with(&dotted)),
+        )
+        .exec(&db)
+        .await;
+
+    match result {
+        Ok(res) => Json(json!({
+            "status": "ok",
+            "deleted": res.rows_affected,
+            "group": prefix,
+            "requires_restart": true,
+        }))
+        .into_response(),
+        Err(e) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to delete group: {e}"),
         ),
     }
 }
