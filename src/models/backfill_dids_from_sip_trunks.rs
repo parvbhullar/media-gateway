@@ -1,21 +1,37 @@
 use crate::config_merge::read_default_country;
-use crate::models::{did, sip_trunk};
+use crate::models::{did, trunk};
 use anyhow::Result;
-use sea_orm::{DatabaseConnection, EntityTrait};
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use serde_json::Value;
 use tracing::{info, warn};
 
-/// One-shot backfill from `sip_trunks.did_numbers` JSON into `rustpbx_dids`.
+/// One-shot backfill from SIP-trunk `did_numbers` JSON (now nested inside
+/// `rustpbx_trunks.kind_config`) into `rustpbx_dids`.
 ///
 /// Idempotent: re-running after a successful backfill does nothing (upserts are skipped
 /// when the row already exists with the same owning trunk).
 pub async fn run(db: &DatabaseConnection) -> Result<BackfillReport> {
     let region = read_default_country(db).await;
-    let trunks = sip_trunk::Entity::find().all(db).await?;
+    let trunks = trunk::Entity::find()
+        .filter(trunk::Column::Kind.eq("sip"))
+        .all(db)
+        .await?;
     let mut report = BackfillReport::default();
 
     for trunk in trunks {
-        let Some(items) = trunk.did_numbers.as_ref().and_then(|v| v.as_array()) else {
+        let sip_cfg = match trunk.sip() {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                warn!(
+                    trunk = %trunk.name,
+                    error = %e,
+                    "backfill skipping trunk with undecodable sip kind_config"
+                );
+                report.invalid += 1;
+                continue;
+            }
+        };
+        let Some(items) = sip_cfg.did_numbers.as_ref().and_then(|v| v.as_array()) else {
             continue;
         };
         for item in items {

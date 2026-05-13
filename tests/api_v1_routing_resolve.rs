@@ -19,7 +19,7 @@ use axum::{
 };
 use chrono::Utc;
 use rustpbx::models::sip_trunk::{
-    self, SipTransport, SipTrunkDirection, SipTrunkStatus,
+    self, SipTransport, SipTrunkConfig, SipTrunkDirection, SipTrunkStatus,
 };
 use rustpbx::models::trunk_group::{self, TrunkGroupDistributionMode};
 use rustpbx::models::trunk_group_member;
@@ -39,20 +39,25 @@ use common::{test_state_empty, test_state_with_api_key};
 
 async fn insert_trunk(state: &rustpbx::app::AppState, name: &str) -> sip_trunk::Model {
     let now = Utc::now();
+    let cfg = SipTrunkConfig {
+        sip_server: Some("sip.example.com:5060".to_string()),
+        sip_transport: SipTransport::Udp,
+        register_enabled: false,
+        rewrite_hostport: true,
+        ..Default::default()
+    };
     let am = sip_trunk::ActiveModel {
         name: Set(name.to_string()),
+        kind: Set("sip".into()),
         display_name: Set(Some(format!("{} display", name))),
         direction: Set(SipTrunkDirection::Outbound),
         status: Set(SipTrunkStatus::Healthy),
-        sip_server: Set(Some("sip.example.com:5060".to_string())),
-        sip_transport: Set(SipTransport::Udp),
         is_active: Set(true),
-        register_enabled: Set(false),
-        rewrite_hostport: Set(true),
         consecutive_failures: Set(0),
         consecutive_successes: Set(0),
         created_at: Set(now),
         updated_at: Set(now),
+        kind_config: Set(serde_json::to_value(&cfg).unwrap()),
         ..Default::default()
     };
     am.insert(state.db()).await.expect("insert trunk")

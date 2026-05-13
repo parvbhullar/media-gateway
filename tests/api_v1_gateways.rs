@@ -5,7 +5,7 @@ use axum::{
     http::{Request, header},
 };
 use chrono::Utc;
-use rustpbx::models::sip_trunk::{self, SipTrunkDirection, SipTrunkStatus, SipTransport};
+use rustpbx::models::sip_trunk::{self, SipTransport, SipTrunkConfig, SipTrunkDirection, SipTrunkStatus};
 use sea_orm::{ActiveModelTrait, Set};
 use serde_json::Value;
 use tower::ServiceExt;
@@ -19,20 +19,25 @@ async fn insert_trunk(
     sip_server: Option<&str>,
 ) -> sip_trunk::Model {
     let now = Utc::now();
+    let cfg = SipTrunkConfig {
+        sip_server: sip_server.map(|s| s.to_string()),
+        sip_transport: SipTransport::Udp,
+        register_enabled: false,
+        rewrite_hostport: true,
+        ..Default::default()
+    };
     let am = sip_trunk::ActiveModel {
         name: Set(name.to_string()),
+        kind: Set("sip".into()),
         display_name: Set(Some(format!("{} display", name))),
         direction: Set(SipTrunkDirection::Outbound),
         status: Set(SipTrunkStatus::Healthy),
-        sip_server: Set(sip_server.map(|s| s.to_string())),
-        sip_transport: Set(SipTransport::Udp),
         is_active: Set(true),
-        register_enabled: Set(false),
-        rewrite_hostport: Set(true),
         consecutive_failures: Set(0),
         consecutive_successes: Set(0),
         created_at: Set(now),
         updated_at: Set(now),
+        kind_config: Set(serde_json::to_value(&cfg).unwrap()),
         ..Default::default()
     };
     am.insert(state.db()).await.expect("insert trunk")

@@ -1,3 +1,7 @@
+// TODO(wave-2-followup / Phase 10): kind-aware Trunks UI. This module still
+// treats every trunk row as SIP — non-SIP kinds are filtered out at read time
+// and unreachable from this handler set. The full kind-aware form (signaling
+// adapter dropdown, ICE servers, etc.) lands in Phase 10.
 use super::bad_request;
 #[cfg(feature = "addon-wholesale")]
 use crate::addons::wholesale::models::{
@@ -12,7 +16,7 @@ use crate::{
     console::{ConsoleState, middleware::AuthRequired},
     models::sip_trunk::{
         ActiveModel as SipTrunkActiveModel, Column as SipTrunkColumn, Entity as SipTrunkEntity,
-        SipTransport, SipTrunkDirection, SipTrunkStatus,
+        SipTransport, SipTrunkConfig, SipTrunkDirection, SipTrunkStatus,
     },
     proxy::routing::ConfigOrigin,
 };
@@ -162,9 +166,20 @@ async fn page_sip_trunk_detail(
     let current_user = state.build_current_user_ctx(&user).await;
 
     match result {
-        Ok(Some(model)) => {
+        Ok(Some(model)) if model.kind == "sip" => {
             #[allow(unused_mut)]
             let mut model_json = serde_json::to_value(&model).unwrap_or(json!({}));
+            // Flatten the SIP-typed view of `kind_config` into the top level
+            // of the JSON the template sees, preserving the legacy field names
+            // the form relies on.
+            if let Ok(sip_cfg) = model.sip()
+                && let (Some(obj), Ok(Value::Object(flat))) =
+                    (model_json.as_object_mut(), serde_json::to_value(&sip_cfg))
+            {
+                for (k, v) in flat {
+                    obj.insert(k, v);
+                }
+            }
 
             #[cfg(feature = "addon-wholesale")]
             if let Some(obj) = model_json.as_object_mut() {
@@ -203,6 +218,11 @@ async fn page_sip_trunk_detail(
                 &headers,
             )
         }
+        Ok(Some(_)) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({"message": "SIP trunk not found"})),
+        )
+            .into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(json!({"message": "SIP trunk not found"})),
@@ -237,7 +257,7 @@ async fn create_sip_trunk(
         ..Default::default()
     };
 
-    if let Err(response) = apply_form_to_active_model(&mut active, &form, now, false) {
+    if let Err(response) = apply_form_to_active_model(&mut active, &form, now, false, None) {
         return response;
     }
 
@@ -286,8 +306,8 @@ async fn update_sip_trunk(
     }
     let db = state.db();
     let model = match SipTrunkEntity::find_by_id(id).one(db).await {
-        Ok(Some(model)) => model,
-        Ok(None) => {
+        Ok(Some(model)) if model.kind == "sip" => model,
+        Ok(Some(_)) | Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(json!({"message": "SIP trunk not found"})),
@@ -304,9 +324,12 @@ async fn update_sip_trunk(
         }
     };
 
+    let existing_sip_cfg = model.sip().unwrap_or_default();
     let mut active: SipTrunkActiveModel = model.into();
     let now = Utc::now();
-    if let Err(response) = apply_form_to_active_model(&mut active, &form, now, true) {
+    if let Err(response) =
+        apply_form_to_active_model(&mut active, &form, now, true, Some(existing_sip_cfg))
+    {
         return response;
     }
 
@@ -354,8 +377,8 @@ async fn delete_sip_trunk(
     }
     let db = state.db();
     let model = match SipTrunkEntity::find_by_id(id).one(db).await {
-        Ok(Some(model)) => model,
-        Ok(None) => {
+        Ok(Some(model)) if model.kind == "sip" => model,
+        Ok(Some(_)) | Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(json!({"message": "SIP trunk not found"})),
@@ -445,7 +468,9 @@ async fn query_sip_trunks(
     let filters = payload.filters.clone().unwrap_or_default();
     let (_, per_page) = payload.normalize();
 
-    let mut selector = SipTrunkEntity::find();
+    // SIP-only view: hide non-SIP rows. Phase 10 will replace this with a
+    // kind-aware Trunks page.
+    let mut selector = SipTrunkEntity::find().filter(SipTrunkColumn::Kind.eq("sip"));
 
     if let Some(ref q_raw) = filters.q {
         let trimmed = q_raw.trim();
@@ -453,8 +478,9 @@ async fn query_sip_trunks(
             let mut condition = Condition::any();
             condition = condition.add(SipTrunkColumn::Name.contains(trimmed));
             condition = condition.add(SipTrunkColumn::DisplayName.contains(trimmed));
-            condition = condition.add(SipTrunkColumn::Carrier.contains(trimmed));
-            condition = condition.add(SipTrunkColumn::SipServer.contains(trimmed));
+            // TODO(wave-2-followup): `carrier` and `sip_server` are now packed
+            // into `kind_config`; restoring contains-search requires JSON path
+            // predicates. Dropped for this wave to keep the list query green.
             selector = selector.filter(condition);
         }
     }
@@ -467,8 +493,9 @@ async fn query_sip_trunks(
         selector = selector.filter(SipTrunkColumn::Direction.eq(direction));
     }
 
-    if let Some(transport) = filters.transport {
-        selector = selector.filter(SipTrunkColumn::SipTransport.eq(transport));
+    if let Some(_transport) = filters.transport {
+        // TODO(wave-2-followup): `sip_transport` moved into `kind_config`;
+        // re-implement via a JSON predicate or in-memory filter.
     }
 
     if filters.only_active.unwrap_or(false) {
@@ -491,10 +518,13 @@ async fn query_sip_trunks(
                 .order_by(SipTrunkColumn::Name, Order::Desc);
         }
         "carrier_asc" => {
-            selector = selector.order_by(SipTrunkColumn::Carrier, Order::Asc);
+            // TODO(wave-2-followup): carrier moved into kind_config; sort by
+            // carrier requires JSON-path ordering. Fallback to name.
+            selector = selector.order_by(SipTrunkColumn::Name, Order::Asc);
         }
         "carrier_desc" => {
-            selector = selector.order_by(SipTrunkColumn::Carrier, Order::Desc);
+            // TODO(wave-2-followup): see above.
+            selector = selector.order_by(SipTrunkColumn::Name, Order::Desc);
         }
         "status_asc" => {
             selector = selector.order_by(SipTrunkColumn::Status, Order::Asc);
@@ -671,6 +701,7 @@ fn apply_form_to_active_model(
     form: &SipTrunkForm,
     now: DateTime<Utc>,
     is_update: bool,
+    existing_sip_cfg: Option<SipTrunkConfig>,
 ) -> Result<(), Response> {
     let allowed_ips = parse_list_field(
         &form.allowed_ips,
@@ -686,13 +717,18 @@ fn apply_form_to_active_model(
     let analytics = parse_json_field(&form.analytics, "analytics")?;
     let tags = parse_json_field(&form.tags, "tags")?;
     let metadata = parse_json_field(&form.metadata, "metadata")?;
+    let register_extra_headers_raw =
+        parse_json_field(&form.register_extra_headers, "register_extra_headers")?;
+    let register_extra_headers: Option<Vec<(String, String)>> = register_extra_headers_raw
+        .as_ref()
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
 
     if !is_update {
         let name = super::require_field(&form.name, "name")?;
         active.name = Set(name);
+        active.kind = Set("sip".to_string());
         active.status = Set(form.status.unwrap_or_default());
         active.direction = Set(form.direction.unwrap_or_default());
-        active.sip_transport = Set(form.sip_transport.unwrap_or_default());
         active.is_active = Set(form.is_active.unwrap_or(true));
         active.created_at = Set(now);
     } else {
@@ -705,9 +741,6 @@ fn apply_form_to_active_model(
         if let Some(direction) = form.direction {
             active.direction = Set(direction);
         }
-        if let Some(transport) = form.sip_transport {
-            active.sip_transport = Set(transport);
-        }
         if let Some(is_active) = form.is_active {
             active.is_active = Set(is_active);
         }
@@ -716,27 +749,8 @@ fn apply_form_to_active_model(
     if !is_update || form.display_name.is_some() {
         active.display_name = Set(super::normalize_optional_string(&form.display_name));
     }
-    if !is_update || form.carrier.is_some() {
-        active.carrier = Set(super::normalize_optional_string(&form.carrier));
-    }
     if !is_update || form.description.is_some() {
         active.description = Set(super::normalize_optional_string(&form.description));
-    }
-    if !is_update || form.sip_server.is_some() {
-        active.sip_server = Set(super::normalize_optional_string(&form.sip_server));
-    }
-    if !is_update || form.outbound_proxy.is_some() {
-        active.outbound_proxy = Set(super::normalize_optional_string(&form.outbound_proxy));
-    }
-    if !is_update || form.auth_username.is_some() {
-        active.auth_username = Set(super::normalize_optional_string(&form.auth_username));
-    }
-    if !is_update || form.auth_password.is_some() {
-        active.auth_password = Set(super::normalize_optional_string(&form.auth_password));
-    }
-    if !is_update || form.default_route_label.is_some() {
-        active.default_route_label =
-            Set(super::normalize_optional_string(&form.default_route_label));
     }
 
     if !is_update || form.max_cps.is_some() {
@@ -758,45 +772,78 @@ fn apply_form_to_active_model(
     if !is_update || form.allowed_ips.is_some() {
         active.allowed_ips = Set(allowed_ips);
     }
-    if !is_update || form.did_numbers.is_some() {
-        active.did_numbers = Set(did_numbers);
-    }
-    if !is_update || form.billing_snapshot.is_some() {
-        active.billing_snapshot = Set(billing_snapshot);
-    }
-    if !is_update || form.analytics.is_some() {
-        active.analytics = Set(analytics);
-    }
     if !is_update || form.tags.is_some() {
         active.tags = Set(tags);
-    }
-    if !is_update || form.incoming_from_user_prefix.is_some() {
-        active.incoming_from_user_prefix = Set(super::normalize_optional_string(
-            &form.incoming_from_user_prefix,
-        ));
-    }
-    if !is_update || form.incoming_to_user_prefix.is_some() {
-        active.incoming_to_user_prefix = Set(super::normalize_optional_string(
-            &form.incoming_to_user_prefix,
-        ));
     }
     if !is_update || form.metadata.is_some() {
         active.metadata = Set(metadata);
     }
 
+    // Build the SIP-typed `kind_config` blob. On update we start from the
+    // previously-decoded config so omitted fields are preserved; on create we
+    // start from defaults.
+    let mut sip_cfg = existing_sip_cfg.unwrap_or_default();
+
+    if !is_update || form.sip_server.is_some() {
+        sip_cfg.sip_server = super::normalize_optional_string(&form.sip_server);
+    }
+    if let Some(transport) = form.sip_transport {
+        sip_cfg.sip_transport = transport;
+    } else if !is_update {
+        sip_cfg.sip_transport = SipTransport::default();
+    }
+    if !is_update || form.outbound_proxy.is_some() {
+        sip_cfg.outbound_proxy = super::normalize_optional_string(&form.outbound_proxy);
+    }
+    if !is_update || form.auth_username.is_some() {
+        sip_cfg.auth_username = super::normalize_optional_string(&form.auth_username);
+    }
+    if !is_update || form.auth_password.is_some() {
+        sip_cfg.auth_password = super::normalize_optional_string(&form.auth_password);
+    }
+    if !is_update || form.default_route_label.is_some() {
+        sip_cfg.default_route_label =
+            super::normalize_optional_string(&form.default_route_label);
+    }
+    if !is_update || form.carrier.is_some() {
+        sip_cfg.carrier = super::normalize_optional_string(&form.carrier);
+    }
+    if !is_update || form.did_numbers.is_some() {
+        sip_cfg.did_numbers = did_numbers;
+    }
+    if !is_update || form.billing_snapshot.is_some() {
+        sip_cfg.billing_snapshot = billing_snapshot;
+    }
+    if !is_update || form.analytics.is_some() {
+        sip_cfg.analytics = analytics;
+    }
+    if !is_update || form.incoming_from_user_prefix.is_some() {
+        sip_cfg.incoming_from_user_prefix =
+            super::normalize_optional_string(&form.incoming_from_user_prefix);
+    }
+    if !is_update || form.incoming_to_user_prefix.is_some() {
+        sip_cfg.incoming_to_user_prefix =
+            super::normalize_optional_string(&form.incoming_to_user_prefix);
+    }
+
     if !is_update {
-        active.register_enabled = Set(form.register_enabled.unwrap_or(false));
+        sip_cfg.register_enabled = form.register_enabled.unwrap_or(false);
     } else if let Some(enabled) = form.register_enabled {
-        active.register_enabled = Set(enabled);
+        sip_cfg.register_enabled = enabled;
     }
     if !is_update || form.register_expires.is_some() {
-        active.register_expires = Set(form.register_expires);
+        sip_cfg.register_expires = form.register_expires;
     }
     if !is_update || form.register_extra_headers.is_some() {
-        let register_extra_headers =
-            parse_json_field(&form.register_extra_headers, "register_extra_headers")?;
-        active.register_extra_headers = Set(register_extra_headers);
+        sip_cfg.register_extra_headers = register_extra_headers;
     }
+
+    if let Err(err) = sip_cfg.validate() {
+        return Err(bad_request(format!("invalid SIP trunk config: {err}")));
+    }
+    let kind_config_json = serde_json::to_value(&sip_cfg)
+        .map_err(|e| bad_request(format!("failed to serialize SIP config: {e}")))?;
+    active.kind_config = Set(kind_config_json);
 
     active.updated_at = Set(now);
 

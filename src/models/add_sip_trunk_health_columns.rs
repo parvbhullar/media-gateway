@@ -18,9 +18,9 @@ impl MigrationTrait for Migration {
             manager
                 .alter_table(
                     Table::alter()
-                        .table(super::sip_trunk::Entity)
+                        .table(super::sip_trunk::legacy::Entity)
                         .add_column(
-                            ColumnDef::new(super::sip_trunk::Column::HealthCheckIntervalSecs)
+                            ColumnDef::new(super::sip_trunk::legacy::Column::HealthCheckIntervalSecs)
                                 .integer()
                                 .null(),
                         )
@@ -33,9 +33,9 @@ impl MigrationTrait for Migration {
             manager
                 .alter_table(
                     Table::alter()
-                        .table(super::sip_trunk::Entity)
+                        .table(super::sip_trunk::legacy::Entity)
                         .add_column(
-                            ColumnDef::new(super::sip_trunk::Column::FailureThreshold)
+                            ColumnDef::new(super::sip_trunk::legacy::Column::FailureThreshold)
                                 .integer()
                                 .null(),
                         )
@@ -48,9 +48,9 @@ impl MigrationTrait for Migration {
             manager
                 .alter_table(
                     Table::alter()
-                        .table(super::sip_trunk::Entity)
+                        .table(super::sip_trunk::legacy::Entity)
                         .add_column(
-                            ColumnDef::new(super::sip_trunk::Column::RecoveryThreshold)
+                            ColumnDef::new(super::sip_trunk::legacy::Column::RecoveryThreshold)
                                 .integer()
                                 .null(),
                         )
@@ -66,9 +66,9 @@ impl MigrationTrait for Migration {
             manager
                 .alter_table(
                     Table::alter()
-                        .table(super::sip_trunk::Entity)
+                        .table(super::sip_trunk::legacy::Entity)
                         .add_column(
-                            ColumnDef::new(super::sip_trunk::Column::ConsecutiveFailures)
+                            ColumnDef::new(super::sip_trunk::legacy::Column::ConsecutiveFailures)
                                 .integer()
                                 .not_null()
                                 .default(0),
@@ -85,9 +85,9 @@ impl MigrationTrait for Migration {
             manager
                 .alter_table(
                     Table::alter()
-                        .table(super::sip_trunk::Entity)
+                        .table(super::sip_trunk::legacy::Entity)
                         .add_column(
-                            ColumnDef::new(super::sip_trunk::Column::ConsecutiveSuccesses)
+                            ColumnDef::new(super::sip_trunk::legacy::Column::ConsecutiveSuccesses)
                                 .integer()
                                 .not_null()
                                 .default(0),

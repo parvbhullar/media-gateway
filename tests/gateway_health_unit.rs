@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::Utc;
 use rustpbx::models::sip_trunk::{
-    self, Entity as TrunkEntity, SipTransport, SipTrunkDirection, SipTrunkStatus,
+    self, Entity as TrunkEntity, SipTransport, SipTrunkConfig, SipTrunkDirection, SipTrunkStatus,
 };
 use rustpbx::proxy::gateway_health::{
     GatewayHealthMonitor, HealthTally, HealthThresholds, ProbeOutcome, Transition,
@@ -61,15 +61,19 @@ async fn make_test_db() -> sea_orm::DatabaseConnection {
 async fn tick_with_probe_flips_to_offline_after_threshold() {
     let db = make_test_db().await;
     let now = Utc::now();
+    let cfg = SipTrunkConfig {
+        sip_server: Some("127.0.0.1:1".into()),
+        sip_transport: SipTransport::Udp,
+        register_enabled: false,
+        rewrite_hostport: true,
+        ..Default::default()
+    };
     let trunk = sip_trunk::ActiveModel {
         name: Set("flippy".into()),
+        kind: Set("sip".into()),
         direction: Set(SipTrunkDirection::Outbound),
         status: Set(SipTrunkStatus::Healthy),
-        sip_server: Set(Some("127.0.0.1:1".into())),
-        sip_transport: Set(SipTransport::Udp),
         is_active: Set(true),
-        register_enabled: Set(false),
-        rewrite_hostport: Set(true),
         consecutive_failures: Set(0),
         consecutive_successes: Set(0),
         // 0 forces a probe on every tick
@@ -78,6 +82,7 @@ async fn tick_with_probe_flips_to_offline_after_threshold() {
         recovery_threshold: Set(Some(2)),
         created_at: Set(now),
         updated_at: Set(now),
+        kind_config: Set(serde_json::to_value(&cfg).unwrap()),
         ..Default::default()
     };
     let inserted = trunk.insert(&db).await.expect("insert trunk");
@@ -112,15 +117,19 @@ async fn tick_with_probe_flips_to_offline_after_threshold() {
 async fn tick_with_probe_recovers_after_successes() {
     let db = make_test_db().await;
     let now = Utc::now();
+    let cfg = SipTrunkConfig {
+        sip_server: Some("127.0.0.1:1".into()),
+        sip_transport: SipTransport::Udp,
+        register_enabled: false,
+        rewrite_hostport: true,
+        ..Default::default()
+    };
     let trunk = sip_trunk::ActiveModel {
         name: Set("recovery".into()),
+        kind: Set("sip".into()),
         direction: Set(SipTrunkDirection::Outbound),
         status: Set(SipTrunkStatus::Offline),
-        sip_server: Set(Some("127.0.0.1:1".into())),
-        sip_transport: Set(SipTransport::Udp),
         is_active: Set(true),
-        register_enabled: Set(false),
-        rewrite_hostport: Set(true),
         consecutive_failures: Set(0),
         consecutive_successes: Set(0),
         health_check_interval_secs: Set(Some(0)),
@@ -128,6 +137,7 @@ async fn tick_with_probe_recovers_after_successes() {
         recovery_threshold: Set(Some(2)),
         created_at: Set(now),
         updated_at: Set(now),
+        kind_config: Set(serde_json::to_value(&cfg).unwrap()),
         ..Default::default()
     };
     let inserted = trunk.insert(&db).await.expect("insert trunk");

@@ -17,9 +17,9 @@ use sea_orm::{
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::models::sip_trunk::{
-    self, Column as TrunkColumn, Entity as TrunkEntity, Model as TrunkModel, SipTrunkDirection,
-    SipTrunkStatus,
+use crate::models::trunk::{
+    self as trunk_model, Column as TrunkColumn, Entity as TrunkEntity, Model as TrunkModel,
+    TrunkDirection, TrunkStatus,
 };
 
 /// Configurable thresholds for the consecutive-result state machine.
@@ -41,7 +41,7 @@ impl Default for HealthThresholds {
 /// Persistent counters and the current observed status for a single trunk.
 #[derive(Debug, Clone)]
 pub struct HealthTally {
-    pub status: SipTrunkStatus,
+    pub status: TrunkStatus,
     pub consecutive_failures: i32,
     pub consecutive_successes: i32,
 }
@@ -51,11 +51,11 @@ pub struct HealthTally {
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Transition {
     NoChange,
-    To(SipTrunkStatus),
+    To(TrunkStatus),
 }
 
 impl HealthTally {
-    pub fn new(status: SipTrunkStatus) -> Self {
+    pub fn new(status: TrunkStatus) -> Self {
         Self {
             status,
             consecutive_failures: 0,
@@ -68,12 +68,12 @@ impl HealthTally {
         self.consecutive_successes += 1;
         if matches!(
             self.status,
-            SipTrunkStatus::Offline | SipTrunkStatus::Warning | SipTrunkStatus::Standby
+            TrunkStatus::Offline | TrunkStatus::Warning | TrunkStatus::Standby
         ) && self.consecutive_successes >= th.recovery
         {
-            self.status = SipTrunkStatus::Healthy;
+            self.status = TrunkStatus::Healthy;
             self.consecutive_successes = 0;
-            return Transition::To(SipTrunkStatus::Healthy);
+            return Transition::To(TrunkStatus::Healthy);
         }
         Transition::NoChange
     }
@@ -83,12 +83,12 @@ impl HealthTally {
         self.consecutive_failures += 1;
         if matches!(
             self.status,
-            SipTrunkStatus::Healthy | SipTrunkStatus::Warning | SipTrunkStatus::Standby
+            TrunkStatus::Healthy | TrunkStatus::Warning | TrunkStatus::Standby
         ) && self.consecutive_failures >= th.failure
         {
-            self.status = SipTrunkStatus::Offline;
+            self.status = TrunkStatus::Offline;
             self.consecutive_failures = 0;
-            return Transition::To(SipTrunkStatus::Offline);
+            return Transition::To(TrunkStatus::Offline);
         }
         Transition::NoChange
     }
@@ -129,12 +129,26 @@ pub async fn probe_trunk(
     let start = std::time::Instant::now();
     let elapsed_ms = |t: std::time::Instant| t.elapsed().as_millis() as u64;
 
+    // 0. Decode the SIP-specific kind config. The caller filters by
+    //    kind="sip" before invoking us, but be defensive: a malformed
+    //    kind_config shouldn't crash the probe loop.
+    let sip_cfg = match trunk.sip() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            return ProbeOutcome {
+                ok: false,
+                latency_ms: 0,
+                detail: format!("invalid kind_config: {}", e),
+            };
+        }
+    };
+
     // 1. Resolve destination. Prefer explicit outbound proxy, fall back to
     //    sip_server.
-    let dest = match trunk
+    let dest = match sip_cfg
         .outbound_proxy
         .as_deref()
-        .or(trunk.sip_server.as_deref())
+        .or(sip_cfg.sip_server.as_deref())
     {
         Some(d) if !d.trim().is_empty() => d.trim().to_string(),
         _ => {
@@ -174,10 +188,10 @@ pub async fn probe_trunk(
 
     // Resolve the trunk's configured transport so the Via header and
     // underlying connection use the correct protocol (TCP/TLS/UDP).
-    let transport = match trunk.sip_transport {
-        crate::models::sip_trunk::SipTransport::Tcp => rsipstack::sip::Transport::Tcp,
-        crate::models::sip_trunk::SipTransport::Tls => rsipstack::sip::Transport::Tls,
-        crate::models::sip_trunk::SipTransport::Udp => rsipstack::sip::Transport::Udp,
+    let transport = match sip_cfg.sip_transport {
+        crate::models::trunk::SipTransport::Tcp => rsipstack::sip::Transport::Tcp,
+        crate::models::trunk::SipTransport::Tls => rsipstack::sip::Transport::Tls,
+        crate::models::trunk::SipTransport::Udp => rsipstack::sip::Transport::Udp,
     };
     let addrs = endpoint.transport_layer.get_addrs();
     let sip_addr = addrs
@@ -368,7 +382,11 @@ impl GatewayHealthMonitor {
     {
         let rows = TrunkEntity::find()
             .filter(TrunkColumn::IsActive.eq(true))
-            .filter(TrunkColumn::Direction.ne(SipTrunkDirection::Inbound.as_str()))
+            // OPTIONS probing only applies to SIP trunks. WebRTC and any
+            // future kinds are skipped here so non-SIP rows never reach
+            // SIP-typed field access below.
+            .filter(TrunkColumn::Kind.eq("sip"))
+            .filter(TrunkColumn::Direction.ne(TrunkDirection::Inbound.as_str()))
             .all(&self.db)
             .await?;
 
@@ -409,7 +427,7 @@ impl GatewayHealthMonitor {
                 new_successes = tally.consecutive_successes;
             }
 
-            let mut am: sip_trunk::ActiveModel = trunk.clone().into();
+            let mut am: trunk_model::ActiveModel = trunk.clone().into();
             am.last_health_check_at = Set(Some(now));
             am.consecutive_failures = Set(new_failures);
             am.consecutive_successes = Set(new_successes);

@@ -19,29 +19,34 @@ use rsipstack::{
     transport::{udp::UdpConnection, TransportLayer},
 };
 use rustpbx::{
-    models::sip_trunk::{Model as TrunkModel, SipTrunkDirection, SipTrunkStatus, SipTransport},
+    models::sip_trunk::{Model as TrunkModel, SipTransport, SipTrunkConfig, SipTrunkDirection, SipTrunkStatus},
     proxy::gateway_health::probe_trunk,
 };
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
 
-/// Build a `sip_trunk::Model` pointing at `target` (e.g. "sip:127.0.0.1:5080").
+/// Build a `trunk::Model` pointing at `target` (e.g. "sip:127.0.0.1:5080").
 fn make_trunk(target: &str) -> TrunkModel {
     let now = chrono::Utc::now();
+    let cfg = SipTrunkConfig {
+        sip_server: Some(target.to_string()),
+        sip_transport: SipTransport::Udp,
+        register_enabled: false,
+        rewrite_hostport: false,
+        ..Default::default()
+    };
     TrunkModel {
         id: 1,
         name: "probe-test".into(),
+        kind: "sip".into(),
         status: SipTrunkStatus::Healthy,
         direction: SipTrunkDirection::Outbound,
-        sip_server: Some(target.to_string()),
-        sip_transport: SipTransport::Udp,
         is_active: true,
-        register_enabled: false,
-        rewrite_hostport: false,
         created_at: now,
         updated_at: now,
         consecutive_failures: 0,
         consecutive_successes: 0,
+        kind_config: serde_json::to_value(&cfg).unwrap(),
         ..Default::default()
     }
 }

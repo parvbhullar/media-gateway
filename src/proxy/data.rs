@@ -937,29 +937,44 @@ fn write_routes_file(path: &Path, routes: &[RouteRule]) -> Result<()> {
 async fn load_trunks_from_db(db: &DatabaseConnection) -> Result<HashMap<String, TrunkConfig>> {
     let models = sip_trunk::Entity::find()
         .filter(sip_trunk::Column::IsActive.eq(true))
+        // Only SIP trunks land in the SIP proxy's in-memory trunk cache.
+        // WebRTC/other kinds are dispatched separately (see Phase 7).
+        .filter(sip_trunk::Column::Kind.eq("sip"))
         .order_by_asc(sip_trunk::Column::Name)
         .all(db)
         .await?;
 
     let mut trunks = HashMap::new();
     for model in models {
-        if let Some((name, trunk)) = convert_trunk(model) {
-            trunks.insert(name, trunk);
+        match convert_trunk(model) {
+            Ok(Some((name, trunk))) => {
+                trunks.insert(name, trunk);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(error = %e, "skipping trunk row with invalid kind_config");
+            }
         }
     }
     Ok(trunks)
 }
 
-fn convert_trunk(model: sip_trunk::Model) -> Option<(String, TrunkConfig)> {
-    let primary = model.sip_server.clone().or(model.outbound_proxy.clone());
-    let dest = primary?;
+fn convert_trunk(model: sip_trunk::Model) -> Result<Option<(String, TrunkConfig)>> {
+    // Parse the kind-specific config once; downstream reads off the typed
+    // struct rather than re-parsing JSON per field.
+    let sip_cfg = model.sip()?;
 
-    let backup_dest = model
+    let primary = sip_cfg.sip_server.clone().or(sip_cfg.outbound_proxy.clone());
+    let Some(dest) = primary else {
+        return Ok(None);
+    };
+
+    let backup_dest = sip_cfg
         .outbound_proxy
         .clone()
         .filter(|outbound| *outbound != dest);
 
-    let transport = Some(model.sip_transport.as_str().to_string());
+    let transport = Some(sip_cfg.sip_transport.as_str().to_string());
 
     let mut inbound_hosts = extract_string_array(model.allowed_ips.clone());
     if let Some(host) = extract_host_from_uri(&dest)
@@ -982,8 +997,8 @@ fn convert_trunk(model: sip_trunk::Model) -> Option<(String, TrunkConfig)> {
     let trunk = TrunkConfig {
         dest,
         backup_dest,
-        username: model.auth_username,
-        password: model.auth_password,
+        username: sip_cfg.auth_username,
+        password: sip_cfg.auth_password,
         codec: Vec::new(),
         disabled: Some(!model.is_active),
         max_calls: model.max_concurrent.map(|v| v as u32),
@@ -994,24 +1009,24 @@ fn convert_trunk(model: sip_trunk::Model) -> Option<(String, TrunkConfig)> {
         direction: Some(model.direction.into()),
         inbound_hosts,
         recording,
-        incoming_from_user_prefix: model.incoming_from_user_prefix,
-        incoming_to_user_prefix: model.incoming_to_user_prefix,
+        incoming_from_user_prefix: sip_cfg.incoming_from_user_prefix,
+        incoming_to_user_prefix: sip_cfg.incoming_to_user_prefix,
         country: None,
         policy: None,
-        register_enabled: if model.register_enabled {
+        register_enabled: if sip_cfg.register_enabled {
             Some(true)
         } else {
             None
         },
-        register_expires: model.register_expires.map(|v| v as u32),
-        register_extra_headers: model
+        register_expires: sip_cfg.register_expires.map(|v| v as u32),
+        register_extra_headers: sip_cfg
             .register_extra_headers
-            .and_then(|v| serde_json::from_value(v).ok()),
-        rewrite_hostport: model.rewrite_hostport,
+            .map(|pairs| pairs.into_iter().collect()),
+        rewrite_hostport: sip_cfg.rewrite_hostport,
         origin: ConfigOrigin::embedded(),
     };
 
-    Some((model.name, trunk))
+    Ok(Some((model.name, trunk)))
 }
 
 pub(crate) async fn load_routes_from_db(

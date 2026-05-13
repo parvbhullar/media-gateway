@@ -1,3 +1,6 @@
+// TODO(wave-2-followup / Phase 10): full kind-aware diagnostics UI. This
+// module currently treats every trunk as SIP-only; rows with `kind != "sip"`
+// are filtered out at query time and skipped in `trunk_config_from_model`.
 use crate::{
     call::{DialDirection, Location, RoutingState},
     config::{Config, ProxyConfig, RecordingPolicy, RouteResult, UserBackendConfig},
@@ -140,7 +143,11 @@ async fn diagnostics_bootstrap(state: &Arc<ConsoleState>) -> JsonValue {
     if let Some(server) = state.sip_server() {
         let data_context = server.data_context.clone();
         let config_trunks = data_context.trunks_snapshot();
+        // TODO(wave-2-followup / Phase 10): kind-aware diagnostics UI. For
+        // now only surface SIP trunks; non-SIP rows are invisible here.
+        use sea_orm::{ColumnTrait, QueryFilter};
         let db_trunks = sip_trunk::Entity::find()
+            .filter(sip_trunk::Column::Kind.eq("sip"))
             .all(state.db())
             .await
             .unwrap_or_default();
@@ -531,9 +538,9 @@ fn build_trunk_overview(
         let status = model.status.as_str().to_string();
         let last_test_at = model.last_health_check_at.map(|dt| dt.to_rfc3339());
         let direction = match model.direction {
-            sip_trunk::SipTrunkDirection::Inbound => vec!["inbound".to_string()],
-            sip_trunk::SipTrunkDirection::Outbound => vec!["outbound".to_string()],
-            sip_trunk::SipTrunkDirection::Bidirectional => {
+            crate::models::trunk::TrunkDirection::Inbound => vec!["inbound".to_string()],
+            crate::models::trunk::TrunkDirection::Outbound => vec!["outbound".to_string()],
+            crate::models::trunk::TrunkDirection::Bidirectional => {
                 vec!["inbound".to_string(), "outbound".to_string()]
             }
         };
@@ -596,18 +603,25 @@ fn json_value_to_string_list(value: &JsonValue) -> Vec<String> {
 }
 
 fn trunk_config_from_model(model: &sip_trunk::Model) -> Option<routing::TrunkConfig> {
-    let dest = model
+    // TODO(wave-2-followup / Phase 10): non-SIP trunk kinds are not yet
+    // surfaced in console diagnostics. Skip them for now.
+    if model.kind != "sip" {
+        return None;
+    }
+    let sip_cfg = model.sip().ok()?;
+
+    let dest = sip_cfg
         .sip_server
         .clone()
         .and_then(|value| normalize_non_empty(&value))
         .or_else(|| {
-            model
+            sip_cfg
                 .outbound_proxy
                 .clone()
                 .and_then(|value| normalize_non_empty(&value))
         })?;
 
-    let backup_dest = model
+    let backup_dest = sip_cfg
         .outbound_proxy
         .as_ref()
         .and_then(|value| normalize_non_empty(value))
@@ -636,34 +650,34 @@ fn trunk_config_from_model(model: &sip_trunk::Model) -> Option<routing::TrunkCon
     Some(routing::TrunkConfig {
         dest,
         backup_dest,
-        username: model.auth_username.clone(),
-        password: model.auth_password.clone(),
+        username: sip_cfg.auth_username.clone(),
+        password: sip_cfg.auth_password.clone(),
         codec: Vec::new(),
         disabled: Some(!model.is_active),
         max_calls: model.max_concurrent.map(|value| value as u32),
         max_cps: model.max_cps.map(|value| value as u32),
         weight: None,
-        transport: Some(model.sip_transport.as_str().to_string()),
+        transport: Some(sip_cfg.sip_transport.as_str().to_string()),
         id: Some(model.id),
         direction: Some(model.direction.into()),
         inbound_hosts,
         recording,
-        incoming_from_user_prefix: model.incoming_from_user_prefix.clone(),
-        incoming_to_user_prefix: model.incoming_to_user_prefix.clone(),
+        incoming_from_user_prefix: sip_cfg.incoming_from_user_prefix.clone(),
+        incoming_to_user_prefix: sip_cfg.incoming_to_user_prefix.clone(),
         origin: routing::ConfigOrigin::embedded(),
         country: None,
         policy: None,
-        register_enabled: if model.register_enabled {
+        register_enabled: if sip_cfg.register_enabled {
             Some(true)
         } else {
             None
         },
-        register_expires: model.register_expires.map(|v| v as u32),
-        register_extra_headers: model
+        register_expires: sip_cfg.register_expires.map(|v| v as u32),
+        register_extra_headers: sip_cfg
             .register_extra_headers
-            .as_ref()
-            .and_then(|v| serde_json::from_value(v.clone()).ok()),
-        rewrite_hostport: model.rewrite_hostport,
+            .clone()
+            .map(|pairs| pairs.into_iter().collect::<std::collections::HashMap<_, _>>()),
+        rewrite_hostport: sip_cfg.rewrite_hostport,
     })
 }
 
@@ -1210,7 +1224,11 @@ async fn route_evaluate(
         }
         EvaluationDataset::Database => {
             let db = state.db();
-            let trunk_models = match sip_trunk::Entity::find().all(db).await {
+            // TODO(wave-2-followup / Phase 10): kind-aware UI. SIP-only for now.
+            use sea_orm::{ColumnTrait as _, QueryFilter as _};
+            let trunk_models = match sip_trunk::Entity::find()
+                .filter(sip_trunk::Column::Kind.eq("sip"))
+                .all(db).await {
                 Ok(models) => models,
                 Err(err) => {
                     return (

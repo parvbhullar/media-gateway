@@ -41,6 +41,7 @@ impl MigratorTrait for Migrator {
             Box::new(super::trunk_acl_entries::Migration),
             Box::new(super::routing_tables::Migration),
             Box::new(super::webhooks::Migration),
+            Box::new(super::migrate_sip_trunks_to_trunks_unified::Migration),
         ]
     }
 }

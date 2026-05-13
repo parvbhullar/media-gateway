@@ -15,17 +15,22 @@ async fn insert_legacy_trunk(
     did_numbers_json: serde_json::Value,
 ) {
     let now = chrono::Utc::now();
+    let cfg = sip_trunk::SipTrunkConfig {
+        sip_transport: sip_trunk::SipTransport::Udp,
+        did_numbers: Some(did_numbers_json),
+        register_enabled: false,
+        rewrite_hostport: true,
+        ..Default::default()
+    };
     let trunk = sip_trunk::ActiveModel {
         name: Set(name.to_string()),
+        kind: Set("sip".into()),
         status: Set(sip_trunk::SipTrunkStatus::Healthy),
         direction: Set(sip_trunk::SipTrunkDirection::Bidirectional),
-        sip_transport: Set(sip_trunk::SipTransport::Udp),
-        did_numbers: Set(Some(did_numbers_json)),
         is_active: Set(true),
-        register_enabled: Set(false),
-        rewrite_hostport: Set(true),
         created_at: Set(now),
         updated_at: Set(now),
+        kind_config: Set(serde_json::to_value(&cfg).unwrap()),
         ..Default::default()
     };
     sip_trunk::Entity::insert(trunk).exec(db).await.unwrap();

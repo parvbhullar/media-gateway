@@ -4,6 +4,9 @@ use crate::addons::queue::models::{
 use crate::addons::queue::services::utils as queue_utils;
 use crate::console::handlers::{bad_request, forms};
 use crate::console::{ConsoleState, middleware::AuthRequired};
+// TODO(wave-2-followup / Phase 10): routing handlers reference trunks
+// generically here. Until kind-aware UI lands, the trunk load is filtered
+// to `kind = "sip"` so non-SIP trunks are invisible in the routing console.
 use crate::models::{
     routing::{
         ActiveModel as RoutingActiveModel, Column as RoutingColumn, Entity as RoutingEntity,
@@ -553,6 +556,7 @@ async fn generate_clone_name(db: &DatabaseConnection, original: &str) -> Result<
 
 async fn load_trunks(db: &DatabaseConnection) -> Result<Vec<SipTrunkModel>, DbErr> {
     SipTrunkEntity::find()
+        .filter(SipTrunkColumn::Kind.eq("sip"))
         .order_by_asc(SipTrunkColumn::Name)
         .all(db)
         .await
@@ -569,6 +573,13 @@ fn build_trunk_options(trunks: &[SipTrunkModel]) -> Vec<Value> {
     trunks
         .iter()
         .map(|trunk| {
+            // `carrier` lives in `kind_config` post Wave 1; only meaningful
+            // for SIP kind. Non-SIP trunks are filtered out by `load_trunks`.
+            let carrier = trunk
+                .sip()
+                .ok()
+                .and_then(|cfg| cfg.carrier)
+                .unwrap_or_default();
             json!({
                 "id": trunk.id,
                 "name": trunk.name,
@@ -576,7 +587,7 @@ fn build_trunk_options(trunks: &[SipTrunkModel]) -> Vec<Value> {
                     .display_name
                     .clone()
                     .unwrap_or_else(|| trunk.name.clone()),
-                "carrier": trunk.carrier.clone().unwrap_or_default(),
+                "carrier": carrier,
                 "status": trunk.status,
                 "direction": trunk.direction,
             })
