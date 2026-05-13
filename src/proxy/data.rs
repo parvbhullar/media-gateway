@@ -1829,6 +1829,7 @@ foo = "bar"
 
     #[test]
     fn load_kind_aware_webrtc_validates_but_skips_routing_map() {
+        crate::proxy::bridge::signaling::register_builtins();
         crate::models::kind_schemas::register_builtins();
         let path = write_trunk_file(
             "webrtc_ok.toml",
@@ -1842,6 +1843,10 @@ direction = "outbound"
 signaling = "http_json"
 endpoint_url = "http://127.0.0.1:7860/api/offer"
 audio_codec = "opus"
+
+[trunk.kind_config.protocol]
+request_body_template = '{"sdp":"{offer_sdp}","type":"offer"}'
+response_answer_path = "$.sdp"
 "#,
         );
         let (trunks, _files) = load_trunks_from_files(&[path.to_string_lossy().to_string()])

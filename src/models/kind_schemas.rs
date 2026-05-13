@@ -105,9 +105,22 @@ pub fn register_builtins() {
                 .map_err(|e| KindValidationError::invalid("webrtc", e.to_string()))?;
             cfg.validate()
                 .map_err(|e| KindValidationError::invalid("webrtc", e.to_string()))?;
-            // TODO(pr-3): delegate protocol validation to
-            //   signaling::lookup(cfg.signaling).validate_protocol(cfg.protocol)
-            // once the signaling-adapter registry lands.
+            // Delegate protocol-blob validation to the signaling adapter
+            // named by the trunk's `signaling` field. The adapter registry
+            // is populated at startup (`signaling::register_builtins`) and
+            // is process-global; tests that exercise the `webrtc` validator
+            // also call `register_builtins` so the adapter is reachable.
+            let adapter = crate::proxy::bridge::signaling::lookup(&cfg.signaling).ok_or_else(
+                || {
+                    KindValidationError::invalid(
+                        "webrtc",
+                        format!("signaling adapter '{}' not registered", cfg.signaling),
+                    )
+                },
+            )?;
+            adapter
+                .validate_protocol(cfg.protocol.as_ref())
+                .map_err(|e| KindValidationError::invalid("webrtc", e.to_string()))?;
             Ok(())
         }),
     );
@@ -165,12 +178,56 @@ mod tests {
 
     #[test]
     fn validate_webrtc_accepts_valid_config() {
+        // The webrtc validator now delegates protocol validation to the
+        // adapter named by `signaling`, so we must register adapters too.
+        crate::proxy::bridge::signaling::register_builtins();
+        register_builtins();
+        let cfg = json!({
+            "signaling": "http_json",
+            "endpoint_url": "https://signal.example.com/offer",
+            "protocol": {
+                "request_body_template": r#"{"sdp":"{offer_sdp}","type":"offer"}"#,
+                "response_answer_path": "$.sdp",
+            },
+        });
+        assert!(validate("webrtc", &cfg).is_ok());
+    }
+
+    #[test]
+    fn validate_webrtc_rejects_unknown_signaling_adapter() {
+        crate::proxy::bridge::signaling::register_builtins();
+        register_builtins();
+        let cfg = json!({
+            "signaling": "nonexistent_adapter_xyz",
+            "endpoint_url": "https://signal.example.com/offer",
+        });
+        match validate("webrtc", &cfg) {
+            Err(KindValidationError::Invalid { kind, message }) => {
+                assert_eq!(kind, "webrtc");
+                assert!(message.contains("nonexistent_adapter_xyz"));
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_webrtc_rejects_missing_protocol_for_http_json() {
+        crate::proxy::bridge::signaling::register_builtins();
         register_builtins();
         let cfg = json!({
             "signaling": "http_json",
             "endpoint_url": "https://signal.example.com/offer",
         });
-        assert!(validate("webrtc", &cfg).is_ok());
+        match validate("webrtc", &cfg) {
+            Err(KindValidationError::Invalid { kind, message }) => {
+                assert_eq!(kind, "webrtc");
+                assert!(
+                    message.contains("missing protocol") || message.contains("protocol"),
+                    "expected protocol-related error, got: {message}"
+                );
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
     }
 
     #[test]

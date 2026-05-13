@@ -272,6 +272,12 @@ impl AppStateBuilder {
             crate::models::create_db(&config.database_url).await?
         };
 
+        // Register built-in WebRTC signaling adapters (e.g. "http_json")
+        // before the kind_schemas validators, since the `webrtc` validator
+        // delegates protocol-blob validation to the adapter registered
+        // under the trunk's `signaling` name. Both calls are idempotent.
+        crate::proxy::bridge::signaling::register_builtins();
+
         // Register built-in trunk kind_config validators (sip, webrtc).
         // Idempotent — safe across multiple AppState builds in tests.
         crate::models::kind_schemas::register_builtins();
