@@ -29,12 +29,20 @@ use serde_json::Value as JsonValue;
 use crate::app::AppState;
 use crate::handler::api_v1::error::{ApiError, ApiResult};
 use crate::models::did::{Column as DidColumn, Entity as DidEntity};
+use crate::models::kind_schemas::{self, KindValidationError};
 use crate::models::sip_trunk::{
     self, ActiveModel as TrunkActiveModel, Column as TrunkColumn, Entity as TrunkEntity,
     Model as TrunkModel, SipTransport, SipTrunkConfig, SipTrunkDirection, SipTrunkStatus,
-    WebRtcTrunkConfig,
 };
 use crate::proxy::gateway_health::probe_trunk;
+
+/// Map a `KindValidationError` into the file's existing `ApiError` envelope.
+/// All variants surface as HTTP 400 with the error message carried through;
+/// `Invalid { kind, message }` preserves any field-attributed detail that
+/// the underlying serde / `validate()` call produced.
+fn map_kind_validation_err(e: KindValidationError) -> ApiError {
+    ApiError::bad_request(e.to_string())
+}
 
 #[derive(Debug, Serialize)]
 pub struct GatewayView {
@@ -267,56 +275,42 @@ async fn trunk_by_name(
 /// `kind_config`).
 fn build_kind_and_config_for_create(req: &CreateGatewayRequest) -> ApiResult<(String, JsonValue)> {
     let kind = req.kind.clone().unwrap_or_else(|| "sip".to_string());
-    match kind.as_str() {
-        "sip" => {
-            // Start from explicit kind_config if provided, else default.
-            let mut cfg: SipTrunkConfig = match &req.kind_config {
-                Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
-                    ApiError::bad_request(format!("invalid sip kind_config: {e}"))
-                })?,
-                None => SipTrunkConfig::default(),
-            };
-            // Legacy top-level fields override (back-compat).
-            if let Some(v) = normalize_optional_string(req.sip_server.clone()) {
-                cfg.sip_server = Some(v);
-            }
-            if let Some(v) = normalize_optional_string(req.outbound_proxy.clone()) {
-                cfg.outbound_proxy = Some(v);
-            }
-            if let Some(t) = req.transport {
-                cfg.sip_transport = t;
-            }
-            if let Some(v) = normalize_optional_string(req.auth_username.clone()) {
-                cfg.auth_username = Some(v);
-            }
-            if let Some(v) = normalize_optional_string(req.auth_password.clone()) {
-                cfg.auth_password = Some(v);
-            }
-            cfg.validate()
-                .map_err(|e| ApiError::bad_request(e.to_string()))?;
-            let v = serde_json::to_value(&cfg)
-                .map_err(|e| ApiError::internal(format!("serialize sip config: {e}")))?;
-            Ok(("sip".to_string(), v))
+    // SIP retains the legacy top-level fold-in path; non-SIP kinds use the
+    // request's `kind_config` blob verbatim. Final validation for every kind
+    // runs through `kind_schemas::validate` so adding a new kind only
+    // requires registering a new validator.
+    let kind_config_json: JsonValue = if kind == "sip" {
+        let mut cfg: SipTrunkConfig = match &req.kind_config {
+            Some(v) => serde_json::from_value(v.clone())
+                .map_err(|e| ApiError::bad_request(format!("invalid sip kind_config: {e}")))?,
+            None => SipTrunkConfig::default(),
+        };
+        // Legacy top-level fields override (back-compat).
+        if let Some(v) = normalize_optional_string(req.sip_server.clone()) {
+            cfg.sip_server = Some(v);
         }
-        "webrtc" => {
-            let raw = req
-                .kind_config
-                .clone()
-                .ok_or_else(|| ApiError::bad_request("webrtc trunks require kind_config"))?;
-            let cfg: WebRtcTrunkConfig = serde_json::from_value(raw).map_err(|e| {
-                ApiError::bad_request(format!("invalid webrtc kind_config: {e}"))
-            })?;
-            cfg.validate()
-                .map_err(|e| ApiError::bad_request(e.to_string()))?;
-            let v = serde_json::to_value(&cfg)
-                .map_err(|e| ApiError::internal(format!("serialize webrtc config: {e}")))?;
-            Ok(("webrtc".to_string(), v))
+        if let Some(v) = normalize_optional_string(req.outbound_proxy.clone()) {
+            cfg.outbound_proxy = Some(v);
         }
-        // TODO(wave-2-followup): dispatch via kind_schemas registry (Phase 3).
-        other => Err(ApiError::bad_request(format!(
-            "unknown trunk kind '{other}'"
-        ))),
-    }
+        if let Some(t) = req.transport {
+            cfg.sip_transport = t;
+        }
+        if let Some(v) = normalize_optional_string(req.auth_username.clone()) {
+            cfg.auth_username = Some(v);
+        }
+        if let Some(v) = normalize_optional_string(req.auth_password.clone()) {
+            cfg.auth_password = Some(v);
+        }
+        serde_json::to_value(&cfg)
+            .map_err(|e| ApiError::internal(format!("serialize sip config: {e}")))?
+    } else {
+        req.kind_config.clone().ok_or_else(|| {
+            ApiError::bad_request(format!("{kind} trunks require kind_config"))
+        })?
+    };
+
+    kind_schemas::validate(&kind, &kind_config_json).map_err(map_kind_validation_err)?;
+    Ok((kind, kind_config_json))
 }
 
 /// Build the updated `(kind, kind_config_json)` for a PUT by merging the
@@ -331,75 +325,60 @@ fn build_kind_and_config_for_update(
         .kind
         .clone()
         .unwrap_or_else(|| existing.kind.clone());
-    match kind.as_str() {
-        "sip" => {
-            let mut cfg: SipTrunkConfig = if existing.kind == "sip" {
-                existing
-                    .sip()
-                    .map_err(|e| ApiError::internal(e.to_string()))?
-            } else if let Some(v) = &req.kind_config {
-                serde_json::from_value(v.clone()).map_err(|e| {
-                    ApiError::bad_request(format!("invalid sip kind_config: {e}"))
-                })?
-            } else {
-                SipTrunkConfig::default()
-            };
-            // Apply request-supplied kind_config (replace) over existing.
-            if let Some(v) = &req.kind_config {
-                cfg = serde_json::from_value(v.clone()).map_err(|e| {
-                    ApiError::bad_request(format!("invalid sip kind_config: {e}"))
-                })?;
-            }
-            // Legacy top-level fields override.
-            if let Some(v) = req.sip_server.clone() {
-                cfg.sip_server = normalize_optional_string(Some(v));
-            }
-            if let Some(v) = req.outbound_proxy.clone() {
-                cfg.outbound_proxy = normalize_optional_string(Some(v));
-            }
-            if let Some(t) = req.transport {
-                cfg.sip_transport = t;
-            }
-            if let Some(v) = req.auth_username.clone() {
-                cfg.auth_username = normalize_optional_string(Some(v));
-            }
-            if let Some(v) = req.auth_password.clone() {
-                cfg.auth_password = normalize_optional_string(Some(v));
-            }
-            cfg.validate()
-                .map_err(|e| ApiError::bad_request(e.to_string()))?;
-            let v = serde_json::to_value(&cfg)
-                .map_err(|e| ApiError::internal(format!("serialize sip config: {e}")))?;
-            Ok(("sip".to_string(), v))
+    // SIP retains its legacy fold-in / merge-on-existing path; other kinds
+    // use the request blob (or fall back to the stored blob when the kind
+    // is unchanged). Final validation runs through `kind_schemas::validate`.
+    let kind_config_json: JsonValue = if kind == "sip" {
+        let mut cfg: SipTrunkConfig = if existing.kind == "sip" {
+            existing
+                .sip()
+                .map_err(|e| ApiError::internal(e.to_string()))?
+        } else if let Some(v) = &req.kind_config {
+            serde_json::from_value(v.clone())
+                .map_err(|e| ApiError::bad_request(format!("invalid sip kind_config: {e}")))?
+        } else {
+            SipTrunkConfig::default()
+        };
+        // Apply request-supplied kind_config (replace) over existing.
+        if let Some(v) = &req.kind_config {
+            cfg = serde_json::from_value(v.clone())
+                .map_err(|e| ApiError::bad_request(format!("invalid sip kind_config: {e}")))?;
         }
-        "webrtc" => {
-            let raw = req
-                .kind_config
-                .clone()
-                .or_else(|| {
-                    if existing.kind == "webrtc" {
-                        Some(existing.kind_config.clone())
-                    } else {
-                        None
-                    }
-                })
-                .ok_or_else(|| {
-                    ApiError::bad_request("webrtc trunks require kind_config")
-                })?;
-            let cfg: WebRtcTrunkConfig = serde_json::from_value(raw).map_err(|e| {
-                ApiError::bad_request(format!("invalid webrtc kind_config: {e}"))
-            })?;
-            cfg.validate()
-                .map_err(|e| ApiError::bad_request(e.to_string()))?;
-            let v = serde_json::to_value(&cfg)
-                .map_err(|e| ApiError::internal(format!("serialize webrtc config: {e}")))?;
-            Ok(("webrtc".to_string(), v))
+        // Legacy top-level fields override.
+        if let Some(v) = req.sip_server.clone() {
+            cfg.sip_server = normalize_optional_string(Some(v));
         }
-        // TODO(wave-2-followup): dispatch via kind_schemas registry (Phase 3).
-        other => Err(ApiError::bad_request(format!(
-            "unknown trunk kind '{other}'"
-        ))),
-    }
+        if let Some(v) = req.outbound_proxy.clone() {
+            cfg.outbound_proxy = normalize_optional_string(Some(v));
+        }
+        if let Some(t) = req.transport {
+            cfg.sip_transport = t;
+        }
+        if let Some(v) = req.auth_username.clone() {
+            cfg.auth_username = normalize_optional_string(Some(v));
+        }
+        if let Some(v) = req.auth_password.clone() {
+            cfg.auth_password = normalize_optional_string(Some(v));
+        }
+        serde_json::to_value(&cfg)
+            .map_err(|e| ApiError::internal(format!("serialize sip config: {e}")))?
+    } else {
+        req.kind_config
+            .clone()
+            .or_else(|| {
+                if existing.kind == kind {
+                    Some(existing.kind_config.clone())
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| {
+                ApiError::bad_request(format!("{kind} trunks require kind_config"))
+            })?
+    };
+
+    kind_schemas::validate(&kind, &kind_config_json).map_err(map_kind_validation_err)?;
+    Ok((kind, kind_config_json))
 }
 
 async fn create_gateway(

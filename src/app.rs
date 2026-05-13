@@ -272,6 +272,10 @@ impl AppStateBuilder {
             crate::models::create_db(&config.database_url).await?
         };
 
+        // Register built-in trunk kind_config validators (sip, webrtc).
+        // Idempotent — safe across multiple AppState builds in tests.
+        crate::models::kind_schemas::register_builtins();
+
         let addon_registry = Arc::new(crate::addons::registry::AddonRegistry::new());
 
         // Run addon migrations if not skipped

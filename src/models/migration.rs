@@ -42,6 +42,7 @@ impl MigratorTrait for Migrator {
             Box::new(super::routing_tables::Migration),
             Box::new(super::webhooks::Migration),
             Box::new(super::migrate_sip_trunks_to_trunks_unified::Migration),
+            Box::new(super::add_trunks_last_health_check_at::Migration),
         ]
     }
 }
