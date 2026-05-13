@@ -17,7 +17,7 @@ use tracing::{info, warn};
 use crate::{
     addons::queue::services::utils as queue_utils,
     config::{ProxyConfig, RecordingPolicy},
-    models::{routing, sip_trunk},
+    models::{kind_schemas, routing, sip_trunk, trunk::SipTrunkConfig},
     proxy::routing::matcher::RouteResourceLookup,
     proxy::routing::{
         ConfigOrigin, DestConfig, MatchConditions, RewriteRules, RouteAction, RouteDirection,
@@ -723,10 +723,69 @@ impl RouteResourceLookup for ProxyDataContext {
     }
 }
 
+/// Trunk include-file shape. Accepts BOTH:
+///
+/// * **Legacy routing-format** — the historical shape used by the file-based
+///   loader. SIP-only; routing-layer fields live at the top level under a
+///   `[trunks.<name>]` map. Continues to work unchanged.
+///
+/// * **Kind-aware format (PR 2B)** — an array `[[trunk]]` of entries that
+///   carry an explicit `kind` discriminator and a nested `[kind_config]`
+///   table validated through `kind_schemas`. SIP entries are folded into
+///   the routing `TrunkConfig` shape. Non-SIP entries (e.g. `kind = "webrtc"`)
+///   validate successfully but are skipped from the routing map — the routing
+///   layer only forwards SIP. WebRTC trunks are dispatched separately by the
+///   bridge in Phase 7.
 #[derive(Default, Deserialize, Serialize)]
 struct TrunkIncludeFile {
     #[serde(default)]
     trunks: HashMap<String, TrunkConfig>,
+    /// Kind-aware entries (new in PR 2B). Optional; absent in legacy files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    trunk: Vec<KindAwareTrunkEntry>,
+}
+
+/// Kind-aware trunk entry from a TOML include file. Routing-shared fields
+/// (`name`, `direction`, `is_active`, optional caps, ACLs) live at the top
+/// level; per-kind config lives under `[kind_config]`.
+#[derive(Debug, Deserialize, Serialize)]
+struct KindAwareTrunkEntry {
+    pub name: String,
+    #[serde(default = "default_kind_sip")]
+    pub kind: String,
+    #[serde(default = "default_true_loader")]
+    pub is_active: bool,
+    #[serde(default)]
+    pub direction: Option<crate::models::sip_trunk::SipTrunkDirection>,
+    #[serde(default)]
+    pub max_cps: Option<u32>,
+    #[serde(default)]
+    pub max_concurrent: Option<u32>,
+    #[serde(default)]
+    pub allowed_ips: Option<serde_json::Value>,
+    /// Optional metadata blob — recording policy is folded from here.
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+    /// The kind-specific config. Required for non-SIP kinds. For SIP it
+    /// may be omitted; in that case the loader falls back to gathering
+    /// any legacy top-level SIP fields (see `legacy_sip`).
+    #[serde(default)]
+    pub kind_config: Option<serde_json::Value>,
+    /// Legacy back-compat: when `kind` is absent (defaults to `"sip"`) and
+    /// `kind_config` is absent, the deserializer accepts the historical
+    /// top-level SIP fields here via `#[serde(flatten)]` into a catch-all.
+    /// Documented as supported for one release cycle; new files should use
+    /// the explicit `[kind_config]` block.
+    #[serde(flatten)]
+    pub legacy_sip: HashMap<String, serde_json::Value>,
+}
+
+fn default_kind_sip() -> String {
+    "sip".to_string()
+}
+
+fn default_true_loader() -> bool {
+    true
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -760,7 +819,7 @@ fn load_trunks_from_files(
             if !files.contains(&path_display) {
                 files.push(path_display.clone());
             }
-            if data.trunks.is_empty() {
+            if data.trunks.is_empty() && data.trunk.is_empty() {
                 info!("trunk include file {} contained no trunks", path_display);
             }
             for (name, mut trunk) in data.trunks {
@@ -768,9 +827,183 @@ fn load_trunks_from_files(
                 trunk.origin = ConfigOrigin::from_file(path_display.clone());
                 trunks.insert(name, trunk);
             }
+            for entry in data.trunk {
+                match process_kind_aware_entry(entry, &path_display) {
+                    Ok(Some((name, trunk))) => {
+                        trunks.insert(name, trunk);
+                    }
+                    Ok(None) => {
+                        // Non-SIP kind validated successfully but not added to
+                        // the routing map (routing layer only forwards SIP).
+                    }
+                    Err(e) => {
+                        warn!(
+                            file = %path_display,
+                            error = %e,
+                            "skipping invalid trunk entry from include file"
+                        );
+                    }
+                }
+            }
         }
     }
     Ok((trunks, files))
+}
+
+/// Validate a kind-aware include-file trunk entry and, for SIP, project it
+/// onto the routing-layer `TrunkConfig` shape. Returns:
+///
+/// * `Ok(Some((name, trunk)))` — SIP entry that should land in the routing map.
+/// * `Ok(None)` — Non-SIP entry validated successfully but routing layer
+///   doesn't consume it (e.g. WebRTC trunks, dispatched separately).
+/// * `Err(_)` — Validation failed; caller logs and skips.
+fn process_kind_aware_entry(
+    entry: KindAwareTrunkEntry,
+    path_display: &str,
+) -> Result<Option<(String, TrunkConfig)>> {
+    if entry.name.trim().is_empty() {
+        return Err(anyhow!("trunk entry missing required `name`"));
+    }
+
+    // For SIP, fold any legacy top-level fields into `kind_config` so the
+    // validator sees the complete blob — same tolerance as the REST CRUD.
+    let kind_config_value = build_kind_config_value(&entry)?;
+
+    // Single validation gate: every kind goes through `kind_schemas`.
+    kind_schemas::validate(&entry.kind, &kind_config_value)
+        .map_err(|e| anyhow!("trunk '{}' kind='{}': {}", entry.name, entry.kind, e))?;
+
+    if entry.kind != "sip" {
+        info!(
+            file = %path_display,
+            name = %entry.name,
+            kind = %entry.kind,
+            "loaded non-SIP trunk from include file (validated; not added to routing map)"
+        );
+        return Ok(None);
+    }
+
+    // SIP path: project onto the routing `TrunkConfig` shape — same logic
+    // as `convert_trunk` for DB rows.
+    let sip_cfg: SipTrunkConfig = serde_json::from_value(kind_config_value)
+        .map_err(|e| anyhow!("trunk '{}': decode sip kind_config: {}", entry.name, e))?;
+
+    let primary = sip_cfg.sip_server.clone().or(sip_cfg.outbound_proxy.clone());
+    let Some(dest) = primary else {
+        return Err(anyhow!(
+            "sip trunk '{}' missing both sip_server and outbound_proxy",
+            entry.name
+        ));
+    };
+    let backup_dest = sip_cfg
+        .outbound_proxy
+        .clone()
+        .filter(|outbound| *outbound != dest);
+    let transport = Some(sip_cfg.sip_transport.as_str().to_string());
+
+    let mut inbound_hosts = extract_string_array(entry.allowed_ips.clone());
+    if let Some(host) = extract_host_from_uri(&dest)
+        && host.parse::<IpAddr>().is_ok()
+    {
+        push_unique(&mut inbound_hosts, host);
+    }
+    if let Some(backup) = &backup_dest
+        && let Some(host) = extract_host_from_uri(backup)
+        && host.parse::<IpAddr>().is_ok()
+    {
+        push_unique(&mut inbound_hosts, host);
+    }
+
+    let recording = entry
+        .metadata
+        .as_ref()
+        .and_then(recording_policy_from_metadata);
+
+    let trunk = TrunkConfig {
+        dest,
+        backup_dest,
+        username: sip_cfg.auth_username,
+        password: sip_cfg.auth_password,
+        codec: Vec::new(),
+        disabled: Some(!entry.is_active),
+        max_calls: entry.max_concurrent,
+        max_cps: entry.max_cps,
+        weight: None,
+        transport,
+        id: None,
+        direction: entry.direction.map(|d| d.into()),
+        inbound_hosts,
+        recording,
+        incoming_from_user_prefix: sip_cfg.incoming_from_user_prefix,
+        incoming_to_user_prefix: sip_cfg.incoming_to_user_prefix,
+        country: None,
+        policy: None,
+        register_enabled: if sip_cfg.register_enabled {
+            Some(true)
+        } else {
+            None
+        },
+        register_expires: sip_cfg.register_expires.map(|v| v as u32),
+        register_extra_headers: sip_cfg
+            .register_extra_headers
+            .map(|pairs| pairs.into_iter().collect()),
+        rewrite_hostport: sip_cfg.rewrite_hostport,
+        origin: ConfigOrigin::from_file(path_display.to_string()),
+    };
+
+    info!(
+        file = %path_display,
+        name = %entry.name,
+        kind = %entry.kind,
+        "loaded kind-aware trunk from include file"
+    );
+    Ok(Some((entry.name, trunk)))
+}
+
+/// Compose the `kind_config` JSON value the validator will consume:
+///
+/// * If `kind_config` is present, use it verbatim (canonical nested format).
+/// * Else if `kind == "sip"`, gather any legacy top-level SIP fields into a
+///   synthetic object so the validator can apply the same checks.
+/// * Else, error — non-SIP kinds must use the explicit `[kind_config]` form.
+fn build_kind_config_value(entry: &KindAwareTrunkEntry) -> Result<serde_json::Value> {
+    if let Some(v) = &entry.kind_config {
+        return Ok(v.clone());
+    }
+    if entry.kind == "sip" {
+        // Whitelist the known legacy SIP field names so we don't sweep in
+        // unrelated top-level keys.
+        const SIP_LEGACY_KEYS: &[&str] = &[
+            "sip_server",
+            "sip_transport",
+            "outbound_proxy",
+            "auth_username",
+            "auth_password",
+            "register_enabled",
+            "register_expires",
+            "register_extra_headers",
+            "rewrite_hostport",
+            "did_numbers",
+            "incoming_from_user_prefix",
+            "incoming_to_user_prefix",
+            "default_route_label",
+            "billing_snapshot",
+            "analytics",
+            "carrier",
+        ];
+        let mut map = serde_json::Map::new();
+        for k in SIP_LEGACY_KEYS {
+            if let Some(v) = entry.legacy_sip.get(*k) {
+                map.insert((*k).to_string(), v.clone());
+            }
+        }
+        return Ok(serde_json::Value::Object(map));
+    }
+    Err(anyhow!(
+        "trunk '{}' kind='{}': missing required `kind_config`",
+        entry.name,
+        entry.kind
+    ))
 }
 
 fn load_routes_from_files(patterns: &[String]) -> Result<(Vec<RouteRule>, Vec<String>)> {
@@ -914,6 +1147,7 @@ fn write_trunks_file(path: &Path, trunks: &HashMap<String, TrunkConfig>) -> Resu
             .iter()
             .map(|(name, trunk)| (name.clone(), trunk.clone()))
             .collect(),
+        trunk: Vec::new(),
     };
     let toml = toml::to_string_pretty(&data)
         .with_context(|| format!("failed to serialize trunks toml for {}", path.display()))?;
@@ -1474,6 +1708,183 @@ mod tests {
             acl_enabled(Some(vec!["acl".to_string()])),
             "only acl → enabled"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // PR 2B — kind-aware file-based trunk loader (Phase 8b).
+    //
+    // The loader accepts three TOML shapes per file:
+    //   1. Legacy routing-format: `[trunks.<name>] dest=...` — unchanged.
+    //   2. Kind-aware nested: `[[trunk]] kind="sip" [kind_config] ...`.
+    //   3. Kind-aware legacy SIP: `[[trunk]] name="..." sip_server="..."`
+    //      with top-level fields and no `[kind_config]`. Documented as
+    //      supported for one release cycle; new files should use #2.
+    // -----------------------------------------------------------------
+
+    fn write_trunk_file(name: &str, body: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rustpbx_pr2b_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn load_legacy_routing_format_unchanged() {
+        // The historical `[trunks.<name>]` shape still works.
+        let path = write_trunk_file(
+            "legacy.toml",
+            r#"[trunks.legacy_pstn]
+dest = "sip:1.2.3.4:5060"
+direction = "bidirectional"
+transport = "udp"
+inbound_hosts = ["1.2.3.4"]
+"#,
+        );
+        let (trunks, _files) = load_trunks_from_files(&[path.to_string_lossy().to_string()])
+            .expect("load should succeed");
+        let trunk = trunks.get("legacy_pstn").expect("trunk loaded");
+        assert_eq!(trunk.dest, "sip:1.2.3.4:5060");
+        assert_eq!(trunk.transport.as_deref(), Some("udp"));
+    }
+
+    #[test]
+    fn load_kind_aware_nested_sip_folds_into_routing() {
+        crate::models::kind_schemas::register_builtins();
+        let path = write_trunk_file(
+            "nested.toml",
+            r#"[[trunk]]
+name = "nested_sip"
+kind = "sip"
+is_active = true
+direction = "outbound"
+
+[trunk.kind_config]
+sip_server = "5.6.7.8:5060"
+sip_transport = "udp"
+auth_username = "alice"
+auth_password = "s3cret"
+register_enabled = true
+register_expires = 600
+"#,
+        );
+        let (trunks, _files) = load_trunks_from_files(&[path.to_string_lossy().to_string()])
+            .expect("load should succeed");
+        let trunk = trunks.get("nested_sip").expect("trunk loaded");
+        assert_eq!(trunk.dest, "5.6.7.8:5060");
+        assert_eq!(trunk.username.as_deref(), Some("alice"));
+        assert_eq!(trunk.password.as_deref(), Some("s3cret"));
+        assert_eq!(trunk.register_enabled, Some(true));
+        assert_eq!(trunk.register_expires, Some(600));
+        assert_eq!(trunk.disabled, Some(false));
+    }
+
+    #[test]
+    fn load_kind_aware_legacy_sip_fields_fold() {
+        // Back-compat: kind absent (defaults to "sip"), top-level SIP fields.
+        crate::models::kind_schemas::register_builtins();
+        let path = write_trunk_file(
+            "legacy_sip.toml",
+            r#"[[trunk]]
+name = "legacy_sip"
+is_active = true
+sip_server = "9.9.9.9:5060"
+sip_transport = "tcp"
+auth_username = "bob"
+register_enabled = false
+"#,
+        );
+        let (trunks, _files) = load_trunks_from_files(&[path.to_string_lossy().to_string()])
+            .expect("load should succeed");
+        let trunk = trunks.get("legacy_sip").expect("trunk loaded");
+        assert_eq!(trunk.dest, "9.9.9.9:5060");
+        assert_eq!(trunk.transport.as_deref(), Some("tcp"));
+        assert_eq!(trunk.username.as_deref(), Some("bob"));
+    }
+
+    #[test]
+    fn load_kind_aware_unknown_kind_is_skipped() {
+        crate::models::kind_schemas::register_builtins();
+        let path = write_trunk_file(
+            "unknown.toml",
+            r#"[[trunk]]
+name = "frobnicator"
+kind = "frobnicate"
+
+[trunk.kind_config]
+foo = "bar"
+"#,
+        );
+        let (trunks, _files) = load_trunks_from_files(&[path.to_string_lossy().to_string()])
+            .expect("load should still return Ok");
+        assert!(
+            trunks.get("frobnicator").is_none(),
+            "unknown kind must be skipped, not added to routing map"
+        );
+    }
+
+    #[test]
+    fn load_kind_aware_webrtc_validates_but_skips_routing_map() {
+        crate::models::kind_schemas::register_builtins();
+        let path = write_trunk_file(
+            "webrtc_ok.toml",
+            r#"[[trunk]]
+name = "pipecat_bot"
+kind = "webrtc"
+is_active = true
+direction = "outbound"
+
+[trunk.kind_config]
+signaling = "http_json"
+endpoint_url = "http://127.0.0.1:7860/api/offer"
+audio_codec = "opus"
+"#,
+        );
+        let (trunks, _files) = load_trunks_from_files(&[path.to_string_lossy().to_string()])
+            .expect("load should succeed");
+        assert!(
+            trunks.get("pipecat_bot").is_none(),
+            "webrtc trunks are not added to the routing map (dispatched separately)"
+        );
+    }
+
+    #[test]
+    fn load_kind_aware_webrtc_missing_signaling_is_rejected() {
+        crate::models::kind_schemas::register_builtins();
+        // `signaling = ""` fails WebRtcTrunkConfig::validate.
+        let path = write_trunk_file(
+            "webrtc_bad.toml",
+            r#"[[trunk]]
+name = "bad_bot"
+kind = "webrtc"
+
+[trunk.kind_config]
+signaling = ""
+endpoint_url = "http://127.0.0.1:7860/api/offer"
+"#,
+        );
+        let (trunks, _files) = load_trunks_from_files(&[path.to_string_lossy().to_string()])
+            .expect("load should not error, just skip");
+        assert!(trunks.get("bad_bot").is_none(), "invalid webrtc trunk must be skipped");
+    }
+
+    #[test]
+    fn load_kind_aware_non_sip_requires_kind_config() {
+        crate::models::kind_schemas::register_builtins();
+        let path = write_trunk_file(
+            "missing_config.toml",
+            r#"[[trunk]]
+name = "no_config"
+kind = "webrtc"
+"#,
+        );
+        let (trunks, _files) = load_trunks_from_files(&[path.to_string_lossy().to_string()])
+            .expect("load should return Ok and skip the entry");
+        assert!(trunks.get("no_config").is_none());
     }
 
     #[test]
