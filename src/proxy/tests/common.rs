@@ -113,6 +113,9 @@ pub async fn create_test_server_with_config(
         },
         webhook_cancel_registry: std::sync::Arc::new(crate::proxy::webhook::WebhookCancelRegistry::new()),
         trunk_capacity: std::sync::Arc::new(crate::proxy::trunk_capacity_state::TrunkCapacityState::new()),
+        webrtc_bridge_sessions: std::sync::Arc::new(
+            crate::proxy::webrtc_bridge_sessions::WebRtcBridgeSessions::new(),
+        ),
     });
 
     // Add test users

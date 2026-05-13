@@ -33,7 +33,9 @@ use axum::{
 use chrono::Utc;
 use rustpbx::models::sip_trunk::{self, SipTrunkDirection, SipTrunkStatus};
 use rustpbx::proxy::bridge::signaling;
-use rustpbx::proxy::webrtc_route_dispatch::dispatch_webrtc_by_name;
+use rustpbx::proxy::webrtc_route_dispatch::{
+    dispatch_webrtc_by_name, lookup_webrtc_close_context,
+};
 use sea_orm::{ActiveModelTrait, Set};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -271,5 +273,147 @@ async fn dispatch_webrtc_by_name_rejects_disabled_trunk() {
     assert!(
         msg.contains("disabled"),
         "error should call out the disabled state, got: {msg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PR 6: tests covering the BYE-time teardown context lookup, exercised both
+// for the new `kind="webrtc"` path and to confirm the legacy `kind="sip"`
+// path is correctly rejected by the same helper (so the call layer can't
+// accidentally hand a SIP trunk to webrtc teardown).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn lookup_webrtc_close_context_returns_endpoint_and_auth_for_webrtc_kind() {
+    signaling::register_builtins();
+    let state = test_state_empty().await;
+
+    let kind_config = json!({
+        "signaling": "http_json",
+        "endpoint_url": "http://127.0.0.1:7860/api/offer",
+        "audio_codec": "opus",
+        "auth_header": "Bearer test-token-123",
+        "protocol": {
+            "request_body_template": r#"{"sdp":"{offer_sdp}"}"#,
+            "response_answer_path": "$.sdp",
+        }
+    });
+    let now = Utc::now();
+    let am = sip_trunk::ActiveModel {
+        name: Set("pipecat_close_ctx".to_string()),
+        kind: Set("webrtc".into()),
+        direction: Set(SipTrunkDirection::Outbound),
+        status: Set(SipTrunkStatus::Healthy),
+        is_active: Set(true),
+        consecutive_failures: Set(0),
+        consecutive_successes: Set(0),
+        created_at: Set(now),
+        updated_at: Set(now),
+        kind_config: Set(kind_config),
+        ..Default::default()
+    };
+    let _ = am
+        .insert(state.db())
+        .await
+        .expect("insert webrtc trunk for close-context test");
+
+    let (url, auth) = lookup_webrtc_close_context(state.db(), "pipecat_close_ctx")
+        .await
+        .expect("close-context lookup should succeed for an active webrtc trunk");
+    assert_eq!(url, "http://127.0.0.1:7860/api/offer");
+    assert_eq!(auth.as_deref(), Some("Bearer test-token-123"));
+}
+
+#[tokio::test]
+async fn lookup_webrtc_close_context_rejects_sip_kind() {
+    // Legacy SIP trunk — the close-context helper must not return a
+    // SIP-shaped row dressed up as a webrtc one. Asserting this here pins
+    // the boundary between kinds so a future change can't silently widen
+    // the helper.
+    signaling::register_builtins();
+    let state = test_state_empty().await;
+
+    let sip_cfg = json!({
+        "sip_server": "sip:example.com:5060",
+        "sip_transport": "udp",
+        "register_enabled": false,
+        "rewrite_hostport": true,
+    });
+    let now = Utc::now();
+    let am = sip_trunk::ActiveModel {
+        name: Set("legacy_sip_trunk".to_string()),
+        kind: Set("sip".into()),
+        direction: Set(SipTrunkDirection::Outbound),
+        status: Set(SipTrunkStatus::Healthy),
+        is_active: Set(true),
+        consecutive_failures: Set(0),
+        consecutive_successes: Set(0),
+        created_at: Set(now),
+        updated_at: Set(now),
+        kind_config: Set(sip_cfg),
+        ..Default::default()
+    };
+    let _ = am
+        .insert(state.db())
+        .await
+        .expect("insert legacy sip trunk");
+
+    let result = lookup_webrtc_close_context(state.db(), "legacy_sip_trunk").await;
+    assert!(
+        result.is_err(),
+        "close-context lookup must reject sip-kind trunks; got: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn lookup_webrtc_close_context_returns_none_auth_when_absent() {
+    // Sanity check: a webrtc trunk without `auth_header` configured yields
+    // `None` (rather than an empty string), so the BYE-time
+    // `SignalingContext` doesn't accidentally forward a bogus header.
+    signaling::register_builtins();
+    let state = test_state_empty().await;
+
+    let kind_config = json!({
+        "signaling": "http_json",
+        "endpoint_url": "http://127.0.0.1:7860/api/offer",
+        "audio_codec": "opus",
+        "protocol": {
+            "request_body_template": r#"{"sdp":"{offer_sdp}"}"#,
+            "response_answer_path": "$.sdp",
+        }
+    });
+    let now = Utc::now();
+    let am = sip_trunk::ActiveModel {
+        name: Set("no_auth_bot".to_string()),
+        kind: Set("webrtc".into()),
+        direction: Set(SipTrunkDirection::Outbound),
+        status: Set(SipTrunkStatus::Healthy),
+        is_active: Set(true),
+        consecutive_failures: Set(0),
+        consecutive_successes: Set(0),
+        created_at: Set(now),
+        updated_at: Set(now),
+        kind_config: Set(kind_config),
+        ..Default::default()
+    };
+    let _ = am.insert(state.db()).await.expect("insert webrtc trunk");
+
+    let (url, auth) = lookup_webrtc_close_context(state.db(), "no_auth_bot")
+        .await
+        .expect("lookup should succeed");
+    assert_eq!(url, "http://127.0.0.1:7860/api/offer");
+    assert!(auth.is_none(), "auth_header should be None when omitted");
+}
+
+#[tokio::test]
+async fn lookup_webrtc_close_context_rejects_missing_trunk() {
+    signaling::register_builtins();
+    let state = test_state_empty().await;
+    let result = lookup_webrtc_close_context(state.db(), "nonexistent").await;
+    assert!(result.is_err());
+    let msg = result.err().unwrap().to_string();
+    assert!(
+        msg.contains("not found") && msg.contains("nonexistent"),
+        "error should name the missing trunk, got: {msg}"
     );
 }

@@ -37,6 +37,7 @@ pub mod user_extension;
 pub mod user_http;
 pub mod user_plain;
 pub mod webhook;
+pub mod webrtc_bridge_sessions;
 pub mod webrtc_route_dispatch;
 pub mod ws;
 

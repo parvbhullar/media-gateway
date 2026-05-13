@@ -65,6 +65,52 @@ pub trait CallRouter: Send + Sync {
     ) -> Result<Dialplan, RouteError>;
 }
 
+/// Outcome of routing an inbound INVITE.
+///
+/// The standard path produces a [`Dialplan`] that the SIP forward machinery
+/// consumes. PR 6 introduced a second variant — [`DialplanOutcome::WebRtcBridge`] —
+/// emitted when the routing matcher resolves the INVITE to a `kind="webrtc"`
+/// trunk. That variant short-circuits the forward machinery: the call layer
+/// drives the bridge dispatcher directly, replies 200 OK with the bridge's
+/// RTP-side SDP, and stashes session state for BYE-time teardown.
+///
+/// Custom [`CallRouter`] implementations don't produce this variant — only
+/// the built-in matcher invoked through `default_resolve` does. Hence the
+/// trait's signature stays `Result<Dialplan, _>` unchanged.
+pub enum DialplanOutcome {
+    Dialplan(Dialplan),
+    WebRtcBridge {
+        trunk_name: String,
+        kind_config: serde_json::Value,
+    },
+}
+
+impl std::fmt::Debug for DialplanOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dialplan(_) => f.debug_struct("Dialplan").finish_non_exhaustive(),
+            Self::WebRtcBridge { trunk_name, .. } => f
+                .debug_struct("WebRtcBridge")
+                .field("trunk_name", trunk_name)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+impl DialplanOutcome {
+    /// Test/internal helper: unwrap to a [`Dialplan`], panicking on the
+    /// `WebRtcBridge` variant. Used by unit tests that exercise
+    /// `default_resolve` against non-webrtc routes.
+    pub fn expect_dialplan(self) -> Dialplan {
+        match self {
+            Self::Dialplan(d) => d,
+            Self::WebRtcBridge { trunk_name, .. } => {
+                panic!("expected DialplanOutcome::Dialplan, got WebRtcBridge {trunk_name}")
+            }
+        }
+    }
+}
+
 /// Extract the caller's IP from an incoming request (prefers Via `received`
 /// param, falls back to Via sent-by host). Used to pick the local interface
 /// that routes back to the caller for Contact/SDP.
@@ -524,7 +570,7 @@ impl CallModule {
         route_invite: Box<dyn RouteInvite>,
         caller: &SipUser,
         cookie: &TransactionCookie,
-    ) -> Result<Dialplan, RouteError> {
+    ) -> Result<DialplanOutcome, RouteError> {
         let callee_uri = resolve_callee_uri(original).map_err(|e| RouteError::from((e, None)))?;
         let callee_realm = callee_uri.host().to_string();
 
@@ -767,31 +813,20 @@ impl CallModule {
             match preview_outcome {
                 RouteResult::Queue { queue, hints, .. } => (None, Some(queue), None, hints),
                 RouteResult::Forward(option, hints) => (Some(option), None, None, hints),
-                // TODO(pr-4-followup): wire WebRTC bridge dispatch into the
-                // SIP response path. The matcher has already identified the
-                // trunk; this call site needs to:
-                //   1. Extract the inbound INVITE's SDP offer from `original`.
-                //   2. Call `crate::proxy::webrtc_route_dispatch::dispatch_webrtc_by_name(
-                //          db, &trunk_name, &offer_sdp, ice).await?`.
-                //   3. Reply to the INVITE with the resulting `sip_sdp_answer`
-                //      as the 200 OK body (Content-Type: application/sdp).
-                //   4. Stash the resulting `Arc<BridgePeer>` + adapter+session
-                //      on the dialog/call state so BYE can run teardown
-                //      (`adapter.close(&ctx, &session)` + drop bridge).
-                // For v1 this path returns 503 — the bridge module + adapter
-                // are exercised by `tests/webrtc_trunk_bridge_test.rs` and
-                // the integration through the SIP forward machinery lands
-                // in the follow-up PR.
-                RouteResult::WebRtcBridge { trunk_name, .. } => {
-                    let err = anyhow::anyhow!(
-                        "webrtc trunk '{}' matched but SIP-side dispatch wiring \
-                         is deferred (see TODO pr-4-followup)",
-                        trunk_name
-                    );
-                    return Err(RouteError::from((
-                        err,
-                        Some(rsipstack::sip::StatusCode::ServiceUnavailable),
-                    )));
+                // PR 6: matcher detected a `kind="webrtc"` trunk. Short-circuit
+                // the SIP-forward Dialplan flow — the call layer drives the
+                // bridge dispatcher directly. See
+                // `proxy::call::CallModule::handle_invite` for the
+                // dispatch + 200-OK + session-stash code path.
+                RouteResult::WebRtcBridge {
+                    trunk_name,
+                    kind_config,
+                    ..
+                } => {
+                    return Ok(DialplanOutcome::WebRtcBridge {
+                        trunk_name,
+                        kind_config,
+                    });
                 }
                 RouteResult::NotHandled(_, hints) => (None, None, None, hints),
                 RouteResult::Abort(code, reason) => {
@@ -923,7 +958,7 @@ impl CallModule {
                 .insert(CalleeOfflineMarker);
         }
 
-        Ok(dialplan)
+        Ok(DialplanOutcome::Dialplan(dialplan))
     }
 
     fn apply_recording_policy(&self, mut dialplan: Dialplan, caller: &SipUser) -> Dialplan {
@@ -1176,7 +1211,7 @@ impl CallModule {
         tx: &mut Transaction,
         cookie: TransactionCookie,
         caller: &SipUser,
-    ) -> Result<Dialplan, RouteError> {
+    ) -> Result<DialplanOutcome, RouteError> {
         let trunk_context = cookie.get_extension::<TrunkContext>();
         let source_trunk_hint = trunk_context.as_ref().map(|c| c.name.clone());
 
@@ -1200,16 +1235,29 @@ impl CallModule {
                 })
             };
 
-        let dialplan = if let Some(resolver) = self.inner.server.call_router.as_ref() {
-            resolver
-                .resolve(&tx.original, route_invite, caller, &cookie)
-                .await
+        // Custom CallRouter implementations cannot emit a WebRtcBridge
+        // outcome — only the built-in matcher does. So a custom router's
+        // `Dialplan` is wrapped as-is.
+        let outcome: DialplanOutcome = if let Some(resolver) =
+            self.inner.server.call_router.as_ref()
+        {
+            DialplanOutcome::Dialplan(
+                resolver
+                    .resolve(&tx.original, route_invite, caller, &cookie)
+                    .await?,
+            )
         } else {
             self.default_resolve(&tx.original, route_invite, caller, &cookie)
-                .await
-        }?;
+                .await?
+        };
 
-        let mut dialplan = dialplan;
+        let mut dialplan = match outcome {
+            DialplanOutcome::Dialplan(d) => d,
+            // The bridge branch skips all dialplan-flavor post-processing
+            // (caller_contact, inspectors, callee user lookup, recording
+            // policy) — none of it applies to a media-only bridge.
+            bridge @ DialplanOutcome::WebRtcBridge { .. } => return Ok(bridge),
+        };
         if dialplan.caller_contact.is_none() {
             // Use the local IP that routes to the caller, so the caller can
             // actually reach us for ACK/BYE. Falls back to default when the
@@ -1275,7 +1323,152 @@ impl CallModule {
         }
 
         let dialplan = self.apply_recording_policy(dialplan, caller);
-        Ok(dialplan)
+        Ok(DialplanOutcome::Dialplan(dialplan))
+    }
+
+    /// PR 6 — drive the WebRTC bridge for an INVITE whose routing matcher
+    /// resolved to a `kind="webrtc"` trunk.
+    ///
+    /// Returns `Ok(())` after a successful dispatch + 200-OK + session-stash
+    /// (the bridge media tasks are running by the time this returns). Any
+    /// dispatcher / SDP / DB error is mapped to a SIP failure response and
+    /// returned as `Err`.
+    async fn dispatch_webrtc_bridge(
+        &self,
+        tx: &mut Transaction,
+        trunk_name: &str,
+    ) -> Result<(), RouteError> {
+        let offer_body = tx.original.body();
+        if offer_body.is_empty() {
+            return Err(RouteError::from((
+                anyhow!("INVITE has empty body — webrtc bridge requires SDP offer"),
+                Some(rsipstack::sip::StatusCode::BadRequest),
+            )));
+        }
+        let offer_sdp = std::str::from_utf8(offer_body).map_err(|e| {
+            RouteError::from((
+                anyhow!("INVITE body is not valid UTF-8 SDP: {e}"),
+                Some(rsipstack::sip::StatusCode::BadRequest),
+            ))
+        })?;
+
+        let db = self.inner.server.database.as_ref().ok_or_else(|| {
+            RouteError::from((
+                anyhow!("webrtc bridge requires a database connection"),
+                Some(rsipstack::sip::StatusCode::ServerInternalError),
+            ))
+        })?;
+
+        let ice_servers = self.inner.server.rtp_config.ice_servers.as_deref();
+
+        let outcome = crate::proxy::webrtc_route_dispatch::dispatch_webrtc_by_name(
+            db,
+            trunk_name,
+            offer_sdp,
+            ice_servers,
+        )
+        .await
+        .map_err(|e| {
+            warn!(trunk = %trunk_name, error = %e, "webrtc bridge dispatch failed");
+            RouteError::from((e, Some(rsipstack::sip::StatusCode::ServiceUnavailable)))
+        })?;
+
+        // Recover the trunk's signaling endpoint + auth so the BYE-time
+        // `adapter.close` call has the same context the negotiate call used.
+        // Failing here is non-fatal — the bridge is already running; we
+        // just won't be able to invoke adapter.close cleanly.
+        let (endpoint_url, auth_header) =
+            match crate::proxy::webrtc_route_dispatch::lookup_webrtc_close_context(
+                db, trunk_name,
+            )
+            .await
+            {
+                Ok(pair) => pair,
+                Err(e) => {
+                    warn!(trunk = %trunk_name, error = %e,
+                          "failed to capture webrtc close context; \
+                           bridge running but adapter.close() will use empty URL");
+                    (String::new(), None)
+                }
+            };
+
+        // Send 200 OK with the bridge's RTP-side SDP answer as the body.
+        // `reply_with` injects the To-tag on the request before responding,
+        // so the dialog id is only stable *after* this call returns.
+        let body_bytes = outcome.sip_sdp_answer.clone().into_bytes();
+        tx.reply_with(
+            rsipstack::sip::StatusCode::OK,
+            vec![rsipstack::sip::Header::ContentType(
+                rsipstack::sip::headers::ContentType::from("application/sdp"),
+            )],
+            Some(body_bytes),
+        )
+        .await
+        .map_err(|e| {
+            RouteError::from((
+                anyhow!("failed to send 200 OK for webrtc bridge: {e}"),
+                Some(rsipstack::sip::StatusCode::ServerInternalError),
+            ))
+        })?;
+
+        // Compute the dialog id *after* the 200 OK so the local-tag injected
+        // by `reply_with` is reflected. Subsequent in-dialog requests (ACK,
+        // BYE) will derive the same id via TransactionRole::Server.
+        let dialog_id = DialogId::try_from((&tx.original, TransactionRole::Server))
+            .map_err(|e| RouteError::from((anyhow!(e), None)))?;
+
+        // Stash session state for BYE-time teardown before starting media —
+        // start_bridge is async-but-quick, and we want the registry entry
+        // visible before any chance of a racing BYE.
+        let session = crate::proxy::webrtc_bridge_sessions::WebRtcBridgeSession {
+            bridge: outcome.bridge.clone(),
+            adapter: outcome.adapter.clone(),
+            session: outcome.session,
+            endpoint_url,
+            auth_header,
+        };
+        self.inner
+            .server
+            .webrtc_bridge_sessions
+            .insert(dialog_id.clone(), session)
+            .await;
+
+        outcome.bridge.start_bridge().await;
+
+        info!(%dialog_id, trunk = %trunk_name, "webrtc bridge established");
+        Ok(())
+    }
+
+    /// PR 6 — BYE/transport-failure teardown hook for webrtc bridge dialogs.
+    ///
+    /// Called from `on_transaction_begin` for in-dialog requests; if the
+    /// dialog matches a stashed webrtc bridge session we drain it, drive
+    /// `adapter.close`, and drop the bridge. Teardown errors are logged but
+    /// not propagated — the BYE response goes out either way.
+    async fn teardown_webrtc_bridge_if_present(&self, dialog_id: &DialogId) {
+        let session = match self
+            .inner
+            .server
+            .webrtc_bridge_sessions
+            .remove(dialog_id)
+            .await
+        {
+            Some(s) => s,
+            None => return,
+        };
+        let ctx = crate::proxy::bridge::signaling::SignalingContext {
+            endpoint_url: session.endpoint_url.clone(),
+            auth_header: session.auth_header.clone(),
+            timeout_ms: 5_000,
+            protocol: None,
+        };
+        if let Err(e) = session.adapter.close(&ctx, &session.session).await {
+            warn!(%dialog_id, error = %e, "webrtc bridge adapter.close failed");
+        }
+        // Dropping `session` drops the last Arc<BridgePeer> clone (assuming
+        // nothing else holds one), triggering `BridgePeer::Drop` which
+        // cancels the bridge's cancel_token; the forwarding tasks exit.
+        info!(%dialog_id, "webrtc bridge torn down");
     }
 
     fn report_failure(
@@ -1354,7 +1547,18 @@ impl CallModule {
                     info!(%old_session_id, "Replaces target is in a conference; proceeding with seat replacement");
                     // Proceed with normal call creation, then spawn background task to do seat replacement
                     let dialplan = match self.build_dialplan(tx, cookie.clone(), &caller).await {
-                        Ok(d) => d,
+                        Ok(DialplanOutcome::Dialplan(d)) => d,
+                        Ok(DialplanOutcome::WebRtcBridge { trunk_name, .. }) => {
+                            warn!(
+                                %trunk_name,
+                                "Replaces-with-webrtc-bridge target is not supported; \
+                                 rejecting with 503"
+                            );
+                            tx.reply(rsipstack::sip::StatusCode::ServiceUnavailable)
+                                .await
+                                .map_err(|e| anyhow!("Failed to send reply: {}", e))?;
+                            return Ok(());
+                        }
                         Err(route_err) => {
                             if cookie.is_spam() {
                                 return Ok(());
@@ -1458,7 +1662,18 @@ impl CallModule {
                     // Standard attended transfer: C sends INVITE with Replaces to replace B
                     // We create a conference on the fly and merge both sessions
                     let dialplan = match self.build_dialplan(tx, cookie.clone(), &caller).await {
-                        Ok(d) => d,
+                        Ok(DialplanOutcome::Dialplan(d)) => d,
+                        Ok(DialplanOutcome::WebRtcBridge { trunk_name, .. }) => {
+                            warn!(
+                                %trunk_name,
+                                "Replaces-with-webrtc-bridge target is not supported; \
+                                 rejecting with 503"
+                            );
+                            tx.reply(rsipstack::sip::StatusCode::ServiceUnavailable)
+                                .await
+                                .map_err(|e| anyhow!("Failed to send reply: {}", e))?;
+                            return Ok(());
+                        }
                         Err(route_err) => {
                             if cookie.is_spam() {
                                 return Ok(());
@@ -1575,7 +1790,54 @@ impl CallModule {
         }
 
         let dialplan = match self.build_dialplan(tx, cookie.clone(), &caller).await {
-            Ok(d) => d,
+            Ok(DialplanOutcome::Dialplan(d)) => d,
+            Ok(DialplanOutcome::WebRtcBridge { trunk_name, .. }) => {
+                // PR 6: matcher resolved to a kind="webrtc" trunk — short-
+                // circuit the SIP forward machinery and drive the bridge
+                // dispatcher directly. On success the INVITE is already 200
+                // OK'd inside `dispatch_webrtc_bridge` and the bridge state
+                // is stashed for BYE-time teardown; nothing more to do here.
+                match self.dispatch_webrtc_bridge(tx, &trunk_name).await {
+                    Ok(()) => return Ok(()),
+                    Err(route_err) => {
+                        if cookie.is_spam() {
+                            return Ok(());
+                        }
+                        let code = route_err
+                            .status
+                            .unwrap_or(rsipstack::sip::StatusCode::ServiceUnavailable);
+                        let reason_text = route_err.error.to_string();
+                        let reason_value = if reason_text.contains(";cause=") {
+                            reason_text.clone()
+                        } else {
+                            q850_reason_value(&code, Some(reason_text.as_str()))
+                        };
+                        warn!(
+                            %code,
+                            key = %tx.key,
+                            trunk = %trunk_name,
+                            reason = %reason_value,
+                            "webrtc bridge dispatch failed"
+                        );
+                        // Only send a SIP failure response if we haven't
+                        // already sent something (`reply_with` inside the
+                        // dispatcher might have run before failure).
+                        if tx.last_response.is_none() {
+                            tx.reply_with(
+                                code.clone(),
+                                vec![rsipstack::sip::Header::Other(
+                                    "Reason".into(),
+                                    reason_value,
+                                )],
+                                None,
+                            )
+                            .await
+                            .map_err(|e| anyhow!("Failed to send reply: {}", e))?;
+                        }
+                        return Err(route_err.error);
+                    }
+                }
+            }
             Err(route_err) => {
                 if cookie.is_spam() {
                     return Ok(());
@@ -2302,8 +2564,41 @@ impl ProxyModule for CallModule {
             | rsipstack::sip::Method::Update
             | rsipstack::sip::Method::Cancel
             | rsipstack::sip::Method::Bye => {
-                if let Err(e) = self.process_message(tx).await {
-                    warn!(%dialog_id, method=%tx.original.method, "error process {}\n{}", e, tx.original.to_string());
+                let is_terminating = matches!(
+                    tx.original.method,
+                    rsipstack::sip::Method::Bye | rsipstack::sip::Method::Cancel
+                );
+                // PR 6: webrtc bridge dialogs aren't tracked in the dialog
+                // layer (we never built a SipSession for them), so
+                // `process_message` will be a no-op for them. Reply directly
+                // and run teardown so the BYE response goes out.
+                let is_webrtc_bridge_dialog = is_terminating
+                    && self
+                        .inner
+                        .server
+                        .webrtc_bridge_sessions
+                        .contains(&dialog_id)
+                        .await;
+
+                if is_webrtc_bridge_dialog {
+                    // Reply 200 OK to the BYE/CANCEL ourselves.
+                    if let Err(e) = tx
+                        .reply_with(rsipstack::sip::StatusCode::OK, vec![], None)
+                        .await
+                    {
+                        warn!(%dialog_id, error = %e, "failed to reply OK to webrtc bridge BYE");
+                    }
+                    self.teardown_webrtc_bridge_if_present(&dialog_id).await;
+                } else {
+                    if let Err(e) = self.process_message(tx).await {
+                        warn!(%dialog_id, method=%tx.original.method, "error process {}\n{}", e, tx.original.to_string());
+                    }
+                    // Safety net: if a webrtc bridge session somehow exists
+                    // for this dialog (shouldn't, given the check above) it
+                    // still gets torn down.
+                    if is_terminating {
+                        self.teardown_webrtc_bridge_if_present(&dialog_id).await;
+                    }
                 }
                 Ok(ProxyAction::Abort)
             }
@@ -2514,7 +2809,8 @@ mod tests {
                 &TransactionCookie::default(),
             )
             .await
-            .expect("offline user should not error at resolve time");
+            .expect("offline user should not error at resolve time")
+            .expect_dialplan();
 
         assert!(dialplan.is_empty(), "targets should be empty");
         assert!(
@@ -2577,7 +2873,8 @@ mod tests {
                 &TransactionCookie::default(),
             )
             .await
-            .expect("online user should succeed");
+            .expect("online user should succeed")
+            .expect_dialplan();
 
         assert!(!dialplan.is_empty(), "online user should have targets");
         assert!(
@@ -2620,7 +2917,8 @@ mod tests {
                 &TransactionCookie::default(),
             )
             .await
-            .expect("external destination should succeed");
+            .expect("external destination should succeed")
+            .expect_dialplan();
 
         assert!(!dialplan.is_empty(), "external callee should have targets");
         assert!(
@@ -2673,7 +2971,8 @@ mod tests {
                 &cookie,
             )
             .await
-            .expect("wholesale trunk should not error at resolve time");
+            .expect("wholesale trunk should not error at resolve time")
+            .expect_dialplan();
 
         assert!(dialplan.is_empty(), "wholesale locator empty => empty targets");
         assert!(
@@ -2766,7 +3065,8 @@ mod tests {
                 &TransactionCookie::default(),
             )
             .await
-            .expect("offline internal user should not error — 480 deferred to build_dialplan");
+            .expect("offline internal user should not error — 480 deferred to build_dialplan")
+            .expect_dialplan();
 
         assert!(
             dialplan.is_empty(),
@@ -2811,7 +3111,8 @@ mod tests {
                 &TransactionCookie::default(),
             )
             .await
-            .expect("external destination should fall through to locs");
+            .expect("external destination should fall through to locs")
+            .expect_dialplan();
 
         use crate::call::{DialStrategy, DialplanFlow};
         match &dialplan.flow {
@@ -2869,7 +3170,8 @@ mod tests {
                 &TransactionCookie::default(),
             )
             .await
-            .expect("always forwarding should bypass offline locator check");
+            .expect("always forwarding should bypass offline locator check")
+            .expect_dialplan();
 
         let target = dialplan
             .first_target()
@@ -2982,5 +3284,191 @@ mod tests {
 
         let resolved = resolve_callee_uri(&request).expect("expected callee uri");
         assert_eq!(resolved, to_uri);
+    }
+
+    // ------------------------------------------------------------------
+    // PR 6: DialplanOutcome + bridge-routing coverage. Verifies that the
+    // routing path produces the right `DialplanOutcome` variant for both
+    // the legacy SIP / NotHandled flow and the new WebRTC bridge flow.
+    // ------------------------------------------------------------------
+
+    /// A RouteInvite stub that pretends every INVITE resolved to a
+    /// `kind="webrtc"` trunk. Used to drive `default_resolve`'s
+    /// WebRtcBridge arm without setting up a real matcher.
+    struct WebRtcBridgeRouteInvite {
+        trunk_name: String,
+    }
+
+    #[async_trait]
+    impl RouteInvite for WebRtcBridgeRouteInvite {
+        async fn route_invite(
+            &self,
+            option: InviteOption,
+            _origin: &rsipstack::sip::Request,
+            _direction: &DialDirection,
+            _cookie: &TransactionCookie,
+        ) -> Result<RouteResult> {
+            Ok(RouteResult::WebRtcBridge {
+                trunk_name: self.trunk_name.clone(),
+                kind_config: serde_json::json!({
+                    "signaling": "http_json",
+                    "endpoint_url": "http://127.0.0.1:7860/api/offer",
+                    "audio_codec": "opus",
+                    "protocol": {
+                        "request_body_template": "{\"sdp\":\"{offer_sdp}\"}",
+                        "response_answer_path": "$.sdp",
+                    }
+                }),
+                option,
+                hints: None,
+            })
+        }
+    }
+
+    #[test]
+    fn expect_dialplan_returns_inner_for_dialplan_variant() {
+        let dp = Dialplan::new(
+            "test-session".to_string(),
+            crate::proxy::tests::common::create_test_request(
+                rsipstack::sip::Method::Invite,
+                "alice",
+                None,
+                "rustpbx.com",
+                None,
+            ),
+            DialDirection::Internal,
+        );
+        let outcome = DialplanOutcome::Dialplan(dp);
+        // Should not panic.
+        let _ = outcome.expect_dialplan();
+    }
+
+    #[test]
+    #[should_panic(expected = "expected DialplanOutcome::Dialplan")]
+    fn expect_dialplan_panics_on_webrtc_bridge_variant() {
+        let outcome = DialplanOutcome::WebRtcBridge {
+            trunk_name: "pipecat".into(),
+            kind_config: serde_json::json!({}),
+        };
+        let _ = outcome.expect_dialplan();
+    }
+
+    #[tokio::test]
+    async fn default_resolve_returns_webrtc_bridge_outcome_for_webrtc_route() {
+        let (server, config) = create_test_server().await;
+        let module = CallModule::new(config, server);
+
+        let mut request = crate::proxy::tests::common::create_test_request(
+            rsipstack::sip::Method::Invite,
+            "bp",
+            None,
+            "rustpbx.com",
+            None,
+        );
+        // Force callee outside the local realm so the matcher path (not the
+        // internal-user lookup) decides routing.
+        request.uri = rsipstack::sip::Uri::try_from("sip:9000@external.example").unwrap();
+        replace_to_header(
+            &mut request,
+            rsipstack::sip::Uri::try_from("sip:9000@external.example").unwrap(),
+        );
+
+        let caller = SipUser {
+            username: "bp".to_string(),
+            realm: Some("rustpbx.com".to_string()),
+            ..Default::default()
+        };
+
+        let outcome = module
+            .default_resolve(
+                &request,
+                Box::new(WebRtcBridgeRouteInvite {
+                    trunk_name: "pipecat_bot".into(),
+                }),
+                &caller,
+                &TransactionCookie::default(),
+            )
+            .await
+            .expect("webrtc bridge route should not error at resolve time");
+
+        match outcome {
+            DialplanOutcome::WebRtcBridge { trunk_name, kind_config } => {
+                assert_eq!(trunk_name, "pipecat_bot");
+                assert_eq!(
+                    kind_config["signaling"].as_str(),
+                    Some("http_json"),
+                    "kind_config should be passed through from the matcher"
+                );
+            }
+            DialplanOutcome::Dialplan(_) => {
+                panic!("expected WebRtcBridge outcome, got Dialplan")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn default_resolve_returns_dialplan_outcome_for_sip_route() {
+        // The classic SIP-kind / NotHandled path must remain a
+        // `DialplanOutcome::Dialplan(_)` after the PR 6 refactor.
+        let (server, config) = create_test_server().await;
+        let module = CallModule::new(config, server);
+
+        let mut request = crate::proxy::tests::common::create_test_request(
+            rsipstack::sip::Method::Invite,
+            "bp",
+            None,
+            "rustpbx.com",
+            None,
+        );
+        request.uri = rsipstack::sip::Uri::try_from("sip:9000@external.example").unwrap();
+        replace_to_header(
+            &mut request,
+            rsipstack::sip::Uri::try_from("sip:9000@external.example").unwrap(),
+        );
+
+        let caller = SipUser {
+            username: "bp".to_string(),
+            realm: Some("rustpbx.com".to_string()),
+            ..Default::default()
+        };
+
+        let outcome = module
+            .default_resolve(
+                &request,
+                Box::new(NotHandledRouteInvite),
+                &caller,
+                &TransactionCookie::default(),
+            )
+            .await
+            .expect("classic sip route should not error at resolve time");
+
+        match outcome {
+            DialplanOutcome::Dialplan(_) => {}
+            DialplanOutcome::WebRtcBridge { trunk_name, .. } => {
+                panic!("expected Dialplan outcome, got WebRtcBridge {trunk_name}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn webrtc_bridge_sessions_registry_roundtrip_on_server_inner() {
+        // Tip-of-iceberg sanity that the registry hung off SipServerInner is
+        // present and usable from the call layer.
+        use rsipstack::dialog::DialogId;
+
+        let (server, _config) = create_test_server().await;
+        assert_eq!(
+            server.webrtc_bridge_sessions.len().await,
+            0,
+            "registry should start empty"
+        );
+
+        let id = DialogId {
+            call_id: "smoke-test".into(),
+            local_tag: "lt".into(),
+            remote_tag: "rt".into(),
+        };
+        assert!(!server.webrtc_bridge_sessions.contains(&id).await);
+        assert!(server.webrtc_bridge_sessions.remove(&id).await.is_none());
     }
 }

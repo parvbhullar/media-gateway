@@ -53,3 +53,23 @@ pub async fn dispatch_webrtc_by_name(
 
     dispatch_webrtc(&row, invite_offer_sdp, global_ice_servers).await
 }
+
+/// Resolve the WebRTC trunk's signaling endpoint URL + auth header from the
+/// DB. Used by the BYE-time teardown path to build a `SignalingContext`
+/// matching the one used at `negotiate` time without re-running the full
+/// dispatcher. Returns `(endpoint_url, auth_header)`.
+pub async fn lookup_webrtc_close_context(
+    db: &DatabaseConnection,
+    trunk_name: &str,
+) -> Result<(String, Option<String>)> {
+    let row = trunk::Entity::find()
+        .filter(trunk::Column::Name.eq(trunk_name))
+        .one(db)
+        .await
+        .map_err(|e| anyhow!("db error looking up trunk '{}': {}", trunk_name, e))?
+        .ok_or_else(|| anyhow!("trunk '{}' not found", trunk_name))?;
+    let cfg = row
+        .webrtc()
+        .map_err(|e| anyhow!("trunk '{}' webrtc() config parse failed: {}", trunk_name, e))?;
+    Ok((cfg.endpoint_url, cfg.auth_header))
+}
