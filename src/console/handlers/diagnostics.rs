@@ -1,5 +1,7 @@
-// TODO(wave-2-followup / Phase 10): full kind-aware diagnostics UI. This
-// module currently treats every trunk as SIP-only; rows with `kind != "sip"`
+// PR 5 / Phase 10: this module surfaces every trunk row in the diagnostics
+// overview, but the SIP-OPTIONS health probe still applies only to `kind =
+// "sip"` trunks; non-SIP trunks render with a "—" status. Legacy notes:
+// originally this module treated every trunk as SIP-only; rows with `kind != "sip"`
 // are filtered out at query time and skipped in `trunk_config_from_model`.
 use crate::{
     call::{DialDirection, Location, RoutingState},
@@ -143,11 +145,10 @@ async fn diagnostics_bootstrap(state: &Arc<ConsoleState>) -> JsonValue {
     if let Some(server) = state.sip_server() {
         let data_context = server.data_context.clone();
         let config_trunks = data_context.trunks_snapshot();
-        // TODO(wave-2-followup / Phase 10): kind-aware diagnostics UI. For
-        // now only surface SIP trunks; non-SIP rows are invisible here.
-        use sea_orm::{ColumnTrait, QueryFilter};
+        // PR 5 / Phase 10: load every trunk row regardless of kind. The
+        // SIP OPTIONS probe below short-circuits for non-SIP rows via
+        // `trunk_config_from_model`, which only renders a SIP-typed view.
         let db_trunks = sip_trunk::Entity::find()
-            .filter(sip_trunk::Column::Kind.eq("sip"))
             .all(state.db())
             .await
             .unwrap_or_default();
@@ -678,6 +679,8 @@ fn trunk_config_from_model(model: &sip_trunk::Model) -> Option<routing::TrunkCon
             .clone()
             .map(|pairs| pairs.into_iter().collect::<std::collections::HashMap<_, _>>()),
         rewrite_hostport: sip_cfg.rewrite_hostport,
+        kind: "sip".to_string(),
+        kind_config: None,
     })
 }
 
@@ -1224,10 +1227,10 @@ async fn route_evaluate(
         }
         EvaluationDataset::Database => {
             let db = state.db();
-            // TODO(wave-2-followup / Phase 10): kind-aware UI. SIP-only for now.
-            use sea_orm::{ColumnTrait as _, QueryFilter as _};
+            // PR 5 / Phase 10: load every kind; `trunk_config_from_model`
+            // returns `None` for non-SIP rows so the runtime trunk map stays
+            // SIP-only (which is what the routing evaluator expects today).
             let trunk_models = match sip_trunk::Entity::find()
-                .filter(sip_trunk::Column::Kind.eq("sip"))
                 .all(db).await {
                 Ok(models) => models,
                 Err(err) => {
@@ -1411,6 +1414,32 @@ async fn route_evaluate(
                 RouteOutcomeView::Application {
                     app_type: app_name.clone(),
                 },
+                option.caller.to_string(),
+                option.callee.to_string(),
+                request.uri.to_string(),
+                rewrites,
+            )
+        }
+        RouteResult::WebRtcBridge { option, trunk_name, .. } => {
+            // Surface a WebRTC bridge match as a Forward outcome in
+            // diagnostics — same shape as `Forward` but with the
+            // destination labeled as the WebRTC trunk.
+            let rewrites = collect_rewrite_diff(&original_option, &option);
+            (
+                RouteOutcomeView::Forward(RouteForwardOutcome {
+                    destination: Some(format!("webrtc:{}", trunk_name)),
+                    headers: option
+                        .headers
+                        .clone()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|h| h.to_string())
+                        .collect(),
+                    credential: option.credential.clone().map(|cred| CredentialView {
+                        username: cred.username,
+                        realm: cred.realm.map(|r| r.to_string()),
+                    }),
+                }),
                 option.caller.to_string(),
                 option.callee.to_string(),
                 request.uri.to_string(),

@@ -90,6 +90,21 @@ pub struct TrunkConfig {
     pub rewrite_hostport: bool,
     #[serde(skip)]
     pub origin: ConfigOrigin,
+    /// Trunk kind discriminator. `"sip"` (default) for SIP trunks; `"webrtc"`
+    /// for WebRTC bridge trunks. The routing matcher branches on this in the
+    /// `Forward` arm — SIP trunks take the legacy SIP forward path; WebRTC
+    /// trunks short-circuit into [`crate::proxy::bridge::dispatch_webrtc`].
+    #[serde(default = "default_trunk_kind")]
+    pub kind: String,
+    /// Raw `kind_config` JSON for non-SIP kinds. Only populated when
+    /// `kind != "sip"`. Cached here so the matcher's WebRTC branch can hand
+    /// it directly to `dispatch_webrtc` without a second DB hit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind_config: Option<serde_json::Value>,
+}
+
+fn default_trunk_kind() -> String {
+    "sip".to_string()
 }
 
 fn default_rewrite_hostport() -> bool {
@@ -122,6 +137,8 @@ impl Default for TrunkConfig {
             register_extra_headers: None,
             rewrite_hostport: true,
             origin: ConfigOrigin::embedded(),
+            kind: default_trunk_kind(),
+            kind_config: None,
         }
     }
 }

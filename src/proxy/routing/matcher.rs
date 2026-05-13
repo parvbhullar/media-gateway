@@ -388,11 +388,59 @@ async fn match_invite_impl(
                                     }
                                 }
 
-                            apply_trunk_config(&mut option, trunk_config)?;
-                            info!(
-                                "Selected trunk: {} for destination: {}",
-                                selected_trunk, trunk_config.dest
-                            );
+                            // Branch on trunk kind (Phase 7). WebRTC trunks
+                            // short-circuit into the bridge dispatcher; SIP
+                            // trunks fall through to the legacy Forward path.
+                            match trunk_config.kind.as_str() {
+                                "webrtc" => {
+                                    let kind_config = trunk_config
+                                        .kind_config
+                                        .clone()
+                                        .unwrap_or(serde_json::Value::Null);
+                                    info!(
+                                        trunk = %selected_trunk,
+                                        kind = "webrtc",
+                                        "routing INVITE to WebRTC bridge dispatcher"
+                                    );
+                                    return Ok(RouteResult::WebRtcBridge {
+                                        trunk_name: selected_trunk,
+                                        kind_config,
+                                        option,
+                                        hints,
+                                    });
+                                }
+                                "sip" | "" => {
+                                    apply_trunk_config(&mut option, trunk_config)?;
+                                    info!(
+                                        "Selected trunk: {} for destination: {}",
+                                        selected_trunk, trunk_config.dest
+                                    );
+                                }
+                                other => {
+                                    tracing::warn!(
+                                        trunk = %selected_trunk,
+                                        kind = %other,
+                                        "trunk has unsupported kind; rejecting with 503"
+                                    );
+                                    if let Some(trace) = &mut trace {
+                                        trace.abort = Some(RouteAbortTrace {
+                                            code: rsipstack::sip::StatusCode::ServiceUnavailable
+                                                .into(),
+                                            reason: Some(format!(
+                                                "trunk '{}' has unsupported kind '{}'",
+                                                selected_trunk, other
+                                            )),
+                                        });
+                                    }
+                                    return Ok(RouteResult::Abort(
+                                        rsipstack::sip::StatusCode::ServiceUnavailable,
+                                        Some(format!(
+                                            "trunk '{}' has unsupported kind '{}'",
+                                            selected_trunk, other
+                                        )),
+                                    ));
+                                }
+                            }
                         } else {
                             info!("Trunk '{}' not found in configuration", selected_trunk);
                         }

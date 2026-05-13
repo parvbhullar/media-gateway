@@ -58,6 +58,9 @@ pub struct ExtensionPayload {
 
 #[derive(Deserialize, Default, Clone)]
 pub struct SipTrunkForm {
+    /// Trunk kind discriminator: "sip" (default) or "webrtc". When omitted on
+    /// update, the existing kind is preserved.
+    pub kind: Option<String>,
     pub name: Option<String>,
     pub display_name: Option<String>,
     pub carrier: Option<String>,
@@ -89,6 +92,13 @@ pub struct SipTrunkForm {
     pub register_enabled: Option<bool>,
     pub register_expires: Option<i32>,
     pub register_extra_headers: Option<String>,
+    // ---- WebRTC kind fields. Populated only when `kind = "webrtc"`. ----
+    pub webrtc_signaling: Option<String>,
+    pub webrtc_endpoint_url: Option<String>,
+    pub webrtc_audio_codec: Option<String>,
+    pub webrtc_auth_header: Option<String>,
+    pub webrtc_ice_servers: Option<String>,
+    pub webrtc_protocol: Option<String>,
 }
 
 #[derive(Deserialize, Default, Clone)]

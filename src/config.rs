@@ -805,6 +805,24 @@ impl std::fmt::Debug for DialplanHints {
 #[allow(clippy::large_enum_variant)]
 pub enum RouteResult {
     Forward(InviteOption, Option<DialplanHints>),
+    /// Route resolved to a `kind="webrtc"` trunk. The matcher returns this
+    /// variant instead of [`RouteResult::Forward`] so the SIP-side caller
+    /// can hand the INVITE's SDP offer to
+    /// [`crate::proxy::bridge::dispatch_webrtc`] rather than running the
+    /// usual SIP forward machinery. The matcher itself doesn't have the
+    /// INVITE SDP body, so dispatch happens at the call layer.
+    ///
+    /// `kind_config` is the raw JSON blob from the trunk row's `kind_config`
+    /// column (typed view: `WebRtcTrunkConfig`). Cached on the in-memory
+    /// trunk so the matcher doesn't need DB access at route time.
+    ///
+    /// `option`/`hints` mirror the `Forward` shape for trace logging.
+    WebRtcBridge {
+        trunk_name: String,
+        kind_config: serde_json::Value,
+        option: InviteOption,
+        hints: Option<DialplanHints>,
+    },
     Queue {
         option: InviteOption,
         queue: QueuePlan,

@@ -47,6 +47,7 @@ async fn test_match_invite_no_routes() {
         }
         RouteResult::Application { .. } => panic!("unexpected Application route in test"),
         RouteResult::Reject { .. } => panic!("unexpected Reject route in test"),
+        RouteResult::WebRtcBridge { .. } => panic!("unexpected WebRtcBridge route in test"),
     }
 }
 
@@ -246,6 +247,7 @@ async fn test_match_invite_inbound_respects_source_trunk() {
         }
         RouteResult::Application { .. } => panic!("unexpected Application route in test"),
         RouteResult::Reject { .. } => panic!("unexpected Reject route in test"),
+        RouteResult::WebRtcBridge { .. } => panic!("unexpected WebRtcBridge route in test"),
     }
 }
 
@@ -305,6 +307,7 @@ async fn test_match_invite_inbound_without_source_trunk() {
         }
         RouteResult::Application { .. } => panic!("unexpected Application route in test"),
         RouteResult::Reject { .. } => panic!("unexpected Reject route in test"),
+        RouteResult::WebRtcBridge { .. } => panic!("unexpected WebRtcBridge route in test"),
     }
 }
 
@@ -381,6 +384,7 @@ async fn test_match_invite_exact_match() {
         }
         RouteResult::Application { .. } => panic!("unexpected Application route in test"),
         RouteResult::Reject { .. } => panic!("unexpected Reject route in test"),
+        RouteResult::WebRtcBridge { .. } => panic!("unexpected WebRtcBridge route in test"),
     }
 }
 
@@ -454,6 +458,7 @@ async fn test_match_invite_regex_match() {
         }
         RouteResult::Application { .. } => panic!("unexpected Application route in test"),
         RouteResult::Reject { .. } => panic!("unexpected Reject route in test"),
+        RouteResult::WebRtcBridge { .. } => panic!("unexpected WebRtcBridge route in test"),
     }
 }
 
@@ -555,6 +560,7 @@ async fn test_match_invite_queue_action_builds_hold_and_fallback() {
         RouteResult::Abort(..) => panic!("queue route aborted"),
         RouteResult::Application { .. } => panic!("unexpected Application route in test"),
         RouteResult::Reject { .. } => panic!("unexpected Reject route in test"),
+        RouteResult::WebRtcBridge { .. } => panic!("unexpected WebRtcBridge route in test"),
     }
 }
 
@@ -784,6 +790,7 @@ async fn test_match_invite_reject_rule() {
         }
         RouteResult::Application { .. } => panic!("unexpected Application route in test"),
         RouteResult::Reject { .. } => panic!("unexpected Reject route in test"),
+        RouteResult::WebRtcBridge { .. } => panic!("unexpected WebRtcBridge route in test"),
     }
 }
 
@@ -854,6 +861,7 @@ async fn test_match_invite_rewrite_rules() {
         }
         RouteResult::Application { .. } => panic!("unexpected Application route in test"),
         RouteResult::Reject { .. } => panic!("unexpected Reject route in test"),
+        RouteResult::WebRtcBridge { .. } => panic!("unexpected WebRtcBridge route in test"),
     }
 }
 
@@ -945,6 +953,7 @@ async fn test_match_invite_load_balancing() {
             }
             RouteResult::Application { .. } => panic!("unexpected Application route in test"),
             RouteResult::Reject { .. } => panic!("unexpected Reject route in test"),
+            RouteResult::WebRtcBridge { .. } => panic!("unexpected WebRtcBridge route in test"),
         }
     }
 
@@ -1028,6 +1037,7 @@ async fn test_match_invite_header_matching() {
         }
         RouteResult::Application { .. } => panic!("unexpected Application route in test"),
         RouteResult::Reject { .. } => panic!("unexpected Reject route in test"),
+        RouteResult::WebRtcBridge { .. } => panic!("unexpected WebRtcBridge route in test"),
     }
 }
 
@@ -1096,6 +1106,7 @@ async fn test_match_invite_default_route() {
         }
         RouteResult::Application { .. } => panic!("unexpected Application route in test"),
         RouteResult::Reject { .. } => panic!("unexpected Reject route in test"),
+        RouteResult::WebRtcBridge { .. } => panic!("unexpected WebRtcBridge route in test"),
     }
 }
 
@@ -1171,6 +1182,7 @@ async fn test_match_invite_advanced_rewrite_patterns() {
         }
         RouteResult::Application { .. } => panic!("unexpected Application route in test"),
         RouteResult::Reject { .. } => panic!("unexpected Reject route in test"),
+        RouteResult::WebRtcBridge { .. } => panic!("unexpected WebRtcBridge route in test"),
     }
 
     // Test case 2: Simple digit extraction 12345 -> prefix{1}suffix
@@ -1232,6 +1244,7 @@ async fn test_match_invite_advanced_rewrite_patterns() {
         }
         RouteResult::Application { .. } => panic!("unexpected Application route in test"),
         RouteResult::Reject { .. } => panic!("unexpected Reject route in test"),
+        RouteResult::WebRtcBridge { .. } => panic!("unexpected WebRtcBridge route in test"),
     }
 }
 
@@ -1312,6 +1325,7 @@ async fn test_match_invite_rewrite_from_host_uses_match_capture() {
         }
         RouteResult::Application { .. } => panic!("unexpected Application route in test"),
         RouteResult::Reject { .. } => panic!("unexpected Reject route in test"),
+        RouteResult::WebRtcBridge { .. } => panic!("unexpected WebRtcBridge route in test"),
     }
 }
 
@@ -1532,6 +1546,7 @@ async fn test_match_invite_application_action() {
         RouteResult::Abort(_, _) => panic!("Expected Application, got Abort"),
         RouteResult::Queue { .. } => panic!("Expected Application, got Queue"),
         RouteResult::Reject { .. } => panic!("Expected Application, got Reject"),
+        RouteResult::WebRtcBridge { .. } => panic!("Expected Application, got WebRtcBridge"),
     }
 }
 

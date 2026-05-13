@@ -873,6 +873,36 @@ fn process_kind_aware_entry(
     kind_schemas::validate(&entry.kind, &kind_config_value)
         .map_err(|e| anyhow!("trunk '{}' kind='{}': {}", entry.name, entry.kind, e))?;
 
+    if entry.kind == "webrtc" {
+        // Project WebRTC trunk file entry onto a minimal routing
+        // `TrunkConfig`. Mirrors `convert_webrtc_trunk` for DB rows.
+        let webrtc_cfg: crate::models::trunk::WebRtcTrunkConfig =
+            serde_json::from_value(kind_config_value.clone()).map_err(|e| {
+                anyhow!("trunk '{}': decode webrtc kind_config: {}", entry.name, e)
+            })?;
+        let trunk = TrunkConfig {
+            dest: webrtc_cfg.endpoint_url.clone(),
+            disabled: Some(!entry.is_active),
+            max_calls: entry.max_concurrent,
+            max_cps: entry.max_cps,
+            direction: entry.direction.map(|d| d.into()),
+            recording: entry
+                .metadata
+                .as_ref()
+                .and_then(recording_policy_from_metadata),
+            origin: ConfigOrigin::from_file(path_display.to_string()),
+            kind: "webrtc".to_string(),
+            kind_config: Some(kind_config_value),
+            ..Default::default()
+        };
+        info!(
+            file = %path_display,
+            name = %entry.name,
+            kind = %entry.kind,
+            "loaded webrtc trunk from include file"
+        );
+        return Ok(Some((entry.name, trunk)));
+    }
     if entry.kind != "sip" {
         info!(
             file = %path_display,
@@ -949,6 +979,8 @@ fn process_kind_aware_entry(
             .map(|pairs| pairs.into_iter().collect()),
         rewrite_hostport: sip_cfg.rewrite_hostport,
         origin: ConfigOrigin::from_file(path_display.to_string()),
+        kind: "sip".to_string(),
+        kind_config: None,
     };
 
     info!(
@@ -1169,11 +1201,11 @@ fn write_routes_file(path: &Path, routes: &[RouteRule]) -> Result<()> {
 }
 
 async fn load_trunks_from_db(db: &DatabaseConnection) -> Result<HashMap<String, TrunkConfig>> {
+    // Both SIP and WebRTC trunks land in the routing-layer cache so the
+    // matcher can branch by kind in the `Forward` arm (see Phase 7). Other
+    // (unknown) kinds are skipped with a warning by `convert_trunk`.
     let models = sip_trunk::Entity::find()
         .filter(sip_trunk::Column::IsActive.eq(true))
-        // Only SIP trunks land in the SIP proxy's in-memory trunk cache.
-        // WebRTC/other kinds are dispatched separately (see Phase 7).
-        .filter(sip_trunk::Column::Kind.eq("sip"))
         .order_by_asc(sip_trunk::Column::Name)
         .all(db)
         .await?;
@@ -1194,6 +1226,26 @@ async fn load_trunks_from_db(db: &DatabaseConnection) -> Result<HashMap<String, 
 }
 
 fn convert_trunk(model: sip_trunk::Model) -> Result<Option<(String, TrunkConfig)>> {
+    // Branch on kind. SIP trunks project onto the full SIP-shaped
+    // `TrunkConfig`. WebRTC trunks get a minimal projection — only the
+    // routing layer's required fields (`dest`, `direction`, capacity caps)
+    // are populated; the matcher detects them via `kind="webrtc"` and routes
+    // them into the bridge dispatcher instead of the SIP forward path.
+    match model.kind.as_str() {
+        "sip" => convert_sip_trunk(model),
+        "webrtc" => convert_webrtc_trunk(model),
+        other => {
+            warn!(
+                trunk = %model.name,
+                kind = %other,
+                "skipping trunk with unsupported kind"
+            );
+            Ok(None)
+        }
+    }
+}
+
+fn convert_sip_trunk(model: sip_trunk::Model) -> Result<Option<(String, TrunkConfig)>> {
     // Parse the kind-specific config once; downstream reads off the typed
     // struct rather than re-parsing JSON per field.
     let sip_cfg = model.sip()?;
@@ -1258,6 +1310,57 @@ fn convert_trunk(model: sip_trunk::Model) -> Result<Option<(String, TrunkConfig)
             .map(|pairs| pairs.into_iter().collect()),
         rewrite_hostport: sip_cfg.rewrite_hostport,
         origin: ConfigOrigin::embedded(),
+        kind: "sip".to_string(),
+        kind_config: None,
+    };
+
+    Ok(Some((model.name, trunk)))
+}
+
+/// Project a `kind="webrtc"` trunk row onto the routing-layer `TrunkConfig`.
+///
+/// The routing matcher only needs enough to identify the trunk, run shared
+/// trunk-policy/capacity checks, and detect `kind="webrtc"` so the Forward
+/// arm short-circuits into [`crate::proxy::bridge::dispatch_webrtc`]. The
+/// full webrtc-specific config (signaling adapter, endpoint URL, protocol,
+/// ICE servers) is preserved verbatim in `kind_config` so the dispatcher
+/// can read it without a second DB roundtrip.
+fn convert_webrtc_trunk(model: sip_trunk::Model) -> Result<Option<(String, TrunkConfig)>> {
+    let webrtc_cfg = model.webrtc()?;
+    // Use the signaling endpoint URL as the trunk's `dest` so logging and
+    // diagnostics have something human-meaningful, and so anything
+    // downstream that key-by-dest doesn't crash on an empty string.
+    let dest = webrtc_cfg.endpoint_url.clone();
+
+    let trunk = TrunkConfig {
+        dest,
+        backup_dest: None,
+        username: None,
+        password: None,
+        codec: Vec::new(),
+        disabled: Some(!model.is_active),
+        max_calls: model.max_concurrent.map(|v| v as u32),
+        max_cps: model.max_cps.map(|v| v as u32),
+        weight: None,
+        transport: None,
+        id: Some(model.id),
+        direction: Some(model.direction.into()),
+        inbound_hosts: Vec::new(),
+        recording: model
+            .metadata
+            .as_ref()
+            .and_then(recording_policy_from_metadata),
+        incoming_from_user_prefix: None,
+        incoming_to_user_prefix: None,
+        country: None,
+        policy: None,
+        register_enabled: None,
+        register_expires: None,
+        register_extra_headers: None,
+        rewrite_hostport: true,
+        origin: ConfigOrigin::embedded(),
+        kind: "webrtc".to_string(),
+        kind_config: Some(model.kind_config.clone()),
     };
 
     Ok(Some((model.name, trunk)))
@@ -1828,7 +1931,10 @@ foo = "bar"
     }
 
     #[test]
-    fn load_kind_aware_webrtc_validates_but_skips_routing_map() {
+    fn load_kind_aware_webrtc_lands_in_routing_map_with_kind_discriminator() {
+        // Phase 7 (PR 4): webrtc trunks now land in the routing map so the
+        // matcher's Forward arm can detect `kind="webrtc"` and short-circuit
+        // into the bridge dispatcher (see `proxy/routing/matcher.rs`).
         crate::proxy::bridge::signaling::register_builtins();
         crate::models::kind_schemas::register_builtins();
         let path = write_trunk_file(
@@ -1851,10 +1957,13 @@ response_answer_path = "$.sdp"
         );
         let (trunks, _files) = load_trunks_from_files(&[path.to_string_lossy().to_string()])
             .expect("load should succeed");
-        assert!(
-            trunks.get("pipecat_bot").is_none(),
-            "webrtc trunks are not added to the routing map (dispatched separately)"
-        );
+        let trunk = trunks
+            .get("pipecat_bot")
+            .expect("webrtc trunk should appear in routing map for Phase 7 dispatch");
+        assert_eq!(trunk.kind, "webrtc");
+        assert_eq!(trunk.dest, "http://127.0.0.1:7860/api/offer");
+        let kc = trunk.kind_config.as_ref().expect("kind_config preserved");
+        assert_eq!(kc.get("signaling").and_then(|v| v.as_str()), Some("http_json"));
     }
 
     #[test]

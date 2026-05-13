@@ -73,7 +73,29 @@ default('RustPBX') }}{% endblock %}
         </template>
 
         <form class="space-y-6" @submit.prevent="submit">
-            <div class="rounded-xl bg-white p-3 shadow-sm ring-1 ring-black/5">
+            <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
+                <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                    <div>
+                        <h2 class="text-sm font-semibold text-slate-900">Trunk kind</h2>
+                        <p class="text-xs text-slate-500">Pick how this trunk talks to the outside world. SIP is the
+                            default; WebRTC bridges to a signaling-adapter endpoint.</p>
+                    </div>
+                    <div class="inline-flex rounded-lg border border-slate-200 bg-slate-50 p-1 text-xs font-semibold">
+                        <template x-for="opt in kindOptions" :key="opt.value">
+                            <button type="button" @click="setKind(opt.value)"
+                                :disabled="mode === 'edit'"
+                                :class="form.kind === opt.value ? 'bg-white text-sky-700 shadow-sm' : 'text-slate-500 hover:text-slate-700'"
+                                class="rounded-md px-3 py-1.5 transition disabled:cursor-not-allowed disabled:opacity-60">
+                                <span x-text="opt.label"></span>
+                            </button>
+                        </template>
+                    </div>
+                </div>
+                <p class="mt-2 text-[11px] text-slate-400" x-show="mode === 'edit'">Trunk kind cannot be changed after
+                    creation — delete and recreate to switch kinds.</p>
+            </section>
+
+            <div class="rounded-xl bg-white p-3 shadow-sm ring-1 ring-black/5" x-show="form.kind === 'sip'" x-cloak>
                 <nav class="inline-flex w-full flex-wrap gap-2 rounded-lg border border-slate-200 bg-slate-50 p-1 text-xs font-semibold text-slate-600"
                     role="tablist" aria-label="SIP trunk configuration tabs">
                     <button type="button" class="flex-1 rounded-md px-4 py-2 text-left transition sm:flex-none"
@@ -131,6 +153,7 @@ default('RustPBX') }}{% endblock %}
                 </nav>
             </div>
 
+            <template x-if="form.kind === 'sip'">
             <div class="space-y-6" x-show="activeTab === 'general'" x-transition.opacity x-cloak
                 id="sip-trunk-tab-general" role="tabpanel" tabindex="0">
                 <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
@@ -245,7 +268,9 @@ default('RustPBX') }}{% endblock %}
                     </div>
                 </section>
             </div>
+            </template>
 
+            <template x-if="form.kind === 'sip'">
             <div class="space-y-6" x-show="activeTab === 'access'" x-transition.opacity x-cloak
                 id="sip-trunk-tab-access" role="tabpanel" tabindex="0">
                 <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
@@ -326,7 +351,9 @@ default('RustPBX') }}{% endblock %}
                     </div>
                 </section>
             </div>
+            </template>
 
+            <template x-if="form.kind === 'sip'">
             <div class="space-y-6" x-show="activeTab === 'registration'" x-transition.opacity x-cloak
                 id="sip-trunk-tab-registration" role="tabpanel" tabindex="0">
                 <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
@@ -417,6 +444,116 @@ default('RustPBX') }}{% endblock %}
                     </section>
                 </template>
             </div>
+            </template>
+
+            <!-- WebRTC kind: shared general fields + signaling adapter config -->
+            <template x-if="form.kind === 'webrtc'">
+            <div class="space-y-6">
+                <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
+                    <h2 class="text-sm font-semibold text-slate-900">General</h2>
+                    <div class="mt-4 grid gap-4 md:grid-cols-2">
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Trunk name
+                            <input type="text" x-model.trim="form.name" maxlength="120" required
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="pipecat_bot">
+                            <span class="text-xs font-normal text-slate-400">Unique identifier used by routing rules.</span>
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Display name
+                            <input type="text" x-model.trim="form.display_name" maxlength="160"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Status
+                            <select x-model="form.status"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <template x-for="option in statusOptions" :key="option.value">
+                                    <option :value="option.value" x-text="option.label"></option>
+                                </template>
+                            </select>
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Direction
+                            <select x-model="form.direction"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <template x-for="option in directionOptions" :key="option.value">
+                                    <option :value="option.value" x-text="option.label"></option>
+                                </template>
+                            </select>
+                        </label>
+                        <div class="flex flex-col gap-2">
+                            <span class="text-sm font-medium text-slate-700">Active</span>
+                            <button type="button" @click="toggleActive()"
+                                class="inline-flex items-center gap-2 rounded-lg px-3 py-1 text-xs font-semibold ring-2 transition"
+                                :class="form.is_active ? 'bg-emerald-50 text-emerald-600 ring-emerald-200' : 'bg-slate-100 text-slate-500 ring-slate-200'">
+                                <span x-text="form.is_active ? 'Enabled' : 'Disabled'"></span>
+                            </button>
+                        </div>
+                    </div>
+                    <label class="mt-4 flex flex-col gap-2 text-sm font-medium text-slate-700">
+                        Description
+                        <textarea rows="2" x-model.trim="form.description"
+                            class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"></textarea>
+                    </label>
+                </section>
+
+                <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
+                    <h2 class="text-sm font-semibold text-slate-900">WebRTC signaling</h2>
+                    <p class="mt-1 text-sm text-slate-500">Configures the WebRTC bridge that forwards SIP audio to a
+                        peer over a registered signaling adapter.</p>
+                    <div class="mt-4 grid gap-4 md:grid-cols-2">
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Signaling adapter
+                            <select x-model="form.webrtc_signaling"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <template x-for="opt in signalingAdapters" :key="opt">
+                                    <option :value="opt" x-text="opt"></option>
+                                </template>
+                            </select>
+                            <span class="text-xs font-normal text-slate-400">Built-ins: http_json. Custom adapters register at startup.</span>
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Audio codec
+                            <select x-model="form.webrtc_audio_codec"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <template x-for="opt in webrtcAudioCodecs" :key="opt">
+                                    <option :value="opt" x-text="opt"></option>
+                                </template>
+                            </select>
+                        </label>
+                        <label class="md:col-span-2 flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Endpoint URL
+                            <input type="text" x-model.trim="form.webrtc_endpoint_url" maxlength="512" required
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="https://signal.example.com/offer">
+                            <span class="text-xs font-normal text-slate-400">Adapter-specific signaling endpoint.</span>
+                        </label>
+                        <label class="md:col-span-2 flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Authorization header
+                            <input type="text" x-model.trim="form.webrtc_auth_header" maxlength="512"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="Bearer ...">
+                            <span class="text-xs font-normal text-slate-400">Optional. Sent as Authorization on outbound requests.</span>
+                        </label>
+                        <label class="md:col-span-2 flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            ICE servers (JSON array)
+                            <textarea rows="4" x-model="form.webrtc_ice_servers"
+                                class="font-mono rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder='[{"urls":["stun:stun.l.google.com:19302"]}]'></textarea>
+                            <span class="text-xs font-normal text-slate-400">Optional. Overrides the global ICE config if set.</span>
+                        </label>
+                        <label class="md:col-span-2 flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Protocol config (adapter-specific JSON)
+                            <textarea rows="6" x-model="form.webrtc_protocol"
+                                class="font-mono rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder='{"request_body_template":"{\"sdp\":\"{offer_sdp}\",\"type\":\"offer\"}","response_answer_path":"$.sdp"}'></textarea>
+                            <span class="text-xs font-normal text-slate-400">Validated by the selected adapter on save.</span>
+                        </label>
+                    </div>
+                </section>
+            </div>
+            </template>
 
             <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <p class="text-xs text-slate-400">{{ "sip_trunk_detail.save_hint" | t }}</p>
@@ -462,7 +599,14 @@ default('RustPBX') }}{% endblock %}
                 { value: 'tcp', label: 'TCP' },
                 { value: 'tls', label: 'TLS' },
             ],
+            kindOptions: [
+                { value: 'sip', label: 'SIP' },
+                { value: 'webrtc', label: 'WebRTC' },
+            ],
+            signalingAdapters: [],
+            webrtcAudioCodecs: ['opus', 'g722'],
             form: {
+                kind: 'sip',
                 name: '',
                 display_name: '',
                 carrier: '',
@@ -489,6 +633,12 @@ default('RustPBX') }}{% endblock %}
                 register_enabled: false,
                 register_expires: '',
                 register_extra_headers: '',
+                webrtc_signaling: 'http_json',
+                webrtc_endpoint_url: '',
+                webrtc_audio_codec: 'opus',
+                webrtc_auth_header: '',
+                webrtc_ice_servers: '',
+                webrtc_protocol: '',
             },
             regStatus: null,
             success: null,
@@ -516,9 +666,26 @@ default('RustPBX') }}{% endblock %}
                     value: String(value).toLowerCase(),
                     label: this.directionLabel(value),
                 }));
+
+                const adapters = Array.isArray(this.filters.signaling_adapters) && this.filters.signaling_adapters.length
+                    ? this.filters.signaling_adapters
+                    : ['http_json'];
+                this.signalingAdapters = adapters.map((a) => String(a));
+                if (this.signalingAdapters.length && !this.signalingAdapters.includes(this.form.webrtc_signaling)) {
+                    this.form.webrtc_signaling = this.signalingAdapters[0];
+                }
+                const codecs = Array.isArray(this.filters.webrtc_audio_codecs) && this.filters.webrtc_audio_codecs.length
+                    ? this.filters.webrtc_audio_codecs
+                    : ['opus', 'g722'];
+                this.webrtcAudioCodecs = codecs.map((c) => String(c));
+            },
+            setKind(value) {
+                if (this.mode === 'edit') return;
+                this.form.kind = value;
             },
             populateFromModel() {
                 const model = this.model || {};
+                this.form.kind = (model.kind || 'sip').toLowerCase();
                 this.form.name = model.name || '';
                 this.form.display_name = model.display_name || '';
                 this.form.carrier = model.carrier || '';
@@ -552,6 +719,15 @@ default('RustPBX') }}{% endblock %}
                 if (this.form.register_enabled && this.mode === 'edit') {
                     this.loadRegStatus();
                 }
+                // WebRTC fields. The server flattens `WebRtcTrunkConfig` into
+                // `webrtc_*`-prefixed keys on the model JSON; mirror those onto
+                // the form so editing round-trips cleanly.
+                this.form.webrtc_signaling = model.webrtc_signaling || 'http_json';
+                this.form.webrtc_endpoint_url = model.webrtc_endpoint_url || '';
+                this.form.webrtc_audio_codec = model.webrtc_audio_codec || 'opus';
+                this.form.webrtc_auth_header = model.webrtc_auth_header || '';
+                this.form.webrtc_ice_servers = this.formatJson(model.webrtc_ice_servers);
+                this.form.webrtc_protocol = this.formatJson(model.webrtc_protocol);
             },
             get pageTitle() {
                 const td = (this.t || {}).sip_trunk_detail || {};
@@ -719,12 +895,29 @@ default('RustPBX') }}{% endblock %}
             },
             buildPayload() {
                 const params = new URLSearchParams();
+                params.set('kind', (this.form.kind || 'sip').trim());
                 params.set('name', this.form.name.trim());
                 params.set('display_name', this.form.display_name.trim());
-                params.set('carrier', this.form.carrier.trim());
                 params.set('description', this.form.description.trim());
                 params.set('status', this.form.status.trim());
                 params.set('direction', this.form.direction.trim());
+                params.set('is_active', this.form.is_active ? 'true' : 'false');
+                if (this.form.kind === 'webrtc') {
+                    params.set('webrtc_signaling', (this.form.webrtc_signaling || '').trim());
+                    params.set('webrtc_endpoint_url', (this.form.webrtc_endpoint_url || '').trim());
+                    params.set('webrtc_audio_codec', (this.form.webrtc_audio_codec || 'opus').trim());
+                    if ((this.form.webrtc_auth_header || '').trim()) {
+                        params.set('webrtc_auth_header', this.form.webrtc_auth_header.trim());
+                    }
+                    if ((this.form.webrtc_ice_servers || '').trim()) {
+                        params.set('webrtc_ice_servers', this.form.webrtc_ice_servers.trim());
+                    }
+                    if ((this.form.webrtc_protocol || '').trim()) {
+                        params.set('webrtc_protocol', this.form.webrtc_protocol.trim());
+                    }
+                    return params;
+                }
+                params.set('carrier', this.form.carrier.trim());
                 params.set('sip_transport', this.form.sip_transport.trim());
 
                 if (this.form.sip_server.trim()) params.set('sip_server', this.form.sip_server.trim());

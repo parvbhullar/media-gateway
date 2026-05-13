@@ -767,6 +767,32 @@ impl CallModule {
             match preview_outcome {
                 RouteResult::Queue { queue, hints, .. } => (None, Some(queue), None, hints),
                 RouteResult::Forward(option, hints) => (Some(option), None, None, hints),
+                // TODO(pr-4-followup): wire WebRTC bridge dispatch into the
+                // SIP response path. The matcher has already identified the
+                // trunk; this call site needs to:
+                //   1. Extract the inbound INVITE's SDP offer from `original`.
+                //   2. Call `crate::proxy::webrtc_route_dispatch::dispatch_webrtc_by_name(
+                //          db, &trunk_name, &offer_sdp, ice).await?`.
+                //   3. Reply to the INVITE with the resulting `sip_sdp_answer`
+                //      as the 200 OK body (Content-Type: application/sdp).
+                //   4. Stash the resulting `Arc<BridgePeer>` + adapter+session
+                //      on the dialog/call state so BYE can run teardown
+                //      (`adapter.close(&ctx, &session)` + drop bridge).
+                // For v1 this path returns 503 — the bridge module + adapter
+                // are exercised by `tests/webrtc_trunk_bridge_test.rs` and
+                // the integration through the SIP forward machinery lands
+                // in the follow-up PR.
+                RouteResult::WebRtcBridge { trunk_name, .. } => {
+                    let err = anyhow::anyhow!(
+                        "webrtc trunk '{}' matched but SIP-side dispatch wiring \
+                         is deferred (see TODO pr-4-followup)",
+                        trunk_name
+                    );
+                    return Err(RouteError::from((
+                        err,
+                        Some(rsipstack::sip::StatusCode::ServiceUnavailable),
+                    )));
+                }
                 RouteResult::NotHandled(_, hints) => (None, None, None, hints),
                 RouteResult::Abort(code, reason) => {
                     let err = anyhow::anyhow!(
