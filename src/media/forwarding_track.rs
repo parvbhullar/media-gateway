@@ -40,16 +40,10 @@ pub struct ForwardingTrack {
     current_egress_profile: Mutex<Option<NegotiatedLegProfile>>,
     transcoder: Mutex<Option<Transcoder>>,
     audio_mapping: Mutex<Option<AudioMapping>>,
-    /// Timestamp rewriting for audio frames (when audio clock rates differ)
     audio_timing: Mutex<Option<RtpTiming>>,
-    /// Timestamp rewriting for DTMF frames (when DTMF clock rates differ)
     dtmf_timing: Mutex<Option<RtpTiming>>,
-    /// Issue #171: recording is dispatched via a bounded channel to a
-    /// dedicated task so that codec decoding and disk I/O never block the
-    /// RTP forwarding hot path.  The channel is intentionally bounded;
-    /// if the recorder task falls behind (e.g. disk pressure) we drop
-    /// the sample rather than accumulate unbounded memory.
     recorder_tx: Option<mpsc::Sender<(Leg, MediaSample)>>,
+    sipflow_tx: Option<mpsc::Sender<(Leg, MediaSample)>>,
     recorder_leg: Leg,
     dtmf_mapping: Mutex<Option<DtmfMapping>>,
 }
@@ -60,10 +54,13 @@ pub struct ForwardingTrackHandle {
 }
 
 impl ForwardingTrack {
+    pub const DEFAULT_SIPFLOW_CHANNEL_CAPACITY: usize = 256;
+
     pub fn new(
         track_id: String,
         inner: Arc<dyn MediaStreamTrack>,
         recorder_tx: Option<mpsc::Sender<(Leg, MediaSample)>>,
+        sipflow_tx: Option<mpsc::Sender<(Leg, MediaSample)>>,
         recorder_leg: Leg,
         ingress_profile: NegotiatedLegProfile,
         egress_profile: NegotiatedLegProfile,
@@ -80,6 +77,7 @@ impl ForwardingTrack {
             audio_timing: Mutex::new(None),
             dtmf_timing: Mutex::new(None),
             recorder_tx,
+            sipflow_tx,
             recorder_leg,
             dtmf_mapping: Mutex::new(None),
         }
@@ -257,6 +255,11 @@ impl MediaStreamTrack for ForwardingTrack {
                 let _ = tx.try_send((self.recorder_leg, sample.clone()));
             }
 
+            // SipFlow RTP recording: non-blocking tee, drops if consumer falls behind.
+            if let Some(tx) = &self.sipflow_tx {
+                let _ = tx.try_send((self.recorder_leg, sample.clone()));
+            }
+
             if let MediaSample::Audio(ref frame) = sample {
                 let matched_dtmf = dtmf_mapping
                     .as_ref()
@@ -278,28 +281,28 @@ impl MediaStreamTrack for ForwardingTrack {
                         dtmf_frame.payload_type = Some(target_pt);
 
                         if let Some(target_clock_rate) = mapping.target_clock_rate
-                            && mapping.source_clock_rate != target_clock_rate {
-                                dtmf_frame.data = rewrite_dtmf_duration(
-                                    &dtmf_frame.data,
+                            && mapping.source_clock_rate != target_clock_rate
+                        {
+                            dtmf_frame.data = rewrite_dtmf_duration(
+                                &dtmf_frame.data,
+                                mapping.source_clock_rate,
+                                target_clock_rate,
+                            );
+                            let mut guard = self.dtmf_timing.lock();
+                            if let Some(timing) = guard.as_mut() {
+                                timing.rewrite(
+                                    &mut dtmf_frame,
                                     mapping.source_clock_rate,
                                     target_clock_rate,
+                                    target_pt,
                                 );
-                                let mut guard = self.dtmf_timing.lock();
-                                if let Some(timing) = guard.as_mut() {
-                                    timing.rewrite(
-                                        &mut dtmf_frame,
-                                        mapping.source_clock_rate,
-                                        target_clock_rate,
-                                        target_pt,
-                                    );
-                                }
                             }
+                        }
 
                         return Ok(MediaSample::Audio(dtmf_frame));
                     }
 
-                    // Source sent telephone-event but the target leg did not negotiate it.
-                    continue;
+                    return Ok(sample);
                 }
 
                 if let Some(audio_mapping) = audio_mapping.as_ref().filter(|_| matched_audio) {
@@ -419,6 +422,7 @@ mod tests {
             "test".to_string(),
             track,
             Some(tx),
+            None, // no sipflow channel
             Leg::A,
             NegotiatedLegProfile::default(),
             NegotiatedLegProfile::default(),
@@ -449,6 +453,7 @@ mod tests {
             "test-no-rec".to_string(),
             track,
             None, // no recorder channel
+            None, // no sipflow channel
             Leg::B,
             NegotiatedLegProfile::default(),
             NegotiatedLegProfile::default(),
@@ -460,5 +465,299 @@ mod tests {
             .expect("recv error");
 
         assert!(matches!(result, MediaSample::Audio(_)));
+    }
+
+    /// Verify sipflow_tx receives a copy of each forwarded sample without
+    /// blocking the hot path and without interfering with the recorder_tx.
+    #[tokio::test]
+    async fn sipflow_tx_receives_sample() {
+        let (sf_tx, mut sf_rx) = mpsc::channel::<(Leg, MediaSample)>(256);
+        let sample = audio_sample(0 /* PCMU */);
+        let track = OneShotTrack::new(sample.clone());
+
+        let ft = ForwardingTrack::new(
+            "test-sipflow".to_string(),
+            track,
+            None, // no recorder channel
+            Some(sf_tx),
+            Leg::A,
+            NegotiatedLegProfile::default(),
+            NegotiatedLegProfile::default(),
+        );
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), ft.recv())
+            .await
+            .expect("recv timed out")
+            .expect("recv error");
+
+        // Hot path returns the sample unchanged.
+        assert!(matches!(result, MediaSample::Audio(_)));
+
+        // sipflow channel must also have received the sample.
+        let (leg, _sf_sample) = sf_rx.try_recv().expect("sample must be in sipflow channel");
+        assert_eq!(leg, Leg::A);
+    }
+
+    /// Both recorder_tx AND sipflow_tx can be active simultaneously; each
+    /// must receive its own copy of the sample.
+    #[tokio::test]
+    async fn both_recorder_and_sipflow_receive_sample() {
+        let (rec_tx, mut rec_rx) = mpsc::channel::<(Leg, MediaSample)>(256);
+        let (sf_tx, mut sf_rx) = mpsc::channel::<(Leg, MediaSample)>(256);
+        let sample = audio_sample(0 /* PCMU */);
+        let track = OneShotTrack::new(sample.clone());
+
+        let ft = ForwardingTrack::new(
+            "test-both".to_string(),
+            track,
+            Some(rec_tx),
+            Some(sf_tx),
+            Leg::B,
+            NegotiatedLegProfile::default(),
+            NegotiatedLegProfile::default(),
+        );
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), ft.recv())
+            .await
+            .expect("recv timed out")
+            .expect("recv error");
+
+        assert!(matches!(result, MediaSample::Audio(_)));
+
+        let (rec_leg, _) = rec_rx
+            .try_recv()
+            .expect("recorder channel must have sample");
+        let (sf_leg, _) = sf_rx.try_recv().expect("sipflow channel must have sample");
+        assert_eq!(rec_leg, Leg::B);
+        assert_eq!(sf_leg, Leg::B);
+    }
+
+    #[tokio::test]
+    async fn sipflow_full_channel_does_not_block() {
+        let (sf_tx, _sf_rx) = mpsc::channel::<(Leg, MediaSample)>(1);
+
+        let _ = sf_tx.try_send((Leg::A, audio_sample(0)));
+
+        let track = OneShotTrack::new(audio_sample(0));
+        let ft = ForwardingTrack::new(
+            "test-full".to_string(),
+            track,
+            None,
+            Some(sf_tx),
+            Leg::A,
+            NegotiatedLegProfile::default(),
+            NegotiatedLegProfile::default(),
+        );
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), ft.recv())
+            .await
+            .expect("recv must not block when sipflow channel is full");
+
+        assert!(result.is_ok());
+    }
+
+    fn make_profile_with_dtmf(
+        audio_codec: audio_codec::CodecType,
+        audio_pt: u8,
+        dtmf_pt: Option<u8>,
+    ) -> NegotiatedLegProfile {
+        use crate::media::negotiate::NegotiatedCodec;
+        NegotiatedLegProfile {
+            audio: Some(NegotiatedCodec {
+                codec: audio_codec,
+                payload_type: audio_pt,
+                clock_rate: 8000,
+                channels: 1,
+            }),
+            video: None,
+            dtmf: dtmf_pt.map(|pt| NegotiatedCodec {
+                codec: audio_codec::CodecType::TelephoneEvent,
+                payload_type: pt,
+                clock_rate: 8000,
+                channels: 1,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn dtmf_frame_bypasses_active_transcoder() {
+        use audio_codec::CodecType;
+
+        let ingress = make_profile_with_dtmf(CodecType::PCMU, 0, Some(101));
+        let egress = make_profile_with_dtmf(CodecType::PCMA, 8, Some(101));
+
+        // digit 5, volume 10, duration 160 ticks — a valid RFC 2833 packet.
+        let dtmf_data = Bytes::from_static(&[0x05, 0x0A, 0x00, 0xA0]);
+        let sample = MediaSample::Audio(AudioFrame {
+            payload_type: Some(101),
+            clock_rate: 8000,
+            data: dtmf_data.clone(),
+            ..Default::default()
+        });
+
+        let track = OneShotTrack::new(sample);
+        let ft = ForwardingTrack::new(
+            "test-dtmf-bypass".to_string(),
+            track,
+            None,
+            None,
+            Leg::A,
+            ingress,
+            egress,
+        );
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), ft.recv())
+            .await
+            .expect("DTMF frame was unexpectedly dropped (recv timed out)")
+            .expect("recv error");
+
+        let MediaSample::Audio(frame) = result else {
+            panic!("expected audio sample");
+        };
+        assert_eq!(
+            frame.payload_type,
+            Some(101),
+            "telephone-event PT must not be changed"
+        );
+        assert_eq!(
+            frame.data, dtmf_data,
+            "telephone-event payload must not be modified by the transcoder"
+        );
+    }
+
+    #[tokio::test]
+    async fn dtmf_frame_passed_through_when_egress_has_no_dtmf_capability() {
+        use audio_codec::CodecType;
+
+        let ingress = make_profile_with_dtmf(CodecType::PCMU, 0, Some(101));
+        // Egress has no DTMF → DtmfMapping::target_pt will be None.
+        // The frame should be passed through as-is (not dropped) so that the far-end
+        // trunk still receives RFC 2833 digits even when it omitted telephone-event from
+        // its answer SDP (common behaviour for G729 wholesale trunks).
+        let egress = make_profile_with_dtmf(CodecType::PCMA, 8, None);
+
+        let sample = MediaSample::Audio(AudioFrame {
+            payload_type: Some(101),
+            clock_rate: 8000,
+            data: Bytes::from_static(&[0x05, 0x0A, 0x00, 0xA0]),
+            ..Default::default()
+        });
+
+        let track = OneShotTrack::new(sample);
+        let ft = ForwardingTrack::new(
+            "test-dtmf-passthrough".to_string(),
+            track,
+            None,
+            None,
+            Leg::A,
+            ingress,
+            egress,
+        );
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(200), ft.recv())
+            .await
+            .expect("recv timed out — telephone-event must be passed through, not dropped")
+            .expect("recv returned error");
+
+        let MediaSample::Audio(frame) = result else {
+            panic!("expected audio sample");
+        };
+        // PT must be unchanged (source PT 101) since no target PT mapping exists.
+        assert_eq!(
+            frame.payload_type,
+            Some(101),
+            "telephone-event PT should be preserved when egress has no DTMF capability"
+        );
+    }
+
+    #[tokio::test]
+    async fn audio_frame_transcoded_to_egress_pt() {
+        use audio_codec::CodecType;
+
+        let ingress = make_profile_with_dtmf(CodecType::PCMU, 0, Some(101));
+        let egress = make_profile_with_dtmf(CodecType::PCMA, 8, Some(101));
+
+        // 160 bytes of PCMU-encoded silence (0xFF = µ-law silence).
+        let audio_sample = MediaSample::Audio(AudioFrame {
+            payload_type: Some(0), // PCMU
+            clock_rate: 8000,
+            data: Bytes::from(vec![0xFFu8; 160]),
+            ..Default::default()
+        });
+
+        let track = OneShotTrack::new(audio_sample);
+        let ft = ForwardingTrack::new(
+            "test-audio-transcode".to_string(),
+            track,
+            None,
+            None,
+            Leg::A,
+            ingress,
+            egress,
+        );
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(200), ft.recv())
+            .await
+            .expect("recv timed out")
+            .expect("recv error");
+
+        let MediaSample::Audio(frame) = result else {
+            panic!("expected audio sample");
+        };
+        assert_eq!(
+            frame.payload_type,
+            Some(8),
+            "audio must be re-labeled with PCMA PT after PCMU→PCMA transcoding"
+        );
+    }
+
+    /// When the ingress leg uses one dynamic PT for telephone-event and the
+    /// egress leg negotiated a *different* dynamic PT (e.g. 101 vs 96), the
+    /// ForwardingTrack must rewrite the PT in the forwarded frame.
+    #[tokio::test]
+    async fn dtmf_pt_remapped_to_egress_pt_when_pts_differ() {
+        use audio_codec::CodecType;
+
+        // Ingress: PCMU PT=0, telephone-event PT=101
+        // Egress : PCMA PT=8, telephone-event PT=96 (different dynamic PT)
+        let ingress = make_profile_with_dtmf(CodecType::PCMU, 0, Some(101));
+        let egress = make_profile_with_dtmf(CodecType::PCMA, 8, Some(96));
+
+        let dtmf_data = Bytes::from_static(&[0x05, 0x0A, 0x00, 0xA0]);
+        let sample = MediaSample::Audio(AudioFrame {
+            payload_type: Some(101), // ingress PT
+            clock_rate: 8000,
+            data: dtmf_data.clone(),
+            ..Default::default()
+        });
+
+        let track = OneShotTrack::new(sample);
+        let ft = ForwardingTrack::new(
+            "test-dtmf-remap".to_string(),
+            track,
+            None,
+            None,
+            Leg::A,
+            ingress,
+            egress,
+        );
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(200), ft.recv())
+            .await
+            .expect("recv timed out")
+            .expect("recv error");
+
+        let MediaSample::Audio(frame) = result else {
+            panic!("expected audio sample");
+        };
+        assert_eq!(
+            frame.payload_type,
+            Some(96),
+            "telephone-event PT must be remapped from ingress PT=101 to egress PT=96"
+        );
+        assert_eq!(
+            frame.data, dtmf_data,
+            "telephone-event payload must not be modified during PT remapping"
+        );
     }
 }

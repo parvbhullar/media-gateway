@@ -17,7 +17,7 @@ use rsipstack::sip::Param;
 use rsipstack::sip::headers::typed::CSeq;
 use rsipstack::sip::headers::{CallId, ContentType};
 use rsipstack::sip::typed::{From as FromHeader, To as ToHeader, Via};
-use rsipstack::sip::{Header, Method, Request, Uri, Version};
+use rsipstack::sip::{Header, Method, Request, SipMessage, Uri, Version};
 use rsipstack::transaction::endpoint::EndpointInnerRef;
 use rsipstack::transaction::key::{TransactionKey, TransactionRole};
 use rsipstack::transaction::transaction::Transaction;
@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -73,6 +74,7 @@ enum ClusterMessageBody {
 struct ClusterLocatorMessage {
     event: String,
     aor: String,
+    registered_aor: Option<String>,
     contact_raw: Option<String>,
     expires: u32,
     destination: Option<String>,
@@ -81,9 +83,14 @@ struct ClusterLocatorMessage {
 impl ClusterLocatorMessage {
     fn to_event(&self) -> Option<LocatorEvent> {
         let aor: Uri = self.aor.parse().ok()?;
+        let registered_aor = self
+            .registered_aor
+            .as_deref()
+            .and_then(|value| value.parse().ok());
         let loc = Location {
             aor,
             expires: self.expires,
+            registered_aor,
             contact_raw: self.contact_raw.clone(),
             destination: None, // not needed for presence/CC logic
             ..Default::default()
@@ -134,6 +141,7 @@ impl From<&LocatorEvent> for ClusterLocatorMessage {
                 ClusterLocatorMessage {
                     event: event.to_string(),
                     aor: loc.aor.to_string(),
+                    registered_aor: loc.registered_aor.as_ref().map(|aor| aor.to_string()),
                     contact_raw: loc.contact_raw.clone(),
                     expires: loc.expires,
                     destination: loc.destination.as_ref().map(|d| d.to_string()),
@@ -144,6 +152,7 @@ impl From<&LocatorEvent> for ClusterLocatorMessage {
                 ClusterLocatorMessage {
                     event: "unregistered".to_string(),
                     aor: loc.aor.to_string(),
+                    registered_aor: loc.registered_aor.as_ref().map(|aor| aor.to_string()),
                     contact_raw: loc.contact_raw.clone(),
                     expires: loc.expires,
                     destination: loc.destination.as_ref().map(|d| d.to_string()),
@@ -171,6 +180,7 @@ pub struct ClusterEventHub {
     locator_events: tokio::sync::broadcast::Sender<LocatorEvent>,
     presence_manager: Arc<PresenceManager>,
     endpoint_inner: EndpointInnerRef,
+    local_sip_addr: SocketAddr,
     peers: Vec<SocketAddr>,
     handlers: RwLock<Vec<Arc<dyn ClusterEventHandler>>>,
 }
@@ -180,12 +190,14 @@ impl ClusterEventHub {
         locator_events: tokio::sync::broadcast::Sender<LocatorEvent>,
         presence_manager: Arc<PresenceManager>,
         endpoint_inner: EndpointInnerRef,
+        local_sip_addr: SocketAddr,
         peers: Vec<SocketAddr>,
     ) -> Self {
         Self {
             locator_events,
             presence_manager,
             endpoint_inner,
+            local_sip_addr,
             peers,
             handlers: RwLock::new(Vec::new()),
         }
@@ -341,11 +353,14 @@ impl ClusterEventHub {
             .unwrap_or("tag")
             .to_string();
 
-        let via = Via::parse(&format!("SIP/2.0/UDP {}:5060;branch={}", peer.ip(), branch))
-            .map_err(|e| anyhow!("invalid via: {}", e))?;
+        let via = Via::parse(&format!(
+            "SIP/2.0/UDP {};branch={}",
+            self.local_sip_addr, branch
+        ))
+        .map_err(|e| anyhow!("invalid via: {}", e))?;
         let from = FromHeader {
             display_name: None,
-            uri: format!("sip:cluster@{}", peer.ip()).parse()?,
+            uri: format!("sip:cluster@{}", self.local_sip_addr).parse()?,
             params: vec![Param::Tag(rsipstack::sip::uri::Tag::new(&tag))],
         };
         let to = ToHeader {
@@ -379,6 +394,13 @@ impl ClusterEventHub {
         let mut tx = Transaction::new_client(key, request, self.endpoint_inner.clone(), None);
         tx.send().await?;
         debug!("cluster MESSAGE sent to {}", peer);
+        match tokio::time::timeout(Duration::from_millis(200), tx.receive()).await {
+            Ok(Some(SipMessage::Response(resp))) => {
+                debug!(status = %resp.status_code, peer = %peer, "cluster MESSAGE response received");
+            }
+            Ok(_) => {}
+            Err(_) => debug!("timed out waiting for cluster MESSAGE response from {}", peer),
+        }
         Ok(())
     }
 }
@@ -406,7 +428,7 @@ impl ClusterEventModule {
     }
 
     fn extract_source_ip(tx: &Transaction) -> Option<IpAddr> {
-        let addr = tx.connection.as_ref()?.get_addr();
+        let addr = tx.connection.as_ref()?.get_remote_addr()?;
         let ip: IpAddr = addr.addr.host.clone().try_into().ok()?;
         Some(ip)
     }
@@ -549,6 +571,7 @@ mod tests {
         let msg = ClusterLocatorMessage {
             event: "registered".to_string(),
             aor: "sip:1001@pbx.local".to_string(),
+            registered_aor: Some("sip:1001@pbx.local".to_string()),
             contact_raw: Some("sip:1001@10.0.0.1:5060".to_string()),
             expires: 3600,
             destination: Some("10.0.0.1:5060".to_string()),
@@ -563,6 +586,7 @@ mod tests {
             ClusterMessageBody::Locator(m) => {
                 assert_eq!(m.event, "registered");
                 assert_eq!(m.aor, "sip:1001@pbx.local");
+                assert_eq!(m.registered_aor.as_deref(), Some("sip:1001@pbx.local"));
                 assert_eq!(m.contact_raw.as_deref(), Some("sip:1001@10.0.0.1:5060"));
                 assert_eq!(m.expires, 3600);
                 assert_eq!(m.destination.as_deref(), Some("10.0.0.1:5060"));
@@ -576,6 +600,7 @@ mod tests {
         let msg = ClusterLocatorMessage {
             event: "unregistered".to_string(),
             aor: "sip:2001@pbx.local".to_string(),
+            registered_aor: None,
             contact_raw: None,
             expires: 0,
             destination: None,
@@ -589,6 +614,7 @@ mod tests {
             ClusterMessageBody::Locator(m) => {
                 assert_eq!(m.event, "unregistered");
                 assert_eq!(m.aor, "sip:2001@pbx.local");
+                assert_eq!(m.registered_aor, None);
                 assert_eq!(m.contact_raw, None);
                 assert_eq!(m.expires, 0);
                 assert_eq!(m.destination, None);
@@ -602,6 +628,7 @@ mod tests {
         let msg = ClusterLocatorMessage {
             event: "registered".to_string(),
             aor: "sip:test@x".to_string(),
+            registered_aor: None,
             contact_raw: None,
             expires: 60,
             destination: None,
@@ -617,6 +644,7 @@ mod tests {
         let msg = ClusterLocatorMessage {
             event: "registered".to_string(),
             aor: "sip:1001@pbx.local".to_string(),
+            registered_aor: Some("sip:1001@pbx.local".to_string()),
             contact_raw: Some("sip:1001@10.0.0.1:5060".to_string()),
             expires: 3600,
             destination: None,
@@ -625,6 +653,10 @@ mod tests {
         match event {
             LocatorEvent::Registered(loc) => {
                 assert_eq!(loc.aor.to_string(), "sip:1001@pbx.local");
+                assert_eq!(
+                    loc.registered_aor.as_ref().map(|uri| uri.to_string()).as_deref(),
+                    Some("sip:1001@pbx.local")
+                );
                 assert_eq!(loc.expires, 3600);
                 assert_eq!(loc.contact_raw.unwrap(), "sip:1001@10.0.0.1:5060");
             }
@@ -637,6 +669,7 @@ mod tests {
         let msg = ClusterLocatorMessage {
             event: "unregistered".to_string(),
             aor: "sip:2001@pbx.local".to_string(),
+            registered_aor: None,
             contact_raw: None,
             expires: 0,
             destination: None,
@@ -650,6 +683,7 @@ mod tests {
         let msg = ClusterLocatorMessage {
             event: "unknown_event".to_string(),
             aor: "sip:test@x".to_string(),
+            registered_aor: None,
             contact_raw: None,
             expires: 0,
             destination: None,
@@ -667,6 +701,7 @@ mod tests {
         let msg = ClusterLocatorMessage {
             event: "registered".to_string(),
             aor: String::new(),
+            registered_aor: None,
             contact_raw: None,
             expires: 0,
             destination: None,
@@ -817,9 +852,11 @@ mod tests {
     #[test]
     fn test_locator_event_to_message_registered() {
         let aor: Uri = "sip:1001@pbx.local".parse().unwrap();
+        let registered_aor: Uri = "sip:1001@example.com".parse().unwrap();
         let loc = Location {
             aor: aor.clone(),
             expires: 3600,
+            registered_aor: Some(registered_aor),
             contact_raw: Some("sip:1001@10.0.0.1".to_string()),
             destination: None,
             ..Default::default()
@@ -828,6 +865,7 @@ mod tests {
         let msg = ClusterLocatorMessage::from(&event);
         assert_eq!(msg.event, "registered");
         assert_eq!(msg.aor, "sip:1001@pbx.local");
+        assert_eq!(msg.registered_aor.as_deref(), Some("sip:1001@example.com"));
         assert_eq!(msg.expires, 3600);
         assert_eq!(msg.contact_raw.as_deref(), Some("sip:1001@10.0.0.1"));
     }
@@ -853,9 +891,11 @@ mod tests {
     #[test]
     fn test_locator_event_offline_to_message() {
         let aor: Uri = "sip:3001@pbx.local".parse().unwrap();
+        let registered_aor: Uri = "sip:3001@example.com".parse().unwrap();
         let loc = Location {
             aor: aor.clone(),
             expires: 0,
+            registered_aor: Some(registered_aor),
             contact_raw: Some("sip:3001@10.0.0.3".to_string()),
             destination: None,
             ..Default::default()
@@ -863,6 +903,7 @@ mod tests {
         let event = LocatorEvent::Offline(vec![loc]);
         let msg = ClusterLocatorMessage::from(&event);
         assert_eq!(msg.event, "unregistered");
+        assert_eq!(msg.registered_aor.as_deref(), Some("sip:3001@example.com"));
         assert_eq!(msg.contact_raw.as_deref(), Some("sip:3001@10.0.0.3"));
     }
 
@@ -906,12 +947,17 @@ mod tests {
 
         let handler: Arc<dyn ClusterEventHandler> = Arc::new(DummyHandler);
         let aor: Uri = "sip:test@x".parse().unwrap();
-        let loc = Location { aor, ..Default::default() };
+        let loc = Location {
+            aor,
+            ..Default::default()
+        };
         let state = PresenceState::default();
         let source = EventSource::Local;
 
         // Just verify they run without panic
-        handler.on_locator_event(&LocatorEvent::Registered(loc), &source).await;
+        handler
+            .on_locator_event(&LocatorEvent::Registered(loc), &source)
+            .await;
         handler.on_presence_event("1001", &state, &source).await;
     }
 
@@ -958,6 +1004,7 @@ mod tests {
             locator_tx,
             presence_manager,
             endpoint.inner.clone(),
+            "127.0.0.1:5060".parse().unwrap(),
             vec![],
         ))
     }
@@ -1032,7 +1079,8 @@ mod tests {
             5060,
         ));
 
-        hub.on_remote_presence_change(identity, state.clone(), remote_source).await;
+        hub.on_remote_presence_change(identity, state.clone(), remote_source)
+            .await;
 
         // Memory state should be updated
         let stored = hub.presence_manager.get_state(identity);
@@ -1077,7 +1125,8 @@ mod tests {
         // Simulate what the hub's broadcast subscriber does for local events
         // (dispatch_local_locator_event only calls notify handlers + forward,
         // it does NOT call handle_locator_event)
-        hub.notify_locator_handlers(&event, &EventSource::Local).await;
+        hub.notify_locator_handlers(&event, &EventSource::Local)
+            .await;
 
         // Handler got notified
         assert_eq!(*handler.locator_count.lock().unwrap(), 1);
@@ -1094,9 +1143,11 @@ mod tests {
     #[test]
     fn test_locator_event_full_round_trip() {
         let aor: Uri = "sip:1001@pbx.local".parse().unwrap();
+        let registered_aor: Uri = "sip:1001@example.com".parse().unwrap();
         let original_loc = Location {
             aor: aor.clone(),
             expires: 3600,
+            registered_aor: Some(registered_aor),
             contact_raw: Some("sip:1001@10.0.0.1:5060;transport=udp".to_string()),
             destination: None,
             ..Default::default()
@@ -1119,6 +1170,10 @@ mod tests {
         assert!(matches!(reconstructed, LocatorEvent::Registered(_)));
         if let LocatorEvent::Registered(loc) = reconstructed {
             assert_eq!(loc.aor, aor);
+            assert_eq!(
+                loc.registered_aor.as_ref().map(|uri| uri.to_string()).as_deref(),
+                Some("sip:1001@example.com")
+            );
             assert_eq!(loc.expires, 3600);
             assert_eq!(
                 loc.contact_raw.as_deref(),
@@ -1172,6 +1227,7 @@ mod tests {
         let msg = ClusterLocatorMessage {
             event: String::new(),
             aor: String::new(),
+            registered_aor: None,
             contact_raw: Some(String::new()),
             expires: 0,
             destination: None,

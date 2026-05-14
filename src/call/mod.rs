@@ -1,7 +1,7 @@
 use crate::{
     config::{MediaProxyMode, RouteResult},
     media::recorder::RecorderOption,
-    media::negotiate::CodecSelectionStrategy,
+    proxy::routing::VideoPolicy,
 };
 use anyhow::Result;
 use audio_codec::CodecType;
@@ -27,7 +27,9 @@ pub mod queue_config;
 pub mod runtime;
 pub mod sip;
 pub mod user;
-pub use cookie::{CalleeDisplayName, CalleeOfflineMarker, TenantId, TransactionCookie, TrunkContext};
+pub use cookie::{
+    CalleeDisplayName, CalleeOfflineMarker, TenantId, TransactionCookie, TrunkContext,
+};
 pub use user::SipUser;
 
 pub struct RouteContext<'a> {
@@ -66,20 +68,20 @@ pub trait CallFailureHandler: Send + Sync {
 }
 
 /// Default hold audio that ships with config/sounds, relocated in Dockerfile to /app/sounds.
-pub const DEFAULT_QUEUE_HOLD_AUDIO: &str = "sounds/phone-calling.wav";
+pub const DEFAULT_QUEUE_HOLD_AUDIO: &str = "config/sounds/phone-calling.wav";
 /// Default prompt played when a queue cannot find an available agent.
-pub const DEFAULT_QUEUE_FAILURE_AUDIO: &str = "sounds/unavailable-phone.wav";
+pub const DEFAULT_QUEUE_FAILURE_AUDIO: &str = "config/sounds/unavailable-phone.wav";
 
 // --- Built-in voice prompts for queue events ---
 
-pub const DEFAULT_QUEUE_TRANSFER_PROMPT_ZH: &str = "sounds/queue-transfer-zh.wav";
-pub const DEFAULT_QUEUE_TRANSFER_PROMPT_EN: &str = "sounds/queue-transfer-en.wav";
-pub const DEFAULT_QUEUE_BUSY_PROMPT_ZH: &str = "sounds/queue-busy-zh.wav";
-pub const DEFAULT_QUEUE_BUSY_PROMPT_EN: &str = "sounds/queue-busy-en.wav";
-pub const DEFAULT_QUEUE_OFF_HOURS_PROMPT_ZH: &str = "sounds/queue-off-hours-zh.wav";
-pub const DEFAULT_QUEUE_OFF_HOURS_PROMPT_EN: &str = "sounds/queue-off-hours-en.wav";
-pub const DEFAULT_QUEUE_NO_ANSWER_PROMPT_ZH: &str = "sounds/queue-no-answer-zh.wav";
-pub const DEFAULT_QUEUE_NO_ANSWER_PROMPT_EN: &str = "sounds/queue-no-answer-en.wav";
+pub const DEFAULT_QUEUE_TRANSFER_PROMPT_ZH: &str = "config/sounds/queue-transfer-zh.wav";
+pub const DEFAULT_QUEUE_TRANSFER_PROMPT_EN: &str = "config/sounds/queue-transfer-en.wav";
+pub const DEFAULT_QUEUE_BUSY_PROMPT_ZH: &str = "config/sounds/queue-busy-zh.wav";
+pub const DEFAULT_QUEUE_BUSY_PROMPT_EN: &str = "config/sounds/queue-busy-en.wav";
+pub const DEFAULT_QUEUE_OFF_HOURS_PROMPT_ZH: &str = "config/sounds/queue-off-hours-zh.wav";
+pub const DEFAULT_QUEUE_OFF_HOURS_PROMPT_EN: &str = "config/sounds/queue-off-hours-en.wav";
+pub const DEFAULT_QUEUE_NO_ANSWER_PROMPT_ZH: &str = "config/sounds/queue-no-answer-zh.wav";
+pub const DEFAULT_QUEUE_NO_ANSWER_PROMPT_EN: &str = "config/sounds/queue-no-answer-en.wav";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VoicePrompts {
@@ -452,6 +454,11 @@ pub struct QueuePlan {
     pub no_trying_timeout: Option<Duration>,
     pub voice_prompts: Option<VoicePrompts>,
     pub queue_name: String,
+    /// Optional audio file to play when the queue fails, before executing the
+    /// fallback action (hangup, return to IVR, redirect, etc.).
+    /// This separates the "notification audio" from the "final action" so that
+    /// any fallback type can still play a prompt before acting.
+    pub failure_audio: Option<String>,
 }
 
 impl Default for QueuePlan {
@@ -478,6 +485,7 @@ impl Default for QueuePlan {
             no_trying_timeout: None,
             voice_prompts: None,
             queue_name: String::new(),
+            failure_audio: None,
         }
     }
 }
@@ -672,7 +680,7 @@ impl Default for FailureAction {
 }
 
 /// Media configuration for call control
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaConfig {
     /// Media proxy mode
     pub proxy_mode: MediaProxyMode,
@@ -683,10 +691,8 @@ pub struct MediaConfig {
     pub webrtc_port_end: Option<u16>,
     pub ice_servers: Option<Vec<IceServer>>,
     pub enable_latching: bool,
-    /// Codec selection strategy when target is WebRTC.
-    /// Performance (default): avoid transcoding, keep caller's codecs only.
-    /// Quality: prefer Opus > G729 > G722 > G711 (may transcode).
-    pub codec_strategy: CodecSelectionStrategy,
+    /// Video policy: pass-through or strip video from SDP
+    pub video_policy: Option<VideoPolicy>,
 }
 
 impl Default for MediaConfig {
@@ -706,8 +712,13 @@ impl MediaConfig {
             webrtc_port_end: None,
             ice_servers: None,
             enable_latching: true,
-            codec_strategy: CodecSelectionStrategy::default(),
+            video_policy: None,
         }
+    }
+
+    pub fn with_video_policy(mut self, policy: Option<VideoPolicy>) -> Self {
+        self.video_policy = policy;
+        self
     }
 
     pub fn with_proxy_mode(mut self, mode: MediaProxyMode) -> Self {
@@ -739,10 +750,6 @@ impl MediaConfig {
     }
     pub fn with_webrtc_end_port(mut self, end: Option<u16>) -> Self {
         self.webrtc_port_end = end;
-        self
-    }
-    pub fn with_codec_strategy(mut self, strategy: CodecSelectionStrategy) -> Self {
-        self.codec_strategy = strategy;
         self
     }
 }
@@ -1058,6 +1065,37 @@ impl Dialplan {
             None
         } else {
             Some(headers)
+        }
+    }
+}
+
+/// Determines whether media should be anchored (go through the media proxy)
+/// for a given dialplan. Each addon can provide its own policy.
+pub trait MediaPolicy: Send + Sync {
+    fn requires_anchored(&self, dialplan: &Dialplan, mode: &MediaProxyMode) -> bool;
+}
+
+/// Default media policy used when no addon overrides it.
+/// Logic:
+/// - Recording always anchors media
+/// - App/Queue flows anchor media in Auto/NAT mode
+/// - All mode always anchors
+/// - None mode never anchors
+pub struct DefaultMediaPolicy;
+
+impl MediaPolicy for DefaultMediaPolicy {
+    fn requires_anchored(&self, dialplan: &Dialplan, mode: &MediaProxyMode) -> bool {
+        if dialplan.recording.enabled {
+            return true;
+        }
+        let app_or_queue = matches!(
+            dialplan.flow,
+            DialplanFlow::Application { .. } | DialplanFlow::Queue { .. }
+        );
+        match mode {
+            MediaProxyMode::All => true,
+            MediaProxyMode::Auto | MediaProxyMode::Nat => app_or_queue,
+            MediaProxyMode::None | MediaProxyMode::Bypass => false,
         }
     }
 }

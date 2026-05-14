@@ -211,8 +211,24 @@ impl IvrApp {
         // If already on this menu (e.g. Repeat), keep the stack as-is.
     }
 
-    /// Resolve an audio source: if `file` is non-empty use it directly;
-    /// otherwise try TTS synthesis from `text`/`voice`.
+    fn navigate_back(&mut self) -> String {
+        if self.menu_stack.len() > 1 {
+            let popped = self.menu_stack.pop();
+            info!(
+                ivr = %self.definition.name,
+                popped = ?popped,
+                new_top = ?self.menu_stack.last(),
+                "IVR navigating back"
+            );
+        } else {
+            info!(ivr = %self.definition.name, "IVR Back called at root, staying on root");
+        }
+        self.menu_stack
+            .last()
+            .cloned()
+            .unwrap_or_else(|| "root".to_string())
+    }
+
     async fn resolve_audio(
         &self,
         file: Option<&str>,
@@ -220,9 +236,64 @@ impl IvrApp {
         voice: Option<&str>,
     ) -> Option<String> {
         if let Some(path) = file
-            && !path.is_empty() {
-                return Some(path.to_string());
+            && !path.is_empty()
+        {
+            // tts:// URI: parse text and optional voice from the URI, then synthesize
+            if let Some(rest) = path.strip_prefix("tts://") {
+                let (encoded_text, tts_voice) = if let Some((t, q)) = rest.split_once('?') {
+                    let v = q.strip_prefix("voice=").filter(|v| !v.is_empty());
+                    (t, v)
+                } else {
+                    (rest, None)
+                };
+                let tts_text = urlencoding::decode(encoded_text)
+                    .map(|s| s.into_owned())
+                    .unwrap_or_else(|_| encoded_text.to_string());
+                if let Some(service) = self.tts_service.as_ref() {
+                    match service.synthesize(&tts_text, tts_voice).await {
+                        Ok(audio_path) => return Some(audio_path),
+                        Err(e) => {
+                            warn!(ivr = %self.definition.name, text = %tts_text, error = %e, "TTS synthesis failed for tts:// URI");
+                        }
+                    }
+                } else {
+                    // Fallback: try edge-cli if available
+                    let voice_str = tts_voice.unwrap_or("zh-CN-XiaoxiaoNeural").to_string();
+                    let fallback_cfg = crate::tts::TtsConfig {
+                        cache_dir: std::env::temp_dir()
+                            .join("rustpbx_tts_cache")
+                            .to_string_lossy()
+                            .to_string(),
+                        cache_ttl_seconds: 86400,
+                        driver: crate::tts::TtsDriverConfig::Cli(crate::tts::CliTtsConfig {
+                            command: "edge-cli".to_string(),
+                            args: vec![
+                                "speak".to_string(),
+                                "--text".to_string(),
+                                "{text}".to_string(),
+                                "--voice".to_string(),
+                                "{voice}".to_string(),
+                                "--output".to_string(),
+                                "{output}".to_string(),
+                            ],
+                            output_format: "mp3".to_string(),
+                        }),
+                    };
+                    let fallback_service = crate::tts::TtsService::new(fallback_cfg);
+                    match fallback_service
+                        .synthesize(&tts_text, Some(&voice_str))
+                        .await
+                    {
+                        Ok(audio_path) => return Some(audio_path),
+                        Err(e) => {
+                            warn!(ivr = %self.definition.name, text = %tts_text, error = %e, "edge-cli fallback TTS failed");
+                        }
+                    }
+                }
+                return None;
             }
+            return Some(path.to_string());
+        }
         if let (Some(t), Some(service)) = (text, self.tts_service.as_ref()) {
             match service.synthesize(t, voice).await {
                 Ok(path) => return Some(path),
@@ -332,6 +403,11 @@ impl IvrApp {
             EntryAction::Menu { menu } => {
                 info!(ivr = %self.definition.name, from = %self.current_menu_key(), to = %menu, "IVR navigating to menu");
                 self.enter_menu(menu, ctrl, ctx).await
+            }
+            EntryAction::Back => {
+                let target = self.navigate_back();
+                info!(ivr = %self.definition.name, menu = %target, "IVR entering parent menu after Back");
+                self.enter_menu(&target, ctrl, ctx).await
             }
             EntryAction::Voicemail { target } => {
                 info!(ivr = %self.definition.name, target, "IVR transferring to voicemail");

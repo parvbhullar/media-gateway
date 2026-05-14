@@ -351,33 +351,33 @@ impl RtcTrack {
                 .media_sections
                 .iter_mut()
                 .find(|m| m.kind == MediaKind::Audio)
-            {
-                section.formats.clear();
-                section
-                    .attributes
-                    .retain(|a| a.key != "rtpmap" && a.key != "fmtp");
+        {
+            section.formats.clear();
+            section
+                .attributes
+                .retain(|a| a.key != "rtpmap" && a.key != "fmtp");
 
-                // Build RTP map from codec preference list
-                let mut seen_pts = HashSet::new();
-                for info in self.rtp_map.iter() {
-                    let pt = info.payload_type;
-                    if !seen_pts.insert(pt) {
-                        continue;
-                    }
-                    section.formats.push(pt.to_string());
+            // Build RTP map from codec preference list
+            let mut seen_pts = HashSet::new();
+            for info in self.rtp_map.iter() {
+                let pt = info.payload_type;
+                if !seen_pts.insert(pt) {
+                    continue;
+                }
+                section.formats.push(pt.to_string());
 
+                section.attributes.push(Attribute {
+                    key: "rtpmap".to_string(),
+                    value: Some(format!("{} {}", pt, codec_info_rtpmap(info))),
+                });
+                if let Some(fmtp) = info.codec.fmtp() {
                     section.attributes.push(Attribute {
-                        key: "rtpmap".to_string(),
-                        value: Some(format!("{} {}", pt, codec_info_rtpmap(info))),
+                        key: "fmtp".to_string(),
+                        value: Some(format!("{} {}", pt, fmtp)),
                     });
-                    if let Some(fmtp) = info.codec.fmtp() {
-                        section.attributes.push(Attribute {
-                            key: "fmtp".to_string(),
-                            value: Some(format!("{} {}", pt, fmtp)),
-                        });
-                    }
                 }
             }
+        }
         pc.set_local_description(desc)?;
         let desc = pc
             .local_description()
@@ -427,9 +427,10 @@ impl Track for RtcTrack {
             Err(e) => {
                 let err_str = e.to_string();
                 if err_str.contains("HaveLocalOffer")
-                    && let Some(desc) = self.pc.local_description() {
-                        return Ok(desc.to_sdp_string());
-                    }
+                    && let Some(desc) = self.pc.local_description()
+                {
+                    return Ok(desc.to_sdp_string());
+                }
                 Err(anyhow!(e))
             }
         }
@@ -653,7 +654,7 @@ pub struct FileTrack {
     loop_playback: bool,
     cancel_token: CancellationToken,
     pc: PeerConnection,
-    completion_notify: Arc<tokio::sync::Notify>,
+    on_end: Option<PlaybackEndCallback>,
     codec_preference: Vec<CodecType>,
     codec_info: Option<negotiate::CodecInfo>,
     mode: TransportMode,
@@ -674,7 +675,7 @@ impl Clone for FileTrack {
             loop_playback: self.loop_playback,
             cancel_token: self.cancel_token.clone(),
             pc: self.pc.clone(),
-            completion_notify: self.completion_notify.clone(),
+            on_end: self.on_end.clone(),
             codec_preference: self.codec_preference.clone(),
             codec_info: self.codec_info.clone(),
             mode: self.mode.clone(),
@@ -699,7 +700,7 @@ pub(crate) struct FileTrackPlaybackSource {
     rtp_ticks_per_frame: u32,
     rtp_timestamp: u32,
     sequence_number: u16,
-    completion_notify: Arc<tokio::sync::Notify>,
+    on_end: Option<PlaybackEndCallback>,
     loop_playback: bool,
 }
 
@@ -714,7 +715,9 @@ impl FileTrackPlaybackSource {
 
         if read == 0 {
             debug!("FileTrack playback completed (source exhausted)");
-            self.completion_notify.notify_waiters();
+            if let Some(on_end) = self.on_end.take() {
+                on_end(PlaybackEndReason::Completed);
+            }
             return None;
         }
 
@@ -738,6 +741,22 @@ impl FileTrackPlaybackSource {
     }
 }
 
+impl Drop for FileTrackPlaybackSource {
+    fn drop(&mut self) {
+        if let Some(on_end) = self.on_end.take() {
+            on_end(PlaybackEndReason::Interrupted);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybackEndReason {
+    Completed,
+    Interrupted,
+}
+
+pub type PlaybackEndCallback = Arc<dyn Fn(PlaybackEndReason) + Send + Sync + 'static>;
+
 impl FileTrack {
     pub fn new(track_id: String) -> Self {
         let config = RtcConfiguration {
@@ -754,7 +773,7 @@ impl FileTrack {
             loop_playback: false,
             cancel_token: CancellationToken::new(),
             pc,
-            completion_notify: Arc::new(tokio::sync::Notify::new()),
+            on_end: None,
             codec_preference: vec![CodecType::PCMU, CodecType::PCMA],
             codec_info: None,
             mode: TransportMode::Rtp,
@@ -780,6 +799,11 @@ impl FileTrack {
 
     pub fn with_cancel_token(mut self, token: CancellationToken) -> Self {
         self.cancel_token = token;
+        self
+    }
+
+    pub fn with_on_end(mut self, on_end: PlaybackEndCallback) -> Self {
+        self.on_end = Some(on_end);
         self
     }
 
@@ -842,10 +866,6 @@ impl FileTrack {
 
     pub fn with_ssrc(self, _ssrc: u32) -> Self {
         self
-    }
-
-    pub async fn wait_for_completion(&self) {
-        self.completion_notify.notified().await;
     }
 
     fn init_audio_source(&mut self) -> Result<()> {
@@ -933,7 +953,7 @@ impl FileTrack {
             rtp_ticks_per_frame: frame_timing.rtp_ticks_per_frame,
             rtp_timestamp: rand::random(),
             sequence_number: rand::random(),
-            completion_notify: self.completion_notify.clone(),
+            on_end: self.on_end.clone(),
             loop_playback: self.loop_playback,
         })
     }
@@ -1027,7 +1047,7 @@ impl FileTrack {
         }
 
         // Clone everything we need to move into the background task.
-        let completion_notify = self.completion_notify.clone();
+        let mut on_end = self.on_end.clone();
         let cancel_token = self.cancel_token.clone();
         let loop_playback = self.loop_playback;
 
@@ -1043,7 +1063,9 @@ impl FileTrack {
                 tokio::select! {
                     _ = cancel_token.cancelled() => {
                         debug!("FileTrack playback cancelled");
-                        completion_notify.notify_waiters();
+                        if let Some(on_end) = on_end.take() {
+                            on_end(PlaybackEndReason::Interrupted);
+                        }
                         break;
                     }
                     _ = interval.tick() => {
@@ -1052,13 +1074,11 @@ impl FileTrack {
                         let read = audio_source_manager.read_samples(&mut pcm_buf);
 
                         if read == 0 {
-                            // Source exhausted — completion_notify was already
-                            // triggered by AudioSourceManager::read_samples.
-                            // For non-looping sources we also notify here in case
-                            // the manager chose not to.
                             if !loop_playback {
                                 debug!("FileTrack playback completed (file exhausted)");
-                                completion_notify.notify_waiters();
+                                if let Some(on_end) = on_end.take() {
+                                    on_end(PlaybackEndReason::Completed);
+                                }
                                 break;
                             }
                             // Looping sources restart automatically; keep going.
@@ -1086,7 +1106,9 @@ impl FileTrack {
 
                         if let Err(e) = source_target.send(MediaSample::Audio(frame)).await {
                             debug!("FileTrack source_target.send failed (receiver gone): {}", e);
-                            completion_notify.notify_waiters();
+                            if let Some(on_end) = on_end.take() {
+                                on_end(PlaybackEndReason::Interrupted);
+                            }
                             break;
                         }
                     }
@@ -1144,33 +1166,33 @@ impl Track for FileTrack {
                 .media_sections
                 .iter_mut()
                 .find(|m| m.kind == MediaKind::Audio)
-            {
-                section.formats.clear();
-                section
-                    .attributes
-                    .retain(|a| a.key != "rtpmap" && a.key != "fmtp");
+        {
+            section.formats.clear();
+            section
+                .attributes
+                .retain(|a| a.key != "rtpmap" && a.key != "fmtp");
 
-                let mut seen_pts = HashSet::new();
-                for codec in &self.codec_preference {
-                    let pt = codec.payload_type();
-                    if !seen_pts.insert(pt) {
-                        continue;
-                    }
-                    let pt_str = pt.to_string();
-                    section.formats.push(pt_str.clone());
+            let mut seen_pts = HashSet::new();
+            for codec in &self.codec_preference {
+                let pt = codec.payload_type();
+                if !seen_pts.insert(pt) {
+                    continue;
+                }
+                let pt_str = pt.to_string();
+                section.formats.push(pt_str.clone());
 
+                section.attributes.push(Attribute {
+                    key: "rtpmap".to_string(),
+                    value: Some(format!("{} {}", pt_str, codec.rtpmap())),
+                });
+                if let Some(fmtp) = codec.fmtp() {
                     section.attributes.push(Attribute {
-                        key: "rtpmap".to_string(),
-                        value: Some(format!("{} {}", pt_str, codec.rtpmap())),
+                        key: "fmtp".to_string(),
+                        value: Some(format!("{} {}", pt_str, fmtp)),
                     });
-                    if let Some(fmtp) = codec.fmtp() {
-                        section.attributes.push(Attribute {
-                            key: "fmtp".to_string(),
-                            value: Some(format!("{} {}", pt_str, fmtp)),
-                        });
-                    }
                 }
             }
+        }
 
         self.pc.set_local_description(offer.clone())?;
         Ok(offer.to_sdp_string())
@@ -1185,7 +1207,6 @@ impl Track for FileTrack {
 
     async fn stop(&self) {
         self.cancel_token.cancel();
-        self.completion_notify.notify_waiters();
     }
 
     async fn get_peer_connection(&self) -> Option<PeerConnection> {

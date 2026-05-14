@@ -202,6 +202,7 @@ impl QueueConfig {
             no_trying_timeout: None,
             voice_prompts: self.voice_prompts.clone(),
             queue_name: self.name.clone(),
+            failure_audio: None,
         }
     }
 }
@@ -297,7 +298,6 @@ impl QueueApp {
             call_id: String::new(),
             enqueued_at: None,
             stats: Arc::new(RwLock::new(HashMap::new())),
-
         }
     }
 
@@ -590,12 +590,14 @@ impl CallApp for QueueApp {
     async fn on_enter(
         &mut self,
         ctrl: &mut CallController,
-        _ctx: &ApplicationContext,
+        ctx: &ApplicationContext,
     ) -> anyhow::Result<AppAction> {
         let queue_id = self.config.name.clone();
         info!(queue = %queue_id, "Queue: entering queue application");
         self.state = QueueState::Answering;
         self.enqueued_at = Some(Instant::now());
+
+        ctx.set_queue_name(&queue_id).await;
 
         // Record call offered
         self.update_stats(&queue_id, |stats| {
@@ -734,8 +736,7 @@ impl CallApp for QueueApp {
                     agent_uri: agent_uri.clone(),
                 };
                 let queue_id = self.config.name.clone();
-                let wait_secs =
-                    self.enqueued_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+                let wait_secs = self.enqueued_at.map(|t| t.elapsed().as_secs()).unwrap_or(0);
                 info!(
                     queue = %queue_id,
                     agent = %agent_uri,
@@ -794,9 +795,7 @@ impl CallApp for QueueApp {
                             .voice_prompts
                             .as_ref()
                             .or(self.config.voice_prompts.as_ref());
-                        if let Some(path) =
-                            prompts.and_then(|p| p.transfer_prompt.as_ref())
-                        {
+                        if let Some(path) = prompts.and_then(|p| p.transfer_prompt.as_ref()) {
                             info!("Queue: playing transfer prompt before connecting agent");
                             self.state = QueueState::PlayingTransferPrompt {
                                 agent_uri: agent_uri.to_string(),
@@ -841,7 +840,8 @@ impl CallApp for QueueApp {
                             .update_presence(agent_id, PresenceState::Busy)
                             .await;
                     }
-                    self.handle_agent_unavailable(ctrl, AgentUnavailableReason::Busy).await
+                    self.handle_agent_unavailable(ctrl, AgentUnavailableReason::Busy)
+                        .await
                 }
                 "agent_no_answer" => {
                     info!("Queue: agent no answer");
@@ -852,7 +852,8 @@ impl CallApp for QueueApp {
                             .update_presence(agent_id, PresenceState::Available)
                             .await;
                     }
-                    self.handle_agent_unavailable(ctrl, AgentUnavailableReason::NoAnswer).await
+                    self.handle_agent_unavailable(ctrl, AgentUnavailableReason::NoAnswer)
+                        .await
                 }
                 "all_agents_busy" => {
                     warn!("Queue: all agents busy");
@@ -900,7 +901,8 @@ impl CallApp for QueueApp {
                     }
                 }
 
-                self.handle_agent_unavailable(ctrl, AgentUnavailableReason::NoAnswer).await
+                self.handle_agent_unavailable(ctrl, AgentUnavailableReason::NoAnswer)
+                    .await
             }
             "max_wait_timeout" => {
                 info!("Queue: max wait timeout, executing fallback");
@@ -926,7 +928,10 @@ impl CallApp for QueueApp {
         info!(?reason, "Queue: exiting queue application");
 
         // Update statistics if call was not connected (abandoned)
-        if !matches!(self.state, QueueState::Connected { .. } | QueueState::PlayingTransferPrompt { .. }) {
+        if !matches!(
+            self.state,
+            QueueState::Connected { .. } | QueueState::PlayingTransferPrompt { .. }
+        ) {
             let queue_id = self.config.name.clone();
 
             self.update_stats(&queue_id, |stats| {

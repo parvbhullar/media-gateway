@@ -98,13 +98,14 @@ impl CallReporter {
 
         let mut hangup_messages = snapshot.hangup_messages.clone();
         if hangup_messages.is_empty()
-            && let Some((code, reason)) = snapshot.last_error.as_ref() {
-                hangup_messages.push(CallRecordHangupMessage {
-                    code: u16::from(code.clone()),
-                    reason: reason.clone(),
-                    target: None,
-                });
-            }
+            && let Some((code, reason)) = snapshot.last_error.as_ref()
+        {
+            hangup_messages.push(CallRecordHangupMessage {
+                code: u16::from(code.clone()),
+                reason: reason.clone(),
+                target: None,
+            });
+        }
 
         let rewrite = CallRecordRewrite {
             caller_original: original_caller.clone(),
@@ -148,17 +149,18 @@ impl CallReporter {
 
         if self.context.dialplan.recording.enabled
             && let Some(recorder_config) = self.context.dialplan.recording.option.as_ref()
-                && !recorder_config.recorder_file.is_empty() {
-                    let size = fs::metadata(&recorder_config.recorder_file)
-                        .map(|meta| meta.len())
-                        .unwrap_or(0);
-                    recorder.push(CallRecordMedia {
-                        track_id: "mixed".to_string(),
-                        path: recorder_config.recorder_file.clone(),
-                        size,
-                        extra: None,
-                    });
-                }
+            && !recorder_config.recorder_file.is_empty()
+        {
+            let size = fs::metadata(&recorder_config.recorder_file)
+                .map(|meta| meta.len())
+                .unwrap_or(0);
+            recorder.push(CallRecordMedia {
+                track_id: "mixed".to_string(),
+                path: recorder_config.recorder_file.clone(),
+                size,
+                extra: None,
+            });
+        }
         tracing::info!(
             recording = ?self.context.dialplan.recording,
             has_sipflow_backend = ?has_sipflow_backend,
@@ -170,7 +172,7 @@ impl CallReporter {
 
         let recording_path_for_db = recorder.first().map(|media| media.path.clone());
 
-        let details = CallDetails {
+        let mut details = CallDetails {
             direction,
             status,
             from_number,
@@ -191,6 +193,34 @@ impl CallReporter {
                 .cloned(),
             ..Default::default()
         };
+
+        if details.recording_url.is_none()
+            && let Some(crate::config::SipFlowConfig::Local {
+                upload:
+                    Some(crate::config::SipFlowUploadConfig::S3 {
+                        bucket,
+                        endpoint,
+                        root,
+                        ..
+                    }),
+                ..
+            }) = self.server.sipflow_config.as_ref()
+        {
+            let date_prefix = start_time.format("%Y%m%d").to_string();
+            let key = format!("{}/{}.wav", date_prefix, self.context.session_id);
+            let full_key = if root.is_empty() {
+                key
+            } else {
+                format!("{}/{}", root.trim_end_matches('/'), key)
+            };
+            details.recording_url = Some(format!(
+                "{}/{}/{}",
+                endpoint.trim_end_matches('/'),
+                bucket.trim_matches('/'),
+                full_key.trim_start_matches('/')
+            ));
+            details.recording_duration_secs = Some((now - start_time).num_seconds().max(0) as i32);
+        }
 
         let record = CallRecord {
             call_id: self.context.session_id.clone(),

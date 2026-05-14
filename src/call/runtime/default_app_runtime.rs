@@ -251,15 +251,20 @@ impl AppRuntime for DefaultAppRuntime {
 
     fn required_capabilities(&self) -> Vec<MediaCapability> {
         if let Ok(guard) = self.running.try_read()
-            && let Some(running) = guard.as_ref() {
-                let descriptor = self.get_descriptor(&running.name);
-                return descriptor.required_capabilities;
-            }
+            && let Some(running) = guard.as_ref()
+        {
+            let descriptor = self.get_descriptor(&running.name);
+            return descriptor.required_capabilities;
+        }
         vec![]
     }
 
     fn app_descriptor(&self, app_name: &str) -> Option<AppDescriptor> {
         Some(self.get_descriptor(app_name))
+    }
+
+    fn get_queue_name(&self) -> Option<String> {
+        self.context.queue_name.try_read().ok()?.clone()
     }
 }
 
@@ -355,15 +360,11 @@ static GLOBAL_APP_FACTORIES: std::sync::OnceLock<ParkingRwLock<Vec<(&'static str
     std::sync::OnceLock::new();
 
 fn global_factories() -> &'static ParkingRwLock<Vec<(&'static str, AppFactoryFn)>> {
-    GLOBAL_APP_FACTORIES
-        .get_or_init(|| ParkingRwLock::new(Vec::new()))
+    GLOBAL_APP_FACTORIES.get_or_init(|| ParkingRwLock::new(Vec::new()))
 }
 
 /// Register a custom call app factory that will be available to all sessions.
-pub fn register_call_app(
-    name: &'static str,
-    factory: AppFactoryFn,
-) {
+pub fn register_call_app(name: &'static str, factory: AppFactoryFn) {
     global_factories().write().push((name, factory));
 }
 

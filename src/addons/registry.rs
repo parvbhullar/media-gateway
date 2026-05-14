@@ -1,5 +1,5 @@
-use crate::addons::export_reload::ExportReloadRegistry;
 use crate::addons::Addon;
+use crate::addons::export_reload::ExportReloadRegistry;
 use crate::app::AppState;
 use std::sync::Arc;
 
@@ -75,9 +75,9 @@ impl AddonRegistry {
         #[cfg(feature = "addon-ivr-editor")]
         addons.push(Box::new(super::ivr_editor::IvrEditorAddon::new()));
 
-        // JSON-RPC Router Addon
-        #[cfg(feature = "addon-jsonrpc-router")]
-        addons.push(Box::new(super::jsonrpc_router::JsonRpcRouterAddon::new()));
+        // SBC Addon
+        #[cfg(feature = "addon-sbc")]
+        addons.push(Box::new(super::sbc::SbcAddon::new()));
 
         // Queue Addon
         addons.push(Box::new(super::queue::QueueAddon::new()));
@@ -94,7 +94,10 @@ impl AddonRegistry {
             }
         }
 
-        Self { addons, export_reload }
+        Self {
+            addons,
+            export_reload,
+        }
     }
 
     pub async fn initialize_all(&self, state: AppState) -> anyhow::Result<()> {
@@ -148,9 +151,10 @@ impl AddonRegistry {
             }
             for injection in addon.inject_scripts() {
                 if let Ok(re) = regex::Regex::new(injection.url_path_regex)
-                    && re.is_match(path) {
-                        scripts.push(normalize_static_url(&injection.script_url, config));
-                    }
+                    && re.is_match(path)
+                {
+                    scripts.push(normalize_static_url(&injection.script_url, config));
+                }
             }
         }
         scripts
@@ -206,7 +210,11 @@ impl AddonRegistry {
                     developer: a.developer().to_string(),
                     website: a.website().to_string(),
                     cost: a.cost().to_string(),
-                    screenshots: a.screenshots().iter().map(|s| normalize_static_url(s, &config)).collect(),
+                    screenshots: a
+                        .screenshots()
+                        .iter()
+                        .map(|s| normalize_static_url(s, &config))
+                        .collect(),
                     restart_required: false, // Caller should set this
                     #[cfg(feature = "commerce")]
                     license_status: None,
@@ -286,10 +294,7 @@ impl AddonRegistry {
     }
 
     /// Run database migrations for all enabled addons.
-    pub async fn run_migrations(
-        &self,
-        db: &sea_orm::DatabaseConnection,
-    ) -> anyhow::Result<()> {
+    pub async fn run_migrations(&self, db: &sea_orm::DatabaseConnection) -> anyhow::Result<()> {
         let manager = sea_orm_migration::SchemaManager::new(db);
         for addon in &self.addons {
             for migration in addon.migrations() {
