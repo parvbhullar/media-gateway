@@ -25,6 +25,7 @@ use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use tracing::warn;
 
 use crate::app::AppState;
 use crate::handler::api_v1::error::{ApiError, ApiResult};
@@ -381,6 +382,28 @@ fn build_kind_and_config_for_update(
     Ok((kind, kind_config_json))
 }
 
+/// Refresh the in-memory trunks snapshot + regenerate trunks TOML after any
+/// gateway mutation so the matcher sees changes immediately. Mirrors
+/// `refresh_routes_index` in `routes.rs`. Errors are logged but don't fail
+/// the parent request: the DB write succeeded; the worst case is a stale
+/// snapshot until the next manual reload.
+async fn refresh_trunks_index(state: &AppState) {
+    let config_override = state.config_path.as_ref().and_then(|path| {
+        crate::config::Config::load(path)
+            .ok()
+            .map(|cfg| std::sync::Arc::new(cfg.proxy))
+    });
+    if let Err(e) = state
+        .sip_server()
+        .inner
+        .data_context
+        .reload_trunks(true, config_override)
+        .await
+    {
+        warn!(error = %e, "auto-reload of trunks failed after gateway mutation");
+    }
+}
+
 async fn create_gateway(
     State(state): State<AppState>,
     Json(req): Json<CreateGatewayRequest>,
@@ -419,6 +442,8 @@ async fn create_gateway(
         .insert(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    refresh_trunks_index(&state).await;
 
     Ok((StatusCode::CREATED, Json(GatewayView::from(inserted))))
 }
@@ -462,6 +487,9 @@ async fn update_gateway(
         .update(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    refresh_trunks_index(&state).await;
+
     Ok(Json(GatewayView::from(updated)))
 }
 
@@ -490,5 +518,8 @@ async fn delete_gateway(
         .exec(db)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    refresh_trunks_index(&state).await;
+
     Ok(StatusCode::NO_CONTENT)
 }

@@ -1441,9 +1441,20 @@ fn convert_route(
             rules
         });
 
+    // Accept multiple shapes for `target_trunks`:
+    //   1. [{"name": "pipecat_bot"}]              — legacy/internal shape
+    //   2. [{"trunk_name": "pipecat_bot"}]        — REST-API wire shape
+    //   3. ["pipecat_bot"]                        — bare string list
+    // All collapse to a Vec<String> of trunk names. Empty / unparseable
+    // entries are silently skipped (preserves prior tolerant behavior).
     #[derive(Deserialize)]
-    struct RouteTrunkDocument {
-        name: String,
+    #[serde(untagged)]
+    enum RouteTrunkDocument {
+        Object {
+            #[serde(default, alias = "trunk_name")]
+            name: Option<String>,
+        },
+        Bare(String),
     }
 
     let target_trunks: Vec<String> = model
@@ -1452,7 +1463,10 @@ fn convert_route(
         .and_then(|value| serde_json::from_value::<Vec<RouteTrunkDocument>>(value).ok())
         .unwrap_or_default()
         .into_iter()
-        .map(|trunk| trunk.name)
+        .filter_map(|trunk| match trunk {
+            RouteTrunkDocument::Object { name } => name.filter(|s| !s.is_empty()),
+            RouteTrunkDocument::Bare(s) => Some(s).filter(|s| !s.is_empty()),
+        })
         .collect::<Vec<_>>();
 
     let dest = if target_trunks.is_empty() {
