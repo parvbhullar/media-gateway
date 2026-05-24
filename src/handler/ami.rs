@@ -211,7 +211,7 @@ async fn reload_trunks_handler(State(state): State<AppState>, client_ip: ClientA
         }
         .into_response(),
         Err(error) => {
-            warn!(%client_ip, error = %error, "Trunk reload failed");
+            warn!(%client_ip, error = ?error, "Trunk reload failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({

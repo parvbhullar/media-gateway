@@ -530,6 +530,13 @@ default('RustPBX') }}{% endblock %}
                             <span class="text-xs font-normal text-slate-400">Adapter-specific signaling endpoint.</span>
                         </label>
                         <label class="md:col-span-2 flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Health-check URL
+                            <input type="text" x-model.trim="form.webrtc_health_check_url" maxlength="512"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="https://signal.example.com/healthz">
+                            <span class="text-xs font-normal text-slate-400">Optional. HEAD probed every 30 s / 300 s. Leave blank to probe the Endpoint URL.</span>
+                        </label>
+                        <label class="md:col-span-2 flex flex-col gap-2 text-sm font-medium text-slate-700">
                             Authorization header
                             <input type="text" x-model.trim="form.webrtc_auth_header" maxlength="512"
                                 class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
@@ -637,6 +644,7 @@ default('RustPBX') }}{% endblock %}
                 webrtc_endpoint_url: '',
                 webrtc_audio_codec: 'opus',
                 webrtc_auth_header: '',
+                webrtc_health_check_url: '',
                 webrtc_ice_servers: '',
                 webrtc_protocol: '',
             },
@@ -726,6 +734,7 @@ default('RustPBX') }}{% endblock %}
                 this.form.webrtc_endpoint_url = model.webrtc_endpoint_url || '';
                 this.form.webrtc_audio_codec = model.webrtc_audio_codec || 'opus';
                 this.form.webrtc_auth_header = model.webrtc_auth_header || '';
+                this.form.webrtc_health_check_url = model.webrtc_health_check_url || '';
                 this.form.webrtc_ice_servers = this.formatJson(model.webrtc_ice_servers);
                 this.form.webrtc_protocol = this.formatJson(model.webrtc_protocol);
             },
@@ -909,6 +918,11 @@ default('RustPBX') }}{% endblock %}
                     if ((this.form.webrtc_auth_header || '').trim()) {
                         params.set('webrtc_auth_header', this.form.webrtc_auth_header.trim());
                     }
+                    // Always post webrtc_health_check_url (even when empty) so
+                    // the operator can clear an existing override by blanking
+                    // the field. The handler treats Some("") as a clear,
+                    // None as "leave unchanged".
+                    params.set('webrtc_health_check_url', (this.form.webrtc_health_check_url || '').trim());
                     if ((this.form.webrtc_ice_servers || '').trim()) {
                         params.set('webrtc_ice_servers', this.form.webrtc_ice_servers.trim());
                     }

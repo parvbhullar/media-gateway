@@ -1181,11 +1181,145 @@ fn write_trunks_file(path: &Path, trunks: &HashMap<String, TrunkConfig>) -> Resu
             .collect(),
         trunk: Vec::new(),
     };
-    let toml = toml::to_string_pretty(&data)
+    // Round-trip via serde_json then post-process for TOML compatibility:
+    //   1. Strip null values (TOML has no null).
+    //   2. Within every Object, emit scalar / array-of-scalar keys before any
+    //      nested table / array-of-tables keys. TOML disallows "value after
+    //      table" — without this, a webrtc trunk's `kind_config` with a
+    //      nested `protocol` table followed by a sibling `signaling` string
+    //      fails to serialize.
+    let mut json_value = serde_json::to_value(&data)
+        .with_context(|| format!("failed to convert trunks to json for {}", path.display()))?;
+    normalize_for_toml(&mut json_value);
+    let toml_value: toml::Value = serde_json::from_value(json_value).with_context(|| {
+        format!(
+            "failed to convert normalized trunks json to toml value for {}",
+            path.display()
+        )
+    })?;
+    let toml = toml::to_string_pretty(&toml_value)
         .with_context(|| format!("failed to serialize trunks toml for {}", path.display()))?;
     fs::write(path, toml)
         .with_context(|| format!("failed to write trunks file {}", path.display()))?;
     Ok(())
+}
+
+/// Normalize a JSON value tree for TOML serialization:
+///   - drop `Value::Null` entries (TOML has no null);
+///   - within every `Object`, partition keys so that scalar / array-of-scalar
+///     keys come strictly before any nested `Object` / array-of-`Object` keys
+///     (TOML disallows "value after table").
+fn normalize_for_toml(value: &mut serde_json::Value) {
+    fn is_table_like(v: &serde_json::Value) -> bool {
+        match v {
+            serde_json::Value::Object(_) => true,
+            serde_json::Value::Array(arr) => arr.iter().any(is_table_like),
+            _ => false,
+        }
+    }
+    match value {
+        serde_json::Value::Object(obj) => {
+            // Strip null-valued entries.
+            obj.retain(|_, v| !v.is_null());
+            // Recurse into remaining values first so nested objects/arrays
+            // are already normalized before we partition this level.
+            for (_, v) in obj.iter_mut() {
+                normalize_for_toml(v);
+            }
+            // Re-emit with stable key order: scalars first, tables last.
+            let mut entries: Vec<(String, serde_json::Value)> =
+                std::mem::take(obj).into_iter().collect();
+            entries.sort_by(|a, b| {
+                let a_table = is_table_like(&a.1);
+                let b_table = is_table_like(&b.1);
+                a_table.cmp(&b_table).then_with(|| a.0.cmp(&b.0))
+            });
+            for (k, v) in entries {
+                obj.insert(k, v);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                normalize_for_toml(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod write_trunks_toml_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn normalize_strips_null_and_reorders_tables_last() {
+        let mut v = json!({
+            "audio_codec": "opus",
+            "auth_header": null,
+            "protocol": {"request_body_template": "{}", "response_answer_path": "$.sdp"},
+            "signaling": "http_json",
+            "ice_servers": [{"urls": "stun:..."}]
+        });
+        normalize_for_toml(&mut v);
+        let obj = v.as_object().unwrap();
+        assert!(!obj.contains_key("auth_header"), "null stripped");
+        let order: Vec<&String> = obj.keys().collect();
+        // All non-table-like keys must precede all table-like keys.
+        let first_table_idx = order
+            .iter()
+            .position(|k| matches!(k.as_str(), "ice_servers" | "protocol"))
+            .unwrap();
+        for (i, k) in order.iter().enumerate() {
+            if i < first_table_idx {
+                assert!(
+                    !matches!(k.as_str(), "ice_servers" | "protocol"),
+                    "scalar key '{}' should come before any table",
+                    k
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn webrtc_kind_config_serializes_to_toml() {
+        // Mirrors the shape `pipecat_bot` ends up with after promotion.
+        let mut trunk = TrunkConfig::default();
+        trunk.dest = "http://127.0.0.1:7860/api/offer".into();
+        trunk.transport = Some("udp".into());
+        trunk.id = Some(14);
+        trunk.direction = Some(crate::proxy::routing::TrunkDirection::Outbound);
+        trunk.disabled = Some(false);
+        trunk.kind = "webrtc".into();
+        trunk.kind_config = Some(json!({
+            "audio_codec": "opus",
+            "auth_header": null,
+            "endpoint_url": "http://127.0.0.1:7860/api/offer",
+            "health_check_url": "http://127.0.0.1:7860/healthz",
+            "ice_servers": [{"urls": "stun:stun.l.google.com:19302"}],
+            "protocol": {
+                "request_body_template": "{\"sdp\":\"{offer_sdp}\",\"type\":\"offer\"}",
+                "response_answer_path": "$.sdp",
+                "response_session_path": "$.pc_id"
+            },
+            "signaling": "http_json"
+        }));
+        let mut map = HashMap::new();
+        map.insert("pipecat_bot".to_string(), trunk);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path().to_owned();
+        write_trunks_file(&path, &map).expect("toml serialize should succeed");
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("pipecat_bot"),
+            "round-trip writes back the trunk: {written}"
+        );
+        // Re-parse to confirm the file is valid TOML and our loader still
+        // accepts it.
+        let parsed: TrunkIncludeFile =
+            toml::from_str(&written).expect("re-parse round-tripped TOML");
+        assert!(parsed.trunks.contains_key("pipecat_bot"));
+    }
 }
 
 fn write_routes_file(path: &Path, routes: &[RouteRule]) -> Result<()> {

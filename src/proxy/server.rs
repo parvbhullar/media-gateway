@@ -802,10 +802,17 @@ impl SipServerBuilder {
         inner.endpoint.inner.allows.lock().replace(allow_methods);
 
         // Plan 1: spawn the gateway OPTIONS health monitor. Outbound trunks
-        // get periodically probed and `sip_trunk.status` is flipped between
+        // get periodically probed and `trunk.status` is flipped between
         // `healthy`/`offline` on threshold crossings.
+        //
+        // Per-kind probing is dispatched via the
+        // [`crate::proxy::health_probers`] registry. We register the built-in
+        // probers here once we have the SIP endpoint in hand: the SIP prober
+        // needs it for OPTIONS; the WebRTC prober uses HTTP and doesn't need
+        // any sip state.
         if let Some(db) = inner.database.clone() {
             let endpoint_inner = inner.endpoint.inner.clone();
+            crate::proxy::health_probers::register_builtins(Some(endpoint_inner.clone()));
             let monitor = Arc::new(crate::proxy::gateway_health::GatewayHealthMonitor::new(
                 db,
                 Some(endpoint_inner),

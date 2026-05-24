@@ -29,7 +29,7 @@ use axum::{
     extract::{Form, Path as AxumPath, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use chrono::{DateTime, Utc};
 use sea_orm::sea_query::Order;
@@ -69,6 +69,7 @@ pub fn urls() -> Router<Arc<ConsoleState>> {
                 .post(query_sip_trunks),
         )
         .route("/sip-trunk/new", get(page_sip_trunk_create))
+        .route("/sip-trunk/promote/{name}", post(promote_file_trunk))
         .route(
             "/sip-trunk/{id}",
             get(page_sip_trunk_detail)
@@ -92,7 +93,13 @@ async fn page_sip_trunks(
                 .data_context
                 .trunks_snapshot()
                 .values()
-                .any(|t| matches!(t.origin, ConfigOrigin::File(_)))
+                .any(|t| match &t.origin {
+                    ConfigOrigin::File(path) => !std::path::Path::new(path)
+                        .file_name()
+                        .and_then(|f| f.to_str())
+                        .is_some_and(|f| f.ends_with(".generated.toml")),
+                    _ => false,
+                })
         })
         .unwrap_or(false);
     let ami_endpoint = state.config().proxy.ami_path.clone().unwrap_or_else(|| "/ami/v1".to_string());
@@ -637,13 +644,25 @@ async fn query_sip_trunks(
         })
         .collect();
 
-    // Issue #179: collect file-sourced trunks from in-memory snapshot
+    // Issue #179: collect file-sourced trunks from in-memory snapshot.
+    //
+    // Skip entries whose source file is `*.generated.toml` — those files are
+    // re-emitted from the DB by `reload_trunks(true, ...)` and represent the
+    // same rows already shown in the editable DB list above. Including them
+    // would duplicate every DB trunk in the read-only section.
     let file_trunks: Vec<Value> = if let Some(app_state) = state.app_state() {
         let snapshot = app_state.sip_server().inner.data_context.trunks_snapshot();
         let mut file_items: Vec<Value> = snapshot
             .into_iter()
             .filter_map(|(name, trunk)| {
                 if let ConfigOrigin::File(ref path) = trunk.origin {
+                    let is_generated_mirror = std::path::Path::new(path)
+                        .file_name()
+                        .and_then(|f| f.to_str())
+                        .is_some_and(|f| f.ends_with(".generated.toml"));
+                    if is_generated_mirror {
+                        return None;
+                    }
                     Some(json!({
                         "id": null,
                         "name": name,
@@ -655,6 +674,7 @@ async fn query_sip_trunks(
                         "is_active": trunk.disabled.map(|d| !d).unwrap_or(true),
                         "direction": trunk.direction,
                         "disabled": trunk.disabled.unwrap_or(false),
+                        "promote_url": format!("/sip-trunk/promote/{}", name),
                     }))
                 } else {
                     None
@@ -964,12 +984,24 @@ fn apply_form_to_active_model(
                 existing_webrtc_cfg.as_ref().and_then(|c| c.protocol.clone())
             };
 
+            // Health-check override URL. Follow the same merge semantics
+            // as `auth_header`: on update, only overwrite when the form
+            // explicitly posted the field; otherwise carry the existing
+            // value forward. Empty-string clears the override.
+            let health_check_url = if !is_update || form.webrtc_health_check_url.is_some() {
+                super::normalize_optional_string(&form.webrtc_health_check_url)
+            } else {
+                existing_webrtc_cfg
+                    .as_ref()
+                    .and_then(|c| c.health_check_url.clone())
+            };
             let webrtc_cfg = WebRtcTrunkConfig {
                 signaling,
                 endpoint_url,
                 ice_servers,
                 audio_codec,
                 auth_header,
+                health_check_url,
                 protocol,
             };
 
@@ -1108,6 +1140,47 @@ fn parse_json_field(value: &Option<String>, field: &str) -> Result<Option<Value>
     serde_json::from_str(raw)
         .map(Some)
         .map_err(|err| bad_request(format!("{} must be valid JSON: {}", field, err)))
+}
+
+/// Session-authenticated promote endpoint for the console UI.
+///
+/// Mirrors `POST /api/v1/gateways/{name}/promote` but routes through the
+/// console session-cookie auth path (the browser doesn't carry the bearer
+/// token). The body of the work lives in
+/// [`crate::handler::api_v1::gateways::promote_file_gateway_inner`] so both
+/// entry points behave identically.
+async fn promote_file_trunk(
+    AxumPath(name): AxumPath<String>,
+    State(state): State<Arc<ConsoleState>>,
+    AuthRequired(user): AuthRequired,
+) -> Response {
+    if !state.has_permission(&user, "trunks", "write").await {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"message": "Permission denied"})),
+        )
+            .into_response();
+    }
+    let Some(app_state) = state.app_state() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"message": "App state not available; cannot promote file trunk"})),
+        )
+            .into_response();
+    };
+    match crate::handler::api_v1::gateways::promote_file_gateway_inner(&app_state, &name).await {
+        Ok(model) => (
+            StatusCode::CREATED,
+            Json(json!({
+                "name": model.name,
+                "kind": model.kind,
+                "direction": model.direction.as_str(),
+                "is_active": model.is_active,
+            })),
+        )
+            .into_response(),
+        Err(err) => err.into_response(),
+    }
 }
 
 #[cfg(test)]

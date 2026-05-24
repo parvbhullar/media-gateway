@@ -97,6 +97,7 @@ pub struct SipTrunkForm {
     pub webrtc_endpoint_url: Option<String>,
     pub webrtc_audio_codec: Option<String>,
     pub webrtc_auth_header: Option<String>,
+    pub webrtc_health_check_url: Option<String>,
     pub webrtc_ice_servers: Option<String>,
     pub webrtc_protocol: Option<String>,
 }

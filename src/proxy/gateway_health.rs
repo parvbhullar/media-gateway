@@ -288,26 +288,40 @@ pub async fn probe_trunk(
 }
 
 /// Periodic OPTIONS health monitor for outbound trunks.
+///
+/// The probe cadence is dynamic per trunk:
+/// - Trunks with `status = Healthy` are probed every `healthy_interval`
+///   (default 300 s) — slow keepalive once a trunk is known good.
+/// - Trunks with any other status (`Offline`, `Warning`, `Standby`) are
+///   probed every `unhealthy_interval` (default 30 s) — fast recovery
+///   detection so a flapping or down trunk gets re-evaluated quickly.
+/// - A per-trunk `health_check_interval_secs` column on `rustpbx_trunks`
+///   still wins when set (operator override).
 pub struct GatewayHealthMonitor {
     db: DatabaseConnection,
-    endpoint: Option<rsipstack::transaction::endpoint::EndpointInnerRef>,
     tallies: Mutex<HashMap<i64, HealthTally>>,
     tick: Duration,
-    default_interval: Duration,
+    healthy_interval: Duration,
+    unhealthy_interval: Duration,
     probe_timeout: Duration,
 }
 
 impl GatewayHealthMonitor {
+    /// `endpoint` is accepted for back-compat but is no longer stored on
+    /// the monitor — the SIP prober owns the endpoint via the
+    /// `health_probers` registry. The parameter is retained so existing
+    /// call sites (and tests) need no signature change; rename or drop in
+    /// a follow-up if you want a cleaner API.
     pub fn new(
         db: DatabaseConnection,
-        endpoint: Option<rsipstack::transaction::endpoint::EndpointInnerRef>,
+        _endpoint: Option<rsipstack::transaction::endpoint::EndpointInnerRef>,
     ) -> Self {
         Self {
             db,
-            endpoint,
             tallies: Mutex::new(HashMap::new()),
             tick: Duration::from_secs(10),
-            default_interval: Duration::from_secs(30),
+            healthy_interval: Duration::from_secs(300),
+            unhealthy_interval: Duration::from_secs(30),
             probe_timeout: Duration::from_secs(5),
         }
     }
@@ -317,8 +331,21 @@ impl GatewayHealthMonitor {
         self
     }
 
+    /// Back-compat: callers using the old single-interval builder set the
+    /// healthy interval (steady-state probe cadence, what the prior
+    /// implementation used uniformly).
     pub fn with_default_interval(mut self, interval: Duration) -> Self {
-        self.default_interval = interval;
+        self.healthy_interval = interval;
+        self
+    }
+
+    pub fn with_healthy_interval(mut self, interval: Duration) -> Self {
+        self.healthy_interval = interval;
+        self
+    }
+
+    pub fn with_unhealthy_interval(mut self, interval: Duration) -> Self {
+        self.unhealthy_interval = interval;
         self
     }
 
@@ -331,7 +358,8 @@ impl GatewayHealthMonitor {
     pub async fn run(self: Arc<Self>, cancel: CancellationToken) {
         tracing::info!(
             tick_secs = self.tick.as_secs(),
-            default_interval_secs = self.default_interval.as_secs(),
+            healthy_interval_secs = self.healthy_interval.as_secs(),
+            unhealthy_interval_secs = self.unhealthy_interval.as_secs(),
             "gateway_health: monitor started"
         );
         let mut interval = tokio::time::interval(self.tick);
@@ -353,19 +381,22 @@ impl GatewayHealthMonitor {
     }
 
     /// Probe trunks whose last check is older than their per-trunk interval.
+    ///
+    /// Dispatches per-trunk via the [`crate::proxy::health_probers`]
+    /// registry: every kind whose prober is registered gets probed; kinds
+    /// without a prober are silently skipped (logged once at trace level
+    /// to avoid log spam from unsupported kinds). The legacy `Kind.eq("sip")`
+    /// filter is gone — non-SIP trunks (e.g. WebRTC) now show real health.
     pub async fn tick_once(&self) -> anyhow::Result<()> {
-        // Default probe = bound real method to the live endpoint.
-        let endpoint = self.endpoint.clone();
         let probe_timeout = self.probe_timeout;
         let probe = move |trunk: TrunkModel| {
-            let endpoint = endpoint.clone();
             async move {
-                match endpoint {
-                    Some(ep) => probe_trunk(&ep, &trunk, probe_timeout).await,
+                match crate::proxy::health_probers::lookup(&trunk.kind) {
+                    Some(prober) => prober.probe(&trunk, probe_timeout).await,
                     None => ProbeOutcome {
                         ok: false,
                         latency_ms: 0,
-                        detail: "no endpoint".into(),
+                        detail: format!("no prober registered for kind '{}'", trunk.kind),
                     },
                 }
             }
@@ -374,7 +405,7 @@ impl GatewayHealthMonitor {
     }
 
     /// Test-friendly tick that accepts an injected probe function so unit
-    /// tests don't need a live SIP endpoint.
+    /// tests don't need a live SIP endpoint or HTTP server.
     pub async fn tick_with_probe<F, Fut>(&self, probe: F) -> anyhow::Result<()>
     where
         F: Fn(TrunkModel) -> Fut,
@@ -382,20 +413,26 @@ impl GatewayHealthMonitor {
     {
         let rows = TrunkEntity::find()
             .filter(TrunkColumn::IsActive.eq(true))
-            // OPTIONS probing only applies to SIP trunks. WebRTC and any
-            // future kinds are skipped here so non-SIP rows never reach
-            // SIP-typed field access below.
-            .filter(TrunkColumn::Kind.eq("sip"))
             .filter(TrunkColumn::Direction.ne(TrunkDirection::Inbound.as_str()))
             .all(&self.db)
             .await?;
 
         let now = Utc::now();
         for trunk in rows {
+            // Pick the effective interval. Precedence:
+            //   1. Per-trunk override (`health_check_interval_secs`) if set.
+            //   2. Status-based default: Healthy → `healthy_interval`,
+            //      everything else (Offline/Warning/Standby) → `unhealthy_interval`.
+            let default_for_status = match trunk.status {
+                TrunkStatus::Healthy => self.healthy_interval,
+                TrunkStatus::Offline | TrunkStatus::Warning | TrunkStatus::Standby => {
+                    self.unhealthy_interval
+                }
+            }
+            .as_secs() as i32;
             let interval_secs = trunk
                 .health_check_interval_secs
-                .unwrap_or(self.default_interval.as_secs() as i32)
-                as i64;
+                .unwrap_or(default_for_status) as i64;
             if interval_secs > 0 {
                 if let Some(last) = trunk.last_health_check_at {
                     if (now - last).num_seconds() < interval_secs {

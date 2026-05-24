@@ -420,6 +420,7 @@
                                 <th scope="col" class="px-4 py-2">{{ "sip_trunk.direction" | t }}</th>
                                 <th scope="col" class="px-4 py-2">{{ "sip_trunk.source_file" | t }}</th>
                                 <th scope="col" class="px-4 py-2">{{ "sip_trunk.state" | t }}</th>
+                                <th scope="col" class="px-4 py-2 text-right">Actions</th>
                             </tr>
                         </thead>
                         <tbody class="divide-y divide-slate-100 bg-white text-slate-600">
@@ -453,6 +454,15 @@
                                                 Disabled
                                             </span>
                                         </template>
+                                    </td>
+                                    <td class="whitespace-nowrap px-4 py-2 text-right">
+                                        <button type="button"
+                                            class="inline-flex items-center gap-1 rounded-md bg-indigo-600 px-2.5 py-1 text-xs font-semibold text-white shadow-sm hover:bg-indigo-500 disabled:cursor-not-allowed disabled:bg-slate-300"
+                                            :disabled="promoting === trunk.name"
+                                            @click="promoteFileTrunk(trunk)">
+                                            <span x-show="promoting !== trunk.name">Promote to DB</span>
+                                            <span x-show="promoting === trunk.name">Promoting…</span>
+                                        </button>
                                     </td>
                                 </tr>
                             </template>
@@ -490,6 +500,7 @@
             error: null,
             flash: null,
             processingDelete: null,
+            promoting: null,
             reloading: false,
             lastReload: null,
             page: 1,
@@ -970,6 +981,40 @@
                         onConfirm: () => this.reloadTrunks(),
                     },
                 }));
+            },
+            async promoteFileTrunk(trunk) {
+                if (!trunk || !trunk.name || this.promoting) {
+                    return;
+                }
+                const endpoint = trunk.promote_url
+                    ? `${this.basePath.replace(/\/$/, '')}${trunk.promote_url}`
+                    : `${this.basePath.replace(/\/$/, '')}/sip-trunk/promote/${encodeURIComponent(trunk.name)}`;
+                if (!window.confirm(`Promote file trunk "${trunk.name}" into the DB?\n\n` +
+                    `The source file (${trunk.source_file}) will be edited to remove this trunk's section.\n` +
+                    `A .bak copy of the file will be left next to it.`)) {
+                    return;
+                }
+                this.promoting = trunk.name;
+                this.error = null;
+                this.flash = null;
+                try {
+                    const response = await fetch(endpoint, {
+                        method: 'POST',
+                        headers: { 'Accept': 'application/json' },
+                        credentials: 'include',
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        throw new Error(data?.message || data?.error || `Promote failed (HTTP ${response.status})`);
+                    }
+                    this.flash = `Promoted "${trunk.name}" — now editable as a DB trunk.`;
+                    await this.fetchTrunks();
+                } catch (err) {
+                    console.error(err);
+                    this.error = err?.message || 'Failed to promote file trunk';
+                } finally {
+                    this.promoting = null;
+                }
             },
             async reloadTrunks() {
                 if (this.reloading) {

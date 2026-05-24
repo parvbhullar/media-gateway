@@ -112,6 +112,7 @@ pub fn router() -> Router<AppState> {
             "/gateways/{name}",
             get(get_gateway).put(update_gateway).delete(delete_gateway),
         )
+        .route("/gateways/{name}/promote", post(promote_file_gateway))
         .route("/diagnostics/trunk-test", post(trunk_test))
 }
 
@@ -522,4 +523,181 @@ async fn delete_gateway(
     refresh_trunks_index(&state).await;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Promote a file-sourced trunk into the DB.
+///
+/// Workflow:
+///   1. Look up the trunk in the in-memory snapshot. Reject if it's not
+///      found, not file-sourced, or sourced from a `*.generated.toml`
+///      (auto-emitted mirror of the DB).
+///   2. Reject if a DB row with the same name already exists.
+///   3. Build `kind` + `kind_config_json` from the in-memory `TrunkConfig`.
+///      For `kind = "sip"`, repack the legacy top-level fields into
+///      `SipTrunkConfig`. For other kinds, pass the existing `kind_config`
+///      blob through (it was loaded from the file as-is).
+///   4. Insert the DB row.
+///   5. Edit the source file to remove the trunk's section.
+///   6. Refresh the in-memory trunks index so the now-DB row shows up in
+///      the editable list and the file mirror disappears.
+///
+/// Shared by the bearer-auth `/api/v1/gateways/{name}/promote` endpoint
+/// (below) and the session-auth `/console/sip-trunk/promote/{name}`
+/// endpoint (`src/console/handlers/sip_trunk.rs`).
+pub async fn promote_file_gateway_inner(
+    state: &AppState,
+    name: &str,
+) -> ApiResult<TrunkModel> {
+    validate_name(name)?;
+    let db = state.db();
+
+    let snapshot = state
+        .sip_server()
+        .inner
+        .data_context
+        .trunks_snapshot();
+    let trunk = snapshot
+        .get(name)
+        .ok_or_else(|| ApiError::not_found(format!("file trunk '{}' not found in snapshot", name)))?
+        .clone();
+
+    let source_path = match &trunk.origin {
+        crate::proxy::routing::ConfigOrigin::File(p) => p.clone(),
+        _ => {
+            return Err(ApiError::bad_request(format!(
+                "trunk '{}' is not file-sourced",
+                name
+            )));
+        }
+    };
+    let is_generated = std::path::Path::new(&source_path)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .is_some_and(|f| f.ends_with(".generated.toml"));
+    if is_generated {
+        return Err(ApiError::bad_request(format!(
+            "trunk '{}' is sourced from {} — that file is auto-generated from \
+             the DB and cannot be promoted",
+            name, source_path
+        )));
+    }
+
+    if trunk_by_name(db, name).await?.is_some() {
+        return Err(ApiError::conflict(format!(
+            "gateway '{}' already exists in DB; cannot promote duplicate from file",
+            name
+        )));
+    }
+
+    let kind = trunk.kind.clone();
+    let kind_config_json: JsonValue = if kind == "sip" {
+        // Repack the legacy top-level SIP fields exposed on `TrunkConfig`
+        // into the `SipTrunkConfig` shape stored in `rustpbx_trunks.kind_config`.
+        let dest_host = trunk
+            .dest
+            .strip_prefix("sip:")
+            .or_else(|| trunk.dest.strip_prefix("sips:"))
+            .unwrap_or(&trunk.dest)
+            .to_string();
+        let transport = match trunk.transport.as_deref() {
+            Some("tcp") => SipTransport::Tcp,
+            Some("tls") => SipTransport::Tls,
+            _ => SipTransport::Udp,
+        };
+        let sip_cfg = SipTrunkConfig {
+            sip_server: Some(dest_host),
+            sip_transport: transport,
+            outbound_proxy: None,
+            auth_username: trunk.username.clone(),
+            auth_password: trunk.password.clone(),
+            register_enabled: trunk.register_enabled.unwrap_or(false),
+            register_expires: trunk.register_expires.map(|v| v as i32),
+            register_extra_headers: None,
+            rewrite_hostport: trunk.rewrite_hostport,
+            did_numbers: None,
+            incoming_from_user_prefix: trunk.incoming_from_user_prefix.clone(),
+            incoming_to_user_prefix: trunk.incoming_to_user_prefix.clone(),
+            default_route_label: None,
+            billing_snapshot: None,
+            analytics: None,
+            carrier: None,
+        };
+        serde_json::to_value(&sip_cfg).map_err(|e| ApiError::internal(e.to_string()))?
+    } else {
+        // Non-SIP kinds carry their full kind_config inside the in-memory
+        // TrunkConfig. Pass it through unchanged.
+        trunk
+            .kind_config
+            .clone()
+            .ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "trunk '{}' (kind={}) is missing kind_config — file is malformed",
+                    name, kind
+                ))
+            })?
+    };
+
+    kind_schemas::validate(&kind, &kind_config_json).map_err(map_kind_validation_err)?;
+
+    let direction = match trunk.direction {
+        Some(crate::proxy::routing::TrunkDirection::Inbound) => SipTrunkDirection::Inbound,
+        Some(crate::proxy::routing::TrunkDirection::Outbound) => SipTrunkDirection::Outbound,
+        Some(crate::proxy::routing::TrunkDirection::Bidirectional) | None => {
+            SipTrunkDirection::Bidirectional
+        }
+    };
+
+    let now = Utc::now();
+    let am = TrunkActiveModel {
+        name: Set(name.to_string()),
+        kind: Set(kind),
+        display_name: Set(None),
+        direction: Set(direction),
+        status: Set(SipTrunkStatus::default()),
+        is_active: Set(!trunk.disabled.unwrap_or(false)),
+        health_check_interval_secs: Set(None),
+        failure_threshold: Set(None),
+        recovery_threshold: Set(None),
+        consecutive_failures: Set(0),
+        consecutive_successes: Set(0),
+        created_at: Set(now),
+        updated_at: Set(now),
+        kind_config: Set(kind_config_json),
+        ..Default::default()
+    };
+    let inserted = am
+        .insert(db)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    // Remove the trunk's section from the source file. Failure here is a
+    // soft error: the DB row already exists, so on the next reload it'll
+    // win over the file (DB has higher precedence in the loader). We log
+    // but still return success so the user gets visible feedback.
+    if let Err(e) = crate::proxy::data_file_ops::remove_trunk_section_from_file(
+        std::path::Path::new(&source_path),
+        name,
+    ) {
+        warn!(
+            error = %e,
+            trunk = %name,
+            file = %source_path,
+            "promote: failed to remove trunk section from source file; DB row inserted, \
+             file unchanged — operator should clean up manually"
+        );
+    }
+
+    refresh_trunks_index(state).await;
+
+    Ok(inserted)
+}
+
+/// Thin axum wrapper exposing `promote_file_gateway_inner` at
+/// `POST /api/v1/gateways/{name}/promote` (bearer-auth path).
+async fn promote_file_gateway(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> ApiResult<(StatusCode, Json<GatewayView>)> {
+    let inserted = promote_file_gateway_inner(&state, &name).await?;
+    Ok((StatusCode::CREATED, Json(GatewayView::from(inserted))))
 }
