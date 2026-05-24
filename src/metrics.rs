@@ -752,6 +752,46 @@ pub mod cc {
     }
 }
 
+pub mod bridge {
+    /// Number of currently-live SIP↔WebRTC bridge sessions (gauge).
+    /// Tracked by incrementing on session insert and decrementing on remove.
+    pub fn inc_active_sessions() {
+        metrics::gauge!("rustpbx_bridge_sessions_active").increment(1.0);
+    }
+
+    pub fn dec_active_sessions() {
+        metrics::gauge!("rustpbx_bridge_sessions_active").decrement(1.0);
+    }
+
+    /// Per-dispatch terminal outcome — one of:
+    /// "success" | "signaling_error" | "rtp_setup_error" | "reply_error".
+    pub fn dispatch_outcome(outcome: &str) {
+        metrics::counter!(
+            "rustpbx_bridge_dispatch_total",
+            "outcome" => outcome.to_string()
+        )
+        .increment(1);
+    }
+
+    /// Time spent in the signaling adapter's offer/answer negotiation.
+    pub fn signaling_latency_seconds(adapter: &str, duration_secs: f64) {
+        metrics::histogram!(
+            "rustpbx_bridge_signaling_latency_seconds",
+            "adapter" => adapter.to_string()
+        )
+        .record(duration_secs);
+    }
+
+    /// BYE-time teardown outcome — "ok" or "teardown_error".
+    pub fn bye_outcome(outcome: &str) {
+        metrics::counter!(
+            "rustpbx_bridge_bye_total",
+            "outcome" => outcome.to_string()
+        )
+        .increment(1);
+    }
+}
+
 pub fn init_static_gauges() {
     let version = crate::version::get_short_version();
     metrics::gauge!("rustpbx_info", "version" => version).set(1.0);
@@ -875,5 +915,15 @@ mod tests {
         cc::autonomous_decision("assign_agent");
 
         cc::no_answer_action_executed("support", "voicemail");
+
+        bridge::inc_active_sessions();
+        bridge::dec_active_sessions();
+        bridge::dispatch_outcome("success");
+        bridge::dispatch_outcome("signaling_error");
+        bridge::dispatch_outcome("rtp_setup_error");
+        bridge::dispatch_outcome("reply_error");
+        bridge::signaling_latency_seconds("http_json", 0.123);
+        bridge::bye_outcome("ok");
+        bridge::bye_outcome("teardown_error");
     }
 }

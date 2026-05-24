@@ -73,3 +73,23 @@ pub async fn lookup_webrtc_close_context(
         .map_err(|e| anyhow!("trunk '{}' webrtc() config parse failed: {}", trunk_name, e))?;
     Ok((cfg.endpoint_url, cfg.auth_header))
 }
+
+/// Read the WebRTC trunk's capacity limits (`max_concurrent`, `max_cps`)
+/// plus its `id`, used as the gate key in
+/// [`crate::proxy::trunk_capacity_state::TrunkCapacityState`]. Returns
+/// `(trunk_id, max_concurrent_as_u32, max_cps_as_u32)`. When both limits
+/// are `None`, the caller is expected to skip the gate entirely.
+pub async fn lookup_webrtc_capacity_limits(
+    db: &DatabaseConnection,
+    trunk_name: &str,
+) -> Result<(i64, Option<u32>, Option<u32>)> {
+    let row = trunk::Entity::find()
+        .filter(trunk::Column::Name.eq(trunk_name))
+        .one(db)
+        .await
+        .map_err(|e| anyhow!("db error looking up trunk '{}': {}", trunk_name, e))?
+        .ok_or_else(|| anyhow!("trunk '{}' not found", trunk_name))?;
+    let max_calls = row.max_concurrent.and_then(|v| u32::try_from(v).ok());
+    let max_cps = row.max_cps.and_then(|v| u32::try_from(v).ok());
+    Ok((row.id, max_calls, max_cps))
+}

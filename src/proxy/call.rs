@@ -1338,14 +1338,72 @@ impl CallModule {
         tx: &mut Transaction,
         trunk_name: &str,
     ) -> Result<(), RouteError> {
+        // Capture CDR-relevant headers up front so they're available on any
+        // error path (capacity reject, dispatch fail, reply fail, ...).
+        // We emit a failure CDR on those returns so missed/blocked calls
+        // are still visible to billing/audit.
+        let cdr_sender = self.inner.server.callrecord_sender.clone();
+        let cdr_call_id = tx
+            .original
+            .call_id_header()
+            .map(|h| h.value().to_string())
+            .unwrap_or_default();
+        let cdr_caller_uri = tx
+            .original
+            .from_header()
+            .ok()
+            .and_then(|h| h.uri().ok())
+            .map(|u| u.to_string())
+            .unwrap_or_default();
+        let cdr_callee_uri = tx.original.uri.to_string();
+        let cdr_from_number = extract_from_user(&tx.original);
+        let cdr_to_number = extract_to_user(&tx.original);
+        let cdr_start = chrono::Utc::now();
+        // Helper closure to emit a failure CDR before returning Err.
+        // Capturing by value so it's reusable from every early-return site.
+        let emit_failure_cdr = |status_code: u16,
+                                hangup_reason: crate::callrecord::CallRecordHangupReason,
+                                reason: Option<String>,
+                                trunk_id: Option<i64>| {
+            crate::proxy::webrtc_bridge_sessions::emit_bridge_call_record(
+                cdr_sender.as_ref(),
+                &crate::proxy::webrtc_bridge_sessions::BridgeCallRecordInfo {
+                    call_id: cdr_call_id.clone(),
+                    caller_uri: cdr_caller_uri.clone(),
+                    callee_uri: cdr_callee_uri.clone(),
+                    from_number: cdr_from_number.clone(),
+                    to_number: cdr_to_number.clone(),
+                    trunk_name: trunk_name.to_string(),
+                    trunk_id,
+                    start_time: cdr_start,
+                    end_time: chrono::Utc::now(),
+                    status_code,
+                    hangup_reason,
+                    last_error_reason: reason,
+                },
+            );
+        };
+
         let offer_body = tx.original.body();
         if offer_body.is_empty() {
+            emit_failure_cdr(
+                400,
+                crate::callrecord::CallRecordHangupReason::Rejected,
+                Some("INVITE missing SDP offer".into()),
+                None,
+            );
             return Err(RouteError::from((
                 anyhow!("INVITE has empty body — webrtc bridge requires SDP offer"),
                 Some(rsipstack::sip::StatusCode::BadRequest),
             )));
         }
         let offer_sdp = std::str::from_utf8(offer_body).map_err(|e| {
+            emit_failure_cdr(
+                400,
+                crate::callrecord::CallRecordHangupReason::Rejected,
+                Some(format!("INVITE body not valid UTF-8: {e}")),
+                None,
+            );
             RouteError::from((
                 anyhow!("INVITE body is not valid UTF-8 SDP: {e}"),
                 Some(rsipstack::sip::StatusCode::BadRequest),
@@ -1353,25 +1411,114 @@ impl CallModule {
         })?;
 
         let db = self.inner.server.database.as_ref().ok_or_else(|| {
+            emit_failure_cdr(
+                500,
+                crate::callrecord::CallRecordHangupReason::Failed,
+                Some("no DB connection".into()),
+                None,
+            );
             RouteError::from((
                 anyhow!("webrtc bridge requires a database connection"),
                 Some(rsipstack::sip::StatusCode::ServerInternalError),
             ))
         })?;
 
+        // Capacity gate: load the trunk row, pull max_concurrent / max_cps,
+        // and try to acquire a permit before doing any expensive setup. If
+        // both limits are unset the gate is skipped (unlimited). Permit is
+        // stashed on the session below so it lives for the call duration
+        // and is released by its Drop impl on BYE-time teardown.
+        let (trunk_id, max_calls, max_cps) =
+            match crate::proxy::webrtc_route_dispatch::lookup_webrtc_capacity_limits(
+                db, trunk_name,
+            )
+            .await
+            {
+                Ok(triple) => triple,
+                Err(e) => {
+                    warn!(trunk = %trunk_name, error = %e,
+                          "failed to load capacity limits; falling through unmetered");
+                    (0i64, None, None)
+                }
+            };
+        let permit_opt = if trunk_id != 0 && (max_calls.is_some() || max_cps.is_some()) {
+            use crate::proxy::trunk_capacity_state::AcquireOutcome;
+            match self
+                .inner
+                .server
+                .trunk_capacity
+                .try_acquire(trunk_id, max_calls, max_cps)
+            {
+                AcquireOutcome::Ok(permit) => Some(permit),
+                AcquireOutcome::CallsExhausted => {
+                    warn!(trunk = %trunk_name, max_calls = ?max_calls,
+                          "webrtc bridge rejected: concurrent-call cap reached");
+                    emit_failure_cdr(
+                        503,
+                        crate::callrecord::CallRecordHangupReason::ServerUnavailable,
+                        Some(format!(
+                            "trunk concurrent-call cap reached (max_calls={:?})",
+                            max_calls
+                        )),
+                        Some(trunk_id),
+                    );
+                    return Err(RouteError::from((
+                        anyhow!(
+                            "trunk '{}' concurrent-call cap reached (max_calls={:?})",
+                            trunk_name,
+                            max_calls
+                        ),
+                        Some(rsipstack::sip::StatusCode::ServiceUnavailable),
+                    )));
+                }
+                AcquireOutcome::CpsExhausted => {
+                    warn!(trunk = %trunk_name, max_cps = ?max_cps,
+                          "webrtc bridge rejected: CPS cap reached");
+                    emit_failure_cdr(
+                        503,
+                        crate::callrecord::CallRecordHangupReason::ServerUnavailable,
+                        Some(format!("trunk CPS cap reached (max_cps={:?})", max_cps)),
+                        Some(trunk_id),
+                    );
+                    return Err(RouteError::from((
+                        anyhow!(
+                            "trunk '{}' CPS cap reached (max_cps={:?})",
+                            trunk_name,
+                            max_cps
+                        ),
+                        Some(rsipstack::sip::StatusCode::ServiceUnavailable),
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+
         let ice_servers = self.inner.server.rtp_config.ice_servers.as_deref();
 
-        let outcome = crate::proxy::webrtc_route_dispatch::dispatch_webrtc_by_name(
+        let outcome = match crate::proxy::webrtc_route_dispatch::dispatch_webrtc_by_name(
             db,
             trunk_name,
             offer_sdp,
             ice_servers,
         )
         .await
-        .map_err(|e| {
-            warn!(trunk = %trunk_name, error = %e, "webrtc bridge dispatch failed");
-            RouteError::from((e, Some(rsipstack::sip::StatusCode::ServiceUnavailable)))
-        })?;
+        {
+            Ok(o) => o,
+            Err(e) => {
+                warn!(trunk = %trunk_name, error = %e, "webrtc bridge dispatch failed");
+                emit_failure_cdr(
+                    503,
+                    crate::callrecord::CallRecordHangupReason::ServerUnavailable,
+                    Some(format!("dispatch failed: {e}")),
+                    Some(trunk_id).filter(|id| *id != 0),
+                );
+                return Err(RouteError::from((
+                    e,
+                    Some(rsipstack::sip::StatusCode::ServiceUnavailable),
+                )));
+            }
+        };
 
         // Recover the trunk's signaling endpoint + auth so the BYE-time
         // `adapter.close` call has the same context the negotiate call used.
@@ -1395,21 +1542,46 @@ impl CallModule {
         // Send 200 OK with the bridge's RTP-side SDP answer as the body.
         // `reply_with` injects the To-tag on the request before responding,
         // so the dialog id is only stable *after* this call returns.
+        //
+        // If `reply_with` fails here the bot has already accepted the
+        // signaling session — close it remotely before returning Err, or
+        // the bot leaks state until its idle timeout.
         let body_bytes = outcome.sip_sdp_answer.clone().into_bytes();
-        tx.reply_with(
-            rsipstack::sip::StatusCode::OK,
-            vec![rsipstack::sip::Header::ContentType(
-                rsipstack::sip::headers::ContentType::from("application/sdp"),
-            )],
-            Some(body_bytes),
-        )
-        .await
-        .map_err(|e| {
-            RouteError::from((
+        if let Err(e) = tx
+            .reply_with(
+                rsipstack::sip::StatusCode::OK,
+                vec![rsipstack::sip::Header::ContentType(
+                    rsipstack::sip::headers::ContentType::from("application/sdp"),
+                )],
+                Some(body_bytes),
+            )
+            .await
+        {
+            crate::metrics::bridge::dispatch_outcome("reply_error");
+            if let Err(close_err) = outcome
+                .adapter
+                .close(&outcome.ctx, &outcome.session)
+                .await
+            {
+                warn!(
+                    trunk = %trunk_name,
+                    error = %close_err,
+                    "reply_with failed and adapter.close also failed; \
+                     bot session may leak until idle timeout"
+                );
+            }
+            emit_failure_cdr(
+                500,
+                crate::callrecord::CallRecordHangupReason::Failed,
+                Some(format!("reply_with failed: {e}")),
+                Some(trunk_id).filter(|id| *id != 0),
+            );
+            return Err(RouteError::from((
                 anyhow!("failed to send 200 OK for webrtc bridge: {e}"),
                 Some(rsipstack::sip::StatusCode::ServerInternalError),
-            ))
-        })?;
+            )));
+        }
+        crate::metrics::bridge::dispatch_outcome("success");
 
         // Compute the dialog id *after* the 200 OK so the local-tag injected
         // by `reply_with` is reflected. Subsequent in-dialog requests (ACK,
@@ -1426,6 +1598,15 @@ impl CallModule {
             session: outcome.session,
             endpoint_url,
             auth_header,
+            _permit: permit_opt,
+            call_id: cdr_call_id.clone(),
+            caller_uri: cdr_caller_uri.clone(),
+            callee_uri: cdr_callee_uri.clone(),
+            from_number: cdr_from_number.clone(),
+            to_number: cdr_to_number.clone(),
+            trunk_name: trunk_name.to_string(),
+            trunk_id: Some(trunk_id).filter(|id| *id != 0),
+            start_time: cdr_start,
         };
         self.inner
             .server
@@ -1462,9 +1643,47 @@ impl CallModule {
             timeout_ms: 5_000,
             protocol: None,
         };
-        if let Err(e) = session.adapter.close(&ctx, &session.session).await {
-            warn!(%dialog_id, error = %e, "webrtc bridge adapter.close failed");
-        }
+        let teardown_ok = match session.adapter.close(&ctx, &session.session).await {
+            Ok(()) => {
+                crate::metrics::bridge::bye_outcome("ok");
+                true
+            }
+            Err(e) => {
+                crate::metrics::bridge::bye_outcome("teardown_error");
+                warn!(%dialog_id, error = %e, "webrtc bridge adapter.close failed");
+                false
+            }
+        };
+
+        // Emit the final CDR. Captures the natural end-of-call disposition
+        // for a successful bridge — duration = end_time - start_time, and
+        // hangup_reason follows teardown outcome.
+        crate::proxy::webrtc_bridge_sessions::emit_bridge_call_record(
+            self.inner.server.callrecord_sender.as_ref(),
+            &crate::proxy::webrtc_bridge_sessions::BridgeCallRecordInfo {
+                call_id: session.call_id.clone(),
+                caller_uri: session.caller_uri.clone(),
+                callee_uri: session.callee_uri.clone(),
+                from_number: session.from_number.clone(),
+                to_number: session.to_number.clone(),
+                trunk_name: session.trunk_name.clone(),
+                trunk_id: session.trunk_id,
+                start_time: session.start_time,
+                end_time: chrono::Utc::now(),
+                status_code: 200,
+                hangup_reason: if teardown_ok {
+                    crate::callrecord::CallRecordHangupReason::ByCaller
+                } else {
+                    crate::callrecord::CallRecordHangupReason::Failed
+                },
+                last_error_reason: if teardown_ok {
+                    None
+                } else {
+                    Some("adapter.close errored at BYE".to_string())
+                },
+            },
+        );
+
         // Dropping `session` drops the last Arc<BridgePeer> clone (assuming
         // nothing else holds one), triggering `BridgePeer::Drop` which
         // cancels the bridge's cancel_token; the forwarding tasks exit.
