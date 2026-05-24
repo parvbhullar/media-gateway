@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement};
-use sea_orm_migration::MigratorTrait;
+use sea_orm_migration::{MigratorTrait, SchemaManager};
+use std::collections::HashSet;
 use std::time::Duration;
 
 pub mod add_did_trunk_group_name_column;
@@ -34,6 +35,7 @@ pub mod routing;
 pub mod routing_tables;
 pub mod migrate_sip_trunks_to_trunks_unified;
 pub mod add_trunks_last_health_check_at;
+pub mod fix_sip_trunk_kind_config_booleans;
 pub mod sip_trunk;
 pub mod trunk;
 pub mod system_config;
@@ -152,12 +154,17 @@ pub async fn create_db(database_url: &str) -> Result<DatabaseConnection> {
         // sea-orm errors when a migration version exists in the tracking table but no
         // corresponding MigrationTrait is registered (e.g. after moving a migration to
         // an addon-specific migrator). These rows are already applied and their tables
-        // exist, so it is safe to ignore the error and proceed.
+        // exist, so it is safe to ignore the error — but `Migrator::up()` exits before
+        // applying any genuinely pending migrations in that case. Fall back to applying
+        // pending registered migrations one by one so a fresh refactor (e.g. trunks
+        // unify) is not blocked by an unrelated orphan row.
         if msg.contains("is missing, this migration has been applied but its file is missing") {
             tracing::warn!(
                 "some previously-applied migrations are no longer registered in the core \
-                 migrator (likely moved to an addon); skipping: {msg}"
+                 migrator (likely moved to an addon); applying pending registered \
+                 migrations individually: {msg}"
             );
+            apply_pending_registered_migrations(&db, database_url).await?;
         } else {
             tracing::error!("failed to run database migrations on {:?}", e);
             return Err(anyhow::anyhow!(
@@ -168,6 +175,73 @@ pub async fn create_db(database_url: &str) -> Result<DatabaseConnection> {
 
 
     Ok(db)
+}
+
+/// Fallback applied when `Migrator::up()` aborts because the DB has orphan
+/// `seaql_migrations` rows whose source files are no longer registered.
+///
+/// `Migrator::up()` calls `get_pending_migrations()`, which fails on the first
+/// orphan and never returns the pending list. Here we bypass that path:
+/// query `seaql_migrations` directly for already-applied versions, then walk
+/// `Migrator::migrations()` and apply any that are missing. Each registered
+/// migration's `up()` is expected to be idempotent (the codebase already
+/// follows that convention — see e.g. `migrate_sip_trunks_to_trunks_unified`).
+async fn apply_pending_registered_migrations(
+    db: &DatabaseConnection,
+    database_url: &str,
+) -> Result<()> {
+    let backend = db.get_database_backend();
+    let table = migration::Migrator::migration_table_name().to_string();
+
+    let select_sql = match backend {
+        DbBackend::Postgres => format!("SELECT version FROM \"{table}\""),
+        DbBackend::MySql => format!("SELECT version FROM `{table}`"),
+        DbBackend::Sqlite => format!("SELECT version FROM \"{table}\""),
+    };
+    let rows = db
+        .query_all(Statement::from_string(backend, select_sql))
+        .await
+        .with_context(|| format!("failed to read {table}"))?;
+    let applied: HashSet<String> = rows
+        .into_iter()
+        .filter_map(|row| row.try_get::<String>("", "version").ok())
+        .collect();
+
+    let manager = SchemaManager::new(db);
+    for boxed in migration::Migrator::migrations() {
+        let name = boxed.name().to_string();
+        if applied.contains(&name) {
+            continue;
+        }
+        tracing::info!("Applying pending migration '{}'", name);
+        boxed.up(&manager).await.map_err(|e| {
+            tracing::error!("failed to apply migration '{}' on {:?}", name, e);
+            anyhow::anyhow!(
+                "failed to apply pending migration '{name}' on {database_url}: {e}"
+            )
+        })?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("SystemTime before UNIX EPOCH!")
+            .as_secs() as i64;
+        let insert_sql = match backend {
+            DbBackend::MySql => format!(
+                "INSERT INTO `{table}` (version, applied_at) VALUES (?, ?)"
+            ),
+            _ => format!(
+                "INSERT INTO \"{table}\" (version, applied_at) VALUES (?, ?)"
+            ),
+        };
+        db.execute(Statement::from_sql_and_values(
+            backend,
+            insert_sql,
+            [name.clone().into(), now.into()],
+        ))
+        .await
+        .with_context(|| format!("failed to record applied migration '{name}'"))?;
+        tracing::info!("Migration '{}' has been applied", name);
+    }
+    Ok(())
 }
 
 /// Applies SQLite PRAGMA settings that improve concurrency and throughput

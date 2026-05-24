@@ -9,8 +9,40 @@
 
 use anyhow::{Result, anyhow, ensure};
 use sea_orm::entity::prelude::*;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+
+/// Deserialize a JSON bool tolerantly: accepts `true`/`false`, `0`/`1`, or
+/// the string forms `"true"`/`"false"`/`"0"`/`"1"`. Needed because the
+/// initial unify migration (`migrate_sip_trunks_to_trunks_unified`) packed
+/// SQLite BOOLEAN columns into `kind_config` JSON via `json_object(...)`,
+/// which emits the raw integer 0/1 rather than a JSON boolean. The
+/// follow-up migration `fix_sip_trunk_kind_config_booleans` repairs the
+/// stored data, but this deserializer keeps us safe against future imports
+/// or migrations producing the same shape.
+fn bool_from_anything<'de, D>(de: D) -> std::result::Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let v = Value::deserialize(de)?;
+    match &v {
+        Value::Bool(b) => Ok(*b),
+        Value::Number(n) => n
+            .as_i64()
+            .map(|i| i != 0)
+            .ok_or_else(|| D::Error::custom(format!("invalid bool number: {n}"))),
+        Value::String(s) => match s.as_str() {
+            "true" | "1" => Ok(true),
+            "false" | "0" => Ok(false),
+            other => Err(D::Error::custom(format!("invalid bool string: {other}"))),
+        },
+        Value::Null => Ok(false),
+        other => Err(D::Error::custom(format!(
+            "invalid bool value: {other}"
+        ))),
+    }
+}
 
 /// Trunk operational status. Renamed from `SipTrunkStatus`; same variants.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, EnumIter, DeriveActiveEnum, Serialize, Deserialize)]
@@ -189,7 +221,7 @@ pub struct SipTrunkConfig {
     pub auth_username: Option<String>,
     #[serde(default)]
     pub auth_password: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "bool_from_anything")]
     pub register_enabled: bool,
     #[serde(default)]
     pub register_expires: Option<i32>,
@@ -197,7 +229,7 @@ pub struct SipTrunkConfig {
     /// `[["Header-Name", "value"], ...]`.
     #[serde(default)]
     pub register_extra_headers: Option<Vec<(String, String)>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "bool_from_anything")]
     pub rewrite_hostport: bool,
     #[serde(default)]
     pub did_numbers: Option<Value>,
@@ -257,6 +289,13 @@ pub struct WebRtcTrunkConfig {
     /// Optional `Authorization` header forwarded to the signaling endpoint.
     #[serde(default)]
     pub auth_header: Option<String>,
+    /// Optional override URL used by the gateway-health probe (HTTP HEAD).
+    /// When set, the prober hits this URL instead of `endpoint_url`. Useful
+    /// when the signaling endpoint only handles `POST` (returns 405 on
+    /// HEAD) and the bot exposes a separate `/healthz` or `/` for
+    /// liveness. Falls back to `endpoint_url` when unset.
+    #[serde(default)]
+    pub health_check_url: Option<String>,
     /// Adapter-specific protocol blob. Shape is validated by the matching
     /// `WebRtcSignalingAdapter::validate_protocol`.
     #[serde(default)]
@@ -270,6 +309,11 @@ impl WebRtcTrunkConfig {
         }
         url::Url::parse(&self.endpoint_url)
             .map_err(|e| ValidationError::custom(format!("endpoint_url is not a valid URL: {e}")))?;
+        if let Some(hc) = &self.health_check_url {
+            url::Url::parse(hc).map_err(|e| {
+                ValidationError::custom(format!("health_check_url is not a valid URL: {e}"))
+            })?;
+        }
         match self.audio_codec.as_str() {
             "opus" | "g722" => {}
             other => {
