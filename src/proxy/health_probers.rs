@@ -199,6 +199,139 @@ impl KindHealthProber for WebRtcHttpJsonProber {
     }
 }
 
+/// LiveKit prober. Two probe strategies, in precedence order:
+///
+/// 1. If `kind_config.health_check_url` is set, send an HTTP `HEAD` to it
+///    and treat any 2xx/3xx as healthy. This is the same shape as the
+///    WebRTC prober and lets operators point at an `/healthz` endpoint on
+///    a sidecar.
+/// 2. Otherwise, parse `kind_config.server_url` (`ws://` or `wss://`) into
+///    host:port and run a TCP connect with the configured
+///    `signaling_timeout_ms` (defaulting to 5s). A successful connect
+///    counts as healthy. This is cheap and avoids consuming a LiveKit
+///    session slot for every probe; it doesn't validate that LiveKit
+///    itself is responding, only that the signaling TCP socket is open.
+pub struct LiveKitProber {
+    client: reqwest::Client,
+}
+
+impl LiveKitProber {
+    pub fn new() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .build()
+                .expect("reqwest::Client::builder should not fail with defaults"),
+        }
+    }
+}
+
+impl Default for LiveKitProber {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Parse a `ws://host[:port]/...` or `wss://host[:port]/...` URL into
+/// `host:port`, defaulting the port to 80 (ws) or 443 (wss) when omitted.
+/// Returns `Err(detail)` on a malformed URL.
+fn ws_url_to_host_port(url: &str) -> Result<String, String> {
+    let parsed = url::Url::parse(url).map_err(|e| format!("invalid server_url: {e}"))?;
+    let scheme = parsed.scheme();
+    let default_port = match scheme {
+        "ws" => 80u16,
+        "wss" => 443u16,
+        other => return Err(format!("server_url scheme '{other}' is not ws/wss")),
+    };
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "server_url has no host".to_string())?;
+    let port = parsed.port().unwrap_or(default_port);
+    Ok(format!("{host}:{port}"))
+}
+
+#[async_trait]
+impl KindHealthProber for LiveKitProber {
+    async fn probe(&self, trunk: &TrunkModel, timeout: Duration) -> ProbeOutcome {
+        let start = std::time::Instant::now();
+
+        // Precedence 1: explicit health_check_url → HTTP HEAD.
+        if let Some(url) = trunk
+            .kind_config
+            .get("health_check_url")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            let result = self.client.head(url).timeout(timeout).send().await;
+            let latency_ms = start.elapsed().as_millis() as u64;
+            return match result {
+                Ok(resp) => {
+                    let status = resp.status();
+                    let detail = format!(
+                        "HEAD {} {}",
+                        status.as_u16(),
+                        status.canonical_reason().unwrap_or("")
+                    );
+                    let ok = status.is_success() || status.is_redirection();
+                    ProbeOutcome { ok, latency_ms, detail }
+                }
+                Err(e) if e.is_timeout() => ProbeOutcome {
+                    ok: false,
+                    latency_ms,
+                    detail: "timeout".into(),
+                },
+                Err(e) => ProbeOutcome {
+                    ok: false,
+                    latency_ms,
+                    detail: format!("http error: {e}"),
+                },
+            };
+        }
+
+        // Precedence 2: TCP connect against server_url's host:port.
+        let server_url = match trunk
+            .kind_config
+            .get("server_url")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            Some(s) => s,
+            None => {
+                return ProbeOutcome {
+                    ok: false,
+                    latency_ms: 0,
+                    detail: "kind_config has neither health_check_url nor server_url".into(),
+                };
+            }
+        };
+        let host_port = match ws_url_to_host_port(server_url) {
+            Ok(hp) => hp,
+            Err(detail) => {
+                return ProbeOutcome { ok: false, latency_ms: 0, detail };
+            }
+        };
+        let connect_fut = tokio::net::TcpStream::connect(&host_port);
+        let result = tokio::time::timeout(timeout, connect_fut).await;
+        let latency_ms = start.elapsed().as_millis() as u64;
+        match result {
+            Ok(Ok(_stream)) => ProbeOutcome {
+                ok: true,
+                latency_ms,
+                detail: format!("tcp connect ok ({host_port})"),
+            },
+            Ok(Err(e)) => ProbeOutcome {
+                ok: false,
+                latency_ms,
+                detail: format!("tcp connect error: {e}"),
+            },
+            Err(_elapsed) => ProbeOutcome {
+                ok: false,
+                latency_ms,
+                detail: "timeout".into(),
+            },
+        }
+    }
+}
+
 /// Register the built-in probers. Call once at boot. The SIP endpoint must
 /// be known by then (it's required for SIP probing).
 pub fn register_builtins(
@@ -206,6 +339,7 @@ pub fn register_builtins(
 ) {
     register("sip", Arc::new(SipProber::new(sip_endpoint)));
     register("webrtc", Arc::new(WebRtcHttpJsonProber::new()));
+    register("livekit", Arc::new(LiveKitProber::new()));
 }
 
 #[cfg(test)]
@@ -290,6 +424,34 @@ mod tests {
         register_builtins(None);
         assert!(lookup("sip").is_some());
         assert!(lookup("webrtc").is_some());
+        assert!(lookup("livekit").is_some());
         assert!(lookup("nonexistent_kind").is_none());
+    }
+
+    #[tokio::test]
+    async fn livekit_prober_reports_missing_urls() {
+        let p = LiveKitProber::new();
+        let t = make_trunk("livekit", json!({}));
+        let out = p.probe(&t, Duration::from_millis(500)).await;
+        assert!(!out.ok);
+        assert!(out.detail.contains("server_url"));
+    }
+
+    #[tokio::test]
+    async fn livekit_prober_rejects_non_ws_scheme() {
+        let p = LiveKitProber::new();
+        let t = make_trunk("livekit", json!({"server_url": "http://example.com"}));
+        let out = p.probe(&t, Duration::from_millis(500)).await;
+        assert!(!out.ok);
+        assert!(out.detail.contains("ws/wss"));
+    }
+
+    #[tokio::test]
+    async fn livekit_prober_tcp_connect_to_bogus_addr_fails() {
+        // 0.0.0.0:1 — connect should fail well within the timeout.
+        let p = LiveKitProber::new();
+        let t = make_trunk("livekit", json!({"server_url": "ws://0.0.0.0:1"}));
+        let out = p.probe(&t, Duration::from_millis(500)).await;
+        assert!(!out.ok);
     }
 }
