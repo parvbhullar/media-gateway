@@ -1,15 +1,16 @@
-//! Per-dialog state for active SIP↔WebRTC bridge sessions.
+//! Per-dialog state for active SIP↔external bridge sessions.
 //!
 //! When the routing matcher resolves an inbound INVITE to a `kind="webrtc"`
-//! trunk and `proxy/call.rs` drives the bridge dispatcher, the resulting
-//! [`BridgePeer`] + signaling session must outlive the INVITE transaction —
-//! they live until BYE (or transport failure) tears the dialog down. This
-//! module is the side-table keyed by [`DialogId`] where that state lives
-//! between INVITE-time setup and BYE-time teardown.
+//! (or, in future, `kind="livekit"`) trunk and `proxy/call.rs` drives the
+//! bridge dispatcher, the resulting [`MediaBridge`] + signaling teardown
+//! action must outlive the INVITE transaction — they live until BYE (or
+//! transport failure) tears the dialog down. This module is the side-table
+//! keyed by [`DialogId`] where that state lives between INVITE-time setup
+//! and BYE-time teardown.
 //!
 //! The regular SIP forward path uses `proxy::active_call_registry`
 //! (`ActiveProxyCallRegistry`) for the same kind of bookkeeping, but those
-//! entries carry a `SipSession` handle — something the WebRTC bridge path
+//! entries carry a `SipSession` handle — something the external bridge path
 //! deliberately doesn't construct (it short-circuits the full SIP forward
 //! machinery). Hence a dedicated, much smaller registry here.
 
@@ -25,40 +26,31 @@ use crate::callrecord::{
     CallDetails, CallRecord, CallRecordHangupReason, CallRecordLastError, CallRecordSender,
     LegTimeline,
 };
-use crate::media::bridge::BridgePeer;
-use crate::proxy::bridge::signaling::{SessionHandle, SignalingContext, WebRtcSignalingAdapter};
+use crate::proxy::bridge::session::{BridgeKind, BridgeTeardown, MediaBridge};
 
-/// Why a webrtc bridge dialog was torn down. Threaded into
+/// Why a bridge dialog was torn down. Threaded into
 /// [`emit_bridge_call_record`] so the final CDR reflects who hung up.
 #[derive(Debug, Clone, Copy)]
 pub enum BridgeHangupCause {
     /// SIP-side BYE (carrier or caller initiated).
     ByCaller,
-    /// WebRTC-side disconnect / bot-initiated teardown.
+    /// Remote-side disconnect / bot-initiated teardown.
     ByCallee,
-    /// adapter.close() errored at teardown time.
+    /// teardown.close() errored at teardown time.
     TeardownFailed,
 }
 
 /// State pinned for the lifetime of a SIP dialog whose INVITE was bridged to
-/// a WebRTC trunk. On BYE we remove the entry, call `adapter.close(...)`,
-/// and drop the `Arc<BridgePeer>` — its [`Drop`] impl cancels the media
-/// forwarding tasks via the bridge's internal cancellation token.
-pub struct WebRtcBridgeSession {
-    /// The wired bridge. Dropping the last clone closes both PeerConnections
-    /// and the forwarding tasks shut down via `cancel_token`.
-    pub bridge: Arc<BridgePeer>,
-    /// Adapter used to negotiate the WebRTC leg — kept for the teardown
-    /// `close(&ctx, &session)` call.
-    pub adapter: Arc<dyn WebRtcSignalingAdapter>,
-    /// Adapter-defined session blob echoed back on close.
-    pub session: SessionHandle,
-    /// Signaling context captured verbatim from the dispatch call —
-    /// preserves endpoint_url, auth_header, timeout_ms, AND the adapter
-    /// `protocol` blob, so `adapter.close()` sees exactly what
-    /// `adapter.negotiate()` saw. Replaces the older endpoint_url +
-    /// auth_header pair which silently dropped the protocol blob.
-    pub ctx: SignalingContext,
+/// an external (WebRTC / LiveKit) trunk. On BYE we remove the entry, call
+/// `teardown.close()`, and drop the bridge — its [`Drop`] impl cancels the
+/// media forwarding tasks via the bridge's internal cancellation token.
+pub struct BridgeSession {
+    /// Media-plane handle. Dropping the last Arc cancels forwarders.
+    pub bridge: Arc<dyn MediaBridge>,
+    /// Signaling-plane teardown action; invoked at BYE time.
+    pub teardown: Box<dyn BridgeTeardown>,
+    /// Which kind of bridge this is. Recorded into CDR metadata.
+    pub kind: BridgeKind,
     /// Capacity-gate permit acquired before dispatch. Dropping it at BYE
     /// time releases the slot back to the trunk's concurrent-call budget.
     /// `None` when both `max_concurrent` and `max_cps` were unset (no
@@ -66,28 +58,14 @@ pub struct WebRtcBridgeSession {
     pub _permit: Option<crate::proxy::trunk_capacity_state::Permit>,
 
     // --- CDR fields ---------------------------------------------------------
-    // Populated at dispatch time and consumed by BYE-time teardown to emit
-    // a CallRecord on the existing CDR pipeline so bridge calls show up in
-    // billing/audit reports alongside regular SIP calls.
-    /// SIP Call-ID of the originating INVITE — used as the CDR `call_id`.
     pub call_id: String,
-    /// Caller URI (From: header) captured from the INVITE.
     pub caller_uri: String,
-    /// Callee URI (Request-URI / To: header) captured from the INVITE.
     pub callee_uri: String,
-    /// User-part of the From URI, surfaced as `from_number`.
     pub from_number: Option<String>,
-    /// User-part of the Request-URI / To URI, surfaced as `to_number`.
     pub to_number: Option<String>,
-    /// Resolved trunk name.
     pub trunk_name: String,
-    /// Resolved trunk DB id. Populates `rustpbx_call_records.sip_trunk_id`.
     pub trunk_id: Option<i64>,
-    /// Dispatch time — becomes the CDR `start_time`. PDD is `answer_time -
-    /// start_time`.
     pub start_time: DateTime<Utc>,
-    /// Wall-clock time the 200 OK was sent back to the SIP carrier — the
-    /// real `answer_time` for the CDR.
     pub answer_time: DateTime<Utc>,
 }
 
@@ -108,14 +86,17 @@ pub struct BridgeCallRecordInfo {
     /// Free-form reason text for failure dispositions; surfaces in
     /// `CallRecordLastError.reason`.
     pub last_error_reason: Option<String>,
-    /// CDR direction. WebRTC-bridge calls arrive as INVITEs on the SIP
+    /// CDR direction. External-bridge calls arrive as INVITEs on the SIP
     /// carrier — from the gateway's perspective these are inbound calls
-    /// being terminated to a WebRTC bot. Default is "inbound".
+    /// being terminated to a bot. Default is "inbound".
     pub direction: BridgeCallDirection,
     /// When 200 OK was actually sent to the carrier — populates
     /// `answer_time`. Falls back to `start_time` when unset (used by
     /// failure-path CDRs where no 200 OK was ever issued).
     pub answer_time: Option<DateTime<Utc>>,
+    /// Which bridge kind produced this record. Surfaced as the `kind`
+    /// metadata field in the CDR.
+    pub kind: BridgeKind,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -134,7 +115,7 @@ impl BridgeCallDirection {
     }
 }
 
-/// Emit a CDR row for a webrtc-bridge dialog. The CDR pipeline is an
+/// Emit a CDR row for an external-bridge dialog. The CDR pipeline is an
 /// actor reachable through an unbounded `CallRecordSender`; a closed
 /// channel logs a warn and is otherwise swallowed — a CDR write must
 /// never fail the call.
@@ -147,8 +128,12 @@ pub fn emit_bridge_call_record(
     };
 
     let mut metadata = HashMap::new();
+    // Retain the legacy "webrtc_bridge" value so existing dashboards keep
+    // matching. New consumers should key on the dedicated `kind` field
+    // (which carries "webrtc" or "livekit").
     metadata.insert("call_type".to_string(), "webrtc_bridge".to_string());
     metadata.insert("trunk_name".to_string(), info.trunk_name.clone());
+    metadata.insert("kind".to_string(), info.kind.as_str().to_string());
 
     let last_error = info
         .last_error_reason
@@ -196,11 +181,11 @@ pub fn emit_bridge_call_record(
     };
 
     if sender.send(record).is_err() {
-        warn!(call_id = %info.call_id, "webrtc bridge CDR send failed (channel closed)");
+        warn!(call_id = %info.call_id, "bridge CDR send failed (channel closed)");
     }
 }
 
-/// Process-wide registry of active webrtc-bridged dialogs.
+/// Process-wide registry of active external-bridge dialogs.
 ///
 /// Backed by `DashMap` — every in-dialog SIP request (BYE/CANCEL/ACK/INFO/
 /// UPDATE/OPTIONS) hits `contains()` on this registry, and a tokio
@@ -208,11 +193,11 @@ pub fn emit_bridge_call_record(
 /// awaitable write lock on insert/remove, serializing them across cores.
 /// `DashMap` shards the hash space so unrelated dialogs don't contend.
 #[derive(Default)]
-pub struct WebRtcBridgeSessions {
-    inner: DashMap<DialogId, WebRtcBridgeSession>,
+pub struct BridgeSessions {
+    inner: DashMap<DialogId, BridgeSession>,
 }
 
-impl WebRtcBridgeSessions {
+impl BridgeSessions {
     pub fn new() -> Self {
         Self::default()
     }
@@ -237,22 +222,21 @@ impl WebRtcBridgeSessions {
     /// id of the originating INVITE. Replaces any existing entry under the
     /// same key (which would only happen for a re-used Call-ID — pathological
     /// but not a panic-worthy condition).
-    pub async fn insert(&self, dialog_id: DialogId, session: WebRtcBridgeSession) {
-        // On replace, the net active count is unchanged — only increment when
-        // the key is genuinely new.
+    pub async fn insert(&self, dialog_id: DialogId, session: BridgeSession) {
+        let kind = session.kind;
         let replaced = self.inner.insert(dialog_id.clone(), session).is_some();
         if replaced {
-            debug!(%dialog_id, "WebRtcBridgeSessions: replaced existing entry");
+            debug!(%dialog_id, "BridgeSessions: replaced existing entry");
         } else {
-            crate::metrics::bridge::inc_active_sessions();
+            crate::metrics::bridge::inc_active_sessions(kind);
         }
     }
 
     /// Remove and return the session for `dialog_id`, if any.
-    pub async fn remove(&self, dialog_id: &DialogId) -> Option<WebRtcBridgeSession> {
+    pub async fn remove(&self, dialog_id: &DialogId) -> Option<BridgeSession> {
         let popped = self.inner.remove(dialog_id).map(|(_, v)| v);
-        if popped.is_some() {
-            crate::metrics::bridge::dec_active_sessions();
+        if let Some(ref s) = popped {
+            crate::metrics::bridge::dec_active_sessions(s.kind);
         }
         popped
     }
@@ -273,7 +257,7 @@ impl WebRtcBridgeSessions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::Value;
+    use async_trait::async_trait;
 
     fn dialog_id(call: &str) -> DialogId {
         DialogId {
@@ -283,49 +267,30 @@ mod tests {
         }
     }
 
-    struct NoopAdapter;
-    #[async_trait::async_trait]
-    impl WebRtcSignalingAdapter for NoopAdapter {
-        async fn negotiate(
-            &self,
-            _ctx: &crate::proxy::bridge::signaling::SignalingContext,
-            _offer_sdp: &str,
-        ) -> Result<
-            crate::proxy::bridge::signaling::NegotiateOutcome,
-            crate::proxy::bridge::signaling::SignalingError,
-        > {
-            unreachable!("test stub")
+    struct NoopMediaBridge;
+    #[async_trait]
+    impl MediaBridge for NoopMediaBridge {
+        async fn start(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn kind(&self) -> BridgeKind {
+            BridgeKind::WebRtc
         }
     }
 
-    fn fake_session() -> WebRtcBridgeSession {
-        use rustrtc::{
-            PeerConnection, RtcConfiguration, TransportMode,
-            config::{AudioCapability, MediaCapabilities, SdpCompatibilityMode, VideoCapability},
-        };
-        let mk = || {
-            PeerConnection::new(RtcConfiguration {
-                transport_mode: TransportMode::Rtp,
-                media_capabilities: Some(MediaCapabilities {
-                    audio: vec![AudioCapability::pcmu()],
-                    video: Vec::<VideoCapability>::new(),
-                    application: None,
-                }),
-                sdp_compatibility: SdpCompatibilityMode::Standard,
-                ..Default::default()
-            })
-        };
-        let bridge = Arc::new(BridgePeer::new("test".into(), mk(), mk()));
-        WebRtcBridgeSession {
-            bridge,
-            adapter: Arc::new(NoopAdapter),
-            session: SessionHandle(Value::Null),
-            ctx: SignalingContext {
-                endpoint_url: "http://127.0.0.1:1/offer".into(),
-                auth_header: None,
-                timeout_ms: 5_000,
-                protocol: None,
-            },
+    struct NoopTeardown;
+    #[async_trait]
+    impl BridgeTeardown for NoopTeardown {
+        async fn close(&self) -> Result<(), crate::proxy::bridge::session::TeardownError> {
+            Ok(())
+        }
+    }
+
+    fn fake_session() -> BridgeSession {
+        BridgeSession {
+            bridge: Arc::new(NoopMediaBridge),
+            teardown: Box::new(NoopTeardown),
+            kind: BridgeKind::WebRtc,
             _permit: None,
             call_id: "test-call".into(),
             caller_uri: "sip:alice@example.com".into(),
@@ -361,6 +326,7 @@ mod tests {
                 last_error_reason: None,
                 direction: BridgeCallDirection::Inbound,
                 answer_time: None,
+                kind: BridgeKind::WebRtc,
             },
         );
         let record = receiver.recv().await.expect("CDR record sent");
@@ -372,6 +338,7 @@ mod tests {
         let md = record.details.metadata.as_ref().unwrap();
         assert_eq!(md.get("call_type").map(String::as_str), Some("webrtc_bridge"));
         assert_eq!(md.get("trunk_name").map(String::as_str), Some("webrtc-bot"));
+        assert_eq!(md.get("kind").map(String::as_str), Some("webrtc"));
     }
 
     #[tokio::test]
@@ -395,6 +362,7 @@ mod tests {
                 last_error_reason: Some("trunk concurrent-call cap reached".into()),
                 direction: BridgeCallDirection::Inbound,
                 answer_time: None,
+                kind: BridgeKind::WebRtc,
             },
         );
         let record = receiver.recv().await.expect("CDR record sent");
@@ -408,7 +376,7 @@ mod tests {
 
     #[tokio::test]
     async fn insert_then_remove_roundtrips() {
-        let reg = WebRtcBridgeSessions::new();
+        let reg = BridgeSessions::new();
         let id = dialog_id("abc");
         assert_eq!(reg.len().await, 0);
         reg.insert(id.clone(), fake_session()).await;

@@ -17,7 +17,10 @@
 //! per-trunk `kind_config.protocol` JSON and are interpreted by the adapter
 //! selected via the trunk's `signaling` field.
 
+pub mod session;
+pub mod common;
 pub mod signaling;
 pub mod webrtc;
+pub mod livekit;
 
 pub use webrtc::dispatch_webrtc;
