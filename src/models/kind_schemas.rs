@@ -20,7 +20,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use serde_json::Value;
 
-use crate::models::trunk::{SipTrunkConfig, WebRtcTrunkConfig};
+use crate::models::trunk::{LiveKitTrunkConfig, SipTrunkConfig, WebRtcTrunkConfig};
 
 #[derive(Debug, thiserror::Error)]
 pub enum KindValidationError {
@@ -121,6 +121,17 @@ pub fn register_builtins() {
             adapter
                 .validate_protocol(cfg.protocol.as_ref())
                 .map_err(|e| KindValidationError::invalid("webrtc", e.to_string()))?;
+            Ok(())
+        }),
+    );
+
+    register(
+        "livekit",
+        Arc::new(|v: &Value| -> Result<(), KindValidationError> {
+            let cfg: LiveKitTrunkConfig = serde_json::from_value(v.clone())
+                .map_err(|e| KindValidationError::invalid("livekit", e.to_string()))?;
+            cfg.validate()
+                .map_err(|e| KindValidationError::invalid("livekit", e.to_string()))?;
             Ok(())
         }),
     );

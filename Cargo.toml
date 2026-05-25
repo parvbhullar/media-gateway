@@ -187,6 +187,8 @@ aws-lc-rs = { version = "1", optional = true }
 totp-rs = { version = "5.7.1", features = ["qr", "gen_secret"] }
 ldap3 = { version = "0.12.1", optional = true }
 ring = { version = "0.17", optional = true }
+livekit = { version = "0.7", default-features = false, features = ["rustls-tls-webpki-roots"] }
+livekit-api = { version = "0.4", default-features = false, features = ["access-token", "services-tokio", "signal-client-tokio", "rustls-tls-webpki-roots"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

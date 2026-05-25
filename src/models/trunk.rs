@@ -188,6 +188,18 @@ impl Model {
         serde_json::from_value(self.kind_config.clone())
             .map_err(|e| anyhow!("failed to deserialize WebRtcTrunkConfig from kind_config: {e}"))
     }
+
+    /// Typed view of this row's `kind_config` as a `LiveKitTrunkConfig`.
+    /// Errors if `kind != "livekit"` or the JSON does not match the schema.
+    pub fn livekit(&self) -> Result<LiveKitTrunkConfig> {
+        ensure!(
+            self.kind == "livekit",
+            "kind mismatch: expected 'livekit', got '{}'",
+            self.kind
+        );
+        serde_json::from_value(self.kind_config.clone())
+            .map_err(|e| anyhow!("failed to deserialize LiveKitTrunkConfig from kind_config: {e}"))
+    }
 }
 
 /// Lightweight schema validation error type used by per-kind validators
@@ -335,5 +347,186 @@ impl WebRtcTrunkConfig {
             ));
         }
         Ok(())
+    }
+}
+
+/// Configuration shape for `kind = "livekit"` trunks. Serialized as JSON in
+/// the `trunks.kind_config` column. See spec:
+/// `docs/superpowers/specs/2026-05-25-livekit-trunk-design.md`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct LiveKitTrunkConfig {
+    /// LiveKit signaling URL — ws:// or wss://
+    pub server_url: String,
+    /// LiveKit API key.
+    pub api_key: String,
+    /// LiveKit API secret (used for JWT mint + admin RPCs).
+    pub api_secret: String,
+    /// Templated room name. Supported vars: {call_id} {from_user} {to_user}
+    /// {did} {trunk_name}.
+    pub room_template: String,
+    /// Templated participant identity. Same supported vars.
+    pub identity_template: String,
+    /// Optional templated metadata. Must be valid JSON after substitution.
+    #[serde(default)]
+    pub metadata_template: Option<String>,
+    /// Audio codec on the LiveKit publish track. Validated against the
+    /// allow-list (currently: opus, g722).
+    #[serde(default = "default_audio_codec")]
+    pub audio_codec: String,
+    /// Optional HTTP webhook called before the LiveKit room connect. The
+    /// response follows the Decision API contract — see spec.
+    #[serde(default)]
+    pub dispatch_endpoint: Option<String>,
+    /// Optional Authorization header for the webhook.
+    #[serde(default)]
+    pub dispatch_endpoint_auth_header: Option<String>,
+    /// Optional adapter-specific protocol blob for the webhook — mirrors
+    /// the WebRtc HttpJsonProtocol shape; supports request_body_template.
+    #[serde(default)]
+    pub dispatch_endpoint_protocol: Option<Value>,
+    /// If true, schema-validation OR transport failures on the webhook
+    /// abort the call. If false (default), transient failures fall back
+    /// to "accept with no overrides" — schema failures still always abort.
+    #[serde(default)]
+    pub require_webhook_ack: bool,
+    /// Optional URL for kind-aware health probing. Falls back to TCP-connect
+    /// against `server_url`'s host:port when unset.
+    #[serde(default)]
+    pub health_check_url: Option<String>,
+    /// Per-trunk signaling timeout in milliseconds. Defaults to 5000.
+    /// Applies to both the optional webhook POST and the LiveKit
+    /// Room::connect handshake.
+    #[serde(default)]
+    pub signaling_timeout_ms: Option<u64>,
+    /// If true, when the SIP call ends we additionally call the LiveKit
+    /// RoomService::delete_room admin RPC. Useful for single-use rooms.
+    /// Default false: leave the room alive for other participants.
+    #[serde(default)]
+    pub delete_room_on_hangup: bool,
+}
+
+impl LiveKitTrunkConfig {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.server_url.trim().is_empty() {
+            return Err(ValidationError::custom("server_url must not be empty"));
+        }
+        if !(self.server_url.starts_with("ws://") || self.server_url.starts_with("wss://")) {
+            return Err(ValidationError::custom(
+                "server_url must be ws:// or wss://",
+            ));
+        }
+        if self.api_key.trim().is_empty() {
+            return Err(ValidationError::custom("api_key must not be empty"));
+        }
+        if self.api_secret.trim().is_empty() {
+            return Err(ValidationError::custom("api_secret must not be empty"));
+        }
+        if self.room_template.trim().is_empty() {
+            return Err(ValidationError::custom("room_template must not be empty"));
+        }
+        if self.identity_template.trim().is_empty() {
+            return Err(ValidationError::custom("identity_template must not be empty"));
+        }
+        match self.audio_codec.as_str() {
+            "opus" | "g722" => {}
+            other => {
+                return Err(ValidationError::custom(format!(
+                    "audio_codec '{other}' not supported (allowed: opus, g722)"
+                )));
+            }
+        }
+        if let Some(md) = &self.metadata_template {
+            // Validate that after substituting placeholder values, the
+            // template parses as JSON. Replace known {var} placeholders
+            // with a harmless JSON-string value before parsing.
+            let probe = md
+                .replace("{call_id}", "_")
+                .replace("{from_user}", "_")
+                .replace("{to_user}", "_")
+                .replace("{did}", "_")
+                .replace("{trunk_name}", "_");
+            serde_json::from_str::<Value>(&probe).map_err(|e| {
+                ValidationError::custom(format!(
+                    "metadata_template must be valid JSON after substitution: {e}"
+                ))
+            })?;
+        }
+        if let Some(url) = &self.health_check_url {
+            url::Url::parse(url).map_err(|e| {
+                ValidationError::custom(format!("health_check_url not a URL: {e}"))
+            })?;
+        }
+        if let Some(url) = &self.dispatch_endpoint {
+            url::Url::parse(url).map_err(|e| {
+                ValidationError::custom(format!("dispatch_endpoint not a URL: {e}"))
+            })?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod livekit_config_tests {
+    use super::*;
+
+    fn base() -> LiveKitTrunkConfig {
+        LiveKitTrunkConfig {
+            server_url: "wss://livekit.example.com".to_string(),
+            api_key: "key".to_string(),
+            api_secret: "secret".to_string(),
+            room_template: "room-{call_id}".to_string(),
+            identity_template: "sip-{from_user}".to_string(),
+            metadata_template: None,
+            audio_codec: "opus".to_string(),
+            dispatch_endpoint: None,
+            dispatch_endpoint_auth_header: None,
+            dispatch_endpoint_protocol: None,
+            require_webhook_ack: false,
+            health_check_url: None,
+            signaling_timeout_ms: None,
+            delete_room_on_hangup: false,
+        }
+    }
+
+    #[test]
+    fn rejects_empty_server_url() {
+        let mut cfg = base();
+        cfg.server_url = "".to_string();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_non_ws_scheme() {
+        let mut cfg = base();
+        cfg.server_url = "https://example.com".to_string();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_codec() {
+        let mut cfg = base();
+        cfg.audio_codec = "pcmu".to_string();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_metadata_json() {
+        let mut cfg = base();
+        cfg.metadata_template = Some("{not-json".to_string());
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_valid_config() {
+        let cfg = base();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn accepts_valid_metadata_template_with_vars() {
+        let mut cfg = base();
+        cfg.metadata_template =
+            Some(r#"{"call":"{call_id}","from":"{from_user}"}"#.to_string());
+        assert!(cfg.validate().is_ok());
     }
 }
