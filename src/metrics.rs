@@ -753,40 +753,69 @@ pub mod cc {
 }
 
 pub mod bridge {
-    /// Number of currently-live SIP↔WebRTC bridge sessions (gauge).
+    use crate::proxy::bridge::session::BridgeKind;
+
+    /// Number of currently-live SIP bridge sessions (gauge), labelled by bridge kind.
     /// Tracked by incrementing on session insert and decrementing on remove.
-    pub fn inc_active_sessions() {
-        metrics::gauge!("rustpbx_bridge_sessions_active").increment(1.0);
+    pub fn inc_active_sessions(kind: BridgeKind) {
+        metrics::gauge!(
+            "rustpbx_bridge_sessions_active",
+            "kind" => kind.as_str().to_string()
+        )
+        .increment(1.0);
     }
 
-    pub fn dec_active_sessions() {
-        metrics::gauge!("rustpbx_bridge_sessions_active").decrement(1.0);
+    pub fn dec_active_sessions(kind: BridgeKind) {
+        metrics::gauge!(
+            "rustpbx_bridge_sessions_active",
+            "kind" => kind.as_str().to_string()
+        )
+        .decrement(1.0);
     }
 
     /// Per-dispatch terminal outcome — one of:
     /// "success" | "signaling_error" | "rtp_setup_error" | "reply_error".
-    pub fn dispatch_outcome(outcome: &str) {
+    pub fn dispatch_outcome(kind: BridgeKind, outcome: &str) {
         metrics::counter!(
             "rustpbx_bridge_dispatch_total",
+            "kind" => kind.as_str().to_string(),
             "outcome" => outcome.to_string()
         )
         .increment(1);
     }
 
     /// Time spent in the signaling adapter's offer/answer negotiation.
-    pub fn signaling_latency_seconds(adapter: &str, duration_secs: f64) {
+    pub fn signaling_latency_seconds(kind: BridgeKind, adapter: &str, duration_secs: f64) {
         metrics::histogram!(
             "rustpbx_bridge_signaling_latency_seconds",
+            "kind" => kind.as_str().to_string(),
             "adapter" => adapter.to_string()
         )
         .record(duration_secs);
     }
 
     /// BYE-time teardown outcome — "ok" or "teardown_error".
-    pub fn bye_outcome(outcome: &str) {
+    pub fn bye_outcome(kind: BridgeKind, outcome: &str) {
         metrics::counter!(
             "rustpbx_bridge_bye_total",
+            "kind" => kind.as_str().to_string(),
             "outcome" => outcome.to_string()
+        )
+        .increment(1);
+    }
+
+    /// LiveKit-specific: increment when a publish-track frame is dropped
+    /// (back-pressure on the LiveKit room publisher).
+    pub fn livekit_publish_dropped_frames_inc() {
+        metrics::counter!("rustpbx_bridge_livekit_publish_dropped_frames_total").increment(1);
+    }
+
+    /// LiveKit-specific: increment when the LiveKit room disconnects.
+    /// `cause` should be one of "server" | "network" | "admin".
+    pub fn livekit_room_disconnect_inc(cause: &str) {
+        metrics::counter!(
+            "rustpbx_bridge_livekit_room_disconnect_total",
+            "cause" => cause.to_string()
         )
         .increment(1);
     }
@@ -916,14 +945,24 @@ mod tests {
 
         cc::no_answer_action_executed("support", "voicemail");
 
-        bridge::inc_active_sessions();
-        bridge::dec_active_sessions();
-        bridge::dispatch_outcome("success");
-        bridge::dispatch_outcome("signaling_error");
-        bridge::dispatch_outcome("rtp_setup_error");
-        bridge::dispatch_outcome("reply_error");
-        bridge::signaling_latency_seconds("http_json", 0.123);
-        bridge::bye_outcome("ok");
-        bridge::bye_outcome("teardown_error");
+        use crate::proxy::bridge::session::BridgeKind;
+        bridge::inc_active_sessions(BridgeKind::WebRtc);
+        bridge::dec_active_sessions(BridgeKind::WebRtc);
+        bridge::inc_active_sessions(BridgeKind::LiveKit);
+        bridge::dec_active_sessions(BridgeKind::LiveKit);
+        bridge::dispatch_outcome(BridgeKind::WebRtc, "success");
+        bridge::dispatch_outcome(BridgeKind::WebRtc, "signaling_error");
+        bridge::dispatch_outcome(BridgeKind::WebRtc, "rtp_setup_error");
+        bridge::dispatch_outcome(BridgeKind::WebRtc, "reply_error");
+        bridge::dispatch_outcome(BridgeKind::LiveKit, "success");
+        bridge::signaling_latency_seconds(BridgeKind::WebRtc, "http_json", 0.123);
+        bridge::signaling_latency_seconds(BridgeKind::LiveKit, "livekit", 0.456);
+        bridge::bye_outcome(BridgeKind::WebRtc, "ok");
+        bridge::bye_outcome(BridgeKind::WebRtc, "teardown_error");
+        bridge::bye_outcome(BridgeKind::LiveKit, "ok");
+        bridge::livekit_publish_dropped_frames_inc();
+        bridge::livekit_room_disconnect_inc("server");
+        bridge::livekit_room_disconnect_inc("network");
+        bridge::livekit_room_disconnect_inc("admin");
     }
 }
