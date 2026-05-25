@@ -192,9 +192,21 @@ type DtmfHandler = Arc<dyn Fn(char) + Send + Sync + 'static>;
 
 #[derive(Clone)]
 struct BridgeDtmfSink {
-    endpoint: BridgeEndpoint,
     payload_type: u8,
     handler: DtmfHandler,
+}
+
+/// Two-slot DTMF sink table indexed by [`BridgeEndpoint`] — one sink per
+/// direction. `[0] = WebRtc`, `[1] = Rtp`. Both directions can be installed
+/// independently so a bidirectional bridge (SIP↔WebRTC) can pass DTMF
+/// through verbatim each way.
+type DtmfSinkSlots = [Option<BridgeDtmfSink>; 2];
+
+const fn dtmf_slot_index(endpoint: BridgeEndpoint) -> usize {
+    match endpoint {
+        BridgeEndpoint::WebRtc => 0,
+        BridgeEndpoint::Rtp => 1,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,7 +348,7 @@ pub struct BridgePeer {
     forwarding_started: AtomicBool,
     /// Shared recorder for call recording (written by both bridge directions)
     recorder: Option<Arc<parking_lot::RwLock<Option<Recorder>>>>,
-    dtmf_sink: Arc<parking_lot::RwLock<Option<BridgeDtmfSink>>>,
+    dtmf_sink: Arc<parking_lot::RwLock<DtmfSinkSlots>>,
     /// Audio sender channels for forwarding — fast-path aliases
     webrtc_send: Arc<AsyncMutex<Option<MediaSender>>>,
     rtp_send: Arc<AsyncMutex<Option<MediaSender>>>,
@@ -392,7 +404,7 @@ impl BridgePeer {
             cancel_token: CancellationToken::new(),
             forwarding_started: AtomicBool::new(false),
             recorder: None,
-            dtmf_sink: Arc::new(parking_lot::RwLock::new(None)),
+            dtmf_sink: Arc::new(parking_lot::RwLock::new([None, None])),
             webrtc_send: Arc::new(AsyncMutex::new(None)),
             rtp_send: Arc::new(AsyncMutex::new(None)),
             webrtc_output_state: Arc::new(AsyncMutex::new(OutputState { mode: BRIDGE_OUTPUT_PEER, file_source: None })),
@@ -660,9 +672,8 @@ impl BridgePeer {
         payload_type: u8,
         handler: Arc<dyn Fn(char) + Send + Sync + 'static>,
     ) {
-        let mut sink = self.dtmf_sink.write();
-        *sink = Some(BridgeDtmfSink {
-            endpoint,
+        let mut sinks = self.dtmf_sink.write();
+        sinks[dtmf_slot_index(endpoint)] = Some(BridgeDtmfSink {
             payload_type,
             handler,
         });
@@ -1183,7 +1194,7 @@ impl BridgePeer {
         leg_stats: Arc<LegStats>,
         recorder: Option<Arc<parking_lot::RwLock<Option<Recorder>>>>,
         recorder_leg: Option<RecLeg>,
-        dtmf_sink: Arc<parking_lot::RwLock<Option<BridgeDtmfSink>>>,
+        dtmf_sink: Arc<parking_lot::RwLock<DtmfSinkSlots>>,
         transcoder: Option<Arc<parking_lot::RwLock<Option<Transcoder>>>>,
         transcoder_timing: Option<Arc<parking_lot::RwLock<Option<RtpTiming>>>>,
     ) {
@@ -1325,13 +1336,14 @@ impl BridgePeer {
                                         // Telephone-event (DTMF) MUST NOT go through
                                         // audio transcoding — it has its own codec format
                                         // that the G.729/PCMU decoder cannot interpret.
-                                        let is_dtmf = dtmf_sink
-                                            .read()
-                                            .as_ref()
-                                            .filter(|s| s.endpoint == path.source_endpoint())
-                                            .map_or(false, |s| {
-                                                a.payload_type == Some(s.payload_type)
-                                            });
+                                        let is_dtmf = {
+                                            let guard = dtmf_sink.read();
+                                            guard[dtmf_slot_index(path.source_endpoint())]
+                                                .as_ref()
+                                                .map_or(false, |s| {
+                                                    a.payload_type == Some(s.payload_type)
+                                                })
+                                        };
                                         if is_dtmf {
                                             return None;
                                         }
@@ -1471,17 +1483,18 @@ impl BridgePeer {
     }
 
     fn observe_dtmf_sample(
-        dtmf_sink: &Arc<parking_lot::RwLock<Option<BridgeDtmfSink>>>,
+        dtmf_sink: &Arc<parking_lot::RwLock<DtmfSinkSlots>>,
         endpoint: BridgeEndpoint,
         sample: &MediaSample,
         detector: &mut BridgeDtmfDetector,
     ) {
-        let Some(sink) = dtmf_sink.read().clone() else {
+        let sink = {
+            let guard = dtmf_sink.read();
+            guard[dtmf_slot_index(endpoint)].clone()
+        };
+        let Some(sink) = sink else {
             return;
         };
-        if sink.endpoint != endpoint {
-            return;
-        }
 
         let MediaSample::Audio(frame) = sample else {
             return;
@@ -1509,7 +1522,7 @@ impl BridgePeer {
         leg_stats: Arc<LegStats>,
         recorder: Option<Arc<parking_lot::RwLock<Option<Recorder>>>>,
         recorder_leg: Option<RecLeg>,
-        dtmf_sink: Arc<parking_lot::RwLock<Option<BridgeDtmfSink>>>,
+        dtmf_sink: Arc<parking_lot::RwLock<DtmfSinkSlots>>,
         transcoder: Option<Arc<parking_lot::RwLock<Option<Transcoder>>>>,
         transcoder_timing: Option<Arc<parking_lot::RwLock<Option<RtpTiming>>>>,
     ) {
@@ -3009,8 +3022,8 @@ mod tests {
 
         let cancel = CancellationToken::new();
         let stats: Arc<LegStats> = LegStats::new();
-        let dtmf: Arc<parking_lot::RwLock<Option<BridgeDtmfSink>>> =
-            Arc::new(parking_lot::RwLock::new(None));
+        let dtmf: Arc<parking_lot::RwLock<DtmfSinkSlots>> =
+            Arc::new(parking_lot::RwLock::new([None, None]));
 
         // Run the forwarding loop in a background task
         let task_handle = {
@@ -3111,7 +3124,8 @@ mod tests {
 
         let cancel = CancellationToken::new();
         let stats = LegStats::new();
-        let dtmf = Arc::new(parking_lot::RwLock::new(None));
+        let dtmf: Arc<parking_lot::RwLock<DtmfSinkSlots>> =
+            Arc::new(parking_lot::RwLock::new([None, None]));
 
         let task_handle = {
             let c = cancel.clone();

@@ -289,30 +289,42 @@ pub async fn dispatch_webrtc(
             .map_err(setup_err)?;
 
     // 2. Outbound WebRTC leg as offerer.
+    //
+    // Order matters: ICE gathering does not begin until `set_local_description`
+    // is called (per the WebRTC spec). Awaiting `wait_for_gathering_complete`
+    // *before* that would either return immediately (gathering state == new)
+    // or — worse — produce an offer SDP with no `a=candidate:` lines, which
+    // breaks any peer that doesn't tolerate trickle ICE. Pull the SDP from
+    // `local_description()` *after* gathering so the candidates are folded in.
     let webrtc_pc = build_outbound_webrtc_pc(
         cfg.ice_servers.as_ref(),
         &cfg.audio_codec,
         global_ice_servers,
     )
     .map_err(setup_err)?;
-    webrtc_pc
-        .wait_for_gathering_complete()
-        .await;
     let offer = webrtc_pc
         .create_offer()
         .await
         .map_err(|e| setup_err(anyhow!("create_offer failed on WebRTC leg: {e}")))?;
-    let offer_sdp = offer.to_sdp_string();
     webrtc_pc
         .set_local_description(offer)
         .map_err(|e| setup_err(anyhow!("set_local_description failed on WebRTC leg: {e}")))?;
+    webrtc_pc.wait_for_gathering_complete().await;
+    let offer_sdp = webrtc_pc
+        .local_description()
+        .ok_or_else(|| {
+            setup_err(anyhow!(
+                "WebRTC leg has no local description after gathering"
+            ))
+        })?
+        .to_sdp_string();
 
     // 3. Drive signaling. Time the adapter call so on-call can see signaling
     // latency per adapter as a histogram.
     let ctx = SignalingContext {
         endpoint_url: cfg.endpoint_url.clone(),
         auth_header: cfg.auth_header.clone(),
-        timeout_ms: 5_000,
+        timeout_ms: cfg.signaling_timeout_ms.unwrap_or(5_000),
         protocol: cfg.protocol.clone(),
     };
     let signaling_start = std::time::Instant::now();
@@ -363,6 +375,16 @@ pub async fn dispatch_webrtc(
             .await);
         }
     };
+    // Extract the WebRTC-side telephone-event PT from the bot's answer
+    // *before* we hand the SDP off to `set_remote_description` (which
+    // consumes the value). This is the PT the bot will use when sending
+    // DTMF from the WebRTC side towards us, so the symmetric `dtmf_sink`
+    // on `BridgeEndpoint::WebRtc` keys on it.
+    let webrtc_dtmf_pt: Option<u8> = answer_desc
+        .audio_sections()
+        .flat_map(|sec| sec.to_audio_capabilities())
+        .find(|c| c.codec_name.eq_ignore_ascii_case("telephone-event"))
+        .map(|c| c.payload_type);
     if let Err(e) = webrtc_pc.set_remote_description(answer_desc).await {
         return Err(close_on_setup_failure(
             anyhow!("set_remote_description failed on WebRTC leg: {e}"),
@@ -407,14 +429,18 @@ pub async fn dispatch_webrtc(
         .await);
     }
 
-    // 6. DTMF pass-through (RFC 2833). When the SIP carrier negotiated
-    // `telephone-event`, install a `dtmf_sink` keyed on the SIP leg's
-    // DTMF payload type. The bridge data plane checks this sink on every
-    // incoming RTP sample; when the PT matches, the sample bypasses
-    // audio transcoding (which would corrupt the DTMF event encoding)
-    // and is forwarded verbatim to the WebRTC sender. The sink's handler
-    // is a side-effect log only — actual delivery happens through the
-    // existing RTP forwarding path.
+    // 6. DTMF pass-through (RFC 2833) — install per-direction sinks. Each
+    // sink keys on the PT *the sender* uses on that leg:
+    //   * SIP → WebRTC: `sip_dtmf_pt` is the PT the carrier advertised in
+    //     its INVITE offer (i.e. the PT the carrier will *send* DTMF as).
+    //   * WebRTC → SIP: `webrtc_dtmf_pt` is the PT the bot accepted in its
+    //     answer (i.e. the PT the bot will *send* DTMF as).
+    //
+    // The bridge data plane consults the sink slot for the source endpoint
+    // on every incoming sample; matching packets bypass the audio
+    // transcoder (which would corrupt the telephone-event payload) and
+    // are forwarded verbatim. The sink handler logs only; actual delivery
+    // is the existing forwarding path.
     if let Some(pt) = sip_dtmf_pt {
         let trunk_name_for_log = trunk.name.clone();
         bridge.set_dtmf_sink(
@@ -436,8 +462,32 @@ pub async fn dispatch_webrtc(
     } else {
         tracing::debug!(
             trunk = %trunk.name,
-            "carrier did not offer telephone-event; DTMF pass-through disabled \
-             (DTMF tones would be conveyed as in-band audio only)"
+            "carrier did not offer telephone-event; SIP → WebRTC DTMF pass-through \
+             disabled (DTMF tones would be conveyed as in-band audio only)"
+        );
+    }
+    if let Some(pt) = webrtc_dtmf_pt {
+        let trunk_name_for_log = trunk.name.clone();
+        bridge.set_dtmf_sink(
+            crate::media::bridge::BridgeEndpoint::WebRtc,
+            pt,
+            Arc::new(move |digit: char| {
+                tracing::debug!(
+                    trunk = %trunk_name_for_log,
+                    digit = %digit,
+                    "DTMF event received from WebRTC bot"
+                );
+            }),
+        );
+        tracing::info!(
+            trunk = %trunk.name,
+            dtmf_pt = pt,
+            "DTMF pass-through enabled (RFC 2833) for WebRTC → SIP direction"
+        );
+    } else {
+        tracing::debug!(
+            trunk = %trunk.name,
+            "bot answer omitted telephone-event; WebRTC → SIP DTMF pass-through disabled"
         );
     }
 

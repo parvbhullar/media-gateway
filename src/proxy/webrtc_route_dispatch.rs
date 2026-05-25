@@ -33,13 +33,24 @@ pub async fn dispatch_webrtc_by_name(
     invite_offer_sdp: &str,
     global_ice_servers: Option<&[IceServer]>,
 ) -> Result<DispatchOutcome> {
+    let row = fetch_webrtc_trunk(db, trunk_name).await?;
+    dispatch_webrtc(&row, invite_offer_sdp, global_ice_servers).await
+}
+
+/// Fetch the row for a `kind="webrtc"` trunk, validating it's active and of
+/// the right kind. Callers that need capacity limits, dispatch, and close-
+/// context info should fetch the row once via this helper and reuse it,
+/// rather than running three separate DB round-trips per INVITE.
+pub async fn fetch_webrtc_trunk(
+    db: &DatabaseConnection,
+    trunk_name: &str,
+) -> Result<trunk::Model> {
     let row = trunk::Entity::find()
         .filter(trunk::Column::Name.eq(trunk_name))
         .one(db)
         .await
         .map_err(|e| anyhow!("db error looking up trunk '{}': {}", trunk_name, e))?
         .ok_or_else(|| anyhow!("trunk '{}' not found", trunk_name))?;
-
     if !row.is_active {
         return Err(anyhow!("trunk '{}' is disabled", trunk_name));
     }
@@ -50,35 +61,39 @@ pub async fn dispatch_webrtc_by_name(
             row.kind
         ));
     }
-
-    dispatch_webrtc(&row, invite_offer_sdp, global_ice_servers).await
+    Ok(row)
 }
 
 /// Resolve the WebRTC trunk's signaling endpoint URL + auth header from the
 /// DB. Used by the BYE-time teardown path to build a `SignalingContext`
 /// matching the one used at `negotiate` time without re-running the full
 /// dispatcher. Returns `(endpoint_url, auth_header)`.
+///
+/// Prefer stashing `DispatchOutcome.ctx` directly on the session — that
+/// preserves the adapter `protocol` blob too, which this helper drops.
 pub async fn lookup_webrtc_close_context(
     db: &DatabaseConnection,
     trunk_name: &str,
 ) -> Result<(String, Option<String>)> {
-    let row = trunk::Entity::find()
-        .filter(trunk::Column::Name.eq(trunk_name))
-        .one(db)
-        .await
-        .map_err(|e| anyhow!("db error looking up trunk '{}': {}", trunk_name, e))?
-        .ok_or_else(|| anyhow!("trunk '{}' not found", trunk_name))?;
+    let row = fetch_webrtc_trunk(db, trunk_name).await?;
     let cfg = row
         .webrtc()
         .map_err(|e| anyhow!("trunk '{}' webrtc() config parse failed: {}", trunk_name, e))?;
     Ok((cfg.endpoint_url, cfg.auth_header))
 }
 
-/// Read the WebRTC trunk's capacity limits (`max_concurrent`, `max_cps`)
-/// plus its `id`, used as the gate key in
-/// [`crate::proxy::trunk_capacity_state::TrunkCapacityState`]. Returns
-/// `(trunk_id, max_concurrent_as_u32, max_cps_as_u32)`. When both limits
-/// are `None`, the caller is expected to skip the gate entirely.
+/// Extract `(trunk_id, max_concurrent, max_cps)` from a pre-loaded trunk row.
+/// When both limits are `None`, the caller is expected to skip the gate
+/// entirely.
+pub fn capacity_limits_for(row: &trunk::Model) -> (i64, Option<u32>, Option<u32>) {
+    let max_calls = row.max_concurrent.and_then(|v| u32::try_from(v).ok());
+    let max_cps = row.max_cps.and_then(|v| u32::try_from(v).ok());
+    (row.id, max_calls, max_cps)
+}
+
+/// Back-compat wrapper for the integration tests that fetched limits by
+/// name directly. New code on the hot path should call
+/// [`fetch_webrtc_trunk`] once and then [`capacity_limits_for`].
 pub async fn lookup_webrtc_capacity_limits(
     db: &DatabaseConnection,
     trunk_name: &str,
@@ -89,7 +104,5 @@ pub async fn lookup_webrtc_capacity_limits(
         .await
         .map_err(|e| anyhow!("db error looking up trunk '{}': {}", trunk_name, e))?
         .ok_or_else(|| anyhow!("trunk '{}' not found", trunk_name))?;
-    let max_calls = row.max_concurrent.and_then(|v| u32::try_from(v).ok());
-    let max_cps = row.max_cps.and_then(|v| u32::try_from(v).ok());
-    Ok((row.id, max_calls, max_cps))
+    Ok(capacity_limits_for(&row))
 }

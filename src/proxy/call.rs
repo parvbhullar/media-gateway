@@ -1338,6 +1338,12 @@ impl CallModule {
         tx: &mut Transaction,
         trunk_name: &str,
     ) -> Result<(), RouteError> {
+        use crate::callrecord::CallRecordHangupReason;
+        use crate::proxy::webrtc_bridge_sessions::{
+            BridgeCallDirection, BridgeCallRecordInfo, WebRtcBridgeSession,
+            emit_bridge_call_record,
+        };
+
         // Capture CDR-relevant headers up front so they're available on any
         // error path (capacity reject, dispatch fail, reply fail, ...).
         // We emit a failure CDR on those returns so missed/blocked calls
@@ -1360,14 +1366,13 @@ impl CallModule {
         let cdr_to_number = extract_to_user(&tx.original);
         let cdr_start = chrono::Utc::now();
         // Helper closure to emit a failure CDR before returning Err.
-        // Capturing by value so it's reusable from every early-return site.
         let emit_failure_cdr = |status_code: u16,
-                                hangup_reason: crate::callrecord::CallRecordHangupReason,
+                                hangup_reason: CallRecordHangupReason,
                                 reason: Option<String>,
                                 trunk_id: Option<i64>| {
-            crate::proxy::webrtc_bridge_sessions::emit_bridge_call_record(
+            emit_bridge_call_record(
                 cdr_sender.as_ref(),
-                &crate::proxy::webrtc_bridge_sessions::BridgeCallRecordInfo {
+                &BridgeCallRecordInfo {
                     call_id: cdr_call_id.clone(),
                     caller_uri: cdr_caller_uri.clone(),
                     callee_uri: cdr_callee_uri.clone(),
@@ -1380,6 +1385,8 @@ impl CallModule {
                     status_code,
                     hangup_reason,
                     last_error_reason: reason,
+                    direction: BridgeCallDirection::Inbound,
+                    answer_time: None,
                 },
             );
         };
@@ -1388,7 +1395,7 @@ impl CallModule {
         if offer_body.is_empty() {
             emit_failure_cdr(
                 400,
-                crate::callrecord::CallRecordHangupReason::Rejected,
+                CallRecordHangupReason::Rejected,
                 Some("INVITE missing SDP offer".into()),
                 None,
             );
@@ -1400,7 +1407,7 @@ impl CallModule {
         let offer_sdp = std::str::from_utf8(offer_body).map_err(|e| {
             emit_failure_cdr(
                 400,
-                crate::callrecord::CallRecordHangupReason::Rejected,
+                CallRecordHangupReason::Rejected,
                 Some(format!("INVITE body not valid UTF-8: {e}")),
                 None,
             );
@@ -1413,7 +1420,7 @@ impl CallModule {
         let db = self.inner.server.database.as_ref().ok_or_else(|| {
             emit_failure_cdr(
                 500,
-                crate::callrecord::CallRecordHangupReason::Failed,
+                CallRecordHangupReason::Failed,
                 Some("no DB connection".into()),
                 None,
             );
@@ -1423,25 +1430,37 @@ impl CallModule {
             ))
         })?;
 
-        // Capacity gate: load the trunk row, pull max_concurrent / max_cps,
-        // and try to acquire a permit before doing any expensive setup. If
-        // both limits are unset the gate is skipped (unlimited). Permit is
-        // stashed on the session below so it lives for the call duration
-        // and is released by its Drop impl on BYE-time teardown.
+        // Single DB fetch — capacity, dispatch, AND close-context all read
+        // from this one row. Previously each of these went through its own
+        // round-trip per INVITE.
+        let trunk_row = match crate::proxy::webrtc_route_dispatch::fetch_webrtc_trunk(
+            db, trunk_name,
+        )
+        .await
+        {
+            Ok(row) => row,
+            Err(e) => {
+                warn!(trunk = %trunk_name, error = %e, "webrtc trunk lookup failed");
+                emit_failure_cdr(
+                    503,
+                    CallRecordHangupReason::ServerUnavailable,
+                    Some(format!("trunk lookup failed: {e}")),
+                    None,
+                );
+                return Err(RouteError::from((
+                    e,
+                    Some(rsipstack::sip::StatusCode::ServiceUnavailable),
+                )));
+            }
+        };
         let (trunk_id, max_calls, max_cps) =
-            match crate::proxy::webrtc_route_dispatch::lookup_webrtc_capacity_limits(
-                db, trunk_name,
-            )
-            .await
-            {
-                Ok(triple) => triple,
-                Err(e) => {
-                    warn!(trunk = %trunk_name, error = %e,
-                          "failed to load capacity limits; falling through unmetered");
-                    (0i64, None, None)
-                }
-            };
-        let permit_opt = if trunk_id != 0 && (max_calls.is_some() || max_cps.is_some()) {
+            crate::proxy::webrtc_route_dispatch::capacity_limits_for(&trunk_row);
+
+        // Capacity gate. Acquire a permit before any expensive setup; drop
+        // it (refund the CPS token + active counter) on any subsequent
+        // failure path so a stream of failing INVITEs doesn't drain the
+        // bucket and starve legitimate traffic.
+        let permit_opt = if max_calls.is_some() || max_cps.is_some() {
             use crate::proxy::trunk_capacity_state::AcquireOutcome;
             match self
                 .inner
@@ -1455,7 +1474,7 @@ impl CallModule {
                           "webrtc bridge rejected: concurrent-call cap reached");
                     emit_failure_cdr(
                         503,
-                        crate::callrecord::CallRecordHangupReason::ServerUnavailable,
+                        CallRecordHangupReason::ServerUnavailable,
                         Some(format!(
                             "trunk concurrent-call cap reached (max_calls={:?})",
                             max_calls
@@ -1476,7 +1495,7 @@ impl CallModule {
                           "webrtc bridge rejected: CPS cap reached");
                     emit_failure_cdr(
                         503,
-                        crate::callrecord::CallRecordHangupReason::ServerUnavailable,
+                        CallRecordHangupReason::ServerUnavailable,
                         Some(format!("trunk CPS cap reached (max_cps={:?})", max_cps)),
                         Some(trunk_id),
                     );
@@ -1496,58 +1515,49 @@ impl CallModule {
 
         let ice_servers = self.inner.server.rtp_config.ice_servers.as_deref();
 
-        let outcome = match crate::proxy::webrtc_route_dispatch::dispatch_webrtc_by_name(
-            db,
-            trunk_name,
-            offer_sdp,
-            ice_servers,
-        )
-        .await
-        {
-            Ok(o) => o,
-            Err(e) => {
-                warn!(trunk = %trunk_name, error = %e, "webrtc bridge dispatch failed");
-                emit_failure_cdr(
-                    503,
-                    crate::callrecord::CallRecordHangupReason::ServerUnavailable,
-                    Some(format!("dispatch failed: {e}")),
-                    Some(trunk_id).filter(|id| *id != 0),
-                );
-                return Err(RouteError::from((
-                    e,
-                    Some(rsipstack::sip::StatusCode::ServiceUnavailable),
-                )));
-            }
-        };
-
-        // Recover the trunk's signaling endpoint + auth so the BYE-time
-        // `adapter.close` call has the same context the negotiate call used.
-        // Failing here is non-fatal — the bridge is already running; we
-        // just won't be able to invoke adapter.close cleanly.
-        let (endpoint_url, auth_header) =
-            match crate::proxy::webrtc_route_dispatch::lookup_webrtc_close_context(
-                db, trunk_name,
-            )
-            .await
+        let outcome =
+            match crate::proxy::bridge::dispatch_webrtc(&trunk_row, offer_sdp, ice_servers)
+                .await
             {
-                Ok(pair) => pair,
+                Ok(o) => o,
                 Err(e) => {
-                    warn!(trunk = %trunk_name, error = %e,
-                          "failed to capture webrtc close context; \
-                           bridge running but adapter.close() will use empty URL");
-                    (String::new(), None)
+                    warn!(trunk = %trunk_name, error = %e, "webrtc bridge dispatch failed");
+                    // Drop the permit *before* the CDR emission so the
+                    // CPS bucket is credited back. Otherwise a series of
+                    // failing dispatches would drain it and starve real
+                    // traffic.
+                    drop(permit_opt);
+                    emit_failure_cdr(
+                        503,
+                        CallRecordHangupReason::ServerUnavailable,
+                        Some(format!("dispatch failed: {e}")),
+                        Some(trunk_id),
+                    );
+                    return Err(RouteError::from((
+                        e,
+                        Some(rsipstack::sip::StatusCode::ServiceUnavailable),
+                    )));
                 }
             };
 
-        // Send 200 OK with the bridge's RTP-side SDP answer as the body.
-        // `reply_with` injects the To-tag on the request before responding,
-        // so the dialog id is only stable *after* this call returns.
+        // Build the session up-front and stash it *before* sending the 200
+        // OK. A racing BYE could otherwise arrive between `reply_with`
+        // returning and the registry insert, a racing BYE dispatched on a
+        // different tokio task could find the registry empty and fall
+        // through to `process_message` (a no-op for bridge dialogs),
+        // orphaning the bridge.
         //
-        // If `reply_with` fails here the bot has already accepted the
-        // signaling session — close it remotely before returning Err, or
-        // the bot leaks state until its idle timeout.
+        // We mitigate by keeping the gap as short as possible: derive the
+        // dialog id and insert immediately after `reply_with`, with no
+        // real async work in between (the DashMap-backed `insert` doesn't
+        // yield). In practice the SIP stack itself takes longer to
+        // dispatch the BYE transaction than this window, so the race is
+        // effectively closed but not formally eliminated. To eliminate
+        // entirely we'd need to either pre-compute the local-tag before
+        // `reply_with` or key the registry on Call-ID rather than full
+        // DialogId — follow-up if we ever observe a real orphan.
         let body_bytes = outcome.sip_sdp_answer.clone().into_bytes();
-        if let Err(e) = tx
+        let reply_result = tx
             .reply_with(
                 rsipstack::sip::StatusCode::OK,
                 vec![rsipstack::sip::Header::ContentType(
@@ -1555,8 +1565,8 @@ impl CallModule {
                 )],
                 Some(body_bytes),
             )
-            .await
-        {
+            .await;
+        if let Err(e) = reply_result {
             crate::metrics::bridge::dispatch_outcome("reply_error");
             if let Err(close_err) = outcome
                 .adapter
@@ -1570,11 +1580,13 @@ impl CallModule {
                      bot session may leak until idle timeout"
                 );
             }
+            // Refund capacity before CDR emission.
+            drop(permit_opt);
             emit_failure_cdr(
                 500,
-                crate::callrecord::CallRecordHangupReason::Failed,
+                CallRecordHangupReason::Failed,
                 Some(format!("reply_with failed: {e}")),
-                Some(trunk_id).filter(|id| *id != 0),
+                Some(trunk_id),
             );
             return Err(RouteError::from((
                 anyhow!("failed to send 200 OK for webrtc bridge: {e}"),
@@ -1582,22 +1594,22 @@ impl CallModule {
             )));
         }
         crate::metrics::bridge::dispatch_outcome("success");
+        let answer_time = chrono::Utc::now();
 
-        // Compute the dialog id *after* the 200 OK so the local-tag injected
+        // Compute the dialog id after the 200 OK so the local-tag injected
         // by `reply_with` is reflected. Subsequent in-dialog requests (ACK,
         // BYE) will derive the same id via TransactionRole::Server.
         let dialog_id = DialogId::try_from((&tx.original, TransactionRole::Server))
             .map_err(|e| RouteError::from((anyhow!(e), None)))?;
 
-        // Stash session state for BYE-time teardown before starting media —
-        // start_bridge is async-but-quick, and we want the registry entry
-        // visible before any chance of a racing BYE.
-        let session = crate::proxy::webrtc_bridge_sessions::WebRtcBridgeSession {
+        // Stash session state for BYE-time teardown. Insert *before*
+        // `start_bridge` so the registry entry is visible before any
+        // chance of a racing BYE.
+        let session = WebRtcBridgeSession {
             bridge: outcome.bridge.clone(),
             adapter: outcome.adapter.clone(),
             session: outcome.session,
-            endpoint_url,
-            auth_header,
+            ctx: outcome.ctx,
             _permit: permit_opt,
             call_id: cdr_call_id.clone(),
             caller_uri: cdr_caller_uri.clone(),
@@ -1605,8 +1617,9 @@ impl CallModule {
             from_number: cdr_from_number.clone(),
             to_number: cdr_to_number.clone(),
             trunk_name: trunk_name.to_string(),
-            trunk_id: Some(trunk_id).filter(|id| *id != 0),
+            trunk_id: Some(trunk_id),
             start_time: cdr_start,
+            answer_time,
         };
         self.inner
             .server
@@ -1626,7 +1639,19 @@ impl CallModule {
     /// dialog matches a stashed webrtc bridge session we drain it, drive
     /// `adapter.close`, and drop the bridge. Teardown errors are logged but
     /// not propagated — the BYE response goes out either way.
-    async fn teardown_webrtc_bridge_if_present(&self, dialog_id: &DialogId) {
+    ///
+    /// `cause` carries why the teardown is happening (SIP-side BYE vs.
+    /// bot-side disconnect) and shapes the final CDR's `hangup_reason`.
+    async fn teardown_webrtc_bridge_if_present(
+        &self,
+        dialog_id: &DialogId,
+        cause: crate::proxy::webrtc_bridge_sessions::BridgeHangupCause,
+    ) {
+        use crate::callrecord::CallRecordHangupReason;
+        use crate::proxy::webrtc_bridge_sessions::{
+            BridgeCallDirection, BridgeCallRecordInfo, BridgeHangupCause,
+            emit_bridge_call_record,
+        };
         let session = match self
             .inner
             .server
@@ -1637,13 +1662,11 @@ impl CallModule {
             Some(s) => s,
             None => return,
         };
-        let ctx = crate::proxy::bridge::signaling::SignalingContext {
-            endpoint_url: session.endpoint_url.clone(),
-            auth_header: session.auth_header.clone(),
-            timeout_ms: 5_000,
-            protocol: None,
-        };
-        let teardown_ok = match session.adapter.close(&ctx, &session.session).await {
+        // `session.ctx` was captured at dispatch time and preserves the
+        // adapter `protocol` blob too — important for adapters that need
+        // the protocol blob during close (extra_headers, close templates,
+        // etc.).
+        let teardown_ok = match session.adapter.close(&session.ctx, &session.session).await {
             Ok(()) => {
                 crate::metrics::bridge::bye_outcome("ok");
                 true
@@ -1655,12 +1678,27 @@ impl CallModule {
             }
         };
 
-        // Emit the final CDR. Captures the natural end-of-call disposition
-        // for a successful bridge — duration = end_time - start_time, and
-        // hangup_reason follows teardown outcome.
-        crate::proxy::webrtc_bridge_sessions::emit_bridge_call_record(
+        // Map the explicit cause + teardown outcome into the CDR hangup
+        // reason. `TeardownFailed` overrides whatever the caller passed,
+        // but only when adapter.close *also* errored (which is the only
+        // signal we have that the call ended unhealthily — SIP BYE itself
+        // is normal).
+        let hangup_reason = match (cause, teardown_ok) {
+            (BridgeHangupCause::ByCaller, true) => CallRecordHangupReason::ByCaller,
+            (BridgeHangupCause::ByCallee, true) => CallRecordHangupReason::ByCallee,
+            (_, false) | (BridgeHangupCause::TeardownFailed, _) => {
+                CallRecordHangupReason::Failed
+            }
+        };
+        let last_error_reason = if teardown_ok {
+            None
+        } else {
+            Some("adapter.close errored at teardown".to_string())
+        };
+
+        emit_bridge_call_record(
             self.inner.server.callrecord_sender.as_ref(),
-            &crate::proxy::webrtc_bridge_sessions::BridgeCallRecordInfo {
+            &BridgeCallRecordInfo {
                 call_id: session.call_id.clone(),
                 caller_uri: session.caller_uri.clone(),
                 callee_uri: session.callee_uri.clone(),
@@ -1671,22 +1709,17 @@ impl CallModule {
                 start_time: session.start_time,
                 end_time: chrono::Utc::now(),
                 status_code: 200,
-                hangup_reason: if teardown_ok {
-                    crate::callrecord::CallRecordHangupReason::ByCaller
-                } else {
-                    crate::callrecord::CallRecordHangupReason::Failed
-                },
-                last_error_reason: if teardown_ok {
-                    None
-                } else {
-                    Some("adapter.close errored at BYE".to_string())
-                },
+                hangup_reason,
+                last_error_reason,
+                direction: BridgeCallDirection::Inbound,
+                answer_time: Some(session.answer_time),
             },
         );
 
         // Dropping `session` drops the last Arc<BridgePeer> clone (assuming
         // nothing else holds one), triggering `BridgePeer::Drop` which
         // cancels the bridge's cancel_token; the forwarding tasks exit.
+        // It also drops the capacity Permit, refunding the active slot.
         info!(%dialog_id, "webrtc bridge torn down");
     }
 
@@ -2791,7 +2824,14 @@ impl ProxyModule for CallModule {
                 // layer (we never built a SipSession for them), so
                 // `process_message` will be a no-op for them. Reply directly
                 // and run teardown so the BYE response goes out.
-                let is_webrtc_bridge_dialog = is_terminating
+                //
+                // Only BYE is treated as a bridge terminator here. A CANCEL
+                // arriving in-dialog (after our 200 OK has gone out) is no
+                // longer protocol-valid as a transaction cancel; let the
+                // transaction layer respond per RFC 3261. Tearing the
+                // bridge down on a stray CANCEL would silently hang up a
+                // healthy established call.
+                let is_bridge_bye = matches!(tx.original.method, rsipstack::sip::Method::Bye)
                     && self
                         .inner
                         .server
@@ -2799,24 +2839,35 @@ impl ProxyModule for CallModule {
                         .contains(&dialog_id)
                         .await;
 
-                if is_webrtc_bridge_dialog {
-                    // Reply 200 OK to the BYE/CANCEL ourselves.
+                if is_bridge_bye {
+                    use crate::proxy::webrtc_bridge_sessions::BridgeHangupCause;
+                    // Reply 200 OK to the BYE ourselves.
                     if let Err(e) = tx
                         .reply_with(rsipstack::sip::StatusCode::OK, vec![], None)
                         .await
                     {
                         warn!(%dialog_id, error = %e, "failed to reply OK to webrtc bridge BYE");
                     }
-                    self.teardown_webrtc_bridge_if_present(&dialog_id).await;
+                    self.teardown_webrtc_bridge_if_present(
+                        &dialog_id,
+                        BridgeHangupCause::ByCaller,
+                    )
+                    .await;
                 } else {
                     if let Err(e) = self.process_message(tx).await {
                         warn!(%dialog_id, method=%tx.original.method, "error process {}\n{}", e, tx.original.to_string());
                     }
                     // Safety net: if a webrtc bridge session somehow exists
                     // for this dialog (shouldn't, given the check above) it
-                    // still gets torn down.
+                    // still gets torn down — treat it as a transport-level
+                    // failure since neither side cleanly hung up.
                     if is_terminating {
-                        self.teardown_webrtc_bridge_if_present(&dialog_id).await;
+                        use crate::proxy::webrtc_bridge_sessions::BridgeHangupCause;
+                        self.teardown_webrtc_bridge_if_present(
+                            &dialog_id,
+                            BridgeHangupCause::TeardownFailed,
+                        )
+                        .await;
                     }
                 }
                 Ok(ProxyAction::Abort)

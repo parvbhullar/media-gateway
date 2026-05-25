@@ -426,8 +426,17 @@ impl SipSession {
     /// host's private source IP on AWS/NAT setups, which the peer can't
     /// route RTP back to. For private callers, use kernel routing to pick
     /// the correct local interface on multi-homed hosts.
+    ///
+    /// Loopback peers (127.0.0.0/8, ::1) bypass the override entirely — we
+    /// only return whatever `external_ip` config explicitly set. Without
+    /// this, the rustrtc track would be told its external IP is 127.0.0.1,
+    /// which changes its socket-bind behaviour and breaks the proxy/RTP
+    /// e2e tests (`test_p2p_*`, `test_wholesale_*`) — those exercise the
+    /// full forward path on loopback and need rustrtc's default address
+    /// selection. Regression introduced by commit `a5385a7 "Fix tcp"`.
     fn caller_facing_ip_str(&self) -> Option<String> {
         match self.caller_peer_ip {
+            Some(ip) if ip.is_loopback() => self.server.rtp_config.external_ip.clone(),
             Some(ip) if crate::proxy::server::is_public_ip(ip) => self
                 .server
                 .rtp_config

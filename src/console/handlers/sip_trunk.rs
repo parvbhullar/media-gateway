@@ -1003,6 +1003,9 @@ fn apply_form_to_active_model(
                 auth_header,
                 health_check_url,
                 protocol,
+                signaling_timeout_ms: existing_webrtc_cfg
+                    .as_ref()
+                    .and_then(|c| c.signaling_timeout_ms),
             };
 
             serde_json::to_value(&webrtc_cfg)

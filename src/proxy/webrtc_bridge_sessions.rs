@@ -17,8 +17,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use dashmap::DashMap;
 use rsipstack::dialog::DialogId;
-use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
 use crate::callrecord::{
@@ -26,7 +26,19 @@ use crate::callrecord::{
     LegTimeline,
 };
 use crate::media::bridge::BridgePeer;
-use crate::proxy::bridge::signaling::{SessionHandle, WebRtcSignalingAdapter};
+use crate::proxy::bridge::signaling::{SessionHandle, SignalingContext, WebRtcSignalingAdapter};
+
+/// Why a webrtc bridge dialog was torn down. Threaded into
+/// [`emit_bridge_call_record`] so the final CDR reflects who hung up.
+#[derive(Debug, Clone, Copy)]
+pub enum BridgeHangupCause {
+    /// SIP-side BYE (carrier or caller initiated).
+    ByCaller,
+    /// WebRTC-side disconnect / bot-initiated teardown.
+    ByCallee,
+    /// adapter.close() errored at teardown time.
+    TeardownFailed,
+}
 
 /// State pinned for the lifetime of a SIP dialog whose INVITE was bridged to
 /// a WebRTC trunk. On BYE we remove the entry, call `adapter.close(...)`,
@@ -41,12 +53,12 @@ pub struct WebRtcBridgeSession {
     pub adapter: Arc<dyn WebRtcSignalingAdapter>,
     /// Adapter-defined session blob echoed back on close.
     pub session: SessionHandle,
-    /// Endpoint URL captured from the trunk's `kind_config` at INVITE time —
-    /// preserved verbatim so the teardown `SignalingContext` matches the one
-    /// used at `negotiate` time.
-    pub endpoint_url: String,
-    /// Auth header captured from the trunk's `kind_config` at INVITE time.
-    pub auth_header: Option<String>,
+    /// Signaling context captured verbatim from the dispatch call —
+    /// preserves endpoint_url, auth_header, timeout_ms, AND the adapter
+    /// `protocol` blob, so `adapter.close()` sees exactly what
+    /// `adapter.negotiate()` saw. Replaces the older endpoint_url +
+    /// auth_header pair which silently dropped the protocol blob.
+    pub ctx: SignalingContext,
     /// Capacity-gate permit acquired before dispatch. Dropping it at BYE
     /// time releases the slot back to the trunk's concurrent-call budget.
     /// `None` when both `max_concurrent` and `max_cps` were unset (no
@@ -71,8 +83,12 @@ pub struct WebRtcBridgeSession {
     pub trunk_name: String,
     /// Resolved trunk DB id. Populates `rustpbx_call_records.sip_trunk_id`.
     pub trunk_id: Option<i64>,
-    /// Dispatch time — becomes the CDR `start_time` / `answer_time`.
+    /// Dispatch time — becomes the CDR `start_time`. PDD is `answer_time -
+    /// start_time`.
     pub start_time: DateTime<Utc>,
+    /// Wall-clock time the 200 OK was sent back to the SIP carrier — the
+    /// real `answer_time` for the CDR.
+    pub answer_time: DateTime<Utc>,
 }
 
 /// Inputs to [`emit_bridge_call_record`]. Grouped in a struct so the
@@ -92,6 +108,30 @@ pub struct BridgeCallRecordInfo {
     /// Free-form reason text for failure dispositions; surfaces in
     /// `CallRecordLastError.reason`.
     pub last_error_reason: Option<String>,
+    /// CDR direction. WebRTC-bridge calls arrive as INVITEs on the SIP
+    /// carrier — from the gateway's perspective these are inbound calls
+    /// being terminated to a WebRTC bot. Default is "inbound".
+    pub direction: BridgeCallDirection,
+    /// When 200 OK was actually sent to the carrier — populates
+    /// `answer_time`. Falls back to `start_time` when unset (used by
+    /// failure-path CDRs where no 200 OK was ever issued).
+    pub answer_time: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub enum BridgeCallDirection {
+    #[default]
+    Inbound,
+    Outbound,
+}
+
+impl BridgeCallDirection {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Inbound => "inbound",
+            Self::Outbound => "outbound",
+        }
+    }
 }
 
 /// Emit a CDR row for a webrtc-bridge dialog. The CDR pipeline is an
@@ -119,7 +159,7 @@ pub fn emit_bridge_call_record(
         });
 
     let details = CallDetails {
-        direction: "outbound".to_string(),
+        direction: info.direction.as_str().to_string(),
         status: if (200..300).contains(&info.status_code) {
             "completed".to_string()
         } else {
@@ -138,7 +178,7 @@ pub fn emit_bridge_call_record(
         start_time: info.start_time,
         ring_time: None,
         answer_time: if (200..300).contains(&info.status_code) {
-            Some(info.start_time)
+            Some(info.answer_time.unwrap_or(info.start_time))
         } else {
             None
         },
@@ -161,9 +201,15 @@ pub fn emit_bridge_call_record(
 }
 
 /// Process-wide registry of active webrtc-bridged dialogs.
+///
+/// Backed by `DashMap` — every in-dialog SIP request (BYE/CANCEL/ACK/INFO/
+/// UPDATE/OPTIONS) hits `contains()` on this registry, and a tokio
+/// `RwLock<HashMap>` would force every one of those requests through an
+/// awaitable write lock on insert/remove, serializing them across cores.
+/// `DashMap` shards the hash space so unrelated dialogs don't contend.
 #[derive(Default)]
 pub struct WebRtcBridgeSessions {
-    inner: RwLock<HashMap<DialogId, WebRtcBridgeSession>>,
+    inner: DashMap<DialogId, WebRtcBridgeSession>,
 }
 
 impl WebRtcBridgeSessions {
@@ -171,15 +217,30 @@ impl WebRtcBridgeSessions {
         Self::default()
     }
 
+    // ---------------------------------------------------------------------
+    // API note: the methods below are `async fn` but internally synchronous —
+    // `DashMap` does its own sharded locking without yielding. The async
+    // signatures are preserved for API consistency with sibling registries
+    // (e.g. `ActiveProxyCallRegistry`) and so a future swap to a genuinely
+    // async backing store (Redis, distributed cache, etc.) won't churn every
+    // call site.
+    //
+    // SAFETY: do NOT hold a DashMap entry/ref guard across a real `.await`
+    // inside these methods or their callers. The inner locks are
+    // `parking_lot::RwLock`s — they cannot yield, and awaiting while one is
+    // held risks deadlocking the runtime worker. The current call sites
+    // only ever take an entry, read/write it, and let it drop before any
+    // `.await`, which is correct.
+    // ---------------------------------------------------------------------
+
     /// Stash a freshly-built bridge session, keyed by the server-side dialog
     /// id of the originating INVITE. Replaces any existing entry under the
     /// same key (which would only happen for a re-used Call-ID — pathological
     /// but not a panic-worthy condition).
     pub async fn insert(&self, dialog_id: DialogId, session: WebRtcBridgeSession) {
-        let mut guard = self.inner.write().await;
         // On replace, the net active count is unchanged — only increment when
         // the key is genuinely new.
-        let replaced = guard.insert(dialog_id.clone(), session).is_some();
+        let replaced = self.inner.insert(dialog_id.clone(), session).is_some();
         if replaced {
             debug!(%dialog_id, "WebRtcBridgeSessions: replaced existing entry");
         } else {
@@ -189,8 +250,7 @@ impl WebRtcBridgeSessions {
 
     /// Remove and return the session for `dialog_id`, if any.
     pub async fn remove(&self, dialog_id: &DialogId) -> Option<WebRtcBridgeSession> {
-        let mut guard = self.inner.write().await;
-        let popped = guard.remove(dialog_id);
+        let popped = self.inner.remove(dialog_id).map(|(_, v)| v);
         if popped.is_some() {
             crate::metrics::bridge::dec_active_sessions();
         }
@@ -201,12 +261,12 @@ impl WebRtcBridgeSessions {
     /// Used by the BYE/CANCEL fast-path to decide whether to short-circuit
     /// the dialog-layer dispatch.
     pub async fn contains(&self, dialog_id: &DialogId) -> bool {
-        self.inner.read().await.contains_key(dialog_id)
+        self.inner.contains_key(dialog_id)
     }
 
     /// Number of live entries (used by tests and diagnostics).
     pub async fn len(&self) -> usize {
-        self.inner.read().await.len()
+        self.inner.len()
     }
 }
 
@@ -260,8 +320,12 @@ mod tests {
             bridge,
             adapter: Arc::new(NoopAdapter),
             session: SessionHandle(Value::Null),
-            endpoint_url: "http://127.0.0.1:1/offer".into(),
-            auth_header: None,
+            ctx: SignalingContext {
+                endpoint_url: "http://127.0.0.1:1/offer".into(),
+                auth_header: None,
+                timeout_ms: 5_000,
+                protocol: None,
+            },
             _permit: None,
             call_id: "test-call".into(),
             caller_uri: "sip:alice@example.com".into(),
@@ -271,6 +335,7 @@ mod tests {
             trunk_name: "trunk-test".into(),
             trunk_id: Some(42),
             start_time: Utc::now(),
+            answer_time: Utc::now(),
         }
     }
 
@@ -294,13 +359,15 @@ mod tests {
                 status_code: 200,
                 hangup_reason: CallRecordHangupReason::ByCaller,
                 last_error_reason: None,
+                direction: BridgeCallDirection::Inbound,
+                answer_time: None,
             },
         );
         let record = receiver.recv().await.expect("CDR record sent");
         assert_eq!(record.call_id, "lifecycle-call");
         assert_eq!(record.status_code, 200);
         assert_eq!(record.details.status, "completed");
-        assert_eq!(record.details.direction, "outbound");
+        assert_eq!(record.details.direction, "inbound");
         assert_eq!(record.details.sip_trunk_id, Some(99));
         let md = record.details.metadata.as_ref().unwrap();
         assert_eq!(md.get("call_type").map(String::as_str), Some("webrtc_bridge"));
@@ -326,6 +393,8 @@ mod tests {
                 status_code: 503,
                 hangup_reason: CallRecordHangupReason::ServerUnavailable,
                 last_error_reason: Some("trunk concurrent-call cap reached".into()),
+                direction: BridgeCallDirection::Inbound,
+                answer_time: None,
             },
         );
         let record = receiver.recv().await.expect("CDR record sent");

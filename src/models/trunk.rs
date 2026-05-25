@@ -300,6 +300,11 @@ pub struct WebRtcTrunkConfig {
     /// `WebRtcSignalingAdapter::validate_protocol`.
     #[serde(default)]
     pub protocol: Option<Value>,
+    /// Per-trunk signaling timeout in milliseconds. Defaults to 5000 when
+    /// unset. Bots that need cold-start time (model load, container spin-up)
+    /// can raise this without touching global config.
+    #[serde(default)]
+    pub signaling_timeout_ms: Option<u64>,
 }
 
 impl WebRtcTrunkConfig {
