@@ -562,6 +562,174 @@ default('RustPBX') }}{% endblock %}
             </div>
             </template>
 
+            <!-- LiveKit kind: shared general fields + LiveKit room config -->
+            <template x-if="form.kind === 'livekit'">
+            <div class="space-y-6">
+                <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
+                    <h2 class="text-sm font-semibold text-slate-900">General</h2>
+                    <div class="mt-4 grid gap-4 md:grid-cols-2">
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Trunk name
+                            <input type="text" x-model.trim="form.name" maxlength="120" required
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="livekit_room_bot">
+                            <span class="text-xs font-normal text-slate-400">Unique identifier used by routing rules.</span>
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Display name
+                            <input type="text" x-model.trim="form.display_name" maxlength="160"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Status
+                            <select x-model="form.status"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <template x-for="option in statusOptions" :key="option.value">
+                                    <option :value="option.value" x-text="option.label"></option>
+                                </template>
+                            </select>
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Direction
+                            <select x-model="form.direction"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <template x-for="option in directionOptions" :key="option.value">
+                                    <option :value="option.value" x-text="option.label"></option>
+                                </template>
+                            </select>
+                        </label>
+                        <div class="flex flex-col gap-2">
+                            <span class="text-sm font-medium text-slate-700">Active</span>
+                            <button type="button" @click="toggleActive()"
+                                class="inline-flex items-center gap-2 rounded-lg px-3 py-1 text-xs font-semibold ring-2 transition"
+                                :class="form.is_active ? 'bg-emerald-50 text-emerald-600 ring-emerald-200' : 'bg-slate-100 text-slate-500 ring-slate-200'">
+                                <span x-text="form.is_active ? 'Enabled' : 'Disabled'"></span>
+                            </button>
+                        </div>
+                    </div>
+                    <label class="mt-4 flex flex-col gap-2 text-sm font-medium text-slate-700">
+                        Description
+                        <textarea rows="2" x-model.trim="form.description"
+                            class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"></textarea>
+                    </label>
+                </section>
+
+                <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
+                    <h2 class="text-sm font-semibold text-slate-900">LiveKit room</h2>
+                    <p class="mt-1 text-sm text-slate-500">Bridges SIP audio into a LiveKit room. Identity/room templates
+                        support {call_id} {from_user} {to_user} {did} {trunk_name}.</p>
+                    <div class="mt-4 grid gap-4 md:grid-cols-2">
+                        <label class="md:col-span-2 flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Server URL
+                            <input type="text" x-model.trim="form.livekit_server_url" maxlength="512" required
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="wss://livekit.example.com">
+                            <span class="text-xs font-normal text-slate-400">LiveKit signaling URL (ws:// or wss://).</span>
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            API key
+                            <input type="text" x-model.trim="form.livekit_api_key" maxlength="256" required
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            API secret
+                            <input type="password" x-model.trim="form.livekit_api_secret" maxlength="256"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="(unchanged when blank on edit)">
+                            <span class="text-xs font-normal text-slate-400">Used to mint participant JWTs and admin RPCs.</span>
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Room template
+                            <input type="text" x-model.trim="form.livekit_room_template" maxlength="256" required
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="room-{call_id}">
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Identity template
+                            <input type="text" x-model.trim="form.livekit_identity_template" maxlength="256" required
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="sip-{from_user}">
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Audio codec
+                            <select x-model="form.livekit_audio_codec"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <template x-for="opt in livekitAudioCodecs" :key="opt">
+                                    <option :value="opt" x-text="opt"></option>
+                                </template>
+                            </select>
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Signaling timeout (ms)
+                            <input type="number" min="0" x-model="form.livekit_signaling_timeout_ms"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="5000">
+                            <span class="text-xs font-normal text-slate-400">Webhook + Room::connect handshake timeout. Default 5000.</span>
+                        </label>
+                        <label class="md:col-span-2 flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Metadata template (JSON)
+                            <textarea rows="3" x-model="form.livekit_metadata_template"
+                                class="font-mono rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder='{"caller":"{from_user}","trunk":"{trunk_name}"}'></textarea>
+                            <span class="text-xs font-normal text-slate-400">Optional. Must parse as JSON after template substitution.</span>
+                        </label>
+                        <label class="md:col-span-2 flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Health-check URL
+                            <input type="text" x-model.trim="form.livekit_health_check_url" maxlength="512"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="https://livekit.example.com/healthz">
+                            <span class="text-xs font-normal text-slate-400">Optional. Falls back to TCP-connect against server_url host:port.</span>
+                        </label>
+                        <div class="md:col-span-2 flex items-center gap-3">
+                            <input type="checkbox" id="livekit_delete_room_on_hangup"
+                                x-model="form.livekit_delete_room_on_hangup"
+                                class="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-300">
+                            <label for="livekit_delete_room_on_hangup" class="text-sm text-slate-700">
+                                Delete LiveKit room on hangup
+                                <span class="block text-xs font-normal text-slate-400">For single-use rooms. Off by default keeps other participants connected.</span>
+                            </label>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
+                    <h2 class="text-sm font-semibold text-slate-900">Dispatch webhook (optional)</h2>
+                    <p class="mt-1 text-sm text-slate-500">Pre-connect HTTP webhook for room overrides. Follows the
+                        Decision API contract.</p>
+                    <div class="mt-4 grid gap-4 md:grid-cols-2">
+                        <label class="md:col-span-2 flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Dispatch endpoint URL
+                            <input type="text" x-model.trim="form.livekit_dispatch_endpoint" maxlength="512"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="https://control.example.com/livekit/dispatch">
+                        </label>
+                        <label class="md:col-span-2 flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Dispatch Authorization header
+                            <input type="text" x-model.trim="form.livekit_dispatch_endpoint_auth_header" maxlength="512"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="Bearer ...">
+                        </label>
+                        <label class="md:col-span-2 flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Dispatch protocol blob (JSON)
+                            <textarea rows="5" x-model="form.livekit_dispatch_endpoint_protocol"
+                                class="font-mono rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder='{"request_body_template":"..."}'></textarea>
+                            <span class="text-xs font-normal text-slate-400">Optional adapter-specific blob — mirrors the WebRTC HttpJsonProtocol shape.</span>
+                        </label>
+                        <div class="md:col-span-2 flex items-center gap-3">
+                            <input type="checkbox" id="livekit_require_webhook_ack"
+                                x-model="form.livekit_require_webhook_ack"
+                                class="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-300">
+                            <label for="livekit_require_webhook_ack" class="text-sm text-slate-700">
+                                Require webhook ack
+                                <span class="block text-xs font-normal text-slate-400">If on, transport failures abort the call. Off (default) treats transients as accept-with-no-overrides.</span>
+                            </label>
+                        </div>
+                    </div>
+                </section>
+            </div>
+            </template>
+
             <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <p class="text-xs text-slate-400">{{ "sip_trunk_detail.save_hint" | t }}</p>
                 <div class="flex items-center gap-3">
@@ -609,9 +777,11 @@ default('RustPBX') }}{% endblock %}
             kindOptions: [
                 { value: 'sip', label: 'SIP' },
                 { value: 'webrtc', label: 'WebRTC' },
+                { value: 'livekit', label: 'LiveKit' },
             ],
             signalingAdapters: [],
             webrtcAudioCodecs: ['opus', 'g722'],
+            livekitAudioCodecs: ['opus', 'g722'],
             form: {
                 kind: 'sip',
                 name: '',
@@ -647,6 +817,20 @@ default('RustPBX') }}{% endblock %}
                 webrtc_health_check_url: '',
                 webrtc_ice_servers: '',
                 webrtc_protocol: '',
+                livekit_server_url: '',
+                livekit_api_key: '',
+                livekit_api_secret: '',
+                livekit_room_template: 'room-{call_id}',
+                livekit_identity_template: 'sip-{from_user}',
+                livekit_metadata_template: '',
+                livekit_audio_codec: 'opus',
+                livekit_dispatch_endpoint: '',
+                livekit_dispatch_endpoint_auth_header: '',
+                livekit_dispatch_endpoint_protocol: '',
+                livekit_require_webhook_ack: false,
+                livekit_health_check_url: '',
+                livekit_signaling_timeout_ms: '',
+                livekit_delete_room_on_hangup: false,
             },
             regStatus: null,
             success: null,
@@ -686,6 +870,10 @@ default('RustPBX') }}{% endblock %}
                     ? this.filters.webrtc_audio_codecs
                     : ['opus', 'g722'];
                 this.webrtcAudioCodecs = codecs.map((c) => String(c));
+                const lkCodecs = Array.isArray(this.filters.livekit_audio_codecs) && this.filters.livekit_audio_codecs.length
+                    ? this.filters.livekit_audio_codecs
+                    : ['opus', 'g722'];
+                this.livekitAudioCodecs = lkCodecs.map((c) => String(c));
             },
             setKind(value) {
                 if (this.mode === 'edit') return;
@@ -737,6 +925,27 @@ default('RustPBX') }}{% endblock %}
                 this.form.webrtc_health_check_url = model.webrtc_health_check_url || '';
                 this.form.webrtc_ice_servers = this.formatJson(model.webrtc_ice_servers);
                 this.form.webrtc_protocol = this.formatJson(model.webrtc_protocol);
+                // LiveKit fields. Server flattens `LiveKitTrunkConfig` into
+                // `livekit_*`-prefixed keys on the model JSON; mirror those
+                // onto the form so editing round-trips cleanly.
+                this.form.livekit_server_url = model.livekit_server_url || '';
+                this.form.livekit_api_key = model.livekit_api_key || '';
+                // API secret never round-trips into the edit form for
+                // safety. Blank means "leave existing secret unchanged" on
+                // submit; user can re-enter to rotate.
+                this.form.livekit_api_secret = '';
+                this.form.livekit_room_template = model.livekit_room_template || 'room-{call_id}';
+                this.form.livekit_identity_template = model.livekit_identity_template || 'sip-{from_user}';
+                this.form.livekit_metadata_template = model.livekit_metadata_template || '';
+                this.form.livekit_audio_codec = model.livekit_audio_codec || 'opus';
+                this.form.livekit_dispatch_endpoint = model.livekit_dispatch_endpoint || '';
+                this.form.livekit_dispatch_endpoint_auth_header = model.livekit_dispatch_endpoint_auth_header || '';
+                this.form.livekit_dispatch_endpoint_protocol = this.formatJson(model.livekit_dispatch_endpoint_protocol);
+                this.form.livekit_require_webhook_ack = model.livekit_require_webhook_ack === true;
+                this.form.livekit_health_check_url = model.livekit_health_check_url || '';
+                this.form.livekit_signaling_timeout_ms = model.livekit_signaling_timeout_ms != null
+                    ? String(model.livekit_signaling_timeout_ms) : '';
+                this.form.livekit_delete_room_on_hangup = model.livekit_delete_room_on_hangup === true;
             },
             get pageTitle() {
                 const td = (this.t || {}).sip_trunk_detail || {};

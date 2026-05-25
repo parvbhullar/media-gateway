@@ -21,6 +21,7 @@ use crate::{
         ActiveModel as SipTrunkActiveModel, Column as SipTrunkColumn, Entity as SipTrunkEntity,
         SipTransport, SipTrunkConfig, SipTrunkDirection, SipTrunkStatus, WebRtcTrunkConfig,
     },
+    models::trunk::LiveKitTrunkConfig,
     proxy::bridge::signaling,
     proxy::routing::ConfigOrigin,
 };
@@ -209,6 +210,16 @@ async fn page_sip_trunk_detail(
                         }
                     }
                 }
+                "livekit" => {
+                    if let Ok(cfg) = model.livekit()
+                        && let (Some(obj), Ok(Value::Object(flat))) =
+                            (model_json.as_object_mut(), serde_json::to_value(&cfg))
+                    {
+                        for (k, v) in flat {
+                            obj.insert(format!("livekit_{k}"), v);
+                        }
+                    }
+                }
                 _ => {
                     warn!("unknown trunk kind '{}' for trunk id={}", model.kind, id);
                 }
@@ -292,7 +303,7 @@ async fn create_sip_trunk(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "sip".to_string());
     if let Err(response) =
-        apply_form_to_active_model(&mut active, &form, now, false, &kind, None, None)
+        apply_form_to_active_model(&mut active, &form, now, false, &kind, None, None, None)
     {
         return response;
     }
@@ -363,6 +374,7 @@ async fn update_sip_trunk(
     let existing_kind = model.kind.clone();
     let existing_sip_cfg = model.sip().ok();
     let existing_webrtc_cfg = model.webrtc().ok();
+    let existing_livekit_cfg = model.livekit().ok();
     let mut active: SipTrunkActiveModel = model.into();
     let now = Utc::now();
     if let Err(response) = apply_form_to_active_model(
@@ -373,6 +385,7 @@ async fn update_sip_trunk(
         &existing_kind,
         existing_sip_cfg,
         existing_webrtc_cfg,
+        existing_livekit_cfg,
     ) {
         return response;
     }
@@ -637,6 +650,15 @@ async fn query_sip_trunks(
                             }
                         }
                     }
+                    "livekit" => {
+                        if let Ok(cfg) = model.livekit()
+                            && let Ok(Value::Object(flat)) = serde_json::to_value(&cfg)
+                        {
+                            for (k, val) in flat {
+                                obj.entry(format!("livekit_{k}")).or_insert(val);
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -727,9 +749,10 @@ async fn build_filters_payload(db: &DatabaseConnection) -> (Value, Vec<Value>) {
             "transports": SipTransport::iter()
                 .map(|transport| transport.as_str())
                 .collect::<Vec<_>>(),
-            "kinds": ["sip", "webrtc"],
+            "kinds": ["sip", "webrtc", "livekit"],
             "signaling_adapters": signaling_adapters,
             "webrtc_audio_codecs": ["opus", "g722"],
+            "livekit_audio_codecs": ["opus", "g722"],
         }),
         tenants,
     )
@@ -806,8 +829,9 @@ fn apply_form_to_active_model(
     kind: &str,
     existing_sip_cfg: Option<SipTrunkConfig>,
     existing_webrtc_cfg: Option<WebRtcTrunkConfig>,
+    existing_livekit_cfg: Option<LiveKitTrunkConfig>,
 ) -> Result<(), Response> {
-    if !matches!(kind, "sip" | "webrtc") {
+    if !matches!(kind, "sip" | "webrtc" | "livekit") {
         return Err(bad_request(format!("unsupported trunk kind '{kind}'")));
     }
     let allowed_ips = parse_list_field(
@@ -1010,6 +1034,141 @@ fn apply_form_to_active_model(
 
             serde_json::to_value(&webrtc_cfg)
                 .map_err(|e| bad_request(format!("failed to serialize WebRTC config: {e}")))?
+        }
+        "livekit" => {
+            // LiveKit validator (`kind_schemas::validate("livekit", ..)`)
+            // deserializes the blob into `LiveKitTrunkConfig` and runs its
+            // `validate()` — so we just assemble the JSON and let the
+            // shared `validate` gate catch malformed inputs.
+            let dispatch_protocol_json = parse_json_field(
+                &form.livekit_dispatch_endpoint_protocol,
+                "livekit_dispatch_endpoint_protocol",
+            )?;
+
+            let server_url = super::normalize_optional_string(&form.livekit_server_url)
+                .or_else(|| existing_livekit_cfg.as_ref().map(|c| c.server_url.clone()))
+                .unwrap_or_default();
+            // Secrets: on update only overwrite when the form posted the
+            // field (allow empty-string to clear). Otherwise carry the
+            // existing value forward.
+            let api_key = if !is_update || form.livekit_api_key.is_some() {
+                super::normalize_optional_string(&form.livekit_api_key).unwrap_or_default()
+            } else {
+                existing_livekit_cfg
+                    .as_ref()
+                    .map(|c| c.api_key.clone())
+                    .unwrap_or_default()
+            };
+            let api_secret = if !is_update || form.livekit_api_secret.is_some() {
+                super::normalize_optional_string(&form.livekit_api_secret).unwrap_or_default()
+            } else {
+                existing_livekit_cfg
+                    .as_ref()
+                    .map(|c| c.api_secret.clone())
+                    .unwrap_or_default()
+            };
+            let room_template = super::normalize_optional_string(&form.livekit_room_template)
+                .or_else(|| {
+                    existing_livekit_cfg.as_ref().map(|c| c.room_template.clone())
+                })
+                .unwrap_or_default();
+            let identity_template = super::normalize_optional_string(&form.livekit_identity_template)
+                .or_else(|| {
+                    existing_livekit_cfg
+                        .as_ref()
+                        .map(|c| c.identity_template.clone())
+                })
+                .unwrap_or_default();
+            let metadata_template = if !is_update || form.livekit_metadata_template.is_some() {
+                super::normalize_optional_string(&form.livekit_metadata_template)
+            } else {
+                existing_livekit_cfg
+                    .as_ref()
+                    .and_then(|c| c.metadata_template.clone())
+            };
+            let audio_codec = super::normalize_optional_string(&form.livekit_audio_codec)
+                .or_else(|| existing_livekit_cfg.as_ref().map(|c| c.audio_codec.clone()))
+                .unwrap_or_else(|| "opus".to_string());
+            let dispatch_endpoint = if !is_update || form.livekit_dispatch_endpoint.is_some() {
+                super::normalize_optional_string(&form.livekit_dispatch_endpoint)
+            } else {
+                existing_livekit_cfg
+                    .as_ref()
+                    .and_then(|c| c.dispatch_endpoint.clone())
+            };
+            let dispatch_endpoint_auth_header = if !is_update
+                || form.livekit_dispatch_endpoint_auth_header.is_some()
+            {
+                super::normalize_optional_string(&form.livekit_dispatch_endpoint_auth_header)
+            } else {
+                existing_livekit_cfg
+                    .as_ref()
+                    .and_then(|c| c.dispatch_endpoint_auth_header.clone())
+            };
+            let dispatch_endpoint_protocol = if !is_update
+                || form.livekit_dispatch_endpoint_protocol.is_some()
+            {
+                dispatch_protocol_json
+            } else {
+                existing_livekit_cfg
+                    .as_ref()
+                    .and_then(|c| c.dispatch_endpoint_protocol.clone())
+            };
+            let require_webhook_ack = if !is_update {
+                form.livekit_require_webhook_ack.unwrap_or(false)
+            } else {
+                form.livekit_require_webhook_ack.unwrap_or_else(|| {
+                    existing_livekit_cfg
+                        .as_ref()
+                        .map(|c| c.require_webhook_ack)
+                        .unwrap_or(false)
+                })
+            };
+            let health_check_url = if !is_update || form.livekit_health_check_url.is_some() {
+                super::normalize_optional_string(&form.livekit_health_check_url)
+            } else {
+                existing_livekit_cfg
+                    .as_ref()
+                    .and_then(|c| c.health_check_url.clone())
+            };
+            let signaling_timeout_ms = if !is_update || form.livekit_signaling_timeout_ms.is_some()
+            {
+                form.livekit_signaling_timeout_ms
+            } else {
+                existing_livekit_cfg
+                    .as_ref()
+                    .and_then(|c| c.signaling_timeout_ms)
+            };
+            let delete_room_on_hangup = if !is_update {
+                form.livekit_delete_room_on_hangup.unwrap_or(false)
+            } else {
+                form.livekit_delete_room_on_hangup.unwrap_or_else(|| {
+                    existing_livekit_cfg
+                        .as_ref()
+                        .map(|c| c.delete_room_on_hangup)
+                        .unwrap_or(false)
+                })
+            };
+
+            let livekit_cfg = LiveKitTrunkConfig {
+                server_url,
+                api_key,
+                api_secret,
+                room_template,
+                identity_template,
+                metadata_template,
+                audio_codec,
+                dispatch_endpoint,
+                dispatch_endpoint_auth_header,
+                dispatch_endpoint_protocol,
+                require_webhook_ack,
+                health_check_url,
+                signaling_timeout_ms,
+                delete_room_on_hangup,
+            };
+
+            serde_json::to_value(&livekit_cfg)
+                .map_err(|e| bad_request(format!("failed to serialize LiveKit config: {e}")))?
         }
         other => {
             return Err(bad_request(format!("unsupported trunk kind '{other}'")));

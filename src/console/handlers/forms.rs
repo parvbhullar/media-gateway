@@ -100,6 +100,23 @@ pub struct SipTrunkForm {
     pub webrtc_health_check_url: Option<String>,
     pub webrtc_ice_servers: Option<String>,
     pub webrtc_protocol: Option<String>,
+    // ---- LiveKit kind fields. Populated only when `kind = "livekit"`. ----
+    pub livekit_server_url: Option<String>,
+    pub livekit_api_key: Option<String>,
+    pub livekit_api_secret: Option<String>,
+    pub livekit_room_template: Option<String>,
+    pub livekit_identity_template: Option<String>,
+    pub livekit_metadata_template: Option<String>,
+    pub livekit_audio_codec: Option<String>,
+    pub livekit_dispatch_endpoint: Option<String>,
+    pub livekit_dispatch_endpoint_auth_header: Option<String>,
+    /// JSON-encoded protocol blob — mirrors `webrtc_protocol`. Parsed to
+    /// `serde_json::Value` in `apply_form_to_active_model`.
+    pub livekit_dispatch_endpoint_protocol: Option<String>,
+    pub livekit_require_webhook_ack: Option<bool>,
+    pub livekit_health_check_url: Option<String>,
+    pub livekit_signaling_timeout_ms: Option<u64>,
+    pub livekit_delete_room_on_hangup: Option<bool>,
 }
 
 #[derive(Deserialize, Default, Clone)]
