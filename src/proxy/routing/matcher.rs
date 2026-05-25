@@ -388,9 +388,10 @@ async fn match_invite_impl(
                                     }
                                 }
 
-                            // Branch on trunk kind (Phase 7). WebRTC trunks
-                            // short-circuit into the bridge dispatcher; SIP
-                            // trunks fall through to the legacy Forward path.
+                            // Branch on trunk kind (Phase 7). WebRTC and
+                            // LiveKit trunks short-circuit into the bridge
+                            // dispatcher; SIP trunks fall through to the
+                            // legacy Forward path.
                             match trunk_config.kind.as_str() {
                                 "webrtc" => {
                                     let kind_config = trunk_config
@@ -402,7 +403,26 @@ async fn match_invite_impl(
                                         kind = "webrtc",
                                         "routing INVITE to WebRTC bridge dispatcher"
                                     );
-                                    return Ok(RouteResult::WebRtcBridge {
+                                    return Ok(RouteResult::ExternalBridge {
+                                        kind: crate::proxy::bridge::session::BridgeKind::WebRtc,
+                                        trunk_name: selected_trunk,
+                                        kind_config,
+                                        option,
+                                        hints,
+                                    });
+                                }
+                                "livekit" => {
+                                    let kind_config = trunk_config
+                                        .kind_config
+                                        .clone()
+                                        .unwrap_or(serde_json::Value::Null);
+                                    info!(
+                                        trunk = %selected_trunk,
+                                        kind = "livekit",
+                                        "routing INVITE to LiveKit bridge dispatcher"
+                                    );
+                                    return Ok(RouteResult::ExternalBridge {
+                                        kind: crate::proxy::bridge::session::BridgeKind::LiveKit,
                                         trunk_name: selected_trunk,
                                         kind_config,
                                         option,

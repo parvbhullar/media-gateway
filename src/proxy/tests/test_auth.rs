@@ -515,8 +515,8 @@ async fn test_guest_call_allowed_extension() {
         },
         webhook_cancel_registry: std::sync::Arc::new(crate::proxy::webhook::WebhookCancelRegistry::new()),
         trunk_capacity: std::sync::Arc::new(crate::proxy::trunk_capacity_state::TrunkCapacityState::new()),
-        webrtc_bridge_sessions: std::sync::Arc::new(
-            crate::proxy::webrtc_bridge_sessions::WebRtcBridgeSessions::new(),
+        bridge_sessions: std::sync::Arc::new(
+            crate::proxy::bridge_sessions::BridgeSessions::new(),
         ),
     });
 

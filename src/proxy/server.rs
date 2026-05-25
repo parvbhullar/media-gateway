@@ -99,11 +99,11 @@ pub struct SipServerInner {
     /// Constructed at boot, queried by the INVITE-path enforcement gates
     /// (which only fire when `[trunk.enforcement] enabled = true`).
     pub trunk_capacity: Arc<crate::proxy::trunk_capacity_state::TrunkCapacityState>,
-    /// PR 6 — per-dialog state for active SIP↔WebRTC bridge sessions.
-    /// Populated by the WebRtcBridge arm in `proxy::call::CallModule`,
-    /// drained on BYE for teardown (`adapter.close(...)` + bridge drop).
-    pub webrtc_bridge_sessions:
-        Arc<crate::proxy::webrtc_bridge_sessions::WebRtcBridgeSessions>,
+    /// Per-dialog state for active SIP↔external-bridge sessions
+    /// (`kind="webrtc"` today, `kind="livekit"` once that lands). Populated
+    /// by the `ExternalBridge` arm in `proxy::call::CallModule`, drained on
+    /// BYE for teardown (`teardown.close()` + bridge drop).
+    pub bridge_sessions: Arc<crate::proxy::bridge_sessions::BridgeSessions>,
 }
 
 pub type SipServerRef = Arc<SipServerInner>;
@@ -710,9 +710,7 @@ impl SipServerBuilder {
             webhook_sender,
             webhook_cancel_registry,
             trunk_capacity,
-            webrtc_bridge_sessions: Arc::new(
-                crate::proxy::webrtc_bridge_sessions::WebRtcBridgeSessions::new(),
-            ),
+            bridge_sessions: Arc::new(crate::proxy::bridge_sessions::BridgeSessions::new()),
         });
 
         let inner_weak = Arc::downgrade(&inner);

@@ -1420,7 +1420,7 @@ async fn route_evaluate(
                 rewrites,
             )
         }
-        RouteResult::WebRtcBridge { option, trunk_name, .. } => {
+        RouteResult::ExternalBridge { option, trunk_name, .. } => {
             // Surface a WebRTC bridge match as a Forward outcome in
             // diagnostics — same shape as `Forward` but with the
             // destination labeled as the WebRTC trunk.

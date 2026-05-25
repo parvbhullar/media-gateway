@@ -16,7 +16,7 @@
 //! - The mock HTTP signaling endpoint receives the SIP-side offer SDP
 //!
 //! Out of scope: end-to-end SIP listener driving the matcher. The matcher's
-//! Forward-arm branch is type-enforced by the new `RouteResult::WebRtcBridge`
+//! Forward-arm branch is type-enforced by the new `RouteResult::ExternalBridge`
 //! variant (every match site had to add an arm); driving real SIP INVITEs
 //! through it requires Dialplan/SipSession wiring that is deferred to a
 //! follow-up PR (see TODO(pr-4-followup) in `src/proxy/call.rs`).
