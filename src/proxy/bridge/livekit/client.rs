@@ -44,7 +44,13 @@ pub async fn connect_and_publish(server_url: &str, jwt: &str) -> Result<Connecte
         RtcAudioSource::Native(local_source.clone()),
     );
 
-    room.local_participant()
+    // If publish_track fails AFTER Room::connect succeeded, we own a
+    // live LiveKit room with rustpbx as a "ghost" participant. Dropping
+    // `room` won't send a Disconnect message on its own — call close()
+    // explicitly so the LiveKit server sheds the participant immediately
+    // rather than waiting on its idle timeout.
+    if let Err(e) = room
+        .local_participant()
         .publish_track(
             LocalTrack::Audio(track),
             TrackPublishOptions {
@@ -53,7 +59,17 @@ pub async fn connect_and_publish(server_url: &str, jwt: &str) -> Result<Connecte
             },
         )
         .await
-        .map_err(|e| anyhow!("livekit publish_track failed: {e}"))?;
+    {
+        let publish_err = anyhow!("livekit publish_track failed: {e}");
+        if let Err(close_err) = room.close().await {
+            tracing::warn!(
+                error = %close_err,
+                "post-publish-failure room.close also failed; \
+                 LiveKit room may linger until its idle timeout"
+            );
+        }
+        return Err(publish_err);
+    }
 
     Ok(ConnectedRoom {
         room,

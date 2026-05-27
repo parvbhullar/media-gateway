@@ -38,7 +38,13 @@ pub async fn post(client: &reqwest::Client, input: WebhookInput<'_>) -> Result<D
                 .get("request_body_template")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow!("webhook protocol missing request_body_template"))?;
-            let rendered = super::template::render(tmpl, input.vars)
+            // JSON-safe render: vars inside the body template are
+            // substituted into JSON string positions, so we escape
+            // quotes / backslashes / control chars before splicing.
+            // Without this, a SIP user-part containing a quote
+            // (`+91"hacker"`) produces invalid JSON and the webhook
+            // would silently never receive the call.
+            let rendered = super::template::render_for_json_string(tmpl, input.vars)
                 .map_err(|e| anyhow!("webhook template: {e}"))?;
             serde_json::from_str(&rendered).map_err(|e| {
                 anyhow!("webhook body not valid JSON after substitution: {e}")
