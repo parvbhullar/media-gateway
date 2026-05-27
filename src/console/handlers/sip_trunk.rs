@@ -1130,14 +1130,19 @@ fn apply_form_to_active_model(
                     .as_ref()
                     .and_then(|c| c.dispatch_endpoint_protocol.clone())
             };
+            // require_webhook_ack defaults to TRUE for new trunks — see
+            // `LiveKitTrunkConfig::require_webhook_ack`. On updates, fall
+            // through to the existing stored value when the form omits it
+            // (the HTML checkbox is always present, so this guard is
+            // mostly defensive).
             let require_webhook_ack = if !is_update {
-                form.livekit_require_webhook_ack.unwrap_or(false)
+                form.livekit_require_webhook_ack.unwrap_or(true)
             } else {
                 form.livekit_require_webhook_ack.unwrap_or_else(|| {
                     existing_livekit_cfg
                         .as_ref()
                         .map(|c| c.require_webhook_ack)
-                        .unwrap_or(false)
+                        .unwrap_or(true)
                 })
             };
             let health_check_url = if !is_update || form.livekit_health_check_url.is_some() {
@@ -1165,6 +1170,53 @@ fn apply_form_to_active_model(
                         .unwrap_or(false)
                 })
             };
+            // agent_name: take form value when supplied; on update, fall
+            // through to the existing stored value when the form omits it.
+            let agent_name = if !is_update || form.livekit_agent_name.is_some() {
+                super::normalize_optional_string(&form.livekit_agent_name)
+            } else {
+                existing_livekit_cfg
+                    .as_ref()
+                    .and_then(|c| c.agent_name.clone())
+            };
+            // require_agent_dispatch defaults to TRUE for new trunks.
+            let require_agent_dispatch = if !is_update {
+                form.livekit_require_agent_dispatch.unwrap_or(true)
+            } else {
+                form.livekit_require_agent_dispatch.unwrap_or_else(|| {
+                    existing_livekit_cfg
+                        .as_ref()
+                        .map(|c| c.require_agent_dispatch)
+                        .unwrap_or(true)
+                })
+            };
+            // bot_join_timeout_ms: form value wins; on new trunks where
+            // the form omits it, default to 15s so the silent-empty-room
+            // gap is closed without operator action. On updates, preserve
+            // the stored value when the form omits it.
+            let bot_join_timeout_ms = if let Some(v) = form.livekit_bot_join_timeout_ms {
+                Some(v)
+            } else if !is_update {
+                Some(15_000)
+            } else {
+                existing_livekit_cfg
+                    .as_ref()
+                    .and_then(|c| c.bot_join_timeout_ms)
+            };
+            let hold_tone_hz = if !is_update || form.livekit_hold_tone_hz.is_some() {
+                form.livekit_hold_tone_hz
+            } else {
+                existing_livekit_cfg
+                    .as_ref()
+                    .and_then(|c| c.hold_tone_hz)
+            };
+            let jwt_ttl_secs = if !is_update || form.livekit_jwt_ttl_secs.is_some() {
+                form.livekit_jwt_ttl_secs
+            } else {
+                existing_livekit_cfg
+                    .as_ref()
+                    .and_then(|c| c.jwt_ttl_secs)
+            };
 
             let livekit_cfg = LiveKitTrunkConfig {
                 server_url,
@@ -1181,6 +1233,11 @@ fn apply_form_to_active_model(
                 health_check_url,
                 signaling_timeout_ms,
                 delete_room_on_hangup,
+                agent_name,
+                require_agent_dispatch,
+                bot_join_timeout_ms,
+                hold_tone_hz,
+                jwt_ttl_secs,
             };
 
             serde_json::to_value(&livekit_cfg)

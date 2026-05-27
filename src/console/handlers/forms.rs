@@ -117,6 +117,25 @@ pub struct SipTrunkForm {
     pub livekit_health_check_url: Option<String>,
     pub livekit_signaling_timeout_ms: Option<u64>,
     pub livekit_delete_room_on_hangup: Option<bool>,
+    /// LiveKit explicit agent name to dispatch into the room. Either this
+    /// or `livekit_dispatch_endpoint` must be set.
+    #[serde(default)]
+    pub livekit_agent_name: Option<String>,
+    /// When true, agent_dispatch RPC failure aborts the call.
+    #[serde(default)]
+    pub livekit_require_agent_dispatch: Option<bool>,
+    /// Watchdog: cancel the call if no remote participant joins within
+    /// this many milliseconds.
+    #[serde(default)]
+    pub livekit_bot_join_timeout_ms: Option<u64>,
+    /// Hold-tone frequency (Hz) emitted on the SIP side while waiting
+    /// for the bot. 0 = silence.
+    #[serde(default)]
+    pub livekit_hold_tone_hz: Option<u16>,
+    /// JWT TTL in seconds. Default 1800 (30 min). Bumps the auto-
+    /// reconnect window after a mid-call network blip.
+    #[serde(default)]
+    pub livekit_jwt_ttl_secs: Option<u64>,
 }
 
 #[derive(Deserialize, Default, Clone)]

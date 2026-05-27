@@ -628,42 +628,163 @@ default('RustPBX') }}{% endblock %}
                 </section>
 
                 <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
-                    <h2 class="text-sm font-semibold text-slate-900">LiveKit room</h2>
-                    <p class="mt-1 text-sm text-slate-500">Bridges SIP audio into a LiveKit room. Identity/room templates
-                        support {call_id} {from_user} {to_user} {did} {trunk_name}.</p>
+                    <h2 class="text-sm font-semibold text-slate-900">LiveKit connection</h2>
+                    <p class="mt-1 text-sm text-slate-500">Templates support
+                        <code>{call_id} {from_user} {to_user} {did} {trunk_name}</code>.</p>
                     <div class="mt-4 grid gap-4 md:grid-cols-2">
-                        <label class="md:col-span-2 flex flex-col gap-2 text-sm font-medium text-slate-700">
-                            Server URL
+                        <label class="md:col-span-2 flex flex-col gap-1 text-sm font-medium text-slate-700">
+                            Server URL <span class="text-rose-500">*</span>
                             <input type="text" x-model.trim="form.livekit_server_url" maxlength="512" required
                                 class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
                                 placeholder="wss://livekit.example.com">
-                            <span class="text-xs font-normal text-slate-400">LiveKit signaling URL (ws:// or wss://).</span>
+                            <span class="text-xs font-normal text-slate-400">
+                                LiveKit signaling endpoint. <code>ws://</code> for self-host (e.g. <code>ws://localhost:7880</code>),
+                                <code>wss://</code> for LiveKit Cloud.
+                            </span>
                         </label>
-                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
-                            API key
+                        <label class="flex flex-col gap-1 text-sm font-medium text-slate-700">
+                            API key <span class="text-rose-500">*</span>
                             <input type="text" x-model.trim="form.livekit_api_key" maxlength="256" required
                                 class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                            <span class="text-xs font-normal text-slate-400">
+                                From the LiveKit project dashboard (or <code>livekit-server --dev</code> output).
+                            </span>
                         </label>
-                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
-                            API secret
+                        <label class="flex flex-col gap-1 text-sm font-medium text-slate-700">
+                            API secret <span class="text-rose-500">*</span>
                             <input type="password" x-model.trim="form.livekit_api_secret" maxlength="256"
                                 class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
                                 placeholder="(unchanged when blank on edit)">
-                            <span class="text-xs font-normal text-slate-400">Used to mint participant JWTs and admin RPCs.</span>
+                            <span class="text-xs font-normal text-slate-400">
+                                Pairs with the API key. Mints participant JWTs and authenticates the
+                                <code>CreateAgentDispatch</code> / <code>DeleteRoom</code> admin RPCs.
+                                Blank on edit keeps the stored value.
+                            </span>
                         </label>
-                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                        <label class="flex flex-col gap-1 text-sm font-medium text-slate-700">
                             Room template
                             <input type="text" x-model.trim="form.livekit_room_template" maxlength="256" required
                                 class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
                                 placeholder="room-{call_id}">
+                            <span class="text-xs font-normal text-slate-400">
+                                The LiveKit room each call joins (auto-created on first connect). Vars
+                                <code>{call_id} {from_user} {to_user} {did} {trunk_name}</code> are substituted.
+                                Same room across calls = group room; per-call var = one room per call.
+                            </span>
                         </label>
-                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                        <label class="flex flex-col gap-1 text-sm font-medium text-slate-700">
                             Identity template
                             <input type="text" x-model.trim="form.livekit_identity_template" maxlength="256" required
                                 class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
-                                placeholder="sip-{from_user}">
+                                placeholder="caller-{from_user}">
+                            <span class="text-xs font-normal text-slate-400">
+                                Becomes the LiveKit participant identity the bot sees. Must be unique per
+                                concurrent participant in the same room — include <code>{call_id}</code>
+                                or <code>{from_user}</code> to avoid collisions.
+                            </span>
                         </label>
-                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                    </div>
+                </section>
+
+                <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
+                    <h2 class="text-sm font-semibold text-slate-900">Bot routing</h2>
+                    <p class="mt-1 text-sm text-slate-500">
+                        <strong>Set at least one</strong> — agent name (server-side dispatch) or
+                        dispatch endpoint (HTTP webhook). Both can be used together.
+                    </p>
+                    <div class="mt-4 grid gap-4 md:grid-cols-2">
+                        <label class="md:col-span-2 flex flex-col gap-1 text-sm font-medium text-slate-700">
+                            Agent name
+                            <input type="text" x-model.trim="form.livekit_agent_name" maxlength="256"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="voice-agent">
+                            <span class="text-xs font-normal text-slate-400">
+                                Name registered by your LiveKit agent worker. After the caller joins, rustpbx
+                                calls <code>CreateAgentDispatch</code> so LiveKit spins that named agent into
+                                the same room. Zero external infrastructure required.
+                            </span>
+                        </label>
+                        <label class="md:col-span-2 flex flex-col gap-1 text-sm font-medium text-slate-700">
+                            Dispatch endpoint URL
+                            <input type="text" x-model.trim="form.livekit_dispatch_endpoint" maxlength="512"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="https://control.example.com/livekit/dispatch">
+                            <span class="text-xs font-normal text-slate-400">
+                                HTTP webhook called <em>before</em> we connect to LiveKit. Must return
+                                Decision-API JSON: <code>{"decision":"accept"}</code> proceeds,
+                                <code>{"decision":"reject","reject_code":486}</code> aborts with that SIP code.
+                                May also override the templated <code>room</code>, <code>identity</code>,
+                                <code>metadata</code>, or request a <code>wait_ms</code> delay.
+                            </span>
+                        </label>
+                        <label class="md:col-span-2 flex flex-col gap-1 text-sm">
+                            <div class="flex items-center gap-2">
+                                <input type="checkbox" id="livekit_require_agent_dispatch"
+                                    x-model="form.livekit_require_agent_dispatch"
+                                    class="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-300">
+                                <span class="font-medium text-slate-700">Require agent dispatch</span>
+                            </div>
+                            <span class="text-xs font-normal text-slate-400 pl-6">
+                                ON (default): a failed <code>CreateAgentDispatch</code> RPC aborts the call
+                                with 503 and shows up in the CDR as <em>ServerUnavailable</em>. OFF: log a
+                                warning and continue — the no-bot watchdog (below) catches the silent room.
+                            </span>
+                        </label>
+                        <label class="md:col-span-2 flex flex-col gap-1 text-sm">
+                            <div class="flex items-center gap-2">
+                                <input type="checkbox" id="livekit_require_webhook_ack"
+                                    x-model="form.livekit_require_webhook_ack"
+                                    class="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-300">
+                                <span class="font-medium text-slate-700">Require webhook ack</span>
+                            </div>
+                            <span class="text-xs font-normal text-slate-400 pl-6">
+                                ON (default): webhook 5xx / timeout / non-JSON aborts the call. OFF: those
+                                transient failures fall through as "accept with no overrides". Schema
+                                violations (e.g. <code>{"decision":"bogus"}</code>) always abort regardless.
+                            </span>
+                        </label>
+                    </div>
+                </section>
+
+                <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
+                    <h2 class="text-sm font-semibold text-slate-900">Wait behaviour</h2>
+                    <p class="mt-1 text-sm text-slate-500">What the caller hears + how long we hold before giving up.</p>
+                    <div class="mt-4 grid gap-4 md:grid-cols-2">
+                        <label class="flex flex-col gap-1 text-sm font-medium text-slate-700">
+                            No-bot watchdog (ms)
+                            <input type="number" min="0" max="600000" x-model.number="form.livekit_bot_join_timeout_ms"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="15000">
+                            <span class="text-xs font-normal text-slate-400">
+                                Hard timeout: if no remote participant has subscribed an audio track within
+                                this many ms, drop the call cleanly (CDR <em>hangup=ByCallee</em>). Defense
+                                against agent dispatch / webhook silently failing to surface a bot.
+                                <code>0</code> or blank disables.
+                            </span>
+                        </label>
+                        <label class="flex flex-col gap-1 text-sm font-medium text-slate-700">
+                            Hold tone (Hz)
+                            <input type="number" min="0" max="3400" x-model.number="form.livekit_hold_tone_hz"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="0">
+                            <span class="text-xs font-normal text-slate-400">
+                                Continuous low-amplitude sine tone on the SIP side while no participant is
+                                publishing audio. <code>0</code> / blank = silence (most carriers generate
+                                comfort noise on their side anyway). <code>220</code>-<code>440</code> Hz
+                                for an audible "please hold". Above 3400 is clipped by SIP narrowband codecs.
+                            </span>
+                        </label>
+                    </div>
+                </section>
+
+                <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
+                    <button type="button" @click="livekitShowAdvanced = !livekitShowAdvanced"
+                        class="flex w-full items-center justify-between text-left">
+                        <h2 class="text-sm font-semibold text-slate-900">Advanced</h2>
+                        <span class="text-xs text-slate-400" x-text="livekitShowAdvanced ? 'Hide' : 'Show'"></span>
+                    </button>
+                    <div x-show="livekitShowAdvanced" x-cloak class="mt-4 grid gap-4 md:grid-cols-2">
+                        <label class="flex flex-col gap-1 text-sm font-medium text-slate-700">
                             Audio codec
                             <select x-model="form.livekit_audio_codec"
                                 class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
@@ -671,73 +792,95 @@ default('RustPBX') }}{% endblock %}
                                     <option :value="opt" x-text="opt"></option>
                                 </template>
                             </select>
+                            <span class="text-xs font-normal text-slate-400">
+                                Codec used on the LiveKit publish track. <strong>opus</strong> = 48 kHz wideband
+                                (default, recommended). <strong>g722</strong> = 16 kHz wideband (legacy compat).
+                                SIP-side codec is negotiated separately from the carrier's INVITE offer.
+                            </span>
                         </label>
-                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                        <label class="flex flex-col gap-1 text-sm font-medium text-slate-700">
                             Signaling timeout (ms)
                             <input type="number" min="0" x-model="form.livekit_signaling_timeout_ms"
                                 class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
                                 placeholder="5000">
-                            <span class="text-xs font-normal text-slate-400">Webhook + Room::connect handshake timeout. Default 5000.</span>
+                            <span class="text-xs font-normal text-slate-400">
+                                Applied to BOTH the dispatch webhook POST and the LiveKit <code>Room::connect</code>
+                                handshake. Raise for bots with cold-start latency (model load, container boot).
+                                Default <code>5000</code>.
+                            </span>
                         </label>
-                        <label class="md:col-span-2 flex flex-col gap-2 text-sm font-medium text-slate-700">
-                            Metadata template (JSON)
-                            <textarea rows="3" x-model="form.livekit_metadata_template"
-                                class="font-mono rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
-                                placeholder='{"caller":"{from_user}","trunk":"{trunk_name}"}'></textarea>
-                            <span class="text-xs font-normal text-slate-400">Optional. Must parse as JSON after template substitution.</span>
+                        <label class="flex flex-col gap-1 text-sm font-medium text-slate-700">
+                            JWT TTL (seconds)
+                            <input type="number" min="0" x-model="form.livekit_jwt_ttl_secs"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="1800">
+                            <span class="text-xs font-normal text-slate-400">
+                                Lifetime of the JWT we mint to join the room. Once a participant is in the
+                                room the TTL stops mattering — but the SDK's <em>auto-reconnect</em> after a
+                                network blip re-uses this token, so calls longer than the TTL can fail to
+                                recover. Default <code>1800</code> (30 min). Raise for long-running calls.
+                            </span>
                         </label>
-                        <label class="md:col-span-2 flex flex-col gap-2 text-sm font-medium text-slate-700">
+                        <label class="md:col-span-2 flex flex-col gap-1 text-sm font-medium text-slate-700">
                             Health-check URL
                             <input type="text" x-model.trim="form.livekit_health_check_url" maxlength="512"
                                 class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
                                 placeholder="https://livekit.example.com/healthz">
-                            <span class="text-xs font-normal text-slate-400">Optional. Falls back to TCP-connect against server_url host:port.</span>
+                            <span class="text-xs font-normal text-slate-400">
+                                The gateway-health prober hits this URL with HTTP HEAD periodically to mark
+                                the trunk Healthy / Unhealthy. Unhealthy trunks are skipped by the routing
+                                matcher. Blank = fall back to a TCP-connect to the server URL host:port.
+                            </span>
                         </label>
-                        <div class="md:col-span-2 flex items-center gap-3">
-                            <input type="checkbox" id="livekit_delete_room_on_hangup"
-                                x-model="form.livekit_delete_room_on_hangup"
-                                class="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-300">
-                            <label for="livekit_delete_room_on_hangup" class="text-sm text-slate-700">
-                                Delete LiveKit room on hangup
-                                <span class="block text-xs font-normal text-slate-400">For single-use rooms. Off by default keeps other participants connected.</span>
-                            </label>
-                        </div>
-                    </div>
-                </section>
-
-                <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
-                    <h2 class="text-sm font-semibold text-slate-900">Dispatch webhook (optional)</h2>
-                    <p class="mt-1 text-sm text-slate-500">Pre-connect HTTP webhook for room overrides. Follows the
-                        Decision API contract.</p>
-                    <div class="mt-4 grid gap-4 md:grid-cols-2">
-                        <label class="md:col-span-2 flex flex-col gap-2 text-sm font-medium text-slate-700">
-                            Dispatch endpoint URL
-                            <input type="text" x-model.trim="form.livekit_dispatch_endpoint" maxlength="512"
-                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
-                                placeholder="https://control.example.com/livekit/dispatch">
+                        <label class="md:col-span-2 flex flex-col gap-1 text-sm font-medium text-slate-700">
+                            Metadata template (JSON)
+                            <textarea rows="2" x-model="form.livekit_metadata_template"
+                                class="font-mono rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder='{"caller":"{from_user}","trunk":"{trunk_name}"}'></textarea>
+                            <span class="text-xs font-normal text-slate-400">
+                                Per-call participant metadata stamped into the JWT and exposed to the bot via
+                                LiveKit's <code>participant.metadata()</code>. Same vars as the room/identity
+                                templates. Must be valid JSON after substitution (validated at save). This is
+                                NOT the webhook body — see the "Dispatch protocol blob" below for that.
+                            </span>
                         </label>
-                        <label class="md:col-span-2 flex flex-col gap-2 text-sm font-medium text-slate-700">
+                        <label class="md:col-span-2 flex flex-col gap-1 text-sm font-medium text-slate-700">
                             Dispatch Authorization header
                             <input type="text" x-model.trim="form.livekit_dispatch_endpoint_auth_header" maxlength="512"
                                 class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
                                 placeholder="Bearer ...">
+                            <span class="text-xs font-normal text-slate-400">
+                                Sent as the <code>Authorization</code> header on every dispatch webhook POST.
+                                Typical values: <code>Bearer &lt;token&gt;</code>, <code>Basic &lt;base64&gt;</code>.
+                                Only used when "Dispatch endpoint URL" is set.
+                            </span>
                         </label>
-                        <label class="md:col-span-2 flex flex-col gap-2 text-sm font-medium text-slate-700">
+                        <label class="md:col-span-2 flex flex-col gap-1 text-sm font-medium text-slate-700">
                             Dispatch protocol blob (JSON)
                             <textarea rows="5" x-model="form.livekit_dispatch_endpoint_protocol"
                                 class="font-mono rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
                                 placeholder='{"request_body_template":"..."}'></textarea>
-                            <span class="text-xs font-normal text-slate-400">Optional adapter-specific blob — mirrors the WebRTC HttpJsonProtocol shape.</span>
+                            <span class="text-xs font-normal text-slate-400">
+                                The rendered <code>request_body_template</code> (after <code>{var}</code> substitution)
+                                becomes the <strong>entire HTTP POST body</strong>, not a metadata field. Leave blank
+                                to use rustpbx's built-in default body.
+                            </span>
                         </label>
-                        <div class="md:col-span-2 flex items-center gap-3">
-                            <input type="checkbox" id="livekit_require_webhook_ack"
-                                x-model="form.livekit_require_webhook_ack"
-                                class="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-300">
-                            <label for="livekit_require_webhook_ack" class="text-sm text-slate-700">
-                                Require webhook ack
-                                <span class="block text-xs font-normal text-slate-400">If on, transport failures abort the call. Off (default) treats transients as accept-with-no-overrides.</span>
-                            </label>
-                        </div>
+                        <label class="md:col-span-2 flex flex-col gap-1 text-sm">
+                            <div class="flex items-center gap-2">
+                                <input type="checkbox" id="livekit_delete_room_on_hangup"
+                                    x-model="form.livekit_delete_room_on_hangup"
+                                    class="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-300">
+                                <span class="font-medium text-slate-700">Delete LiveKit room on hangup</span>
+                            </div>
+                            <span class="text-xs font-normal text-slate-400 pl-6">
+                                After the SIP call ends and rustpbx disconnects its participant, also call
+                                LiveKit's <code>DeleteRoom</code> admin RPC. <strong>Kicks any remaining
+                                participants</strong> — use only for single-use rooms (one call per room).
+                                Default OFF leaves the room alive for other participants / lets it idle-timeout
+                                naturally.
+                            </span>
+                        </label>
                     </div>
                 </section>
             </div>
@@ -834,21 +977,47 @@ default('RustPBX') }}{% endblock %}
                 livekit_api_key: '',
                 livekit_api_secret: '',
                 livekit_room_template: 'room-{call_id}',
-                livekit_identity_template: 'sip-{from_user}',
+                livekit_identity_template: 'caller-{from_user}',
                 livekit_metadata_template: '',
                 livekit_audio_codec: 'opus',
                 livekit_dispatch_endpoint: '',
                 livekit_dispatch_endpoint_auth_header: '',
-                livekit_dispatch_endpoint_protocol: '',
-                livekit_require_webhook_ack: false,
+                // Pre-filled template that produces the SAME body rustpbx
+                // would send when this field is left empty — operators
+                // can edit / add fields without breaking the contract.
+                // The string assigned to `request_body_template` is itself
+                // a JSON template; `{var}` placeholders are substituted at
+                // call time (vars: call_id, from_user, to_user, did,
+                // trunk_name, room, identity, sip_sdp_offer).
+                livekit_dispatch_endpoint_protocol: JSON.stringify({
+                    request_body_template: JSON.stringify({
+                        call_id: '{call_id}',
+                        from_user: '{from_user}',
+                        to_user: '{to_user}',
+                        did: '{did}',
+                        trunk_name: '{trunk_name}',
+                        room: '{room}',
+                        identity: '{identity}',
+                    }),
+                }, null, 2),
+                livekit_require_webhook_ack: true,
                 livekit_health_check_url: '',
                 livekit_signaling_timeout_ms: '',
                 livekit_delete_room_on_hangup: false,
+                livekit_agent_name: '',
+                livekit_require_agent_dispatch: true,
+                livekit_bot_join_timeout_ms: 15000,
+                livekit_hold_tone_hz: '',
+                livekit_jwt_ttl_secs: '',
             },
+            livekitShowAdvanced: false,
             regStatus: null,
             success: null,
             error: null,
             saving: false,
+            probing: false,
+            probeMessage: null,
+            probeOk: false,
             activeTab: 'general',
             init() {
                 this.loadOptions();
