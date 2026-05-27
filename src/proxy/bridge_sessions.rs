@@ -28,17 +28,10 @@ use crate::callrecord::{
 };
 use crate::proxy::bridge::session::{BridgeKind, BridgeTeardown, MediaBridge};
 
-/// Why a bridge dialog was torn down. Threaded into
-/// [`emit_bridge_call_record`] so the final CDR reflects who hung up.
-#[derive(Debug, Clone, Copy)]
-pub enum BridgeHangupCause {
-    /// SIP-side BYE (carrier or caller initiated).
-    ByCaller,
-    /// Remote-side disconnect / bot-initiated teardown.
-    ByCallee,
-    /// teardown.close() errored at teardown time.
-    TeardownFailed,
-}
+// BridgeHangupCause moved to proxy::bridge::session so the MediaBridge
+// trait can use it as the `watch_disconnect` future's output type.
+// Re-exported here for backwards-compat with existing consumers.
+pub use crate::proxy::bridge::session::BridgeHangupCause;
 
 /// State pinned for the lifetime of a SIP dialog whose INVITE was bridged to
 /// an external (WebRTC / LiveKit) trunk. On BYE we remove the entry, call

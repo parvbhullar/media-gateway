@@ -40,16 +40,34 @@ pub trait MediaBridge: Send + Sync + 'static {
     fn kind(&self) -> BridgeKind;
 
     /// Future that resolves when the media-plane bridge has internally
-    /// signalled end-of-call (e.g. LiveKit `RoomEvent::Disconnected`). The
-    /// default impl never resolves — WebRTC kind has no such signal, SIP
-    /// BYE drives teardown there. LiveKit overrides to expose its
-    /// `cancel_token.cancelled()` future, which call.rs watches to drive
-    /// SIP-side teardown when the LiveKit room ends the session.
+    /// signalled end-of-call (e.g. LiveKit `RoomEvent::Disconnected`,
+    /// the no-bot watchdog firing, etc.). The future's output is the
+    /// cause that should be recorded in the CDR. The default impl
+    /// never resolves — WebRTC kind has no such signal, SIP BYE drives
+    /// teardown there. LiveKit overrides to expose its
+    /// `cancel_token.cancelled()` future + a side-channel cause.
     fn watch_disconnect(
         &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = BridgeHangupCause> + Send + '_>>
+    {
         Box::pin(std::future::pending())
     }
+}
+
+/// Why a bridged dialog was torn down. Set by the media-plane bridge
+/// when it signals end-of-call, threaded through the CDR emit path so
+/// the final record reflects who hung up (or which watchdog fired).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BridgeHangupCause {
+    /// SIP-side BYE (carrier or caller initiated).
+    ByCaller,
+    /// WebRTC-side disconnect / bot-initiated teardown.
+    ByCallee,
+    /// adapter.close() / room.close() errored at teardown time.
+    TeardownFailed,
+    /// LiveKit `bot_join_timeout_ms` watchdog fired — no remote
+    /// participant had subscribed an audio track within the deadline.
+    BotJoinTimeout,
 }
 
 #[async_trait]
