@@ -366,6 +366,25 @@ impl ProxyDataContext {
         // Reconcile trunk registrations after reload.
         self.trunk_registrar.reconcile(&trunks).await;
 
+        // Promote file-trunks that have no DB row yet so the health prober
+        // (which iterates `rustpbx_trunks`) can see them. Insert-only:
+        // existing rows (including live status columns) are never overwritten.
+        if let Some(db) = self.db.as_ref() {
+            let report = crate::proxy::file_trunk_sync::promote_missing_file_trunks(db, &trunks)
+                .await;
+            if report.inserted > 0 || report.skipped_invalid > 0 {
+                info!(
+                    considered = report.considered,
+                    inserted = report.inserted,
+                    skipped_existing = report.skipped_existing,
+                    skipped_embedded = report.skipped_embedded,
+                    skipped_generated = report.skipped_generated,
+                    skipped_invalid = report.skipped_invalid,
+                    "file_trunk_sync: promoted file trunks into rustpbx_trunks"
+                );
+            }
+        }
+
         let finished_at = Utc::now();
         let duration_ms = (finished_at - started_at).num_milliseconds();
         info!(
