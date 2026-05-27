@@ -75,6 +75,21 @@ pub struct LiveKitBridge {
     pub cancel_token: CancellationToken,
     /// For logs.
     pub trunk_name: String,
+    /// If set, task D (no-bot watchdog) cancels the bridge after this many
+    /// milliseconds when `subscribers` is still empty — closes the silent-
+    /// empty-room gap that agent_dispatch / webhook alone can't guarantee.
+    pub bot_join_timeout_ms: Option<u64>,
+    /// If set, task B emits a low-amplitude sine tone at this frequency on
+    /// the SIP-RTP side whenever `subscribers` is empty (silence otherwise).
+    pub hold_tone_hz: Option<u16>,
+    /// Side-channel for the disconnect cause. Whichever internal task
+    /// trips `cancel_token` first writes its cause here; the
+    /// `watch_disconnect()` future then surfaces it to `call.rs`'s
+    /// teardown so the CDR reflects the real reason. Defaults to
+    /// `ByCallee` (room disconnected by LiveKit server / network),
+    /// overridden by the watchdog to `BotJoinTimeout`.
+    pub disconnect_cause:
+        Arc<parking_lot::Mutex<crate::proxy::bridge::session::BridgeHangupCause>>,
 }
 
 impl Drop for LiveKitBridge {
@@ -90,6 +105,91 @@ impl Drop for LiveKitBridge {
 fn codec_type_for(cap: &AudioCapability) -> anyhow::Result<CodecType> {
     CodecType::try_from(cap.codec_name.as_str())
         .map_err(|e| anyhow!("unsupported SIP codec '{}': {e}", cap.codec_name))
+}
+
+/// Map a LiveKit `DisconnectReason` to a short Prometheus-friendly label
+/// for the `rustpbx_livekit_room_disconnects_total{cause}` counter.
+/// Closes L9 — preserves the granularity of the SDK's reason in metrics
+/// instead of collapsing everything to "server".
+fn disconnect_reason_label(reason: i32) -> &'static str {
+    // `livekit::RoomEvent::Disconnected.reason` is a `DisconnectReason`
+    // enum represented as i32 by prost. We match the variant codes
+    // directly rather than depending on the imported enum names.
+    match reason {
+        0 => "unknown",
+        1 => "client_initiated",
+        2 => "duplicate_identity",
+        3 => "server_shutdown",
+        4 => "participant_removed",
+        5 => "room_deleted",
+        6 => "state_mismatch",
+        7 => "join_failure",
+        8 => "migration",
+        9 => "signal_close",
+        10 => "room_closed",
+        11 => "user_unavailable",
+        12 => "user_rejected",
+        13 => "sip_trunk_failure",
+        14 => "connection_timeout",
+        _ => "other",
+    }
+}
+
+/// Spawn the no-bot watchdog. Called once at start-up by `start()`, and
+/// re-armed by Task C whenever `subscribers` transitions back to empty
+/// (closes L7 — bot drops mid-call shouldn't leave a silent room).
+///
+/// `label` is logged so operators can distinguish initial-arm firings
+/// from re-arm firings in the trunk's logs.
+fn spawn_no_bot_watchdog(
+    timeout_ms: u64,
+    label: &'static str,
+    cancel: CancellationToken,
+    subscribers: Arc<DashMap<String, NativeAudioStream>>,
+    trunk_name: String,
+    disconnect_cause: Arc<parking_lot::Mutex<crate::proxy::bridge::session::BridgeHangupCause>>,
+) {
+    tokio::spawn(async move {
+        tracing::info!(
+            trunk = %trunk_name,
+            timeout_ms,
+            label,
+            "LiveKit no-bot watchdog armed"
+        );
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                tracing::debug!(trunk = %trunk_name, label,
+                    "LiveKit watchdog: cancelled before timeout");
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)) => {
+                if subscribers.is_empty() {
+                    // Race protection (M4): yield once so any in-flight
+                    // TrackSubscribed event from Task C has a chance to
+                    // land before we fire.
+                    tokio::task::yield_now().await;
+                    if subscribers.is_empty() {
+                        tracing::warn!(
+                            trunk = %trunk_name,
+                            timeout_ms,
+                            label,
+                            "LiveKit bot did not join within timeout — aborting call"
+                        );
+                        *disconnect_cause.lock() =
+                            crate::proxy::bridge::session::BridgeHangupCause::BotJoinTimeout;
+                        crate::metrics::bridge::livekit_room_disconnect_inc("watchdog");
+                        cancel.cancel();
+                        return;
+                    }
+                }
+                tracing::info!(
+                    trunk = %trunk_name,
+                    subscriber_count = subscribers.len(),
+                    label,
+                    "LiveKit bot present before watchdog fired"
+                );
+            }
+        }
+    });
 }
 
 #[async_trait]
@@ -162,11 +262,13 @@ impl MediaBridge for LiveKitBridge {
             let trunk_name = trunk_name.clone();
             let subscribers = self.subscribers.clone();
             let codec_type = sip_codec_type;
+            let hold_tone_hz = self.hold_tone_hz;
             tokio::spawn(async move {
                 tracing::info!(
                     trunk = %trunk_name,
                     codec = ?codec_type,
                     sip_clock_rate,
+                    hold_tone_hz = ?hold_tone_hz,
                     "LiveKit forward task B (LiveKit→SIP) started"
                 );
                 run_livekit_to_sip(
@@ -177,10 +279,27 @@ impl MediaBridge for LiveKitBridge {
                     sip_pt,
                     sip_send,
                     cancel.clone(),
+                    hold_tone_hz,
                 )
                 .await;
                 tracing::info!(trunk = %trunk_name, "LiveKit forward task B exited");
             });
+        }
+
+        // ── Task D: no-bot-join watchdog (optional, opt-in) ───────────
+        // Initial arming at start-up: closes the silent-empty-room gap
+        // at call setup. Task C re-arms a fresh watchdog every time the
+        // subscriber set transitions back to empty (i.e. all bots left
+        // mid-call) — closes L7.
+        if let Some(timeout_ms) = self.bot_join_timeout_ms {
+            spawn_no_bot_watchdog(
+                timeout_ms,
+                "initial",
+                cancel.clone(),
+                self.subscribers.clone(),
+                trunk_name.clone(),
+                self.disconnect_cause.clone(),
+            );
         }
 
         // ── Task C: Room events → subscriber map + disconnect ─────────
@@ -194,6 +313,11 @@ impl MediaBridge for LiveKitBridge {
             let cancel = cancel.clone();
             let trunk_name = trunk_name.clone();
             let subscribers = self.subscribers.clone();
+            // Plumb so the re-arm path in ParticipantDisconnected can
+            // call `spawn_no_bot_watchdog(...)` again when subscribers
+            // drops back to empty (L7).
+            let bot_join_timeout_ms = self.bot_join_timeout_ms;
+            let disconnect_cause_for_c = self.disconnect_cause.clone();
             tokio::spawn(async move {
                 tracing::info!(trunk = %trunk_name, "LiveKit forward task C (room events) started");
                 loop {
@@ -237,13 +361,44 @@ impl MediaBridge for LiveKitBridge {
                                         participant = %identity,
                                         "LiveKit participant left — dropped audio subscriber"
                                     );
+                                    // L7: if that drop took us from
+                                    // "had-a-bot" back to "empty room"
+                                    // mid-call, re-arm the watchdog.
+                                    // Without this a bot that joins,
+                                    // talks, then crashes leaves a
+                                    // silent room until SIP BYE / RTP
+                                    // timeout.
+                                    if subscribers.is_empty()
+                                        && !cancel.is_cancelled()
+                                        && let Some(timeout) = bot_join_timeout_ms
+                                    {
+                                        spawn_no_bot_watchdog(
+                                            timeout,
+                                            "rearm_after_drop",
+                                            cancel.clone(),
+                                            subscribers.clone(),
+                                            trunk_name.clone(),
+                                            disconnect_cause_for_c.clone(),
+                                        );
+                                    }
                                 }
                             }
                             Some(RoomEvent::Disconnected { reason }) => {
-                                tracing::info!(
+                                // L9: surface the reason in metrics and
+                                // logs instead of collapsing to a generic
+                                // "server" disconnect. Cause stays as the
+                                // default `ByCallee` (LiveKit-side ended
+                                // the session) — granular CDR cause split
+                                // is a future enum-expansion change.
+                                let reason_label = disconnect_reason_label(reason as i32);
+                                tracing::warn!(
                                     trunk = %trunk_name,
-                                    ?reason,
+                                    reason = reason_label,
+                                    reason_code = reason as i32,
                                     "LiveKit room disconnected — cancelling bridge"
+                                );
+                                crate::metrics::bridge::livekit_room_disconnect_inc(
+                                    reason_label,
                                 );
                                 cancel.cancel();
                                 break;
@@ -265,12 +420,25 @@ impl MediaBridge for LiveKitBridge {
 
     /// Surface the LiveKit-side disconnect signal so call.rs can drive SIP
     /// teardown when the room ends (task C cancels the token on
-    /// `RoomEvent::Disconnected`).
+    /// `RoomEvent::Disconnected`, task D on the no-bot watchdog).
+    /// The output carries the specific cause whichever task tripped the
+    /// cancel set in `disconnect_cause`.
     fn watch_disconnect(
         &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                Output = crate::proxy::bridge::session::BridgeHangupCause,
+            > + Send
+                + '_,
+        >,
+    > {
         let token = self.cancel_token.clone();
-        Box::pin(async move { token.cancelled().await })
+        let cause = self.disconnect_cause.clone();
+        Box::pin(async move {
+            token.cancelled().await;
+            *cause.lock()
+        })
     }
 }
 
@@ -408,6 +576,7 @@ async fn run_livekit_to_sip(
     sip_pt: u8,
     sip_send: rustrtc::media::track::SampleStreamSource,
     cancel: CancellationToken,
+    hold_tone_hz: Option<u16>,
 ) {
     let mut encoder: Box<dyn Encoder> = audio_codec::create_encoder(codec_type);
     let encoder_rate = encoder.sample_rate();
@@ -430,33 +599,85 @@ async fn run_livekit_to_sip(
     // RTP timestamp increment per ptime, in the SIP codec's clock domain.
     let ts_increment: u32 = sip_clock_rate / 1000 * PTIME_MS;
     let mut frames_sent: u64 = 0;
+    // Sine-wave phase, carried across ticks so the hold tone is
+    // continuous (no audible clicks at frame boundaries).
+    let mut hold_phase: f64 = 0.0;
+    const HOLD_AMP: f64 = 1500.0; // quiet — ~ -25 dBFS
 
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
             _ = ticker.tick() => {
-                // Pragmatic shortcut (v1): forward the first subscriber's
-                // available frame as-is rather than mixing.  Real summing
-                // mixer is a follow-up.  See README note.
+                // L10: saturating-add PCM mixer. Non-blocking poll each
+                // subscriber for any frames currently available, sum
+                // them sample-by-sample into a single mix buffer with
+                // i32 saturation. libwebrtc typically emits 10 ms
+                // frames (480 samples @ 48 kHz); our tick is 20 ms so
+                // a steady stream gives ~2 frames per tick. If frames
+                // differ in length across subscribers we sum up to the
+                // longer length (shorter ones contribute zero in the
+                // tail).
                 let mut mixed: Option<Vec<i16>> = None;
+                let mut contributors: usize = 0;
                 for mut entry in subscribers.iter_mut() {
-                    // Non-blocking poll: take whatever the stream has now
-                    // without waiting.  We use `next().now_or_never()` to
-                    // peek the futures::Stream queue.
                     let stream = entry.value_mut();
                     use futures::future::FutureExt;
-                    if let Some(Some(lk_frame)) = stream.next().now_or_never() {
-                        // Frames are typically 10 ms @ 48 kHz (480 samples)
-                        // from libwebrtc.  Coalesce up to ~ LK_FRAME_SAMPLES.
+                    // Drain everything immediately available — typically
+                    // 1-2 frames @ 10 ms each.
+                    while let Some(Some(lk_frame)) = stream.next().now_or_never() {
                         let samples: Vec<i16> = lk_frame.data.into_owned();
                         if samples.is_empty() {
                             continue;
                         }
-                        mixed = Some(samples);
-                        break;
+                        match mixed.as_mut() {
+                            None => {
+                                mixed = Some(samples);
+                                contributors = 1;
+                            }
+                            Some(mix) => {
+                                contributors += 1;
+                                if samples.len() > mix.len() {
+                                    mix.resize(samples.len(), 0);
+                                }
+                                for (m, s) in mix.iter_mut().zip(samples.iter()) {
+                                    *m = (*m as i32 + *s as i32)
+                                        .clamp(i16::MIN as i32, i16::MAX as i32)
+                                        as i16;
+                                }
+                            }
+                        }
                     }
                 }
-                let Some(pcm_48k) = mixed else { continue; };
+                let _ = contributors; // surfaced for debug tooling
+
+                let pcm_48k = match mixed {
+                    Some(p) => {
+                        // Reset hold phase so the next silent gap starts at zero
+                        // (avoids a click if the bot drops out and rejoins).
+                        hold_phase = 0.0;
+                        p
+                    }
+                    None => match hold_tone_hz {
+                        // No subscriber audio this tick. If a hold tone is
+                        // configured, synthesize one; otherwise emit nothing
+                        // (caller hears silence — pre-fix behaviour).
+                        Some(hz) if hz > 0 => {
+                            let step = std::f64::consts::TAU * (hz as f64)
+                                / (LK_SAMPLE_RATE as f64);
+                            let mut samples: Vec<i16> = Vec::with_capacity(LK_FRAME_SAMPLES);
+                            for _ in 0..LK_FRAME_SAMPLES {
+                                let s = (hold_phase.sin() * HOLD_AMP) as i16;
+                                samples.push(s);
+                                hold_phase += step;
+                                if hold_phase >= std::f64::consts::TAU {
+                                    hold_phase -= std::f64::consts::TAU;
+                                }
+                            }
+                            samples
+                        }
+                        _ => continue,
+                    },
+                };
 
                 let pcm_sip_rate: Vec<i16> = match resampler.as_mut() {
                     Some(r) => r.resample(&pcm_48k),
