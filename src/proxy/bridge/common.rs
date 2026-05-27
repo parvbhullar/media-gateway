@@ -127,7 +127,15 @@ pub(crate) async fn build_inbound_rtp_pc(
     let local_desc = pc
         .local_description()
         .ok_or_else(|| anyhow!("RTP leg has no local description after set_local_description"))?;
-    let answer_sdp = local_desc.to_sdp_string();
+    // rustrtc emits a=sendonly in RTP-mode answers because no local track is
+    // attached at this point — but the bridge will pump RTP from the WebRTC
+    // leg into this socket once media starts flowing, and we also need the
+    // SIP peer to send us its audio. Force sendrecv so the caller actually
+    // transmits.
+    let answer_sdp = local_desc
+        .to_sdp_string()
+        .replace("a=sendonly", "a=sendrecv")
+        .replace("a=recvonly", "a=sendrecv");
 
     // Compute the negotiated codec by intersecting the carrier's offer
     // (remote_description) with our supported set. In RFC 3264 terms the

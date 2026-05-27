@@ -39,6 +39,17 @@ pub trait MediaBridge: Send + Sync + 'static {
     async fn start(&self) -> anyhow::Result<()>;
     fn kind(&self) -> BridgeKind;
 
+    /// Attach a shared call recorder before `start()` is called. The
+    /// default impl is a no-op; only kinds with a `BridgePeer`-backed
+    /// data plane (currently WebRTC) wire it through. Must be called
+    /// before `start()` so the forwarder picks the recorder up when it
+    /// spawns.
+    fn attach_recorder(
+        &self,
+        _recorder: std::sync::Arc<parking_lot::RwLock<Option<crate::media::recorder::Recorder>>>,
+    ) {
+    }
+
     /// Future that resolves when the media-plane bridge has internally
     /// signalled end-of-call (e.g. LiveKit `RoomEvent::Disconnected`,
     /// the no-bot watchdog firing, etc.). The future's output is the

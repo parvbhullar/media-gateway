@@ -60,6 +60,10 @@ pub struct BridgeSession {
     pub trunk_id: Option<i64>,
     pub start_time: DateTime<Utc>,
     pub answer_time: DateTime<Utc>,
+    /// Filesystem path of the WAV file the bridge recorder is writing to,
+    /// if recording was enabled for this dialog. Surfaces in the CDR's
+    /// `recorder` media list on teardown.
+    pub recording_path: Option<String>,
 }
 
 /// Inputs to [`emit_bridge_call_record`]. Grouped in a struct so the
@@ -90,6 +94,10 @@ pub struct BridgeCallRecordInfo {
     /// Which bridge kind produced this record. Surfaced as the `kind`
     /// metadata field in the CDR.
     pub kind: BridgeKind,
+    /// Filesystem path of the recorded WAV (if any). Becomes the single
+    /// `CallRecordMedia` entry on the CDR. `None` for failure-path CDRs
+    /// emitted before recording was wired (or when recording is disabled).
+    pub recording_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -166,7 +174,19 @@ pub fn emit_bridge_call_record(
         status_code: info.status_code,
         hangup_reason: Some(info.hangup_reason.clone()),
         hangup_messages: Vec::new(),
-        recorder: Vec::new(),
+        recorder: info
+            .recording_path
+            .as_ref()
+            .map(|path| {
+                let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+                vec![crate::callrecord::CallRecordMedia {
+                    track_id: "bridge".to_string(),
+                    path: path.clone(),
+                    size,
+                    extra: None,
+                }]
+            })
+            .unwrap_or_default(),
         sip_leg_roles: HashMap::new(),
         leg_timeline: LegTimeline::default(),
         details,
@@ -294,6 +314,7 @@ mod tests {
             trunk_id: Some(42),
             start_time: Utc::now(),
             answer_time: Utc::now(),
+            recording_path: None,
         }
     }
 
@@ -320,6 +341,7 @@ mod tests {
                 direction: BridgeCallDirection::Inbound,
                 answer_time: None,
                 kind: BridgeKind::WebRtc,
+                recording_path: None,
             },
         );
         let record = receiver.recv().await.expect("CDR record sent");
@@ -356,6 +378,7 @@ mod tests {
                 direction: BridgeCallDirection::Inbound,
                 answer_time: None,
                 kind: BridgeKind::WebRtc,
+                recording_path: None,
             },
         );
         let record = receiver.recv().await.expect("CDR record sent");

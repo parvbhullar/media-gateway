@@ -19,4 +19,10 @@ impl MediaBridge for WebRtcMediaBridge {
     fn kind(&self) -> BridgeKind {
         BridgeKind::WebRtc
     }
+    fn attach_recorder(
+        &self,
+        recorder: Arc<parking_lot::RwLock<Option<crate::media::recorder::Recorder>>>,
+    ) {
+        self.0.attach_recorder(recorder);
+    }
 }

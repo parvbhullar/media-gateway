@@ -89,6 +89,12 @@ pub struct Recorder {
     dtmf_state_b: Option<DtmfEventState>,
 
     next_flush_ts: u32, // The next timestamp to be flushed
+    // Per-leg end-of-data marker that persists across flushes. Tracks the highest
+    // absolute timestamp written into each leg's buffer so leg_end_ts(leg) can
+    // return the correct per-leg position even after the buffer has been drained.
+    // Distinct from next_flush_ts (global) which advances on either leg's activity.
+    last_written_ts_a: u32,
+    last_written_ts_b: u32,
     ptime: Duration,
 
     written_samples: u64,
@@ -148,6 +154,8 @@ impl Recorder {
             dtmf_state_a: None,
             dtmf_state_b: None,
             next_flush_ts: 0,
+            last_written_ts_a: 0,
+            last_written_ts_b: 0,
             written_samples: 0,
             writer,
             ptime: Duration::from_millis(200),
@@ -326,14 +334,47 @@ impl Recorder {
 
     fn leg_end_ts(&self, leg: Leg) -> u32 {
         let (samples_per_block, bytes_per_block) = self.block_info();
+        let last_written = match leg {
+            Leg::A => self.last_written_ts_a,
+            Leg::B => self.last_written_ts_b,
+        };
         let buffered_end = match leg {
             Leg::A => self.buffer_a.last_key_value(),
             Leg::B => self.buffer_b.last_key_value(),
         }
         .map(|(k, v)| k + (v.len() / bytes_per_block) as u32 * samples_per_block)
-        .unwrap_or(self.next_flush_ts);
+        .unwrap_or(last_written);
 
-        buffered_end.max(self.next_flush_ts)
+        // Wall-clock floor: number of samples that "should" have elapsed since
+        // recording started, computed from monotonic time. This is a true
+        // per-leg anchor that does NOT get polluted by the other leg's activity
+        // (unlike next_flush_ts) but still lets `maybe_reset_leg_timeline`
+        // detect a DTX-resume packet whose RTP clock paused during silence,
+        // so the resumed audio lands at its real-time position instead of
+        // being glued back-to-back with the pre-silence packet.
+        let wall_clock = (self.start_instant.elapsed().as_millis() as u64
+            * self.sample_rate as u64
+            / 1000) as u32;
+
+        buffered_end.max(last_written).max(wall_clock)
+    }
+
+    // Update the per-leg high-water mark. Called whenever data is inserted into
+    // a leg's buffer so leg_end_ts(leg) reports the right position even after
+    // the buffer has been drained by flush().
+    fn bump_last_written(&mut self, leg: Leg, end_ts: u32) {
+        match leg {
+            Leg::A => {
+                if end_ts > self.last_written_ts_a {
+                    self.last_written_ts_a = end_ts;
+                }
+            }
+            Leg::B => {
+                if end_ts > self.last_written_ts_b {
+                    self.last_written_ts_b = end_ts;
+                }
+            }
+        }
     }
 
     fn block_span_samples(&self, data: &[u8]) -> u32 {
@@ -434,12 +475,14 @@ impl Recorder {
                         self.buffer_b.insert(key, data);
                     }
                 }
+                self.bump_last_written(leg, block_end);
                 continue;
             }
 
             if key < start_ts
                 && let Some(prefix) = self.trim_back(&data, start_ts - key)
             {
+                let prefix_end = key.saturating_add(self.block_span_samples(&prefix));
                 match leg {
                     Leg::A => {
                         self.buffer_a.insert(key, prefix);
@@ -448,6 +491,7 @@ impl Recorder {
                         self.buffer_b.insert(key, prefix);
                     }
                 }
+                self.bump_last_written(leg, prefix_end);
             }
 
             if block_end > end_ts
@@ -455,6 +499,7 @@ impl Recorder {
                     self.trim_front(&data, end_ts.saturating_sub(key))
             {
                 let suffix_ts = key.saturating_add(trimmed_samples);
+                let suffix_end = suffix_ts.saturating_add(self.block_span_samples(&suffix));
                 match leg {
                     Leg::A => {
                         self.buffer_a.insert(suffix_ts, suffix);
@@ -463,9 +508,11 @@ impl Recorder {
                         self.buffer_b.insert(suffix_ts, suffix);
                     }
                 }
+                self.bump_last_written(leg, suffix_end);
             }
         }
 
+        let dtmf_end = start_ts.saturating_add(self.block_span_samples(&encoded));
         match leg {
             Leg::A => {
                 self.buffer_a.insert(start_ts, encoded);
@@ -474,6 +521,7 @@ impl Recorder {
                 self.buffer_b.insert(start_ts, encoded);
             }
         }
+        self.bump_last_written(leg, dtmf_end);
     }
 
     fn insert_audio_block(&mut self, leg: Leg, start_ts: u32, encoded: Bytes) {
@@ -509,6 +557,7 @@ impl Recorder {
         }
 
         for (ts, data) in inserts {
+            let end_ts = ts.saturating_add(self.block_span_samples(&data));
             match leg {
                 Leg::A => {
                     self.buffer_a.insert(ts, data);
@@ -517,6 +566,7 @@ impl Recorder {
                     self.buffer_b.insert(ts, data);
                 }
             }
+            self.bump_last_written(leg, end_ts);
         }
     }
 
@@ -1198,6 +1248,8 @@ mod tests {
             dtmf_state_a: None,
             dtmf_state_b: None,
             next_flush_ts: 0,
+            last_written_ts_a: 0,
+            last_written_ts_b: 0,
             written_samples: 0,
             writer: Box::new(TestWriter::new()),
             ptime: Duration::from_millis(20),

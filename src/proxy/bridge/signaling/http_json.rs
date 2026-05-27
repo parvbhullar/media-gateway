@@ -50,6 +50,19 @@ pub struct HttpJsonProtocol {
     /// pairs.
     #[serde(default)]
     pub extra_headers: Option<Vec<(String, String)>>,
+    /// Optional URL the adapter POSTs to on session teardown (BYE-time).
+    /// When unset, close is a no-op (matches the original stateless dialect).
+    /// The Pipecat shim accepts `POST /close {"pc_id":"<handle>"}` — set this
+    /// to that URL so the bot pipeline shuts down immediately instead of
+    /// waiting for ICE/idle timeouts.
+    #[serde(default)]
+    pub close_url: Option<String>,
+    /// JSON body template for the close request. Must contain the literal
+    /// `{session_id}` placeholder, replaced with the session handle string
+    /// captured from the negotiate response (via `response_session_path`).
+    /// Defaults to `{"pc_id":"{session_id}"}` matching the Pipecat shim.
+    #[serde(default)]
+    pub close_body_template: Option<String>,
 }
 
 impl HttpJsonProtocol {
@@ -229,6 +242,69 @@ impl WebRtcSignalingAdapter for HttpJsonAdapter {
             answer_sdp,
             session: SessionHandle(session_value),
         })
+    }
+
+    async fn close(
+        &self,
+        ctx: &SignalingContext,
+        session: &SessionHandle,
+    ) -> Result<(), SignalingError> {
+        let proto_value = match ctx.protocol.as_ref() {
+            Some(v) => v,
+            None => return Ok(()),
+        };
+        let proto: HttpJsonProtocol = match serde_json::from_value(proto_value.clone()) {
+            Ok(p) => p,
+            Err(_) => return Ok(()),
+        };
+        let close_url = match proto.close_url.as_deref() {
+            Some(u) if !u.trim().is_empty() => u,
+            _ => return Ok(()),
+        };
+        let session_id = match &session.0 {
+            Value::String(s) => s.clone(),
+            Value::Null => return Ok(()),
+            other => other.to_string(),
+        };
+        let template = proto
+            .close_body_template
+            .as_deref()
+            .unwrap_or(r#"{"pc_id":"{session_id}"}"#);
+        let escaped = serde_json::to_string(&session_id)
+            .map(|q| q[1..q.len() - 1].to_string())
+            .unwrap_or(session_id);
+        let body_str = template.replace("{session_id}", &escaped);
+        let body: Value = serde_json::from_str(&body_str).map_err(|e| {
+            SignalingError::InvalidProtocol(format!(
+                "close_body_template did not yield valid JSON after substitution: {e}"
+            ))
+        })?;
+        let mut req = self
+            .client
+            .post(close_url)
+            .timeout(Duration::from_millis(ctx.timeout_ms.max(1)))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .json(&body);
+        if let Some(h) = &ctx.auth_header {
+            req = req.header(reqwest::header::AUTHORIZATION, h);
+        }
+        if let Some(extras) = &proto.extra_headers {
+            for (k, v) in extras {
+                req = req.header(k.as_str(), v.as_str());
+            }
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| SignalingError::Transport(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(SignalingError::Transport(format!(
+                "close: non-success HTTP status {}",
+                status.as_u16()
+            )));
+        }
+        Ok(())
     }
 }
 

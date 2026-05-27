@@ -346,8 +346,13 @@ pub struct BridgePeer {
     /// Cancellation token
     cancel_token: CancellationToken,
     forwarding_started: AtomicBool,
-    /// Shared recorder for call recording (written by both bridge directions)
-    recorder: Option<Arc<parking_lot::RwLock<Option<Recorder>>>>,
+    /// Shared recorder for call recording (written by both bridge directions).
+    ///
+    /// Wrapped in an outer `RwLock` so it can be attached after the
+    /// `BridgePeer` has been wrapped in an `Arc` (e.g. by the external-bridge
+    /// dispatcher in `proxy::call`). The inner `Option<Recorder>` is the
+    /// lazy-activation gate consumed by the forwarder hot path.
+    recorder: parking_lot::RwLock<Option<Arc<parking_lot::RwLock<Option<Recorder>>>>>,
     dtmf_sink: Arc<parking_lot::RwLock<DtmfSinkSlots>>,
     /// Audio sender channels for forwarding — fast-path aliases
     webrtc_send: Arc<AsyncMutex<Option<MediaSender>>>,
@@ -394,6 +399,14 @@ pub struct BridgePeer {
 }
 
 impl BridgePeer {
+    /// Attach a shared recorder after the `BridgePeer` has been wrapped in
+    /// an `Arc`. Must be called before `start_bridge()` so the forwarder
+    /// task sees the recorder when it spawns. Subsequent calls overwrite
+    /// any previously-attached recorder.
+    pub fn attach_recorder(&self, recorder: Arc<parking_lot::RwLock<Option<Recorder>>>) {
+        *self.recorder.write() = Some(recorder);
+    }
+
     /// Create a new bridge peer with given WebRTC and RTP PeerConnections
     pub fn new(id: String, webrtc_pc: PeerConnection, rtp_pc: PeerConnection) -> Self {
         Self {
@@ -403,7 +416,7 @@ impl BridgePeer {
             bridge_tasks: AsyncMutex::new(Vec::new()),
             cancel_token: CancellationToken::new(),
             forwarding_started: AtomicBool::new(false),
-            recorder: None,
+            recorder: parking_lot::RwLock::new(None),
             dtmf_sink: Arc::new(parking_lot::RwLock::new([None, None])),
             webrtc_send: Arc::new(AsyncMutex::new(None)),
             rtp_send: Arc::new(AsyncMutex::new(None)),
@@ -958,7 +971,7 @@ impl BridgePeer {
         let cancel_token = self.cancel_token.clone();
         let bridge_id = self.id.clone();
         let dtmf_sink = Arc::clone(&self.dtmf_sink);
-        let recorder = self.recorder.clone();
+        let recorder = self.recorder.read().clone();
 
         tokio::spawn(async move {
             let peers = peers_map.lock().await;
@@ -1062,7 +1075,7 @@ impl BridgePeer {
         let bridge_id = self.id.clone();
         let w2r_stats = Arc::clone(&self.webrtc_to_rtp_stats);
         let r2w_stats = Arc::clone(&self.rtp_to_webrtc_stats);
-        let recorder = self.recorder.clone();
+        let recorder = self.recorder.read().clone();
         let dtmf_sink = Arc::clone(&self.dtmf_sink);
         let webrtc_to_rtp_transcoder = Arc::clone(&self.webrtc_to_rtp_transcoder);
         let webrtc_to_rtp_timing = Arc::clone(&self.webrtc_to_rtp_timing);
@@ -1233,6 +1246,18 @@ impl BridgePeer {
         let is_video = track.kind() == MediaKind::Video;
         let mut dtmf_detector = BridgeDtmfDetector::default();
         let mut packet_count: u64 = 0;
+        // Egress pacing for WebRTC→RTP audio. Cartesia/aiortc emit Opus
+        // frames in bursts when TTS chunks finish encoding (we see kbps
+        // swing 1→90 over a 5s window at a stable nominal 250 pps). SIP
+        // softphone jitter buffers underrun on the gaps and audio sounds
+        // choppy. Re-pace based on the source RTP timestamps so packets
+        // leave at their natural 20 ms cadence. Track an anchor instant
+        // mapped to an anchor RTP timestamp; emit each packet at
+        // `anchor + (rtp_ts - anchor_ts) / clock_rate`. Reset the anchor
+        // on large gaps or accumulated lag so we don't sleep indefinitely
+        // after a TTS pause or drift slowly behind realtime.
+        let pace_audio = !is_video && path.should_strip_webrtc_audio_metadata();
+        let mut playout_anchor: Option<(tokio::time::Instant, u32, u32)> = None;
         // Last seen RTP sequence number for loss estimation
         let mut last_seq: Option<u16> = None;
         // Per-second stats for video diagnostics
@@ -1372,7 +1397,32 @@ impl BridgePeer {
                                     });
                                     match transcoded {
                                         Some(ts) => vec![ts],
-                                        None => vec![MediaSample::Audio(a)],
+                                        None => {
+                                            // No transcoder ran (codecs match end-to-end, e.g.
+                                            // Opus on both legs). The frame still carries the
+                                            // source-side payload type (e.g. SIP PT=96), but the
+                                            // destination leg negotiated a different PT (e.g.
+                                            // WebRTC PT=111). aiortc/strict peers drop packets
+                                            // whose PT doesn't match their negotiated mapping.
+                                            // Clear payload_type so rustrtc's into_rtp_packet
+                                            // falls back to the destination sender's
+                                            // default_payload_type (set when the egress track
+                                            // was registered via add_track). Preserve PT for
+                                            // RFC 2833 telephone-event so DTMF pass-through
+                                            // still works when no sink is installed.
+                                            let is_dtmf = {
+                                                let guard = dtmf_sink.read();
+                                                guard[dtmf_slot_index(path.source_endpoint())]
+                                                    .as_ref()
+                                                    .map_or(false, |s| {
+                                                        a.payload_type == Some(s.payload_type)
+                                                    })
+                                            };
+                                            if !is_dtmf {
+                                                a.payload_type = None;
+                                            }
+                                            vec![MediaSample::Audio(a)]
+                                        }
                                     }
                                 }
                                 MediaSample::Video(mut v) => {
@@ -1451,6 +1501,46 @@ impl BridgePeer {
                                             && let Some(r) = guard.as_mut() {
                                                 let _ = r.write_sample(leg, s, None, None, None::<AudioCodecType>);
                                             }
+                                }
+                            }
+                            if pace_audio
+                                && let Some(MediaSample::Audio(a)) = samples_to_send.first()
+                            {
+                                let clock_rate = a.clock_rate.max(8000);
+                                let rtp_ts = a.rtp_timestamp;
+                                let now = tokio::time::Instant::now();
+                                match playout_anchor {
+                                    None => {
+                                        playout_anchor = Some((now, rtp_ts, clock_rate));
+                                    }
+                                    Some((anchor_inst, anchor_ts, anchor_rate))
+                                        if anchor_rate != clock_rate =>
+                                    {
+                                        // Clock rate changed (codec switch?). Re-anchor.
+                                        let _ = (anchor_inst, anchor_ts);
+                                        playout_anchor = Some((now, rtp_ts, clock_rate));
+                                    }
+                                    Some((anchor_inst, anchor_ts, anchor_rate)) => {
+                                        let delta_ts = rtp_ts.wrapping_sub(anchor_ts);
+                                        let delta_us = (delta_ts as u64)
+                                            .saturating_mul(1_000_000)
+                                            / (anchor_rate as u64);
+                                        let target = anchor_inst
+                                            + tokio::time::Duration::from_micros(delta_us);
+                                        if target > now + tokio::time::Duration::from_secs(1) {
+                                            // Huge gap (TTS pause, anchor drift, ts wrap).
+                                            // Re-anchor here so we don't sleep forever.
+                                            playout_anchor = Some((now, rtp_ts, anchor_rate));
+                                        } else if now.saturating_duration_since(target)
+                                            > tokio::time::Duration::from_millis(200)
+                                        {
+                                            // Accumulated lag too large — reset anchor to
+                                            // catch up instead of falling further behind.
+                                            playout_anchor = Some((now, rtp_ts, anchor_rate));
+                                        } else if target > now {
+                                            tokio::time::sleep_until(target).await;
+                                        }
+                                    }
                                 }
                             }
                             for sample in samples_to_send {
@@ -1856,7 +1946,7 @@ impl BridgePeerBuilder {
         let mut bridge = BridgePeer::new(self.bridge_id, webrtc_pc, rtp_pc);
         bridge.webrtc_sender_codec = self.webrtc_sender_codec;
         bridge.rtp_sender_codec = self.rtp_sender_codec;
-        bridge.recorder = self.recorder;
+        bridge.recorder = parking_lot::RwLock::new(self.recorder);
 
         // Store video codec params for setup_bridge to create video senders
         bridge.webrtc_video_codec = self

@@ -1398,6 +1398,9 @@ impl CallModule {
                     direction: BridgeCallDirection::Inbound,
                     answer_time: None,
                     kind,
+                    // Failure path runs before a Recorder is created — no
+                    // file to attach.
+                    recording_path: None,
                 },
             );
         };
@@ -1598,6 +1601,90 @@ impl CallModule {
                 }
             };
 
+        // Set up call recording for the bridge. Recording is gated on the
+        // global `[recording]` policy (same surface non-bridge calls use);
+        // when disabled, `recording_path` stays `None` and the bridge runs
+        // without a recorder. We attach the recorder *before* `start()` is
+        // called so the forwarder picks it up when it spawns.
+        //
+        // Codec note: WebRTC sends Opus, SIP side varies (PCMU/PCMA/G722/
+        // Opus). `Recorder::new` internally targets PCMU for Opus/G722, and
+        // its per-sample decoder uses the inbound frame's payload type — so
+        // passing `CodecType::PCMU` here yields a playable mono-encoded,
+        // stereo-channel WAV with leg A on one channel and leg B on the
+        // other regardless of which codec each leg negotiated.
+        let recording_path: Option<String> = self
+            .inner
+            .config
+            .recording
+            .as_ref()
+            .filter(|p| p.enabled)
+            .and_then(|policy| {
+                let root = policy.recorder_path();
+                let date = chrono::Utc::now().format("%Y%m%d").to_string();
+                let safe_call_id = Self::sanitize_filename_component(
+                    &cdr_call_id,
+                    &uuid::Uuid::new_v4().to_string(),
+                );
+                let mut path = std::path::PathBuf::from(root);
+                path.push(date);
+                path.push(safe_call_id);
+                path.set_extension("wav");
+                Some(path.to_string_lossy().to_string())
+            });
+        if let (Some(path), BridgeKind::WebRtc) = (recording_path.as_ref(), kind) {
+            match crate::media::recorder::Recorder::new(path, CodecType::PCMU) {
+                Ok(mut rec) => {
+                    // Tell the recorder what codec/PT each leg uses so its
+                    // per-leg timeline projection uses the right clock rate.
+                    // Without this the recorder defaults to its output clock
+                    // (PCMU 8 kHz) for every leg, but the actual SIP-side
+                    // frames carry 48 kHz Opus timestamps — the resulting
+                    // mismatch makes the recorder log a
+                    // `timeline discontinuity` reset on every packet and
+                    // garble the caller's audio in the WAV.
+                    //
+                    // Leg A = inbound SIP side: parse the caller's offer SDP.
+                    // Leg B = bot/WebRTC side: bridge always negotiates Opus
+                    // at PT=111 today, so we use a fixed Opus profile.
+                    let leg_a_profile =
+                        crate::media::negotiate::MediaNegotiator::extract_leg_profile(
+                            std::str::from_utf8(&offer_body).unwrap_or(""),
+                        );
+                    rec.set_leg_profile(crate::media::recorder::Leg::A, leg_a_profile);
+                    let leg_b_profile = crate::media::negotiate::NegotiatedLegProfile {
+                        audio: Some(crate::media::negotiate::NegotiatedCodec {
+                            codec: CodecType::Opus,
+                            payload_type: 111,
+                            clock_rate: 48000,
+                            channels: 2,
+                        }),
+                        video: None,
+                        dtmf: None,
+                    };
+                    rec.set_leg_profile(crate::media::recorder::Leg::B, leg_b_profile);
+                    let shared = std::sync::Arc::new(parking_lot::RwLock::new(Some(rec)));
+                    outcome.bridge.attach_recorder(shared);
+                    info!(call_id = %cdr_call_id, path = %path,
+                        "webrtc bridge recording enabled");
+                }
+                Err(e) => {
+                    // Don't fail the call — just log and continue without
+                    // recording. The CDR will omit the recorder entry.
+                    warn!(call_id = %cdr_call_id, path = %path, error = %e,
+                        "failed to create webrtc bridge recorder; continuing without recording");
+                }
+            }
+        }
+        // LiveKit bridges do not run through BridgePeer; recording on that
+        // path is a separate follow-up. Leave `recording_path` set so the
+        // CDR doesn't show a stale path — clear it for non-WebRTC kinds.
+        let recording_path = if matches!(kind, BridgeKind::WebRtc) {
+            recording_path
+        } else {
+            None
+        };
+
         // Build the session up-front and stash it *before* sending the 200
         // OK. A racing BYE could otherwise arrive between `reply_with`
         // returning and the registry insert, a racing BYE dispatched on a
@@ -1615,12 +1702,27 @@ impl CallModule {
         // `reply_with` or key the registry on Call-ID rather than full
         // DialogId — follow-up if we ever observe a real orphan.
         let body_bytes = outcome.sip_sdp_answer.clone().into_bytes();
+        let mut reply_headers = vec![rsipstack::sip::Header::ContentType(
+            rsipstack::sip::headers::ContentType::from("application/sdp"),
+        )];
+        // RFC 3261 §13.3.1.4: a 2xx response to INVITE MUST contain a
+        // Contact header so the UAC knows where to send ACK and BYE.
+        // Without it the dialog never reaches Established on the caller
+        // side — softphones won't ACK, won't enable audio, and can't hang
+        // up cleanly.
+        let peer_ip = extract_peer_ip_from_request(&tx.original);
+        if let Some(uri) = self.inner.server.contact_uri_for_peer(peer_ip) {
+            let typed = rsipstack::sip::typed::Contact {
+                display_name: None,
+                uri,
+                params: vec![],
+            };
+            reply_headers.push(rsipstack::sip::Header::from(typed));
+        }
         let reply_result = tx
             .reply_with(
                 rsipstack::sip::StatusCode::OK,
-                vec![rsipstack::sip::Header::ContentType(
-                    rsipstack::sip::headers::ContentType::from("application/sdp"),
-                )],
+                reply_headers,
                 Some(body_bytes),
             )
             .await;
@@ -1674,6 +1776,7 @@ impl CallModule {
             trunk_id: Some(trunk_id),
             start_time: cdr_start,
             answer_time,
+            recording_path: recording_path.clone(),
         };
         self.inner
             .server
@@ -1835,6 +1938,7 @@ impl CallModule {
                 direction: BridgeCallDirection::Inbound,
                 answer_time: Some(session.answer_time),
                 kind: session.kind,
+                recording_path: session.recording_path.clone(),
             },
         );
 
