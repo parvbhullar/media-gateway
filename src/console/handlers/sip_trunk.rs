@@ -71,6 +71,7 @@ pub fn urls() -> Router<Arc<ConsoleState>> {
         )
         .route("/sip-trunk/new", get(page_sip_trunk_create))
         .route("/sip-trunk/promote/{name}", post(promote_file_trunk))
+        .route("/sip-trunk/{id}/probe", post(probe_trunk_now))
         .route(
             "/sip-trunk/{id}",
             get(page_sip_trunk_detail)
@@ -372,6 +373,7 @@ async fn update_sip_trunk(
     };
 
     let existing_kind = model.kind.clone();
+    let existing_kind_config = model.kind_config.clone();
     let existing_sip_cfg = model.sip().ok();
     let existing_webrtc_cfg = model.webrtc().ok();
     let existing_livekit_cfg = model.livekit().ok();
@@ -388,6 +390,20 @@ async fn update_sip_trunk(
         existing_livekit_cfg,
     ) {
         return response;
+    }
+
+    // If kind_config changed (e.g. endpoint_url / health_check_url /
+    // server_url / webhook_url got edited), clear the prober's
+    // bookkeeping so the next tick re-probes against the new target
+    // instead of honoring a stale `last_health_check_at` timestamp.
+    let new_kind_config = match &active.kind_config {
+        sea_orm::ActiveValue::Set(v) | sea_orm::ActiveValue::Unchanged(v) => Some(v.clone()),
+        _ => None,
+    };
+    if new_kind_config.as_ref() != Some(&existing_kind_config) {
+        active.last_health_check_at = Set(None);
+        active.consecutive_failures = Set(0);
+        active.consecutive_successes = Set(0);
     }
 
     match active.update(db).await {
@@ -1343,6 +1359,83 @@ async fn promote_file_trunk(
             .into_response(),
         Err(err) => err.into_response(),
     }
+}
+
+/// Manual "Check now" — runs an immediate probe against a single trunk and
+/// writes the outcome through the same state machine the periodic monitor
+/// uses ([`crate::proxy::gateway_health::apply_probe_outcome`]). Lets an
+/// operator force a refresh after fixing an endpoint without waiting for
+/// the back-off interval to expire.
+async fn probe_trunk_now(
+    AxumPath(id): AxumPath<i64>,
+    State(state): State<Arc<ConsoleState>>,
+    AuthRequired(user): AuthRequired,
+) -> Response {
+    if !state.has_permission(&user, "trunks", "write").await {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"message": "Permission denied"})),
+        )
+            .into_response();
+    }
+    let db = state.db();
+    let trunk = match SipTrunkEntity::find_by_id(id).one(db).await {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, Json(json!({"message": "Trunk not found"})))
+                .into_response();
+        }
+        Err(e) => {
+            warn!(error = %e, "probe_trunk_now: db lookup failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"message": format!("db lookup failed: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let prober = match crate::proxy::health_probers::lookup(&trunk.kind) {
+        Some(p) => p,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "message": format!("no health prober registered for kind '{}'", trunk.kind),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let timeout = std::time::Duration::from_secs(5);
+    let outcome = prober.probe(&trunk, timeout).await;
+
+    let updated = match crate::proxy::gateway_health::apply_probe_outcome(db, &trunk, &outcome).await {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(trunk = %trunk.name, error = %e, "probe_trunk_now: persist failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"message": format!("persist failed: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": outcome.ok,
+            "latency_ms": outcome.latency_ms,
+            "detail": outcome.detail,
+            "status": updated.status.as_str(),
+            "consecutive_failures": updated.consecutive_failures,
+            "consecutive_successes": updated.consecutive_successes,
+            "last_health_check_at": updated.last_health_check_at,
+        })),
+    )
+        .into_response()
 }
 
 #[cfg(test)]

@@ -315,14 +315,22 @@
                                         </div>
                                     </template>
                                 </td>
-                                <td class="whitespace-nowrap px-4 py-2">
-                                    <span
-                                        class="inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-semibold"
-                                        :class="statusBadgeClasses(trunk.status)">
-                                        <span class="h-1.5 w-1.5 rounded-full"
-                                            :class="statusDotClasses(trunk.status)"></span>
-                                        <span x-text="statusBadgeLabel(trunk.status)"></span>
-                                    </span>
+                                <td class="px-4 py-2">
+                                    <div class="flex flex-col items-start gap-1">
+                                        <span
+                                            class="inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-semibold"
+                                            :class="statusBadgeClasses(trunk.status)">
+                                            <span class="h-1.5 w-1.5 rounded-full"
+                                                :class="statusDotClasses(trunk.status)"></span>
+                                            <span x-text="statusBadgeLabel(trunk.status)"></span>
+                                        </span>
+                                        <template x-if="probeResults[trunk.id]">
+                                            <span class="block max-w-[18rem] truncate text-[11px] leading-tight"
+                                                :class="probeResults[trunk.id].ok ? 'text-emerald-600' : 'text-rose-600'"
+                                                :title="probeResults[trunk.id].detail"
+                                                x-text="(probeResults[trunk.id].ok ? '✓ ' : '✗ ') + probeResults[trunk.id].detail + (probeResults[trunk.id].latency_ms != null ? ` (${probeResults[trunk.id].latency_ms} ms)` : '')"></span>
+                                        </template>
+                                    </div>
                                 </td>
                                 <td class="whitespace-nowrap px-4 py-2">
                                     <template x-if="trunk.register_enabled">
@@ -352,6 +360,16 @@
                                             class="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-3 py-1 text-xs font-semibold text-slate-600 transition hover:border-sky-300 hover:text-sky-700">
                                             View
                                         </a>
+                                        <button type="button"
+                                            class="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-3 py-1 text-xs font-semibold transition"
+                                            :class="probingId === trunk.id ? 'text-slate-300 cursor-not-allowed' : 'text-slate-600 hover:border-sky-300 hover:text-sky-700'"
+                                            :disabled="probingId === trunk.id" @click="probeTrunk(trunk)"
+                                            :title="probeResults[trunk.id]?.detail || 'Run an immediate health probe'">
+                                            <svg class="h-3 w-3" :class="probingId === trunk.id ? 'animate-spin' : ''" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8">
+                                                <path stroke-linecap="round" stroke-linejoin="round" d="M4 10a6 6 0 0 1 10.6-3.8M16 10a6 6 0 0 1-10.6 3.8M14 4v3h-3M6 16v-3h3"/>
+                                            </svg>
+                                            <span x-text="probingId === trunk.id ? 'Checking…' : 'Check'"></span>
+                                        </button>
                                         <button type="button"
                                             class="inline-flex items-center gap-1 rounded-lg border border-rose-200 px-3 py-1 text-xs font-semibold transition"
                                             :class="processingDelete === trunk.id ? 'text-rose-300 cursor-not-allowed' : 'text-rose-600 hover:bg-rose-50'"
@@ -927,6 +945,44 @@
             },
             detailUrl(id) {
                 return `${this.basePath}/sip-trunk/${id}`;
+            },
+            async probeTrunk(trunk) {
+                if (!trunk || !trunk.id || this.probingId) return;
+                this.probingId = trunk.id;
+                try {
+                    const response = await fetch(`${this.basePath}/sip-trunk/${trunk.id}/probe`, {
+                        method: 'POST',
+                        headers: { 'Accept': 'application/json' },
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        throw new Error(data?.message || `Probe failed (HTTP ${response.status})`);
+                    }
+                    this.probeResults = {
+                        ...this.probeResults,
+                        [trunk.id]: { ok: !!data.ok, detail: data.detail || '', latency_ms: data.latency_ms },
+                    };
+                    if (data.status) {
+                        const idx = this.trunks.findIndex((t) => t.id === trunk.id);
+                        if (idx >= 0) {
+                            this.trunks[idx] = { ...this.trunks[idx], status: data.status };
+                        }
+                    }
+                    const latency = data.latency_ms != null ? ` (${data.latency_ms} ms)` : '';
+                    const summary = `${trunk.display_name || trunk.name}: ${data.detail || 'no detail'}${latency}`;
+                    if (data.ok) {
+                        this.flash = `OK — ${summary}`;
+                        this.error = null;
+                    } else {
+                        this.error = `Failed — ${summary}`;
+                        this.flash = null;
+                    }
+                } catch (err) {
+                    console.error(err);
+                    this.error = err?.message || 'Probe failed';
+                    this.flash = null;
+                }
+                this.probingId = null;
             },
             confirmDelete(trunk) {
                 if (!trunk || !trunk.id) {

@@ -37,14 +37,27 @@ default('RustPBX') }}{% endblock %}
             </div>
             <div class="rounded-xl bg-white p-5 text-sm text-slate-600 shadow-sm ring-1 ring-black/5"
                 x-show="mode === 'edit'" x-cloak>
-                <div class="flex items-center justify-between">
+                <div class="flex items-center justify-between gap-3">
                     <div class="font-semibold text-slate-900">{{ "sip_trunk_detail.trunk_summary" | t }}</div>
-                    <span class="inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-semibold"
-                        :class="statusBadgeClasses(form.status)">
-                        <span class="h-1.5 w-1.5 rounded-full" :class="statusDotClasses(form.status)"></span>
-                        <span x-text="statusBadgeLabel(form.status)"></span>
-                    </span>
+                    <div class="flex items-center gap-2">
+                        <span class="inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-semibold"
+                            :class="statusBadgeClasses(form.status)">
+                            <span class="h-1.5 w-1.5 rounded-full" :class="statusDotClasses(form.status)"></span>
+                            <span x-text="statusBadgeLabel(form.status)"></span>
+                        </span>
+                        <button type="button" @click="probeNow()" :disabled="probing || !model?.id"
+                            class="inline-flex items-center gap-1 rounded-md border border-slate-200 px-2.5 py-1 text-xs font-medium text-slate-600 transition hover:bg-slate-100 disabled:opacity-50"
+                            :title="probeMessage || 'Run an immediate health probe and refresh the status'">
+                            <svg class="h-3 w-3" :class="probing ? 'animate-spin' : ''" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8">
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M4 10a6 6 0 0 1 10.6-3.8M16 10a6 6 0 0 1-10.6 3.8M14 4v3h-3M6 16v-3h3"/>
+                            </svg>
+                            <span x-text="probing ? 'Checking…' : 'Check now'"></span>
+                        </button>
+                    </div>
                 </div>
+                <template x-if="probeMessage">
+                    <p class="mt-2 text-xs" :class="probeOk ? 'text-emerald-600' : 'text-rose-600'" x-text="probeMessage"></p>
+                </template>
                 <dl class="mt-4 space-y-3 text-xs text-slate-500">
                     <div class="flex items-center justify-between gap-6">
                         <dt class="uppercase tracking-wide">{{ "sip_trunk_detail.summary_trunk" | t }}</dt>
@@ -946,6 +959,14 @@ default('RustPBX') }}{% endblock %}
                 this.form.livekit_signaling_timeout_ms = model.livekit_signaling_timeout_ms != null
                     ? String(model.livekit_signaling_timeout_ms) : '';
                 this.form.livekit_delete_room_on_hangup = model.livekit_delete_room_on_hangup === true;
+                this.form.livekit_agent_name = model.livekit_agent_name || '';
+                this.form.livekit_require_agent_dispatch = model.livekit_require_agent_dispatch === true;
+                this.form.livekit_bot_join_timeout_ms = model.livekit_bot_join_timeout_ms != null
+                    ? String(model.livekit_bot_join_timeout_ms) : '';
+                this.form.livekit_hold_tone_hz = model.livekit_hold_tone_hz != null
+                    ? String(model.livekit_hold_tone_hz) : '';
+                this.form.livekit_jwt_ttl_secs = model.livekit_jwt_ttl_secs != null
+                    ? String(model.livekit_jwt_ttl_secs) : '';
             },
             get pageTitle() {
                 const td = (this.t || {}).sip_trunk_detail || {};
@@ -1183,6 +1204,33 @@ default('RustPBX') }}{% endblock %}
                 }
 
                 return params;
+            },
+            async probeNow() {
+                if (!this.model?.id || this.probing) return;
+                this.probing = true;
+                this.probeMessage = null;
+                try {
+                    const response = await fetch(`${this.basePath}/sip-trunk/${this.model.id}/probe`, {
+                        method: 'POST',
+                        headers: { 'Accept': 'application/json' },
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        throw new Error(data?.message || `Probe failed (HTTP ${response.status})`);
+                    }
+                    this.probeOk = !!data.ok;
+                    if (data.status) {
+                        this.form.status = data.status;
+                    }
+                    const latency = data.latency_ms != null ? ` (${data.latency_ms} ms)` : '';
+                    this.probeMessage = `${data.ok ? 'OK' : 'Failed'}: ${data.detail || 'no detail'}${latency}`;
+                } catch (err) {
+                    console.error(err);
+                    this.probeOk = false;
+                    this.probeMessage = err?.message || 'Probe failed';
+                } finally {
+                    this.probing = false;
+                }
             },
             async submit() {
                 const td = (this.t || {}).sip_trunk_detail || {};

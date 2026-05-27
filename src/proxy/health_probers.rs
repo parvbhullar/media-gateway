@@ -9,7 +9,7 @@
 //! Built-in probers:
 //! - `"sip"` — wraps [`crate::proxy::gateway_health::probe_trunk`] (SIP
 //!   OPTIONS keepalive, unchanged behavior).
-//! - `"webrtc"` — HTTP `HEAD` against the signaling endpoint configured on
+//! - `"webrtc"` — HTTP `GET` against the signaling endpoint configured on
 //!   the trunk's `kind_config.endpoint_url`. Any 2xx/3xx counts as healthy;
 //!   4xx/5xx/timeout count as a failure. This is a cheap probe that doesn't
 //!   consume a real session slot on the remote bot. Operators who want
@@ -98,7 +98,11 @@ impl KindHealthProber for SipProber {
 
 /// WebRTC prober for the `http_json` signaling adapter (currently the only
 /// registered adapter, per `crate::proxy::bridge::signaling`). Sends a
-/// plain HTTP `HEAD` to the endpoint URL extracted from `kind_config`.
+/// plain HTTP `GET` to the endpoint URL extracted from `kind_config`.
+/// `GET` (not `HEAD`) is used because most health endpoints in the wild
+/// — Kubernetes liveness, load-balancer probes, FastAPI `@app.get` — only
+/// declare GET; HEAD often returns 405. Health bodies are tiny so the
+/// extra bytes don't matter.
 ///
 /// We deliberately avoid:
 /// - A canary `POST` of a synthetic SDP — that would consume a real
@@ -135,7 +139,7 @@ impl KindHealthProber for WebRtcHttpJsonProber {
         // Pick the URL to probe. Precedence:
         //   1. `kind_config.health_check_url` if present (operator
         //      override — point at /healthz or / when the signaling
-        //      endpoint doesn't implement HEAD).
+        //      endpoint doesn't implement GET).
         //   2. `kind_config.endpoint_url` (default — same URL the
         //      signaling adapter POSTs to for real offers).
         // Read both defensively (raw JSON, not typed view) so future
@@ -162,7 +166,7 @@ impl KindHealthProber for WebRtcHttpJsonProber {
 
         let result = self
             .client
-            .head(&url)
+            .get(&url)
             .timeout(timeout)
             .send()
             .await;
@@ -171,18 +175,15 @@ impl KindHealthProber for WebRtcHttpJsonProber {
         match result {
             Ok(resp) => {
                 let status = resp.status();
-                if status.is_success() || status.is_redirection() {
-                    ProbeOutcome {
-                        ok: true,
-                        latency_ms,
-                        detail: format!("HEAD {} {}", status.as_u16(), status.canonical_reason().unwrap_or("")),
-                    }
-                } else {
-                    ProbeOutcome {
-                        ok: false,
-                        latency_ms,
-                        detail: format!("HEAD {} {}", status.as_u16(), status.canonical_reason().unwrap_or("")),
-                    }
+                let detail = format!(
+                    "GET {} {}",
+                    status.as_u16(),
+                    status.canonical_reason().unwrap_or("")
+                );
+                ProbeOutcome {
+                    ok: status.is_success() || status.is_redirection(),
+                    latency_ms,
+                    detail,
                 }
             }
             Err(e) if e.is_timeout() => ProbeOutcome {
@@ -201,7 +202,7 @@ impl KindHealthProber for WebRtcHttpJsonProber {
 
 /// LiveKit prober. Two probe strategies, in precedence order:
 ///
-/// 1. If `kind_config.health_check_url` is set, send an HTTP `HEAD` to it
+/// 1. If `kind_config.health_check_url` is set, send an HTTP `GET` to it
 ///    and treat any 2xx/3xx as healthy. This is the same shape as the
 ///    WebRTC prober and lets operators point at an `/healthz` endpoint on
 ///    a sidecar.
@@ -254,20 +255,20 @@ impl KindHealthProber for LiveKitProber {
     async fn probe(&self, trunk: &TrunkModel, timeout: Duration) -> ProbeOutcome {
         let start = std::time::Instant::now();
 
-        // Precedence 1: explicit health_check_url → HTTP HEAD.
+        // Precedence 1: explicit health_check_url → HTTP GET.
         if let Some(url) = trunk
             .kind_config
             .get("health_check_url")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
         {
-            let result = self.client.head(url).timeout(timeout).send().await;
+            let result = self.client.get(url).timeout(timeout).send().await;
             let latency_ms = start.elapsed().as_millis() as u64;
             return match result {
                 Ok(resp) => {
                     let status = resp.status();
                     let detail = format!(
-                        "HEAD {} {}",
+                        "GET {} {}",
                         status.as_u16(),
                         status.canonical_reason().unwrap_or("")
                     );
