@@ -1682,8 +1682,24 @@ impl CallModule {
             .await;
 
         // Kick off forwarding tasks via the kind-agnostic start hook.
+        // L13: if start() fails AFTER we've replied 200 OK + stashed the
+        // session, the call would otherwise sit in the registry without
+        // any media flowing — caller hears silence until carrier
+        // RTP-timeout fires. Tear down cleanly so the CDR captures it.
+        // (We can't send a SIP failure response — 200 OK already on the
+        // wire; server-initiated BYE plumbing is a separate follow-up.
+        // See L8 in the LiveKit review.)
         if let Err(e) = bridge_arc.start().await {
-            warn!(%dialog_id, error = %e, "bridge start failed");
+            warn!(%dialog_id, error = %e,
+                "bridge start failed AFTER 200 OK — tearing down session");
+            self.teardown_external_bridge_if_present(
+                &dialog_id,
+                crate::proxy::bridge_sessions::BridgeHangupCause::TeardownFailed,
+            )
+            .await;
+            // Caller learns via RTP timeout; we return Ok because the
+            // 200 OK already went out.
+            return Ok(());
         }
 
         // Spawn a watcher for kinds whose media plane carries its own
@@ -1714,19 +1730,20 @@ impl CallModule {
                 bridge_arc.clone();
             let dialog_id_for_watcher = dialog_id.clone();
             tokio::spawn(async move {
-                bridge_for_watcher.watch_disconnect().await;
+                // The future's output carries the cause whichever Task
+                // (C: room Disconnected, D: watchdog) tripped the
+                // cancel — so the CDR records the real reason.
+                let cause = bridge_for_watcher.watch_disconnect().await;
                 info!(
                     dialog_id = %dialog_id_for_watcher,
+                    ?cause,
                     "livekit bridge signalled disconnect; tearing down session"
                 );
                 // Drop our strong Arc on the bridge before driving
                 // teardown so the registry removal can collect it.
                 drop(bridge_for_watcher);
                 module
-                    .teardown_external_bridge_if_present(
-                        &dialog_id_for_watcher,
-                        crate::proxy::bridge_sessions::BridgeHangupCause::ByCallee,
-                    )
+                    .teardown_external_bridge_if_present(&dialog_id_for_watcher, cause)
                     .await;
             });
         }
@@ -1784,14 +1801,20 @@ impl CallModule {
         let hangup_reason = match (cause, teardown_ok) {
             (BridgeHangupCause::ByCaller, true) => CallRecordHangupReason::ByCaller,
             (BridgeHangupCause::ByCallee, true) => CallRecordHangupReason::ByCallee,
+            // Watchdog firing is a service-side failure mode (the bot
+            // never showed up). Surface as Failed so operators see it
+            // in dashboards alongside other call failures.
+            (BridgeHangupCause::BotJoinTimeout, _) => CallRecordHangupReason::Failed,
             (_, false) | (BridgeHangupCause::TeardownFailed, _) => {
                 CallRecordHangupReason::Failed
             }
         };
-        let last_error_reason = if teardown_ok {
-            None
-        } else {
-            Some("teardown.close errored at teardown".to_string())
+        let last_error_reason = match (cause, teardown_ok) {
+            (BridgeHangupCause::BotJoinTimeout, _) => {
+                Some("bot did not join within bot_join_timeout_ms watchdog".to_string())
+            }
+            (_, false) => Some("teardown.close errored at teardown".to_string()),
+            _ => None,
         };
 
         emit_bridge_call_record(
