@@ -283,6 +283,11 @@ fn default_audio_codec() -> String {
     "opus".to_string()
 }
 
+/// Serde helper for fields whose default value is `true`.
+fn default_true() -> bool {
+    true
+}
+
 /// Configuration shape for `kind = "webrtc"` trunks. Serialized as JSON in
 /// the `trunks.kind_config` column.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -384,10 +389,13 @@ pub struct LiveKitTrunkConfig {
     /// the WebRtc HttpJsonProtocol shape; supports request_body_template.
     #[serde(default)]
     pub dispatch_endpoint_protocol: Option<Value>,
-    /// If true, schema-validation OR transport failures on the webhook
-    /// abort the call. If false (default), transient failures fall back
-    /// to "accept with no overrides" — schema failures still always abort.
-    #[serde(default)]
+    /// If true (default), schema-validation OR transport failures on
+    /// the webhook abort the call. If false, transient failures fall
+    /// back to "accept with no overrides" — schema failures still always
+    /// abort regardless. Default `true` because production deployments
+    /// want hard-fail on controller bugs / outages to surface in CDR
+    /// and metrics instead of silently dropping callers into rooms.
+    #[serde(default = "default_true")]
     pub require_webhook_ack: bool,
     /// Optional URL for kind-aware health probing. Falls back to TCP-connect
     /// against `server_url`'s host:port when unset.
@@ -403,6 +411,51 @@ pub struct LiveKitTrunkConfig {
     /// Default false: leave the room alive for other participants.
     #[serde(default)]
     pub delete_room_on_hangup: bool,
+    /// LiveKit "explicit agent dispatch" — when set, after our caller
+    /// participant joins the room we call the LiveKit AgentDispatch
+    /// admin RPC to spin the named agent into the same room. Lets you
+    /// run with zero external controller: rustpbx itself triggers the
+    /// bot. At least one of `agent_name` or `dispatch_endpoint` MUST be
+    /// set (otherwise the caller lands in an empty room and hears
+    /// silence forever).
+    #[serde(default)]
+    pub agent_name: Option<String>,
+    /// When true (default), a failure of the LiveKit AgentDispatch RPC
+    /// aborts the call with 503 instead of soft-fail-and-continue.
+    /// Pairs with `agent_name`. Default `true` so misconfigured agents
+    /// surface as CDR failures + tracing warnings rather than silent
+    /// empty rooms.
+    #[serde(default = "default_true")]
+    pub require_agent_dispatch: bool,
+    /// When set, the LiveKit bridge runs a watchdog after Room::connect:
+    /// if no remote participant has TrackSubscribed within this many
+    /// milliseconds, the bridge cancels itself, which triggers the
+    /// SIP-side teardown (CDR `hangup=ByCallee`, `last_error="bot did
+    /// not join within …"`). Closes the runtime "silent empty room"
+    /// gap that agent_name + webhook alone can't guarantee — the
+    /// configured agent might fail to register on the LiveKit side, the
+    /// webhook controller might silently drop the request, etc.
+    /// Default None = no watchdog (call stays up until SIP-side BYE).
+    #[serde(default)]
+    pub bot_join_timeout_ms: Option<u64>,
+    /// When set, the LiveKit bridge emits a low-amplitude sine tone at
+    /// this frequency on the SIP-RTP side whenever `subscribers` is
+    /// empty (no remote participant publishing audio). Replaces the
+    /// default silence so the caller hears *something* while waiting
+    /// for the bot to land. Recommended values: 0 = silence (default),
+    /// 200-440 = "please hold" tone. Frequencies above ~3400 Hz are
+    /// clipped by the SIP codec (PCMU/PCMA 8 kHz Nyquist).
+    #[serde(default)]
+    pub hold_tone_hz: Option<u16>,
+    /// JWT TTL in seconds (default 1800 = 30 min). Controls how long
+    /// the minted access token can authenticate `Room::connect` —
+    /// once a participant is in the room the TTL no longer matters
+    /// for the live session, BUT the LiveKit SDK's auto-reconnect
+    /// path re-uses the original JWT, so a network blip on a call
+    /// that's been up longer than the TTL fails to recover. Raise
+    /// for long-running calls; lower for tighter token hygiene.
+    #[serde(default)]
+    pub jwt_ttl_secs: Option<u64>,
 }
 
 impl LiveKitTrunkConfig {
@@ -426,6 +479,27 @@ impl LiveKitTrunkConfig {
         }
         if self.identity_template.trim().is_empty() {
             return Err(ValidationError::custom("identity_template must not be empty"));
+        }
+        // At least one of agent_name OR dispatch_endpoint must be set, so
+        // there's a way for the bot to be told about the call. Both unset
+        // leaves the caller in an empty room hearing silence (see
+        // `docs/smoke_test_livekit_bridge.md`).
+        let has_agent = self
+            .agent_name
+            .as_ref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        let has_webhook = self
+            .dispatch_endpoint
+            .as_ref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false);
+        if !has_agent && !has_webhook {
+            return Err(ValidationError::custom(
+                "at least one of agent_name or dispatch_endpoint must be set \
+                 — otherwise the caller will join an empty LiveKit room with \
+                 nobody to hear them",
+            ));
         }
         match self.audio_codec.as_str() {
             "opus" | "g722" => {}
@@ -470,6 +544,9 @@ mod livekit_config_tests {
     use super::*;
 
     fn base() -> LiveKitTrunkConfig {
+        // base() now includes agent_name so validate() passes — the
+        // bot-routing requirement (`agent_name` OR `dispatch_endpoint`)
+        // is exercised by dedicated tests below.
         LiveKitTrunkConfig {
             server_url: "wss://livekit.example.com".to_string(),
             api_key: "key".to_string(),
@@ -485,6 +562,11 @@ mod livekit_config_tests {
             health_check_url: None,
             signaling_timeout_ms: None,
             delete_room_on_hangup: false,
+            agent_name: Some("voice-agent".to_string()),
+            require_agent_dispatch: false,
+            bot_join_timeout_ms: None,
+            hold_tone_hz: None,
+            jwt_ttl_secs: None,
         }
     }
 
@@ -528,5 +610,42 @@ mod livekit_config_tests {
         cfg.metadata_template =
             Some(r#"{"call":"{call_id}","from":"{from_user}"}"#.to_string());
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_when_neither_agent_name_nor_dispatch_endpoint_set() {
+        let mut cfg = base();
+        cfg.agent_name = None;
+        cfg.dispatch_endpoint = None;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("agent_name") && err.contains("dispatch_endpoint"),
+            "expected error to mention both fields, got: {err}"
+        );
+    }
+
+    #[test]
+    fn accepts_when_only_dispatch_endpoint_set() {
+        let mut cfg = base();
+        cfg.agent_name = None;
+        cfg.dispatch_endpoint = Some("https://controller.example.com/dispatch".to_string());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn accepts_when_only_agent_name_set() {
+        let mut cfg = base();
+        cfg.dispatch_endpoint = None;
+        // base() already has agent_name = Some("voice-agent")
+        assert!(cfg.agent_name.is_some());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_when_agent_name_is_whitespace_only() {
+        let mut cfg = base();
+        cfg.agent_name = Some("   ".to_string());
+        cfg.dispatch_endpoint = None;
+        assert!(cfg.validate().is_err(), "whitespace-only agent_name must not satisfy the gate");
     }
 }
