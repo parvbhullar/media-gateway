@@ -23,6 +23,20 @@ pub struct ConnectedRoom {
 /// "sip-caller" LocalAudioTrack backed by a fresh NativeAudioSource @
 /// 48 kHz mono.
 pub async fn connect_and_publish(server_url: &str, jwt: &str) -> Result<ConnectedRoom> {
+    // Use the SDK's default ICE-transport policy (`All`) so libwebrtc can
+    // gather host + srflx + relay candidates and pick whichever path
+    // actually works against LiveKit's media edge.
+    //
+    // History: we briefly forced `IceTransportsType::Relay` here, on the
+    // theory that this host's UDP egress was blocked. Diagnostic logs
+    // showed that was wrong — direct (srflx) UDP did work intermittently
+    // on the same network; forcing Relay just stripped the working
+    // fallbacks and made the failure mode worse. On networks where TURN
+    // really is the only option, the right knob is a per-trunk
+    // `force_relay` config flag (deferred — add when an operator deploys
+    // somewhere it actually matters). See livekit/sip's `WithDisableTURN`
+    // for the inverse case (co-located deployments that skip TURN
+    // entirely).
     let (room, events) = Room::connect(server_url, jwt, RoomOptions::default())
         .await
         .map_err(|e| anyhow!("livekit Room::connect failed: {e}"))?;

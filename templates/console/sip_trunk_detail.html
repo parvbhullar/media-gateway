@@ -1330,6 +1330,48 @@ default('RustPBX') }}{% endblock %}
                     }
                     return params;
                 }
+                if (this.form.kind === 'livekit') {
+                    // Mirror the webrtc branch — every livekit_* form field
+                    // must be submitted, otherwise the backend's "Option missing
+                    // → preserve existing" path keeps the old value and the
+                    // edit appears to revert silently.
+                    const setStr = (key, val) => {
+                        params.set(key, (val ?? '').toString().trim());
+                    };
+                    const setNum = (key, val) => {
+                        if (val === '' || val == null) return;
+                        const n = Number(val);
+                        if (!Number.isNaN(n)) params.set(key, String(Math.max(0, Math.round(n))));
+                    };
+                    const setBool = (key, val) => {
+                        params.set(key, val ? 'true' : 'false');
+                    };
+                    setStr('livekit_server_url', this.form.livekit_server_url);
+                    setStr('livekit_api_key', this.form.livekit_api_key);
+                    if ((this.form.livekit_api_secret || '').trim()) {
+                        // Treat blank api_secret as "keep stored" — never echo
+                        // the cleared field as an empty string, which would
+                        // fail kind_schemas validation.
+                        params.set('livekit_api_secret', this.form.livekit_api_secret.trim());
+                    }
+                    setStr('livekit_room_template', this.form.livekit_room_template);
+                    setStr('livekit_identity_template', this.form.livekit_identity_template);
+                    setStr('livekit_metadata_template', this.form.livekit_metadata_template);
+                    setStr('livekit_audio_codec', this.form.livekit_audio_codec || 'opus');
+                    setStr('livekit_dispatch_endpoint', this.form.livekit_dispatch_endpoint);
+                    setStr('livekit_dispatch_endpoint_auth_header', this.form.livekit_dispatch_endpoint_auth_header);
+                    setStr('livekit_dispatch_endpoint_protocol', this.form.livekit_dispatch_endpoint_protocol);
+                    setStr('livekit_health_check_url', this.form.livekit_health_check_url);
+                    setStr('livekit_agent_name', this.form.livekit_agent_name);
+                    setBool('livekit_require_webhook_ack', this.form.livekit_require_webhook_ack);
+                    setBool('livekit_require_agent_dispatch', this.form.livekit_require_agent_dispatch);
+                    setBool('livekit_delete_room_on_hangup', this.form.livekit_delete_room_on_hangup);
+                    setNum('livekit_signaling_timeout_ms', this.form.livekit_signaling_timeout_ms);
+                    setNum('livekit_bot_join_timeout_ms', this.form.livekit_bot_join_timeout_ms);
+                    setNum('livekit_hold_tone_hz', this.form.livekit_hold_tone_hz);
+                    setNum('livekit_jwt_ttl_secs', this.form.livekit_jwt_ttl_secs);
+                    return params;
+                }
                 params.set('carrier', this.form.carrier.trim());
                 params.set('sip_transport', this.form.sip_transport.trim());
 

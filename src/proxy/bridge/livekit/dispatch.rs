@@ -129,24 +129,35 @@ pub async fn dispatch_livekit(
         ttl_secs: cfg.jwt_ttl_secs.unwrap_or(30 * 60),
     })?;
 
-    // 5. Connect + publish.
-    let connected = connect_and_publish(&cfg.server_url, &jwt).await?;
+    // LiveKit admin RPCs (AgentDispatch, RoomService) use Twirp over HTTPS;
+    // the signaling URL uses ws(s)://. Translate before constructing
+    // admin clients.
+    let admin_url = admin_url_from_signal(&cfg.server_url);
 
-    // `livekit::Room` is not `Clone` — wrap in Arc so the media bridge and
-    // teardown can both observe the same session.
-    let room_arc = Arc::new(connected.room);
-
-    // 5b. Optional LiveKit-native agent dispatch. When the trunk config
-    // names an agent, ask the LiveKit server to spin that agent into the
-    // same room as our caller participant. The webhook path (3) and this
-    // path are independent: a caller may have BOTH (webhook gets a
-    // heads-up + can override room/identity, then we still dispatch the
-    // named agent to the final room), OR just one. validate() refuses
+    // 4b. LiveKit-native agent dispatch — fire BEFORE Room::connect.
+    //
+    // AgentDispatch is a stateless HTTPS Twirp RPC that LiveKit Cloud
+    // accepts at any time for a named room (the room is created lazily
+    // when the first participant joins). Doing it before Room::connect
+    // means the named agent worker spins up in parallel with our
+    // publisher PC's ICE/DTLS handshake — so on a healthy network the
+    // bot is often already waiting in the room by the time we finish
+    // connecting, AND on a degraded network (e.g. NAT-blocked UDP that
+    // makes Room::connect time out) the agent worker still receives
+    // its dispatch RPC. Without this reordering, a Room::connect
+    // timeout silently swallows the dispatch entirely and the agent
+    // never knows the call was attempted, which makes "agent didn't
+    // get the call" indistinguishable from "agent had a bug" during
+    // diagnosis.
+    //
+    // The webhook path (3) and this path are independent: a caller
+    // may have BOTH (webhook overrides room/identity, then we dispatch
+    // the named agent to the final room) OR just one. validate() refuses
     // configs that have neither, so the caller can never land in an
     // empty room with no path to a bot.
     if let Some(agent_name) = cfg.agent_name.as_deref().filter(|s| !s.trim().is_empty()) {
         let agent_client = livekit_api::services::agent_dispatch::AgentDispatchClient::with_api_key(
-            &cfg.server_url,
+            &admin_url,
             &cfg.api_key,
             &cfg.api_secret,
         );
@@ -168,34 +179,27 @@ pub async fn dispatch_livekit(
                 );
             }
             Err(e) if cfg.require_agent_dispatch => {
-                // Strict mode: abort the call rather than land the caller in
-                // a room without a bot. We've already opened the LiveKit
-                // room (Room::connect succeeded) — close it before
-                // bubbling the error so the LiveKit-side state is clean.
+                // Strict mode: abort the call rather than land the caller
+                // in a room without a bot. We dispatched BEFORE Room::connect,
+                // so there's no room handle to clean up — the dispatch RPC
+                // either succeeded server-side (room reservation may linger
+                // briefly until LiveKit's empty_timeout) or failed before
+                // any state was committed.
                 tracing::warn!(
                     agent = %agent_name,
                     room = %final_room,
                     error = %e,
-                    "livekit agent dispatch failed; require_agent_dispatch=true → aborting"
+                    "livekit agent dispatch failed; require_agent_dispatch=true → aborting before connect"
                 );
-                if let Err(close_err) = room_arc.close().await {
-                    tracing::warn!(
-                        error = %close_err,
-                        "post-agent-dispatch-failure room.close also failed; \
-                         LiveKit room may linger until its idle timeout"
-                    );
-                }
                 return Err(anyhow!(
                     "livekit agent dispatch required but failed: {e}"
                 ));
             }
             Err(e) => {
                 // Soft-fail (default): failure here is logged but doesn't
-                // fail the call. The room is still up and the caller is
-                // still in it; the bot may simply never appear. Mirrors
-                // the "soft-fail" semantics of the webhook path with
-                // require_webhook_ack=false. The bot_join_timeout_ms
-                // watchdog (if configured) will catch a no-show.
+                // fail the call. We proceed to Room::connect; the
+                // bot_join_timeout_ms watchdog (if configured) will catch
+                // a no-show.
                 tracing::warn!(
                     agent = %agent_name,
                     room = %final_room,
@@ -206,6 +210,110 @@ pub async fn dispatch_livekit(
         }
     }
 
+    // 5. Connect + publish.
+    let connected = connect_and_publish(&cfg.server_url, &jwt).await?;
+
+    // `livekit::Room` is not `Clone` — wrap in Arc so the media bridge and
+    // teardown can both observe the same session.
+    let room_arc = Arc::new(connected.room);
+
+    // 5c. Pre-answer wait: hold the SIP-side INVITE in 100 Trying until
+    // an Agent participant joins the room. The bot may still be warming
+    // up (LLM init, TTS first-token, etc.) and not yet publishing audio
+    // when this fires; we accept that brief gap of silence at the start
+    // of the call as the price of answering on a real connection vs.
+    // waiting for the bot's first frame (which can be 5-30s on cold
+    // starts). What this DOES catch: agent_name doesn't match any
+    // deployed worker, the worker crashes during init, or LiveKit Cloud
+    // accepts the dispatch but no worker ever picks it up. Those all
+    // surface as a clean 504 on the initial INVITE rather than a 200 OK
+    // followed by a stuck caller in an empty room.
+    //
+    // The post-answer watchdog inside `media.rs` is the second line of
+    // defense for "agent joined but never published audio" — it sees
+    // subscribers > 0 once TrackSubscribed fires, so it stays armed
+    // until the bot actually starts speaking; if it doesn't, the call
+    // gets BYE'd from the SIP side.
+    let prejoin_timeout = cfg.bot_join_timeout_ms.unwrap_or(15_000);
+    let (fwd_tx, fwd_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut events_rx = connected.events;
+    let deadline = tokio::time::sleep(Duration::from_millis(prejoin_timeout));
+    tokio::pin!(deadline);
+    // Race-window check: with agent_dispatch firing BEFORE Room::connect,
+    // it's possible the agent worker won the race and joined the room
+    // before we did. In that case `ParticipantConnected` was emitted
+    // before our event stream existed — those participants appear in
+    // `room_arc.remote_participants()` as initial state, NOT in the
+    // event stream. Pre-seed `bot_joined` from this snapshot so we
+    // don't spin-wait for an event that will never arrive.
+    let mut bot_joined = room_arc
+        .remote_participants()
+        .values()
+        .any(|p| p.kind() == livekit::participant::ParticipantKind::Agent);
+    if bot_joined {
+        tracing::info!(
+            trunk = %trunk.name,
+            room = %final_room,
+            "LiveKit agent already present at connect time (raced ahead of caller)"
+        );
+    }
+    while !bot_joined {
+        tokio::select! {
+            biased;
+            _ = &mut deadline => {
+                tracing::warn!(
+                    trunk = %trunk.name,
+                    room = %final_room,
+                    timeout_ms = prejoin_timeout,
+                    "LiveKit bot did not join before answering caller; aborting"
+                );
+                if let Err(close_err) = room_arc.close().await {
+                    tracing::warn!(error = %close_err,
+                        "post-prejoin-timeout room.close also failed");
+                }
+                return Err(anyhow!(
+                    "livekit bot did not join within {prejoin_timeout}ms before answer"
+                ));
+            }
+            ev = events_rx.recv() => {
+                let Some(ev) = ev else {
+                    if let Err(close_err) = room_arc.close().await {
+                        tracing::warn!(error = %close_err,
+                            "post-event-stream-close room.close also failed");
+                    }
+                    return Err(anyhow!(
+                        "livekit event stream closed before bot joined"
+                    ));
+                };
+                let agent_joined = matches!(
+                    &ev,
+                    livekit::RoomEvent::ParticipantConnected(p)
+                        if p.kind() == livekit::participant::ParticipantKind::Agent
+                );
+                // Forward to the bridge so it doesn't miss anything.
+                let _ = fwd_tx.send(ev);
+                if agent_joined {
+                    bot_joined = true;
+                    break;
+                }
+            }
+        }
+    }
+    debug_assert!(bot_joined);
+    tracing::info!(
+        trunk = %trunk.name,
+        room = %final_room,
+        "LiveKit agent participant connected; answering caller"
+    );
+    // Spawn forwarder for the rest of the events the bridge will consume.
+    tokio::spawn(async move {
+        while let Some(ev) = events_rx.recv().await {
+            if fwd_tx.send(ev).is_err() {
+                break;
+            }
+        }
+    });
+
     // 6. Build the media-plane bridge.
     let cancel = CancellationToken::new();
     let bridge = Arc::new(LiveKitBridge {
@@ -215,7 +323,7 @@ pub async fn dispatch_livekit(
         local_source: connected.local_source,
         _room: room_arc.clone(),
         subscribers: Arc::new(dashmap::DashMap::new()),
-        events_rx: tokio::sync::Mutex::new(Some(connected.events)),
+        events_rx: tokio::sync::Mutex::new(Some(fwd_rx)),
         cancel_token: cancel.clone(),
         trunk_name: trunk.name.clone(),
         bot_join_timeout_ms: cfg.bot_join_timeout_ms,
@@ -229,7 +337,7 @@ pub async fn dispatch_livekit(
 
     // 7. Build the signaling-plane teardown.
     let room_service =
-        RoomClient::with_api_key(&cfg.server_url, &cfg.api_key, &cfg.api_secret);
+        RoomClient::with_api_key(&admin_url, &cfg.api_key, &cfg.api_secret);
     let teardown = Box::new(LiveKitTeardown {
         room: room_arc,
         room_service: Some(room_service),
@@ -242,4 +350,14 @@ pub async fn dispatch_livekit(
         bridge: bridge as Arc<dyn MediaBridge>,
         teardown,
     })
+}
+
+fn admin_url_from_signal(server_url: &str) -> String {
+    if let Some(rest) = server_url.strip_prefix("wss://") {
+        format!("https://{rest}")
+    } else if let Some(rest) = server_url.strip_prefix("ws://") {
+        format!("http://{rest}")
+    } else {
+        server_url.to_string()
+    }
 }

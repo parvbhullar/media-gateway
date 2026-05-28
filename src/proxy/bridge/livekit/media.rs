@@ -25,6 +25,29 @@ use std::sync::Arc;
 use anyhow::anyhow;
 use async_trait::async_trait;
 use audio_codec::{CodecType, Decoder, Encoder, Resampler};
+use audio_codec::opus::OpusEncoder;
+
+/// Construct the SIP-side audio decoder. We use the audio_codec crate's
+/// default factory (stereo Opus, 48 kHz) because Linphone and most carrier
+/// softphones encode Opus as stereo per `opus/48000/2` in their offer, and
+/// a mono decoder produces SILENCE when fed those payloads. The stereo
+/// decoder internally downmixes L+R to mono on output, so the rest of the
+/// bridge (which deals in mono) sees the same shape either way.
+fn build_sip_decoder(codec: CodecType) -> Box<dyn Decoder> {
+    audio_codec::create_decoder(codec)
+}
+
+/// Construct the SIP-side audio encoder. Mono Opus produces valid mono
+/// packets that Linphone (and any RFC-7587-compliant peer) decodes
+/// correctly via the per-packet TOC byte. Keeping this mono avoids the
+/// stereo encoder's duplicate-mono-to-stereo path (which doubles the
+/// encode cost for no quality benefit, since LiveKit feeds us mono).
+fn build_sip_encoder(codec: CodecType) -> Box<dyn Encoder> {
+    match codec {
+        CodecType::Opus => Box::new(OpusEncoder::new(48_000, 1)),
+        _ => audio_codec::create_encoder(codec),
+    }
+}
 use dashmap::DashMap;
 use futures::StreamExt;
 use livekit::prelude::*;
@@ -453,7 +476,7 @@ async fn run_sip_to_livekit(
     local_source: NativeAudioSource,
     cancel: CancellationToken,
 ) {
-    let mut decoder: Box<dyn Decoder> = audio_codec::create_decoder(codec_type);
+    let mut decoder: Box<dyn Decoder> = build_sip_decoder(codec_type);
     let decoder_rate = decoder.sample_rate();
     let mut resampler: Option<Resampler> = if decoder_rate != LK_SAMPLE_RATE {
         Some(Resampler::new(
@@ -471,6 +494,10 @@ async fn run_sip_to_livekit(
     let mut pcm_buf: Vec<i16> = Vec::with_capacity(LK_FRAME_SAMPLES * 2);
     let mut frames_in: u64 = 0;
     let mut frames_out: u64 = 0;
+    // Rolling audio-level stats, reset at each progress log.
+    let mut peak_abs: i32 = 0;
+    let mut sum_sq: f64 = 0.0;
+    let mut sample_count: u64 = 0;
 
     // The track event arrives once when the carrier's RTP first hits us.
     // From then on we drive everything off `track.recv()`.
@@ -531,6 +558,17 @@ async fn run_sip_to_livekit(
                 // Emit complete 20 ms LK frames.
                 while pcm_buf.len() >= LK_FRAME_SAMPLES {
                     let chunk: Vec<i16> = pcm_buf.drain(..LK_FRAME_SAMPLES).collect();
+                    // Audio-level stats over the chunk: peak abs amplitude
+                    // and accumulated sum-of-squares for RMS. Reset at each
+                    // progress log so the numbers reflect ~10 s of audio.
+                    for &s in &chunk {
+                        let a = (s as i32).unsigned_abs() as i32;
+                        if a > peak_abs {
+                            peak_abs = a;
+                        }
+                        sum_sq += (s as f64) * (s as f64);
+                    }
+                    sample_count += chunk.len() as u64;
                     let lk_frame = LkAudioFrame {
                         data: chunk.into(),
                         sample_rate: LK_SAMPLE_RATE,
@@ -549,13 +587,21 @@ async fn run_sip_to_livekit(
                         tracing::info!(trunk = %trunk_name, "First SIP→LiveKit frame published");
                     }
                     if frames_out.is_multiple_of(500) {
-                        tracing::debug!(
+                        let rms = if sample_count > 0 {
+                            (sum_sq / sample_count as f64).sqrt() as i32
+                        } else { 0 };
+                        tracing::info!(
                             trunk = %trunk_name,
                             frames_in,
                             frames_out,
                             buf_residual = pcm_buf.len(),
+                            peak = peak_abs,
+                            rms,
                             "SIP→LiveKit progress"
                         );
+                        peak_abs = 0;
+                        sum_sq = 0.0;
+                        sample_count = 0;
                     }
                 }
             }
@@ -578,7 +624,7 @@ async fn run_livekit_to_sip(
     cancel: CancellationToken,
     hold_tone_hz: Option<u16>,
 ) {
-    let mut encoder: Box<dyn Encoder> = audio_codec::create_encoder(codec_type);
+    let mut encoder: Box<dyn Encoder> = build_sip_encoder(codec_type);
     let encoder_rate = encoder.sample_rate();
     let mut resampler: Option<Resampler> = if encoder_rate != LK_SAMPLE_RATE {
         Some(Resampler::new(
@@ -599,6 +645,18 @@ async fn run_livekit_to_sip(
     // RTP timestamp increment per ptime, in the SIP codec's clock domain.
     let ts_increment: u32 = sip_clock_rate / 1000 * PTIME_MS;
     let mut frames_sent: u64 = 0;
+    // PCM accumulator @ 48 kHz mono. libwebrtc typically delivers 10 ms
+    // frames (480 samples); we coalesce to exactly 20 ms (960) per RTP
+    // packet so the receiver's clock-rate / ptime / sequence stay
+    // perfectly aligned. Without this, a tick that sees only 10 ms of
+    // buffered audio used to encode 10 ms but still advance RTP
+    // timestamp by 20 ms — caller hears "speech, gap, speech, gap"
+    // (= choppy bot voice).
+    let mut pcm_accum: Vec<i16> = Vec::with_capacity(LK_FRAME_SAMPLES * 4);
+    // Audio-level stats over the last progress window.
+    let mut peak_abs: i32 = 0;
+    let mut sum_sq: f64 = 0.0;
+    let mut sample_count: u64 = 0;
     // Sine-wave phase, carried across ticks so the hold tone is
     // continuous (no audible clicks at frame boundaries).
     let mut hold_phase: f64 = 0.0;
@@ -650,71 +708,96 @@ async fn run_livekit_to_sip(
                 }
                 let _ = contributors; // surfaced for debug tooling
 
-                let pcm_48k = match mixed {
+                match mixed {
                     Some(p) => {
                         // Reset hold phase so the next silent gap starts at zero
                         // (avoids a click if the bot drops out and rejoins).
                         hold_phase = 0.0;
-                        p
+                        pcm_accum.extend_from_slice(&p);
                     }
                     None => match hold_tone_hz {
                         // No subscriber audio this tick. If a hold tone is
-                        // configured, synthesize one; otherwise emit nothing
-                        // (caller hears silence — pre-fix behaviour).
+                        // configured, top up the accumulator with one ptime
+                        // worth of tone so the caller hears a continuous
+                        // ringback. Otherwise let the accumulator drain
+                        // naturally — caller hears silence.
                         Some(hz) if hz > 0 => {
                             let step = std::f64::consts::TAU * (hz as f64)
                                 / (LK_SAMPLE_RATE as f64);
-                            let mut samples: Vec<i16> = Vec::with_capacity(LK_FRAME_SAMPLES);
+                            pcm_accum.reserve(LK_FRAME_SAMPLES);
                             for _ in 0..LK_FRAME_SAMPLES {
-                                let s = (hold_phase.sin() * HOLD_AMP) as i16;
-                                samples.push(s);
+                                pcm_accum.push((hold_phase.sin() * HOLD_AMP) as i16);
                                 hold_phase += step;
                                 if hold_phase >= std::f64::consts::TAU {
                                     hold_phase -= std::f64::consts::TAU;
                                 }
                             }
-                            samples
                         }
-                        _ => continue,
+                        _ => {}
                     },
-                };
-
-                let pcm_sip_rate: Vec<i16> = match resampler.as_mut() {
-                    Some(r) => r.resample(&pcm_48k),
-                    None => pcm_48k,
-                };
-                if pcm_sip_rate.is_empty() {
-                    continue;
-                }
-                let encoded = encoder.encode(&pcm_sip_rate);
-                if encoded.is_empty() {
-                    continue;
                 }
 
-                let frame = RtcAudioFrame {
-                    rtp_timestamp,
-                    clock_rate: sip_clock_rate,
-                    data: encoded.into(),
-                    sequence_number: Some(sequence_number),
-                    payload_type: Some(sip_pt),
-                    marker: false,
-                    header_extension: None,
-                    source_addr: None,
-                    raw_packet: None,
-                };
-                if let Err(e) = sip_send.send_audio(frame).await {
-                    tracing::debug!(trunk = %trunk_name, error = %e,
-                        "SIP send_audio failed — task B exiting");
-                    break;
-                }
-                rtp_timestamp = rtp_timestamp.wrapping_add(ts_increment);
-                sequence_number = sequence_number.wrapping_add(1);
-                frames_sent += 1;
-                if frames_sent == 1 {
-                    tracing::info!(trunk = %trunk_name, "First LiveKit→SIP frame sent");
-                }
-                if frames_sent.is_multiple_of(500) {
-                    tracing::debug!(trunk = %trunk_name, frames_sent, "LiveKit→SIP progress");
+                // Drain in fixed 20 ms (LK_FRAME_SAMPLES) chunks so the RTP
+                // timestamp / sequence increments line up with what we
+                // actually encoded. If multiple chunks are ready (libwebrtc
+                // burst), we emit multiple RTP packets back-to-back; if
+                // fewer than 20 ms is available, we wait for the next tick.
+                while pcm_accum.len() >= LK_FRAME_SAMPLES {
+                    let pcm_48k: Vec<i16> = pcm_accum.drain(..LK_FRAME_SAMPLES).collect();
+                    for &s in &pcm_48k {
+                        let a = (s as i32).unsigned_abs() as i32;
+                        if a > peak_abs {
+                            peak_abs = a;
+                        }
+                        sum_sq += (s as f64) * (s as f64);
+                    }
+                    sample_count += pcm_48k.len() as u64;
+                    let pcm_sip_rate: Vec<i16> = match resampler.as_mut() {
+                        Some(r) => r.resample(&pcm_48k),
+                        None => pcm_48k,
+                    };
+                    if pcm_sip_rate.is_empty() {
+                        continue;
+                    }
+                    let encoded = encoder.encode(&pcm_sip_rate);
+                    if encoded.is_empty() {
+                        continue;
+                    }
+
+                    let frame = RtcAudioFrame {
+                        rtp_timestamp,
+                        clock_rate: sip_clock_rate,
+                        data: encoded.into(),
+                        sequence_number: Some(sequence_number),
+                        payload_type: Some(sip_pt),
+                        marker: false,
+                        header_extension: None,
+                        source_addr: None,
+                        raw_packet: None,
+                    };
+                    if let Err(e) = sip_send.send_audio(frame).await {
+                        tracing::debug!(trunk = %trunk_name, error = %e,
+                            "SIP send_audio failed — task B exiting");
+                        return;
+                    }
+                    rtp_timestamp = rtp_timestamp.wrapping_add(ts_increment);
+                    sequence_number = sequence_number.wrapping_add(1);
+                    frames_sent += 1;
+                    if frames_sent == 1 {
+                        tracing::info!(trunk = %trunk_name, "First LiveKit→SIP frame sent");
+                    }
+                    if frames_sent.is_multiple_of(500) {
+                        let rms = if sample_count > 0 {
+                            (sum_sq / sample_count as f64).sqrt() as i32
+                        } else { 0 };
+                        tracing::info!(trunk = %trunk_name, frames_sent,
+                            buf_residual = pcm_accum.len(),
+                            peak = peak_abs, rms,
+                            "LiveKit→SIP progress");
+                        peak_abs = 0;
+                        sum_sq = 0.0;
+                        sample_count = 0;
+                    }
                 }
             }
         }

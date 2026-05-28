@@ -922,6 +922,37 @@ fn process_kind_aware_entry(
         );
         return Ok(Some((entry.name, trunk)));
     }
+    if entry.kind == "livekit" {
+        let trunk = TrunkConfig {
+            dest: serde_json::from_value::<crate::models::trunk::LiveKitTrunkConfig>(
+                kind_config_value.clone(),
+            )
+            .map_err(|e| {
+                anyhow!("trunk '{}': decode livekit kind_config: {}", entry.name, e)
+            })?
+            .server_url,
+            disabled: Some(!entry.is_active),
+            max_calls: entry.max_concurrent,
+            max_cps: entry.max_cps,
+            direction: entry.direction.map(|d| d.into()),
+            recording: entry
+                .metadata
+                .as_ref()
+                .and_then(recording_policy_from_metadata),
+            rewrite_hostport: true,
+            origin: ConfigOrigin::from_file(path_display.to_string()),
+            kind: "livekit".to_string(),
+            kind_config: Some(kind_config_value),
+            ..Default::default()
+        };
+        info!(
+            file = %path_display,
+            name = %entry.name,
+            kind = %entry.kind,
+            "loaded livekit trunk from include file"
+        );
+        return Ok(Some((entry.name, trunk)));
+    }
     if entry.kind != "sip" {
         info!(
             file = %path_display,
@@ -1387,6 +1418,7 @@ fn convert_trunk(model: sip_trunk::Model) -> Result<Option<(String, TrunkConfig)
     match model.kind.as_str() {
         "sip" => convert_sip_trunk(model),
         "webrtc" => convert_webrtc_trunk(model),
+        "livekit" => convert_livekit_trunk(model),
         other => {
             warn!(
                 trunk = %model.name,
@@ -1514,6 +1546,31 @@ fn convert_webrtc_trunk(model: sip_trunk::Model) -> Result<Option<(String, Trunk
         origin: ConfigOrigin::embedded(),
         kind: "webrtc".to_string(),
         kind_config: Some(model.kind_config.clone()),
+    };
+
+    Ok(Some((model.name, trunk)))
+}
+
+fn convert_livekit_trunk(model: sip_trunk::Model) -> Result<Option<(String, TrunkConfig)>> {
+    let livekit_cfg = model.livekit()?;
+    let dest = livekit_cfg.server_url.clone();
+
+    let trunk = TrunkConfig {
+        dest,
+        disabled: Some(!model.is_active),
+        max_calls: model.max_concurrent.map(|v| v as u32),
+        max_cps: model.max_cps.map(|v| v as u32),
+        id: Some(model.id),
+        direction: Some(model.direction.into()),
+        recording: model
+            .metadata
+            .as_ref()
+            .and_then(recording_policy_from_metadata),
+        rewrite_hostport: true,
+        origin: ConfigOrigin::embedded(),
+        kind: "livekit".to_string(),
+        kind_config: Some(model.kind_config.clone()),
+        ..Default::default()
     };
 
     Ok(Some((model.name, trunk)))
