@@ -199,6 +199,12 @@ pub async fn dispatch_webrtc(
     );
 
     let bridge = Arc::new(BridgePeer::new(trunk.name.clone(), webrtc_pc, rtp_pc));
+    // Opt in to PT-clear-on-passthrough + WebRTC→RTP egress pacer.
+    // These behaviours are needed for strict remote peers (aiortc /
+    // Pipecat) on `kind=webrtc` trunks but break the legacy WS-WebRTC ↔
+    // RTP B2BUA used by `proxy_call::sip_session`, which keeps the
+    // BridgePeer default (`false`). See `BridgePeer::external_bridge_mode`.
+    bridge.set_external_bridge_mode(true);
     if let Err(e) = bridge.setup_bridge_with_codecs(webrtc_caps, rtp_caps).await {
         return Err(close_on_setup_failure(
             anyhow!("bridge setup_bridge_with_codecs failed: {e}"),

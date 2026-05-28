@@ -396,6 +396,17 @@ pub struct BridgePeer {
     webrtc_to_rtp_transcoder: Arc<parking_lot::RwLock<Option<Transcoder>>>,
     /// Optional RTP timestamp/sequence rewriter for WebRTC→RTP direction.
     webrtc_to_rtp_timing: Arc<parking_lot::RwLock<Option<RtpTiming>>>,
+
+    /// Opt-in to the audio-fast-path behaviours added for the external
+    /// WebRTC trunk dispatcher (PT-clear on codec-match-and-no-transcoder
+    /// passthrough, and WebRTC→RTP egress pacing). Default `false` to
+    /// preserve byte-for-byte legacy behaviour on the WS-WebRTC ↔ RTP
+    /// B2BUA path used by `proxy_call::sip_session`. Set to `true` by
+    /// `proxy::bridge::webrtc::dispatch::dispatch_webrtc` only — those
+    /// behaviours are needed for aiortc/Pipecat-style strict peers but
+    /// break less-strict softphones (Linphone/JsSIP) when applied
+    /// unconditionally.
+    external_bridge_mode: AtomicBool,
 }
 
 impl BridgePeer {
@@ -442,7 +453,17 @@ impl BridgePeer {
             rtp_to_webrtc_timing: Arc::new(parking_lot::RwLock::new(None)),
             webrtc_to_rtp_transcoder: Arc::new(parking_lot::RwLock::new(None)),
             webrtc_to_rtp_timing: Arc::new(parking_lot::RwLock::new(None)),
+            external_bridge_mode: AtomicBool::new(false),
         }
+    }
+
+    /// Opt in to the external-WebRTC-trunk audio fast-path behaviours
+    /// (PT-clear on codec-match passthrough + WebRTC→RTP egress pacing).
+    /// Must be called before `start_bridge()` — the forwarder captures the
+    /// flag at spawn time. See the field doc for rationale.
+    pub fn set_external_bridge_mode(&self, on: bool) {
+        self.external_bridge_mode
+            .store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Setup the bridge by adding sample tracks to both sides for forwarding
@@ -1081,6 +1102,9 @@ impl BridgePeer {
         let webrtc_to_rtp_timing = Arc::clone(&self.webrtc_to_rtp_timing);
         let rtp_to_webrtc_transcoder = Arc::clone(&self.rtp_to_webrtc_transcoder);
         let rtp_to_webrtc_timing = Arc::clone(&self.rtp_to_webrtc_timing);
+        let external_bridge_mode = self
+            .external_bridge_mode
+            .load(std::sync::atomic::Ordering::Relaxed);
 
         tokio::spawn(async move {
             // Create fused receivers for both directions
@@ -1129,6 +1153,7 @@ impl BridgePeer {
                                         Arc::clone(&dtmf_sink),
                                         Some(Arc::clone(&webrtc_to_rtp_transcoder)),
                                         Some(Arc::clone(&webrtc_to_rtp_timing)),
+                                        external_bridge_mode,
                                     ).await;
                                 }
                                 webrtc_recv = Box::pin(webrtc_pc.recv());
@@ -1177,6 +1202,7 @@ impl BridgePeer {
                                         Arc::clone(&dtmf_sink),
                                         Some(Arc::clone(&rtp_to_webrtc_transcoder)),
                                         Some(Arc::clone(&rtp_to_webrtc_timing)),
+                                        external_bridge_mode,
                                     ).await;
                                 }
                                 rtp_recv = Box::pin(rtp_pc.recv());
@@ -1210,6 +1236,7 @@ impl BridgePeer {
         dtmf_sink: Arc<parking_lot::RwLock<DtmfSinkSlots>>,
         transcoder: Option<Arc<parking_lot::RwLock<Option<Transcoder>>>>,
         transcoder_timing: Option<Arc<parking_lot::RwLock<Option<RtpTiming>>>>,
+        external_bridge_mode: bool,
     ) {
         // Get the sender channel from weak pointer
         let sender = if let Some(strong) = sender_weak.upgrade() {
@@ -1256,7 +1283,14 @@ impl BridgePeer {
         // `anchor + (rtp_ts - anchor_ts) / clock_rate`. Reset the anchor
         // on large gaps or accumulated lag so we don't sleep indefinitely
         // after a TTS pause or drift slowly behind realtime.
-        let pace_audio = !is_video && path.should_strip_webrtc_audio_metadata();
+        // Pacer is opt-in: only the new external-WebRTC-trunk dispatcher
+        // turns it on. The legacy WS-WebRTC ↔ RTP B2BUA (JsSIP, app
+        // bridge) hits the same `forward_track_to_sender` machinery but
+        // does NOT want re-pacing — its peers tolerate burst-then-quiet
+        // jitter from rustrtc's natural cadence, and the 200 ms re-anchor
+        // logic produces audible micro-gaps on WS-SRTP legs.
+        let pace_audio =
+            external_bridge_mode && !is_video && path.should_strip_webrtc_audio_metadata();
         let mut playout_anchor: Option<(tokio::time::Instant, u32, u32)> = None;
         // Last seen RTP sequence number for loss estimation
         let mut last_seq: Option<u16> = None;
@@ -1398,28 +1432,31 @@ impl BridgePeer {
                                     match transcoded {
                                         Some(ts) => vec![ts],
                                         None => {
-                                            // No transcoder ran (codecs match end-to-end, e.g.
-                                            // Opus on both legs). The frame still carries the
-                                            // source-side payload type (e.g. SIP PT=96), but the
-                                            // destination leg negotiated a different PT (e.g.
-                                            // WebRTC PT=111). aiortc/strict peers drop packets
-                                            // whose PT doesn't match their negotiated mapping.
-                                            // Clear payload_type so rustrtc's into_rtp_packet
-                                            // falls back to the destination sender's
-                                            // default_payload_type (set when the egress track
-                                            // was registered via add_track). Preserve PT for
-                                            // RFC 2833 telephone-event so DTMF pass-through
-                                            // still works when no sink is installed.
-                                            let is_dtmf = {
-                                                let guard = dtmf_sink.read();
-                                                guard[dtmf_slot_index(path.source_endpoint())]
-                                                    .as_ref()
-                                                    .map_or(false, |s| {
-                                                        a.payload_type == Some(s.payload_type)
-                                                    })
-                                            };
-                                            if !is_dtmf {
-                                                a.payload_type = None;
+                                            // PT-clear is opt-in (external_bridge_mode).
+                                            // Rationale: strict peers (aiortc/Pipecat) drop
+                                            // RTP whose PT doesn't match the destination's
+                                            // negotiated PT. Clearing `payload_type` lets
+                                            // rustrtc's `into_rtp_packet` fall back to the
+                                            // destination sender's `default_payload_type`.
+                                            // The legacy WS-WebRTC ↔ RTP B2BUA peers
+                                            // (JsSIP, Linphone) accept the source-side PT
+                                            // verbatim, so leaving it intact preserves
+                                            // media-stable behaviour byte-for-byte. RFC
+                                            // 2833 telephone-event PT is preserved either
+                                            // way so DTMF pass-through still works when no
+                                            // sink is installed.
+                                            if external_bridge_mode {
+                                                let is_dtmf = {
+                                                    let guard = dtmf_sink.read();
+                                                    guard[dtmf_slot_index(path.source_endpoint())]
+                                                        .as_ref()
+                                                        .map_or(false, |s| {
+                                                            a.payload_type == Some(s.payload_type)
+                                                        })
+                                                };
+                                                if !is_dtmf {
+                                                    a.payload_type = None;
+                                                }
                                             }
                                             vec![MediaSample::Audio(a)]
                                         }
@@ -1615,6 +1652,7 @@ impl BridgePeer {
         dtmf_sink: Arc<parking_lot::RwLock<DtmfSinkSlots>>,
         transcoder: Option<Arc<parking_lot::RwLock<Option<Transcoder>>>>,
         transcoder_timing: Option<Arc<parking_lot::RwLock<Option<RtpTiming>>>>,
+        external_bridge_mode: bool,
     ) {
         tokio::spawn(async move {
             Self::run_forward_loop(
@@ -1631,6 +1669,7 @@ impl BridgePeer {
                 dtmf_sink,
                 transcoder,
                 transcoder_timing,
+                external_bridge_mode,
             )
             .await;
         });
@@ -3139,6 +3178,7 @@ mod tests {
                     ds,
                     tr,
                     ti,
+                    false, // external_bridge_mode — keep legacy default for transcoder tests
                 )
                 .await;
             })
@@ -3238,6 +3278,7 @@ mod tests {
                     ds,
                     None, // no transcoder
                     None, // no timing
+                    false, // external_bridge_mode — passthrough test asserts legacy bytes
                 )
                 .await;
             })
