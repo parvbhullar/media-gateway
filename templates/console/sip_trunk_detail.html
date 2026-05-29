@@ -886,6 +886,103 @@ default('RustPBX') }}{% endblock %}
             </div>
             </template>
 
+            <!-- ExternalMedia kind: shared general fields + sidecar PCM config -->
+            <template x-if="form.kind === 'external_media'">
+            <div class="space-y-6">
+                <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
+                    <h2 class="text-sm font-semibold text-slate-900">General</h2>
+                    <div class="mt-4 grid gap-4 md:grid-cols-2">
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Trunk name
+                            <input type="text" x-model.trim="form.name" maxlength="120" required
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="external_media_bot">
+                            <span class="text-xs font-normal text-slate-400">Unique identifier used by routing rules.</span>
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Display name
+                            <input type="text" x-model.trim="form.display_name" maxlength="160"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Status
+                            <select x-model="form.status"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <template x-for="option in statusOptions" :key="option.value">
+                                    <option :value="option.value" x-text="option.label"></option>
+                                </template>
+                            </select>
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Direction
+                            <select x-model="form.direction"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <template x-for="option in directionOptions" :key="option.value">
+                                    <option :value="option.value" x-text="option.label"></option>
+                                </template>
+                            </select>
+                        </label>
+                        <div class="flex flex-col gap-2">
+                            <span class="text-sm font-medium text-slate-700">Active</span>
+                            <button type="button" @click="toggleActive()"
+                                class="inline-flex items-center gap-2 rounded-lg px-3 py-1 text-xs font-semibold ring-2 transition"
+                                :class="form.is_active ? 'bg-emerald-50 text-emerald-600 ring-emerald-200' : 'bg-slate-100 text-slate-500 ring-slate-200'">
+                                <span x-text="form.is_active ? 'Enabled' : 'Disabled'"></span>
+                            </button>
+                        </div>
+                    </div>
+                    <label class="mt-4 flex flex-col gap-2 text-sm font-medium text-slate-700">
+                        Description
+                        <textarea rows="2" x-model.trim="form.description"
+                            class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"></textarea>
+                    </label>
+                </section>
+
+                <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
+                    <h2 class="text-sm font-semibold text-slate-900">Sidecar bridge</h2>
+                    <p class="mt-1 text-sm text-slate-500">rustpbx terminates SIP/RTP and pipes 48&nbsp;kHz mono PCM over
+                        localhost UDP to the sidecar process, which owns the far-end media (e.g. a LiveKit room
+                        participant). LiveKit credentials live in the sidecar's own environment, not here.</p>
+                    <div class="mt-4 grid gap-4 md:grid-cols-2">
+                        <label class="md:col-span-2 flex flex-col gap-1 text-sm font-medium text-slate-700">
+                            Sidecar command <span class="text-rose-500">*</span>
+                            <input type="text" x-model.trim="form.external_media_command" maxlength="1024" required
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="python3 /opt/livekit/sip_bridge_sidecar.py">
+                            <span class="text-xs font-normal text-slate-400">
+                                Spawn command for the per-call sidecar. rustpbx appends
+                                <code>--call-id &lt;id&gt; --did &lt;to&gt; --caller &lt;from&gt; --port &lt;P&gt;</code>.
+                            </span>
+                        </label>
+                        <label class="flex flex-col gap-1 text-sm font-medium text-slate-700">
+                            Audio codec
+                            <select x-model="form.external_media_audio_codec"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <template x-for="opt in externalMediaAudioCodecs" :key="opt">
+                                    <option :value="opt" x-text="opt"></option>
+                                </template>
+                            </select>
+                            <span class="text-xs font-normal text-slate-400">SIP-side voice codec rustpbx negotiates and transcodes.</span>
+                        </label>
+                        <label class="flex flex-col gap-1 text-sm font-medium text-slate-700">
+                            Bot join timeout (ms)
+                            <input type="number" min="0" step="500" x-model="form.external_media_bot_join_timeout_ms"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="15000">
+                            <span class="text-xs font-normal text-slate-400">How long to hold the INVITE awaiting the sidecar's READY before answering. Default 15000.</span>
+                        </label>
+                        <label class="flex flex-col gap-1 text-sm font-medium text-slate-700">
+                            Hold tone (Hz)
+                            <input type="number" min="0" step="10" x-model="form.external_media_hold_tone_hz"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="(blank = silence)">
+                            <span class="text-xs font-normal text-slate-400">Optional comfort tone while no sidecar audio arrives. Blank = silence.</span>
+                        </label>
+                    </div>
+                </section>
+            </div>
+            </template>
+
             <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <p class="text-xs text-slate-400">{{ "sip_trunk_detail.save_hint" | t }}</p>
                 <div class="flex items-center gap-3">
@@ -934,10 +1031,12 @@ default('RustPBX') }}{% endblock %}
                 { value: 'sip', label: 'SIP' },
                 { value: 'webrtc', label: 'WebRTC' },
                 { value: 'livekit', label: 'LiveKit' },
+                { value: 'external_media', label: 'External Media' },
             ],
             signalingAdapters: [],
             webrtcAudioCodecs: ['opus', 'g722'],
             livekitAudioCodecs: ['opus', 'g722'],
+            externalMediaAudioCodecs: ['opus', 'g722', 'pcmu', 'pcma'],
             form: {
                 kind: 'sip',
                 name: '',
@@ -1009,6 +1108,10 @@ default('RustPBX') }}{% endblock %}
                 livekit_bot_join_timeout_ms: 15000,
                 livekit_hold_tone_hz: '',
                 livekit_jwt_ttl_secs: '',
+                external_media_command: '',
+                external_media_audio_codec: 'opus',
+                external_media_bot_join_timeout_ms: 15000,
+                external_media_hold_tone_hz: '',
             },
             livekitShowAdvanced: false,
             regStatus: null,
@@ -1056,6 +1159,10 @@ default('RustPBX') }}{% endblock %}
                     ? this.filters.livekit_audio_codecs
                     : ['opus', 'g722'];
                 this.livekitAudioCodecs = lkCodecs.map((c) => String(c));
+                const emCodecs = Array.isArray(this.filters.external_media_audio_codecs) && this.filters.external_media_audio_codecs.length
+                    ? this.filters.external_media_audio_codecs
+                    : ['opus', 'g722', 'pcmu', 'pcma'];
+                this.externalMediaAudioCodecs = emCodecs.map((c) => String(c));
             },
             setKind(value) {
                 if (this.mode === 'edit') return;
@@ -1136,6 +1243,14 @@ default('RustPBX') }}{% endblock %}
                     ? String(model.livekit_hold_tone_hz) : '';
                 this.form.livekit_jwt_ttl_secs = model.livekit_jwt_ttl_secs != null
                     ? String(model.livekit_jwt_ttl_secs) : '';
+                // ExternalMedia fields. Server flattens `ExternalMediaTrunkConfig`
+                // into `external_media_*`-prefixed keys on the model JSON.
+                this.form.external_media_command = model.external_media_command || '';
+                this.form.external_media_audio_codec = model.external_media_audio_codec || 'opus';
+                this.form.external_media_bot_join_timeout_ms = model.external_media_bot_join_timeout_ms != null
+                    ? String(model.external_media_bot_join_timeout_ms) : '';
+                this.form.external_media_hold_tone_hz = model.external_media_hold_tone_hz != null
+                    ? String(model.external_media_hold_tone_hz) : '';
             },
             get pageTitle() {
                 const td = (this.t || {}).sip_trunk_detail || {};
@@ -1370,6 +1485,21 @@ default('RustPBX') }}{% endblock %}
                     setNum('livekit_bot_join_timeout_ms', this.form.livekit_bot_join_timeout_ms);
                     setNum('livekit_hold_tone_hz', this.form.livekit_hold_tone_hz);
                     setNum('livekit_jwt_ttl_secs', this.form.livekit_jwt_ttl_secs);
+                    return params;
+                }
+                if (this.form.kind === 'external_media') {
+                    const setStr = (key, val) => {
+                        params.set(key, (val ?? '').toString().trim());
+                    };
+                    const setNum = (key, val) => {
+                        if (val === '' || val == null) return;
+                        const n = Number(val);
+                        if (!Number.isNaN(n)) params.set(key, String(Math.max(0, Math.round(n))));
+                    };
+                    setStr('external_media_command', this.form.external_media_command);
+                    setStr('external_media_audio_codec', this.form.external_media_audio_codec || 'opus');
+                    setNum('external_media_bot_join_timeout_ms', this.form.external_media_bot_join_timeout_ms);
+                    setNum('external_media_hold_tone_hz', this.form.external_media_hold_tone_hz);
                     return params;
                 }
                 params.set('carrier', this.form.carrier.trim());

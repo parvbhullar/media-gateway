@@ -15,6 +15,10 @@ use thiserror::Error;
 pub enum BridgeKind {
     WebRtc,
     LiveKit,
+    /// SIP terminated in rustpbx; decoded PCM piped to a co-located sidecar
+    /// process over localhost UDP (sidecar owns the far-end media, e.g. a
+    /// LiveKit room participant). See `proxy::bridge::external_media`.
+    ExternalMedia,
 }
 
 impl BridgeKind {
@@ -22,6 +26,7 @@ impl BridgeKind {
         match self {
             Self::WebRtc => "webrtc",
             Self::LiveKit => "livekit",
+            Self::ExternalMedia => "external_media",
         }
     }
 }

@@ -200,6 +200,19 @@ impl Model {
         serde_json::from_value(self.kind_config.clone())
             .map_err(|e| anyhow!("failed to deserialize LiveKitTrunkConfig from kind_config: {e}"))
     }
+
+    /// Typed view of this row's `kind_config` as an `ExternalMediaTrunkConfig`.
+    /// Errors if `kind != "external_media"` or the JSON does not match the schema.
+    pub fn external_media(&self) -> Result<ExternalMediaTrunkConfig> {
+        ensure!(
+            self.kind == "external_media",
+            "kind mismatch: expected 'external_media', got '{}'",
+            self.kind
+        );
+        serde_json::from_value(self.kind_config.clone()).map_err(|e| {
+            anyhow!("failed to deserialize ExternalMediaTrunkConfig from kind_config: {e}")
+        })
+    }
 }
 
 /// Lightweight schema validation error type used by per-kind validators
@@ -647,5 +660,48 @@ mod livekit_config_tests {
         cfg.agent_name = Some("   ".to_string());
         cfg.dispatch_endpoint = None;
         assert!(cfg.validate().is_err(), "whitespace-only agent_name must not satisfy the gate");
+    }
+}
+
+/// Configuration shape for `kind = "external_media"` trunks. rustpbx
+/// terminates SIP + RTP and pipes decoded 48 kHz mono PCM to a co-located
+/// sidecar process over a localhost UDP socket; the sidecar owns the
+/// far-end media logic (e.g. joining a LiveKit room as a participant).
+/// See `docs/superpowers/specs/2026-05-29-external-media-bridge-design.md`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ExternalMediaTrunkConfig {
+    /// Command used to spawn the per-call sidecar. rustpbx appends
+    /// `--call-id <id> --did <to_user> --caller <from_user> --port <P>`.
+    /// Example: `python3 /opt/livekit/participant.py`.
+    pub command: String,
+    /// SIP-side voice codec to negotiate (drives rustpbx's transcoder).
+    /// Allowed: opus, g722, pcmu, pcma. Default opus.
+    #[serde(default = "default_audio_codec")]
+    pub audio_codec: String,
+    /// How long (ms) to hold the SIP INVITE in 100 Trying waiting for the
+    /// sidecar's `READY` datagram before answering. On timeout the call is
+    /// failed (503). Default 15000.
+    #[serde(default)]
+    pub bot_join_timeout_ms: Option<u64>,
+    /// Optional low-amplitude sine tone (Hz) played to the SIP caller while
+    /// no sidecar audio is arriving yet. Default none (silence).
+    #[serde(default)]
+    pub hold_tone_hz: Option<u16>,
+}
+
+impl ExternalMediaTrunkConfig {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        if self.command.trim().is_empty() {
+            return Err(ValidationError::custom("command must not be empty"));
+        }
+        match self.audio_codec.as_str() {
+            "opus" | "g722" | "pcmu" | "pcma" => {}
+            other => {
+                return Err(ValidationError::custom(format!(
+                    "audio_codec '{other}' not supported (allowed: opus, g722, pcmu, pcma)"
+                )));
+            }
+        }
+        Ok(())
     }
 }

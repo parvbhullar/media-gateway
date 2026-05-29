@@ -1562,6 +1562,15 @@ impl CallModule {
                 )
                 .await
             }
+            BridgeKind::ExternalMedia => {
+                crate::proxy::bridge::external_media::dispatch::dispatch_external_media(
+                    &trunk_row,
+                    offer_sdp,
+                    ice_servers,
+                    &dispatch_ctx,
+                )
+                .await
+            }
         };
         let outcome =
             match dispatch_res {
@@ -1639,7 +1648,11 @@ impl CallModule {
                 path.set_extension("wav");
                 Some(path.to_string_lossy().to_string())
             });
-        if let (Some(path), BridgeKind::WebRtc) = (recording_path.as_ref(), kind) {
+        // Only the WebRTC kind exposes a `BridgePeer` data plane that feeds
+        // the shared `Recorder` today. LiveKit and external_media don't wire
+        // a recorder (separate follow-up).
+        let recording_supported = matches!(kind, BridgeKind::WebRtc);
+        if let Some(path) = recording_path.as_ref().filter(|_| recording_supported) {
             match crate::media::recorder::Recorder::new(path, CodecType::PCMU) {
                 Ok(mut rec) => {
                     // Tell the recorder what codec/PT each leg uses so its
@@ -1652,8 +1665,8 @@ impl CallModule {
                     // garble the caller's audio in the WAV.
                     //
                     // Leg A = inbound SIP side: parse the caller's offer SDP.
-                    // Leg B = bot/WebRTC side: bridge always negotiates Opus
-                    // at PT=111 today, so we use a fixed Opus profile.
+                    // Leg B = bot/WebRTC side: bridge negotiates Opus at PT=111,
+                    // stereo @ 48 kHz, so we use a fixed Opus profile.
                     let leg_a_profile =
                         crate::media::negotiate::MediaNegotiator::extract_leg_profile(
                             std::str::from_utf8(&offer_body).unwrap_or(""),
@@ -1672,21 +1685,21 @@ impl CallModule {
                     rec.set_leg_profile(crate::media::recorder::Leg::B, leg_b_profile);
                     let shared = std::sync::Arc::new(parking_lot::RwLock::new(Some(rec)));
                     outcome.bridge.attach_recorder(shared);
-                    info!(call_id = %cdr_call_id, path = %path,
-                        "webrtc bridge recording enabled");
+                    info!(call_id = %cdr_call_id, path = %path, kind = %kind.as_str(),
+                        "bridge recording enabled");
                 }
                 Err(e) => {
                     // Don't fail the call — just log and continue without
                     // recording. The CDR will omit the recorder entry.
                     warn!(call_id = %cdr_call_id, path = %path, error = %e,
-                        "failed to create webrtc bridge recorder; continuing without recording");
+                        "failed to create bridge recorder; continuing without recording");
                 }
             }
         }
-        // LiveKit bridges do not run through BridgePeer; recording on that
-        // path is a separate follow-up. Leave `recording_path` set so the
-        // CDR doesn't show a stale path — clear it for non-WebRTC kinds.
-        let recording_path = if matches!(kind, BridgeKind::WebRtc) {
+        // Clear the CDR recording path for kinds that don't actually record
+        // (LiveKit), so the CDR doesn't advertise a file that was never
+        // written.
+        let recording_path = if recording_supported {
             recording_path
         } else {
             None
@@ -1834,7 +1847,7 @@ impl CallModule {
         // only learns of the hangup via its own RTP-timeout machinery.
         // Plumbing a proper server-initiated BYE through the
         // dialog/transaction layer is left for a follow-up.
-        if matches!(kind, BridgeKind::LiveKit) {
+        if matches!(kind, BridgeKind::LiveKit | BridgeKind::ExternalMedia) {
             let module = self.clone();
             let bridge_for_watcher: std::sync::Arc<dyn crate::proxy::bridge::session::MediaBridge> =
                 bridge_arc.clone();
@@ -1842,12 +1855,14 @@ impl CallModule {
             tokio::spawn(async move {
                 // The future's output carries the cause whichever Task
                 // (C: room Disconnected, D: watchdog) tripped the
-                // cancel — so the CDR records the real reason.
+                // cancel — so the CDR records the real reason. For
+                // external_media, Task B's `BYE` datagram from the sidecar
+                // resolves it with cause ByCallee.
                 let cause = bridge_for_watcher.watch_disconnect().await;
                 info!(
                     dialog_id = %dialog_id_for_watcher,
                     ?cause,
-                    "livekit bridge signalled disconnect; tearing down session"
+                    "bridge signalled disconnect; tearing down session"
                 );
                 // Drop our strong Arc on the bridge before driving
                 // teardown so the registry removal can collect it.

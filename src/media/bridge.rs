@@ -1149,7 +1149,10 @@ impl BridgePeer {
                                         None, // no audio fallback in WebRTC→RTP direction
                                         Arc::clone(&w2r_stats),
                                         if !is_video { recorder.clone() } else { None },
-                                        if !is_video { Some(RecLeg::A) } else { None },
+                                        // WebRTC→RTP carries the bot/callee audio → Leg B
+                                        // (right channel). call.rs sets the Leg B profile to
+                                        // the bot's Opus and the UI labels right = callee.
+                                        if !is_video { Some(RecLeg::B) } else { None },
                                         Arc::clone(&dtmf_sink),
                                         Some(Arc::clone(&webrtc_to_rtp_transcoder)),
                                         Some(Arc::clone(&webrtc_to_rtp_timing)),
@@ -1198,7 +1201,10 @@ impl BridgePeer {
                                         if is_video { Some(webrtc_send.clone()) } else { None },
                                         Arc::clone(&r2w_stats),
                                         if !is_video { recorder.clone() } else { None },
-                                        if !is_video { Some(RecLeg::B) } else { None },
+                                        // RTP→WebRTC carries the SIP caller's audio → Leg A
+                                        // (left channel). call.rs sets the Leg A profile from
+                                        // the caller's offer SDP and the UI labels left = caller.
+                                        if !is_video { Some(RecLeg::A) } else { None },
                                         Arc::clone(&dtmf_sink),
                                         Some(Arc::clone(&rtp_to_webrtc_transcoder)),
                                         Some(Arc::clone(&rtp_to_webrtc_timing)),

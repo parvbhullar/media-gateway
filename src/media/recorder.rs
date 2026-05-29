@@ -151,6 +151,7 @@ impl Recorder {
             last_ssrc_b: None,
             profile_a: NegotiatedLegProfile::default(),
             profile_b: NegotiatedLegProfile::default(),
+
             dtmf_state_a: None,
             dtmf_state_b: None,
             next_flush_ts: 0,
@@ -212,6 +213,13 @@ impl Recorder {
 
         let codec_hint = codec_hint.or(match (frame.payload_type, profile_audio_pt) {
             (Some(pt), Some(audio_pt)) if pt == audio_pt => profile_audio_codec,
+            // PT was cleared on the wire (external_bridge_mode strips it so
+            // strict peers accept our RTP). Without a PT we'd otherwise fall
+            // through to `try_from(0)` = PCMU and (a) decode the stream with
+            // the wrong codec and (b) on raw-packet legs set an 8 kHz
+            // timeline clock against 48 kHz timestamps → 6× WAV duration.
+            // Trust the negotiated leg profile's codec instead.
+            (None, _) => profile_audio_codec,
             _ => None,
         });
 
@@ -230,6 +238,31 @@ impl Recorder {
             },
             _ => return Ok(()),
         };
+
+        // One-shot per-leg diagnostic: the first frame on each leg (before
+        // its timeline base is set) logs exactly what the recorder will use
+        // for timeline projection. A `frame_clock_rate` that disagrees with
+        // the leg's true RTP clock (e.g. 8000 while the source advances at
+        // 48000) stretches the WAV by that ratio.
+        let base_is_set = match leg {
+            Leg::A => self.base_timestamp_a.is_some(),
+            Leg::B => self.base_timestamp_b.is_some(),
+        };
+        if !base_is_set {
+            debug!(
+                recorder_path = %self.path,
+                ?leg,
+                frame_pt = ?frame.payload_type,
+                frame_clock_rate_field = frame.clock_rate,
+                ?decoder_type,
+                decoder_clock = decoder_type.clock_rate(),
+                used_frame_clock_rate = frame_clock_rate,
+                has_raw_packet = frame.raw_packet.is_some(),
+                out_sample_rate = self.sample_rate,
+                rtp_timestamp = frame.rtp_timestamp,
+                "recorder leg first frame (timeline clock diagnostic)"
+            );
+        }
 
         if decoder_type != self.codec {
             let decoder = self
@@ -1245,6 +1278,7 @@ mod tests {
             last_ssrc_b: None,
             profile_a: NegotiatedLegProfile::default(),
             profile_b: NegotiatedLegProfile::default(),
+
             dtmf_state_a: None,
             dtmf_state_b: None,
             next_flush_ts: 0,

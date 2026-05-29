@@ -21,7 +21,7 @@ use crate::{
         ActiveModel as SipTrunkActiveModel, Column as SipTrunkColumn, Entity as SipTrunkEntity,
         SipTransport, SipTrunkConfig, SipTrunkDirection, SipTrunkStatus, WebRtcTrunkConfig,
     },
-    models::trunk::LiveKitTrunkConfig,
+    models::trunk::{ExternalMediaTrunkConfig, LiveKitTrunkConfig},
     proxy::bridge::signaling,
     proxy::routing::ConfigOrigin,
 };
@@ -221,6 +221,16 @@ async fn page_sip_trunk_detail(
                         }
                     }
                 }
+                "external_media" => {
+                    if let Ok(cfg) = model.external_media()
+                        && let (Some(obj), Ok(Value::Object(flat))) =
+                            (model_json.as_object_mut(), serde_json::to_value(&cfg))
+                    {
+                        for (k, v) in flat {
+                            obj.insert(format!("external_media_{k}"), v);
+                        }
+                    }
+                }
                 _ => {
                     warn!("unknown trunk kind '{}' for trunk id={}", model.kind, id);
                 }
@@ -304,7 +314,7 @@ async fn create_sip_trunk(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "sip".to_string());
     if let Err(response) =
-        apply_form_to_active_model(&mut active, &form, now, false, &kind, None, None, None)
+        apply_form_to_active_model(&mut active, &form, now, false, &kind, None, None, None, None)
     {
         return response;
     }
@@ -377,6 +387,7 @@ async fn update_sip_trunk(
     let existing_sip_cfg = model.sip().ok();
     let existing_webrtc_cfg = model.webrtc().ok();
     let existing_livekit_cfg = model.livekit().ok();
+    let existing_external_media_cfg = model.external_media().ok();
     let mut active: SipTrunkActiveModel = model.into();
     let now = Utc::now();
     if let Err(response) = apply_form_to_active_model(
@@ -388,6 +399,7 @@ async fn update_sip_trunk(
         existing_sip_cfg,
         existing_webrtc_cfg,
         existing_livekit_cfg,
+        existing_external_media_cfg,
     ) {
         return response;
     }
@@ -675,6 +687,15 @@ async fn query_sip_trunks(
                             }
                         }
                     }
+                    "external_media" => {
+                        if let Ok(cfg) = model.external_media()
+                            && let Ok(Value::Object(flat)) = serde_json::to_value(&cfg)
+                        {
+                            for (k, val) in flat {
+                                obj.entry(format!("external_media_{k}")).or_insert(val);
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -765,10 +786,11 @@ async fn build_filters_payload(db: &DatabaseConnection) -> (Value, Vec<Value>) {
             "transports": SipTransport::iter()
                 .map(|transport| transport.as_str())
                 .collect::<Vec<_>>(),
-            "kinds": ["sip", "webrtc", "livekit"],
+            "kinds": ["sip", "webrtc", "livekit", "external_media"],
             "signaling_adapters": signaling_adapters,
             "webrtc_audio_codecs": ["opus", "g722"],
             "livekit_audio_codecs": ["opus", "g722"],
+            "external_media_audio_codecs": ["opus", "g722", "pcmu", "pcma"],
         }),
         tenants,
     )
@@ -846,8 +868,9 @@ fn apply_form_to_active_model(
     existing_sip_cfg: Option<SipTrunkConfig>,
     existing_webrtc_cfg: Option<WebRtcTrunkConfig>,
     existing_livekit_cfg: Option<LiveKitTrunkConfig>,
+    existing_external_media_cfg: Option<ExternalMediaTrunkConfig>,
 ) -> Result<(), Response> {
-    if !matches!(kind, "sip" | "webrtc" | "livekit") {
+    if !matches!(kind, "sip" | "webrtc" | "livekit" | "external_media") {
         return Err(bad_request(format!("unsupported trunk kind '{kind}'")));
     }
     let allowed_ips = parse_list_field(
@@ -1242,6 +1265,51 @@ fn apply_form_to_active_model(
 
             serde_json::to_value(&livekit_cfg)
                 .map_err(|e| bad_request(format!("failed to serialize LiveKit config: {e}")))?
+        }
+        "external_media" => {
+            // ExternalMedia validator (`kind_schemas::validate("external_media", ..)`)
+            // deserializes into `ExternalMediaTrunkConfig` and runs its
+            // `validate()`; we just assemble the JSON with update-aware
+            // merge semantics mirroring the livekit branch.
+            let command = super::normalize_optional_string(&form.external_media_command)
+                .or_else(|| existing_external_media_cfg.as_ref().map(|c| c.command.clone()))
+                .unwrap_or_default();
+            let audio_codec = super::normalize_optional_string(&form.external_media_audio_codec)
+                .or_else(|| {
+                    existing_external_media_cfg
+                        .as_ref()
+                        .map(|c| c.audio_codec.clone())
+                })
+                .unwrap_or_else(|| "opus".to_string());
+            // bot_join_timeout_ms: form value wins; default 15s on create;
+            // preserve stored value on update when the form omits it.
+            let bot_join_timeout_ms = if let Some(v) = form.external_media_bot_join_timeout_ms {
+                Some(v)
+            } else if !is_update {
+                Some(15_000)
+            } else {
+                existing_external_media_cfg
+                    .as_ref()
+                    .and_then(|c| c.bot_join_timeout_ms)
+            };
+            let hold_tone_hz = if !is_update || form.external_media_hold_tone_hz.is_some() {
+                form.external_media_hold_tone_hz
+            } else {
+                existing_external_media_cfg
+                    .as_ref()
+                    .and_then(|c| c.hold_tone_hz)
+            };
+
+            let external_media_cfg = ExternalMediaTrunkConfig {
+                command,
+                audio_codec,
+                bot_join_timeout_ms,
+                hold_tone_hz,
+            };
+
+            serde_json::to_value(&external_media_cfg).map_err(|e| {
+                bad_request(format!("failed to serialize ExternalMedia config: {e}"))
+            })?
         }
         other => {
             return Err(bad_request(format!("unsupported trunk kind '{other}'")));

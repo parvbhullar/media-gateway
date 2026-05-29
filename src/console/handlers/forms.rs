@@ -136,6 +136,21 @@ pub struct SipTrunkForm {
     /// reconnect window after a mid-call network blip.
     #[serde(default)]
     pub livekit_jwt_ttl_secs: Option<u64>,
+    // ---- ExternalMedia kind fields. Populated only when
+    // ---- `kind = "external_media"`. ----
+    /// Command used to spawn the per-call sidecar. rustpbx appends
+    /// `--call-id/--did/--caller/--port`. Required for this kind.
+    pub external_media_command: Option<String>,
+    /// SIP-side voice codec to negotiate. Allowed: opus, g722, pcmu, pcma.
+    pub external_media_audio_codec: Option<String>,
+    /// How long (ms) to hold the SIP INVITE waiting for the sidecar's
+    /// `READY` datagram before answering. Default 15000.
+    #[serde(default)]
+    pub external_media_bot_join_timeout_ms: Option<u64>,
+    /// Optional hold-tone frequency (Hz) while no sidecar audio arrives.
+    /// Blank = silence.
+    #[serde(default)]
+    pub external_media_hold_tone_hz: Option<u16>,
 }
 
 #[derive(Deserialize, Default, Clone)]

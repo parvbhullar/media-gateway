@@ -20,7 +20,9 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use serde_json::Value;
 
-use crate::models::trunk::{LiveKitTrunkConfig, SipTrunkConfig, WebRtcTrunkConfig};
+use crate::models::trunk::{
+    ExternalMediaTrunkConfig, LiveKitTrunkConfig, SipTrunkConfig, WebRtcTrunkConfig,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum KindValidationError {
@@ -132,6 +134,17 @@ pub fn register_builtins() {
                 .map_err(|e| KindValidationError::invalid("livekit", e.to_string()))?;
             cfg.validate()
                 .map_err(|e| KindValidationError::invalid("livekit", e.to_string()))?;
+            Ok(())
+        }),
+    );
+
+    register(
+        "external_media",
+        Arc::new(|v: &Value| -> Result<(), KindValidationError> {
+            let cfg: ExternalMediaTrunkConfig = serde_json::from_value(v.clone())
+                .map_err(|e| KindValidationError::invalid("external_media", e.to_string()))?;
+            cfg.validate()
+                .map_err(|e| KindValidationError::invalid("external_media", e.to_string()))?;
             Ok(())
         }),
     );

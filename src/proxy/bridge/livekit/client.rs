@@ -23,28 +23,13 @@ pub struct ConnectedRoom {
 /// "sip-caller" LocalAudioTrack backed by a fresh NativeAudioSource @
 /// 48 kHz mono.
 pub async fn connect_and_publish(server_url: &str, jwt: &str) -> Result<ConnectedRoom> {
-    // Force ICE transport policy to Relay for the publisher/subscriber PCs.
-    //
-    // Rationale (validated against Oracle-VM ↔ LiveKit Cloud diagnostics):
-    // the publisher PeerConnection's *direct* connectivity checks to
-    // LiveKit's `ice-lite` SFU host candidate (`143.223.91.x`) intermittently
-    // — and eventually persistently — receive no STUN responses (the flaky
-    // public-internet UDP leg between this VM and the SFU). Meanwhile TURN
-    // allocations against LiveKit's TURN servers *always* succeed
-    // (rustpbx → LiveKit-TURN is a reliable path). Forcing Relay routes the
-    // media/connectivity through that TURN path: the only internet hop is
-    // rustpbx → TURN (proven good), and the TURN → SFU hop is internal to
-    // LiveKit's datacenter. This converts the unreliable direct-UDP-to-SFU
-    // leg into the reliable relayed leg.
-    //
-    // Trade-off: ~30-50ms extra one-way latency and LiveKit TURN bandwidth
-    // usage. Acceptable for a NAT'd cloud bridge that owns the SIP↔LiveKit
-    // path. (Self-hosted LiveKit co-located with rustpbx wouldn't need this
-    // — a future per-trunk `force_relay` flag could make it conditional.)
-    let mut room_options = RoomOptions::default();
-    room_options.rtc_config.ice_transport_type =
-        livekit::webrtc::prelude::IceTransportsType::Relay;
-    let (room, events) = Room::connect(server_url, jwt, room_options)
+    // Default ICE transport policy (All) — matches the working Python
+    // `participant.py` PoC, which connected + carried real audio from the
+    // same local IP using default ICE. We briefly forced Relay (for the
+    // Oracle NAT path) but the Python SDK proved default ICE works here, so
+    // force-relay was a suspect for the Rust publisher PC's
+    // wait_pc_connection timeouts. Reverted to isolate Rust-SDK vs config.
+    let (room, events) = Room::connect(server_url, jwt, RoomOptions::default())
         .await
         .map_err(|e| anyhow!("livekit Room::connect failed: {e}"))?;
 

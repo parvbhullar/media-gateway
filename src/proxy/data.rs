@@ -922,6 +922,41 @@ fn process_kind_aware_entry(
         );
         return Ok(Some((entry.name, trunk)));
     }
+    if entry.kind == "external_media" {
+        let trunk = TrunkConfig {
+            dest: serde_json::from_value::<crate::models::trunk::ExternalMediaTrunkConfig>(
+                kind_config_value.clone(),
+            )
+            .map_err(|e| {
+                anyhow!(
+                    "trunk '{}': decode external_media kind_config: {}",
+                    entry.name,
+                    e
+                )
+            })?
+            .command,
+            disabled: Some(!entry.is_active),
+            max_calls: entry.max_concurrent,
+            max_cps: entry.max_cps,
+            direction: entry.direction.map(|d| d.into()),
+            recording: entry
+                .metadata
+                .as_ref()
+                .and_then(recording_policy_from_metadata),
+            rewrite_hostport: true,
+            origin: ConfigOrigin::from_file(path_display.to_string()),
+            kind: "external_media".to_string(),
+            kind_config: Some(kind_config_value),
+            ..Default::default()
+        };
+        info!(
+            file = %path_display,
+            name = %entry.name,
+            kind = %entry.kind,
+            "loaded external_media trunk from include file"
+        );
+        return Ok(Some((entry.name, trunk)));
+    }
     if entry.kind == "livekit" {
         let trunk = TrunkConfig {
             dest: serde_json::from_value::<crate::models::trunk::LiveKitTrunkConfig>(
@@ -1419,6 +1454,7 @@ fn convert_trunk(model: sip_trunk::Model) -> Result<Option<(String, TrunkConfig)
         "sip" => convert_sip_trunk(model),
         "webrtc" => convert_webrtc_trunk(model),
         "livekit" => convert_livekit_trunk(model),
+        "external_media" => convert_external_media_trunk(model),
         other => {
             warn!(
                 trunk = %model.name,
@@ -1569,6 +1605,35 @@ fn convert_livekit_trunk(model: sip_trunk::Model) -> Result<Option<(String, Trun
         rewrite_hostport: true,
         origin: ConfigOrigin::embedded(),
         kind: "livekit".to_string(),
+        kind_config: Some(model.kind_config.clone()),
+        ..Default::default()
+    };
+
+    Ok(Some((model.name, trunk)))
+}
+
+/// Project a `kind="external_media"` trunk row onto the routing-layer
+/// `TrunkConfig`. `dest` is the sidecar spawn command (no SIP server — the
+/// matcher short-circuits this kind into the external_media dispatcher);
+/// the full config stays in `kind_config` for the dispatcher.
+fn convert_external_media_trunk(
+    model: sip_trunk::Model,
+) -> Result<Option<(String, TrunkConfig)>> {
+    let cfg = model.external_media()?;
+    let trunk = TrunkConfig {
+        dest: cfg.command.clone(),
+        disabled: Some(!model.is_active),
+        max_calls: model.max_concurrent.map(|v| v as u32),
+        max_cps: model.max_cps.map(|v| v as u32),
+        id: Some(model.id),
+        direction: Some(model.direction.into()),
+        recording: model
+            .metadata
+            .as_ref()
+            .and_then(recording_policy_from_metadata),
+        rewrite_hostport: true,
+        origin: ConfigOrigin::embedded(),
+        kind: "external_media".to_string(),
         kind_config: Some(model.kind_config.clone()),
         ..Default::default()
     };

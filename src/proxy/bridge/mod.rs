@@ -22,5 +22,6 @@ pub mod common;
 pub mod signaling;
 pub mod webrtc;
 pub mod livekit;
+pub mod external_media;
 
 pub use webrtc::dispatch_webrtc;

@@ -429,6 +429,24 @@ async fn match_invite_impl(
                                         hints,
                                     });
                                 }
+                                "external_media" => {
+                                    let kind_config = trunk_config
+                                        .kind_config
+                                        .clone()
+                                        .unwrap_or(serde_json::Value::Null);
+                                    info!(
+                                        trunk = %selected_trunk,
+                                        kind = "external_media",
+                                        "routing INVITE to external_media (PCM sidecar) dispatcher"
+                                    );
+                                    return Ok(RouteResult::ExternalBridge {
+                                        kind: crate::proxy::bridge::session::BridgeKind::ExternalMedia,
+                                        trunk_name: selected_trunk,
+                                        kind_config,
+                                        option,
+                                        hints,
+                                    });
+                                }
                                 "sip" | "" => {
                                     apply_trunk_config(&mut option, trunk_config)?;
                                     info!(
