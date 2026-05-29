@@ -67,7 +67,7 @@ pub async fn dispatch_webrtc(
     // the bridge data plane forwards DTMF events through verbatim
     // instead of feeding them to the audio transcoder.
     let (rtp_pc, sip_sdp_answer, negotiated_sip_cap, sip_dtmf_pt) =
-        build_inbound_rtp_pc(invite_offer_sdp)
+        build_inbound_rtp_pc(invite_offer_sdp, _ctx)
             .await
             .map_err(setup_err)?;
 

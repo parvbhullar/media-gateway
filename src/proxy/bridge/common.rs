@@ -24,6 +24,19 @@ pub struct DispatchContext {
     pub call_id: String,
     pub from_user: String,
     pub to_user: String,
+    /// Public IP to advertise in the SIP-leg SDP answer (`c=`/candidate
+    /// address). Sourced from the proxy's `rtp_config.external_ip`. When
+    /// `None`, rustrtc falls back to the local bind interface — which is a
+    /// private address on a NAT'd cloud VM (e.g. Oracle `10.0.0.x`),
+    /// making the advertised RTP address unroutable from the SIP caller.
+    pub external_ip: Option<String>,
+    /// Local interface to bind the SIP-leg RTP socket to. From
+    /// `rtp_config.bind_ip`. `None` = rustrtc default selection.
+    pub bind_ip: Option<String>,
+    /// SIP-leg RTP port range (from `rtp_config`), so the bound port falls
+    /// inside the operator's firewall-opened range.
+    pub rtp_start_port: Option<u16>,
+    pub rtp_end_port: Option<u16>,
 }
 
 /// Resolve the effective ICE-server list for this trunk.
@@ -101,6 +114,7 @@ pub(crate) fn sip_side_audio_offer() -> Vec<AudioCapability> {
 /// pass-through (`None` if the carrier didn't offer telephone-event).
 pub(crate) async fn build_inbound_rtp_pc(
     invite_offer_sdp: &str,
+    ctx: &DispatchContext,
 ) -> Result<(PeerConnection, String, AudioCapability, Option<u8>)> {
     let cfg = RtcConfiguration {
         transport_mode: rustrtc::TransportMode::Rtp,
@@ -110,6 +124,22 @@ pub(crate) async fn build_inbound_rtp_pc(
             application: None,
         }),
         sdp_compatibility: SdpCompatibilityMode::Standard,
+        // Advertise the operator's public IP in the answer SDP instead of
+        // the local bind interface. Without this, a NAT'd cloud VM answers
+        // with its private address (e.g. Oracle `10.0.0.x`) and the SIP
+        // caller's RTP is sent to an unroutable destination → no inbound
+        // audio. Mirrors what the legacy `proxy_call::sip_session` path
+        // already does via `rtp_config.external_ip`.
+        external_ip: ctx.external_ip.clone(),
+        bind_ip: ctx.bind_ip.clone(),
+        rtp_start_port: ctx.rtp_start_port,
+        rtp_end_port: ctx.rtp_end_port,
+        // Symmetric RTP / latching: learn the caller's real RTP source
+        // address from the first inbound packet rather than trusting the
+        // SDP `c=` line. SIP softphones behind NAT (e.g. Linphone
+        // advertising a `192.168.x` LAN address) require this for the
+        // return path to reach them.
+        enable_latching: true,
         ..Default::default()
     };
     let pc = PeerConnection::new(cfg);

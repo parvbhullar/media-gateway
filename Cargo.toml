@@ -230,9 +230,18 @@ lto = "thin"
 codegen-units = 1
 strip = "symbols"
 
-# Fast deploy builds: optimized but incremental-friendly (no LTO, 16 units)
+# Fast deploy builds: optimized but incremental-friendly (no LTO, 16 units).
+#
+# `strip` intentionally NOT set here even though release inherits-from-it
+# has `strip = "symbols"`. Stripping the deploy binary has been correlated
+# with corrupted IceCandidate port serialization on cross-toolchain
+# deployments (built on Ubuntu 22.04, run on Ubuntu 24.04). The corruption
+# breaks LiveKit publisher PC ICE because LiveKit's server can't parse our
+# port. Run `cargo build --profile deploy` and ship the unstripped binary
+# (~90MB → ~150MB); the deploy script can strip it post-build if size
+# matters more than safety.
 [profile.deploy]
 inherits = "release"
 lto = false
 codegen-units = 16
-strip = "symbols"
+strip = false

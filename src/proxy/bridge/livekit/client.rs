@@ -23,21 +23,28 @@ pub struct ConnectedRoom {
 /// "sip-caller" LocalAudioTrack backed by a fresh NativeAudioSource @
 /// 48 kHz mono.
 pub async fn connect_and_publish(server_url: &str, jwt: &str) -> Result<ConnectedRoom> {
-    // Use the SDK's default ICE-transport policy (`All`) so libwebrtc can
-    // gather host + srflx + relay candidates and pick whichever path
-    // actually works against LiveKit's media edge.
+    // Force ICE transport policy to Relay for the publisher/subscriber PCs.
     //
-    // History: we briefly forced `IceTransportsType::Relay` here, on the
-    // theory that this host's UDP egress was blocked. Diagnostic logs
-    // showed that was wrong — direct (srflx) UDP did work intermittently
-    // on the same network; forcing Relay just stripped the working
-    // fallbacks and made the failure mode worse. On networks where TURN
-    // really is the only option, the right knob is a per-trunk
-    // `force_relay` config flag (deferred — add when an operator deploys
-    // somewhere it actually matters). See livekit/sip's `WithDisableTURN`
-    // for the inverse case (co-located deployments that skip TURN
-    // entirely).
-    let (room, events) = Room::connect(server_url, jwt, RoomOptions::default())
+    // Rationale (validated against Oracle-VM ↔ LiveKit Cloud diagnostics):
+    // the publisher PeerConnection's *direct* connectivity checks to
+    // LiveKit's `ice-lite` SFU host candidate (`143.223.91.x`) intermittently
+    // — and eventually persistently — receive no STUN responses (the flaky
+    // public-internet UDP leg between this VM and the SFU). Meanwhile TURN
+    // allocations against LiveKit's TURN servers *always* succeed
+    // (rustpbx → LiveKit-TURN is a reliable path). Forcing Relay routes the
+    // media/connectivity through that TURN path: the only internet hop is
+    // rustpbx → TURN (proven good), and the TURN → SFU hop is internal to
+    // LiveKit's datacenter. This converts the unreliable direct-UDP-to-SFU
+    // leg into the reliable relayed leg.
+    //
+    // Trade-off: ~30-50ms extra one-way latency and LiveKit TURN bandwidth
+    // usage. Acceptable for a NAT'd cloud bridge that owns the SIP↔LiveKit
+    // path. (Self-hosted LiveKit co-located with rustpbx wouldn't need this
+    // — a future per-trunk `force_relay` flag could make it conditional.)
+    let mut room_options = RoomOptions::default();
+    room_options.rtc_config.ice_transport_type =
+        livekit::webrtc::prelude::IceTransportsType::Relay;
+    let (room, events) = Room::connect(server_url, jwt, room_options)
         .await
         .map_err(|e| anyhow!("livekit Room::connect failed: {e}"))?;
 

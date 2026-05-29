@@ -50,7 +50,7 @@ pub async fn dispatch_livekit(
 
     // 1. Inbound SIP-side RTP PC + answer.
     let (sip_pc, sip_sdp_answer, sip_codec, sip_dtmf_pt) =
-        build_inbound_rtp_pc(invite_offer_sdp).await?;
+        build_inbound_rtp_pc(invite_offer_sdp, ctx).await?;
 
     // 2. Template substitution.
     let mut vars: HashMap<&str, &str> = HashMap::new();
@@ -137,24 +137,23 @@ pub async fn dispatch_livekit(
     // 4b. LiveKit-native agent dispatch — fire BEFORE Room::connect.
     //
     // AgentDispatch is a stateless HTTPS Twirp RPC that LiveKit Cloud
-    // accepts at any time for a named room (the room is created lazily
-    // when the first participant joins). Doing it before Room::connect
-    // means the named agent worker spins up in parallel with our
-    // publisher PC's ICE/DTLS handshake — so on a healthy network the
-    // bot is often already waiting in the room by the time we finish
-    // connecting, AND on a degraded network (e.g. NAT-blocked UDP that
-    // makes Room::connect time out) the agent worker still receives
-    // its dispatch RPC. Without this reordering, a Room::connect
-    // timeout silently swallows the dispatch entirely and the agent
-    // never knows the call was attempted, which makes "agent didn't
-    // get the call" indistinguishable from "agent had a bug" during
-    // diagnosis.
+    // accepts at any time for a named room. Doing it before our own
+    // `Room::connect` decouples the agent worker from our publisher PC:
+    // the worker receives its job and joins the room even if our
+    // publisher PeerConnection's ICE handshake is slow or (on a flaky
+    // UDP path) times out. With the opposite ordering, a
+    // `wait_pc_connection timed out` on our connect short-circuits via
+    // `?` and the dispatch RPC never fires — the agent never even learns
+    // the call happened. (An earlier revert to dispatch-after-connect was
+    // based on a "dropping pass-through signal" theory that turned out to
+    // be a symptom of a poisoned-sccache build, not the real cause — so
+    // we're back to dispatch-first, which is the correct decoupling.)
     //
-    // The webhook path (3) and this path are independent: a caller
-    // may have BOTH (webhook overrides room/identity, then we dispatch
-    // the named agent to the final room) OR just one. validate() refuses
-    // configs that have neither, so the caller can never land in an
-    // empty room with no path to a bot.
+    // The webhook path (3) and this path are independent: a caller may
+    // have BOTH (webhook overrides room/identity, then we dispatch the
+    // named agent to the final room) OR just one. validate() refuses
+    // configs that have neither, so the caller can never land in an empty
+    // room with no path to a bot.
     if let Some(agent_name) = cfg.agent_name.as_deref().filter(|s| !s.trim().is_empty()) {
         let agent_client = livekit_api::services::agent_dispatch::AgentDispatchClient::with_api_key(
             &admin_url,
@@ -179,12 +178,9 @@ pub async fn dispatch_livekit(
                 );
             }
             Err(e) if cfg.require_agent_dispatch => {
-                // Strict mode: abort the call rather than land the caller
-                // in a room without a bot. We dispatched BEFORE Room::connect,
-                // so there's no room handle to clean up — the dispatch RPC
-                // either succeeded server-side (room reservation may linger
-                // briefly until LiveKit's empty_timeout) or failed before
-                // any state was committed.
+                // Strict mode: abort before opening our own connection.
+                // Dispatch fired before Room::connect, so there's no room
+                // handle to clean up here.
                 tracing::warn!(
                     agent = %agent_name,
                     room = %final_room,
@@ -196,10 +192,9 @@ pub async fn dispatch_livekit(
                 ));
             }
             Err(e) => {
-                // Soft-fail (default): failure here is logged but doesn't
-                // fail the call. We proceed to Room::connect; the
-                // bot_join_timeout_ms watchdog (if configured) will catch
-                // a no-show.
+                // Soft-fail (default): logged but doesn't fail the call.
+                // We still attempt Room::connect; the bot_join_timeout_ms
+                // watchdog (if configured) catches a no-show.
                 tracing::warn!(
                     agent = %agent_name,
                     room = %final_room,
@@ -210,7 +205,8 @@ pub async fn dispatch_livekit(
         }
     }
 
-    // 5. Connect + publish.
+    // 5. Connect + publish (after dispatch, so the agent is already on its
+    // way into the room while our publisher PC negotiates).
     let connected = connect_and_publish(&cfg.server_url, &jwt).await?;
 
     // `livekit::Room` is not `Clone` — wrap in Arc so the media bridge and
@@ -239,23 +235,18 @@ pub async fn dispatch_livekit(
     let mut events_rx = connected.events;
     let deadline = tokio::time::sleep(Duration::from_millis(prejoin_timeout));
     tokio::pin!(deadline);
-    // Race-window check: with agent_dispatch firing BEFORE Room::connect,
-    // it's possible the agent worker won the race and joined the room
-    // before we did. In that case `ParticipantConnected` was emitted
-    // before our event stream existed — those participants appear in
-    // `room_arc.remote_participants()` as initial state, NOT in the
-    // event stream. Pre-seed `bot_joined` from this snapshot so we
-    // don't spin-wait for an event that will never arrive.
+    // agent_dispatch fired BEFORE Room::connect, so the agent worker may
+    // have already joined the room before our event stream existed — its
+    // `ParticipantConnected` would not be replayed. Pre-seed `bot_joined`
+    // from the current remote-participant snapshot so we don't wait on an
+    // event that already fired.
     let mut bot_joined = room_arc
         .remote_participants()
         .values()
         .any(|p| p.kind() == livekit::participant::ParticipantKind::Agent);
     if bot_joined {
-        tracing::info!(
-            trunk = %trunk.name,
-            room = %final_room,
-            "LiveKit agent already present at connect time (raced ahead of caller)"
-        );
+        tracing::info!(trunk = %trunk.name, room = %final_room,
+            "LiveKit agent already present at connect time");
     }
     while !bot_joined {
         tokio::select! {

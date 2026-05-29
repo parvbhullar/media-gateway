@@ -152,7 +152,7 @@ async fn dispatch_closes_session_when_post_negotiate_step_fails() {
 async fn inbound_rtp_pc_negotiates_pcma_when_carrier_only_offers_pcma() {
     let offer = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\n\
                  t=0 0\r\nm=audio 10000 RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\n";
-    let (_pc, answer_sdp, negotiated, _dtmf_pt) = build_inbound_rtp_pc(offer)
+    let (_pc, answer_sdp, negotiated, _dtmf_pt) = build_inbound_rtp_pc(offer, &DispatchContext::default())
         .await
         .expect("PCMA-only offer should negotiate");
     assert_eq!(
@@ -175,7 +175,7 @@ async fn inbound_rtp_pc_negotiates_opus_when_carrier_offers_it() {
     let offer = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\n\
                  t=0 0\r\nm=audio 10000 RTP/AVP 111\r\n\
                  a=rtpmap:111 opus/48000/2\r\n";
-    let (_pc, _answer_sdp, negotiated, _dtmf_pt) = build_inbound_rtp_pc(offer)
+    let (_pc, _answer_sdp, negotiated, _dtmf_pt) = build_inbound_rtp_pc(offer, &DispatchContext::default())
         .await
         .expect("opus-on-SIP offer should negotiate");
     assert_eq!(
@@ -195,7 +195,7 @@ async fn inbound_rtp_pc_honours_carrier_codec_preference() {
                  t=0 0\r\nm=audio 10000 RTP/AVP 0 8 9\r\n\
                  a=rtpmap:0 PCMU/8000\r\na=rtpmap:8 PCMA/8000\r\n\
                  a=rtpmap:9 G722/8000\r\n";
-    let (_pc, _answer_sdp, negotiated, _dtmf_pt) = build_inbound_rtp_pc(offer)
+    let (_pc, _answer_sdp, negotiated, _dtmf_pt) = build_inbound_rtp_pc(offer, &DispatchContext::default())
         .await
         .expect("multi-codec offer should negotiate");
     assert_eq!(
@@ -215,7 +215,7 @@ async fn inbound_rtp_pc_separates_voice_codec_from_dtmf_pt() {
                  t=0 0\r\nm=audio 10000 RTP/AVP 0 101\r\n\
                  a=rtpmap:0 PCMU/8000\r\n\
                  a=rtpmap:101 telephone-event/8000\r\na=fmtp:101 0-16\r\n";
-    let (_pc, _answer_sdp, voice, dtmf_pt) = build_inbound_rtp_pc(offer)
+    let (_pc, _answer_sdp, voice, dtmf_pt) = build_inbound_rtp_pc(offer, &DispatchContext::default())
         .await
         .expect("PCMU + telephone-event offer should negotiate");
     assert_eq!(
@@ -238,7 +238,7 @@ async fn inbound_rtp_pc_honours_carrier_dtmf_pt() {
                  t=0 0\r\nm=audio 10000 RTP/AVP 0 96\r\n\
                  a=rtpmap:0 PCMU/8000\r\n\
                  a=rtpmap:96 telephone-event/8000\r\na=fmtp:96 0-16\r\n";
-    let (_pc, _answer_sdp, _voice, dtmf_pt) = build_inbound_rtp_pc(offer)
+    let (_pc, _answer_sdp, _voice, dtmf_pt) = build_inbound_rtp_pc(offer, &DispatchContext::default())
         .await
         .expect("non-standard DTMF PT should still negotiate");
     assert_eq!(
@@ -255,7 +255,7 @@ async fn inbound_rtp_pc_honours_carrier_dtmf_pt() {
 async fn inbound_rtp_pc_no_dtmf_when_carrier_omits_it() {
     let offer = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\n\
                  t=0 0\r\nm=audio 10000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
-    let (_pc, _answer_sdp, _voice, dtmf_pt) = build_inbound_rtp_pc(offer)
+    let (_pc, _answer_sdp, _voice, dtmf_pt) = build_inbound_rtp_pc(offer, &DispatchContext::default())
         .await
         .expect("PCMU-only offer (no telephone-event) should still negotiate");
     assert_eq!(
@@ -272,7 +272,7 @@ async fn inbound_rtp_pc_no_dtmf_when_carrier_omits_it() {
 async fn inbound_rtp_pc_rejects_unsupported_only_offer() {
     let offer = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\n\
                  t=0 0\r\nm=audio 10000 RTP/AVP 18\r\na=rtpmap:18 G729/8000\r\n";
-    let result = build_inbound_rtp_pc(offer).await;
+    let result = build_inbound_rtp_pc(offer, &DispatchContext::default()).await;
     match result {
         Ok((_, _, neg, _)) => panic!(
             "expected error for G729-only offer, got negotiated={}",

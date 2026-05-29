@@ -1535,6 +1535,13 @@ impl CallModule {
             call_id: cdr_call_id.clone(),
             from_user: cdr_from_number.clone().unwrap_or_default(),
             to_user: cdr_to_number.clone().unwrap_or_default(),
+            // Public IP + bind/port config so the SIP-leg answer SDP
+            // advertises a routable address (not the cloud VM's private
+            // interface IP). Same source the legacy forward path uses.
+            external_ip: self.inner.server.rtp_config.external_ip.clone(),
+            bind_ip: self.inner.server.rtp_config.bind_ip.clone(),
+            rtp_start_port: self.inner.server.rtp_config.start_port,
+            rtp_end_port: self.inner.server.rtp_config.end_port,
         };
         let dispatch_res = match kind {
             BridgeKind::WebRtc => {
