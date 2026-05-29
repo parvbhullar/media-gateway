@@ -47,9 +47,12 @@ cargo build --profile deploy
 
 echo "==> Binary size: $(du -sh $BINARY | cut -f1)"
 
-# strip = "symbols" in Cargo.toml handles this automatically in Rust 1.77+
-# but run strip as safety net for older toolchains
-strip "$BINARY" 2>/dev/null || true
+# Strip intentionally disabled: stripping the deploy binary has been
+# correlated with corrupted IceCandidate port serialization on cross-
+# toolchain runs (built on Ubuntu 22.04, run on Ubuntu 24.04 Oracle VM).
+# Cargo.toml's [profile.deploy] also has `strip = false`. Keep the
+# unstripped binary even at the cost of ~30MB extra over the wire.
+# strip "$BINARY" 2>/dev/null || true
 
 echo "==> Uploading binary..."
 rsync -avz --progress -e "ssh $SSH_OPTS" "$BINARY" "${SERVER_USER}@${SERVER_HOST}:${SERVER_DIR}/rustpbx"
