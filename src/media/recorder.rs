@@ -85,6 +85,11 @@ pub struct Recorder {
     last_ssrc_b: Option<u32>,
     profile_a: NegotiatedLegProfile,
     profile_b: NegotiatedLegProfile,
+    // Per-leg linear gain applied to decoded PCM before re-encode (1.0 =
+    // no-op). Used to balance legs in the mixdown (e.g. a quiet SIP caller vs
+    // a hot TTS bot). Recording-only — does not affect live call audio.
+    gain_a: f32,
+    gain_b: f32,
     dtmf_state_a: Option<DtmfEventState>,
     dtmf_state_b: Option<DtmfEventState>,
 
@@ -151,7 +156,8 @@ impl Recorder {
             last_ssrc_b: None,
             profile_a: NegotiatedLegProfile::default(),
             profile_b: NegotiatedLegProfile::default(),
-
+            gain_a: 1.0,
+            gain_b: 1.0,
             dtmf_state_a: None,
             dtmf_state_b: None,
             next_flush_ts: 0,
@@ -167,6 +173,15 @@ impl Recorder {
         match leg {
             Leg::A => self.profile_a = profile,
             Leg::B => self.profile_b = profile,
+        }
+    }
+
+    /// Set a per-leg linear gain (1.0 = unchanged) applied to decoded PCM
+    /// before re-encode. Recording-only — does not affect live call audio.
+    pub fn set_leg_gain(&mut self, leg: Leg, gain: f32) {
+        match leg {
+            Leg::A => self.gain_a = gain,
+            Leg::B => self.gain_b = gain,
         }
     }
 
@@ -239,31 +254,6 @@ impl Recorder {
             _ => return Ok(()),
         };
 
-        // One-shot per-leg diagnostic: the first frame on each leg (before
-        // its timeline base is set) logs exactly what the recorder will use
-        // for timeline projection. A `frame_clock_rate` that disagrees with
-        // the leg's true RTP clock (e.g. 8000 while the source advances at
-        // 48000) stretches the WAV by that ratio.
-        let base_is_set = match leg {
-            Leg::A => self.base_timestamp_a.is_some(),
-            Leg::B => self.base_timestamp_b.is_some(),
-        };
-        if !base_is_set {
-            debug!(
-                recorder_path = %self.path,
-                ?leg,
-                frame_pt = ?frame.payload_type,
-                frame_clock_rate_field = frame.clock_rate,
-                ?decoder_type,
-                decoder_clock = decoder_type.clock_rate(),
-                used_frame_clock_rate = frame_clock_rate,
-                has_raw_packet = frame.raw_packet.is_some(),
-                out_sample_rate = self.sample_rate,
-                rtp_timestamp = frame.rtp_timestamp,
-                "recorder leg first frame (timeline clock diagnostic)"
-            );
-        }
-
         if decoder_type != self.codec {
             let decoder = self
                 .decoders
@@ -279,7 +269,17 @@ impl Recorder {
                         self.sample_rate as usize,
                     )
                 });
-            let pcm = resampler.resample(&pcm);
+            let mut pcm = resampler.resample(&pcm);
+            // Per-leg recording gain (default 1.0). Hard-clamp to i16.
+            let gain = match leg {
+                Leg::A => self.gain_a,
+                Leg::B => self.gain_b,
+            };
+            if gain != 1.0 {
+                for s in pcm.iter_mut() {
+                    *s = ((*s as f32) * gain).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                }
+            }
             encoded = if let Some(enc) = self.encoder.as_mut() {
                 enc.encode(&pcm)
             } else {
@@ -1278,7 +1278,8 @@ mod tests {
             last_ssrc_b: None,
             profile_a: NegotiatedLegProfile::default(),
             profile_b: NegotiatedLegProfile::default(),
-
+            gain_a: 1.0,
+            gain_b: 1.0,
             dtmf_state_a: None,
             dtmf_state_b: None,
             next_flush_ts: 0,

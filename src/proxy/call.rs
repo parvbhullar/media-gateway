@@ -1688,6 +1688,15 @@ impl CallModule {
                         dtmf: None,
                     };
                     rec.set_leg_profile(crate::media::recorder::Leg::B, leg_b_profile);
+                    // external_media level balance (recording-only): the SIP
+                    // caller arrives ~20 dB below the LiveKit TTS bot, and the
+                    // bot tends to clip the μ-law ceiling. Lift the caller and
+                    // tame the bot so both sit at a comparable level in the WAV.
+                    // Does NOT touch live call audio.
+                    if kind == BridgeKind::ExternalMedia {
+                        rec.set_leg_gain(crate::media::recorder::Leg::A, 3.0);
+                        rec.set_leg_gain(crate::media::recorder::Leg::B, 0.6);
+                    }
                     let shared = std::sync::Arc::new(parking_lot::RwLock::new(Some(rec)));
                     outcome.bridge.attach_recorder(shared);
                     info!(call_id = %cdr_call_id, path = %path, kind = %kind.as_str(),
