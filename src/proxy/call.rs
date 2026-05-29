@@ -1648,10 +1648,11 @@ impl CallModule {
                 path.set_extension("wav");
                 Some(path.to_string_lossy().to_string())
             });
-        // Only the WebRTC kind exposes a `BridgePeer` data plane that feeds
-        // the shared `Recorder` today. LiveKit and external_media don't wire
-        // a recorder (separate follow-up).
-        let recording_supported = matches!(kind, BridgeKind::WebRtc);
+        // WebRTC (BridgePeer) and ExternalMedia (sidecar PCM Task A/B) both
+        // feed the shared `Recorder` (leg A = SIP caller, leg B = bot side).
+        // LiveKit has no recorder data plane yet (separate follow-up).
+        let recording_supported =
+            matches!(kind, BridgeKind::WebRtc | BridgeKind::ExternalMedia);
         if let Some(path) = recording_path.as_ref().filter(|_| recording_supported) {
             match crate::media::recorder::Recorder::new(path, CodecType::PCMU) {
                 Ok(mut rec) => {
@@ -1665,19 +1666,23 @@ impl CallModule {
                     // garble the caller's audio in the WAV.
                     //
                     // Leg A = inbound SIP side: parse the caller's offer SDP.
-                    // Leg B = bot/WebRTC side: bridge negotiates Opus at PT=111,
-                    // stereo @ 48 kHz, so we use a fixed Opus profile.
+                    // Leg B = bot side: Opus @ 48 kHz. WebRTC publishes stereo
+                    // (PT=111); the external_media sidecar re-encodes mono Opus.
+                    // Both legs are fed an explicit codec hint by their bridge,
+                    // so the leg-B PT here is only a fallback — channel count is
+                    // what matters for the decode/downmix.
                     let leg_a_profile =
                         crate::media::negotiate::MediaNegotiator::extract_leg_profile(
                             std::str::from_utf8(&offer_body).unwrap_or(""),
                         );
                     rec.set_leg_profile(crate::media::recorder::Leg::A, leg_a_profile);
+                    let leg_b_channels = if kind == BridgeKind::ExternalMedia { 1 } else { 2 };
                     let leg_b_profile = crate::media::negotiate::NegotiatedLegProfile {
                         audio: Some(crate::media::negotiate::NegotiatedCodec {
                             codec: CodecType::Opus,
                             payload_type: 111,
                             clock_rate: 48000,
-                            channels: 2,
+                            channels: leg_b_channels,
                         }),
                         video: None,
                         dtmf: None,

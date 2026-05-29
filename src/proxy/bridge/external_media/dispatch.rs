@@ -134,6 +134,7 @@ pub async fn dispatch_external_media(
         cancel_token: cancel.clone(),
         trunk_name: trunk.name.clone(),
         disconnect_cause: Arc::new(parking_lot::Mutex::new(BridgeHangupCause::ByCallee)),
+        recorder: parking_lot::RwLock::new(None),
     });
 
     let teardown = Box::new(ExternalMediaTeardown {

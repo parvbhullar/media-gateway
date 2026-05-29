@@ -22,14 +22,21 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use audio_codec::opus::OpusEncoder;
 use audio_codec::{CodecType, Decoder, Encoder, Resampler};
+use parking_lot::RwLock;
 use rustrtc::PeerConnection;
 use rustrtc::config::AudioCapability;
 use rustrtc::media::frame::{AudioFrame as RtcAudioFrame, MediaSample};
 use rustrtc::media::track::{MediaStreamTrack, sample_track};
 use tokio::net::UdpSocket;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::media::recorder::{Leg, Recorder};
 use crate::proxy::bridge::session::{BridgeKind, MediaBridge};
+
+/// Shared recorder handle (leg A = SIP caller, leg B = sidecar/agent),
+/// attached by `call.rs` before `start()`.
+type SharedRecorder = Arc<RwLock<Option<Recorder>>>;
 
 const PTIME_MS: u32 = 20;
 const PCM_SAMPLE_RATE: u32 = 48_000;
@@ -44,6 +51,14 @@ fn build_sip_decoder(codec: CodecType) -> Box<dyn Decoder> {
 }
 
 /// Mono Opus encoder (valid mono via per-packet TOC).
+///
+/// NOTE: audio_codec 0.3.30's `OpusEncoder::new` hardcodes
+/// `OPUS_APPLICATION_VOIP` (speech high-pass / band-limit) and exposes no
+/// bitrate/complexity/application tuning. That VoIP profile is why the bot
+/// sounds thinner than the webrtc kind, which passes the bot's native
+/// full-band Opus through untouched. Making it fuller needs either an
+/// audio_codec bump to 0.3.33 (adds `new_with_application`/`set_bitrate`/
+/// `set_complexity`) or a custom opusic_sys encoder — see build notes.
 fn build_sip_encoder(codec: CodecType) -> Box<dyn Encoder> {
     match codec {
         CodecType::Opus => Box::new(OpusEncoder::new(48_000, 1)),
@@ -54,6 +69,32 @@ fn build_sip_encoder(codec: CodecType) -> Box<dyn Encoder> {
 fn codec_type_for(cap: &AudioCapability) -> anyhow::Result<CodecType> {
     CodecType::try_from(cap.codec_name.as_str())
         .map_err(|e| anyhow!("unsupported SIP codec '{}': {e}", cap.codec_name))
+}
+
+/// One unit of recording work handed off the media hot path.
+struct RecItem {
+    leg: Leg,
+    sample: MediaSample,
+}
+
+/// Drain recording items on a dedicated task so the codec work + periodic
+/// disk flush inside `Recorder::write_sample` never run on the realtime
+/// forwarding tasks (Task A/B) — inline recording previously caused audible
+/// jitter + lock contention that thinned the recorded caller leg. Owns the
+/// recorder exclusively. `codec_hint` is the SIP voice codec both legs carry.
+async fn run_recorder(
+    recorder: SharedRecorder,
+    codec_hint: CodecType,
+    dtmf_pt: Option<u8>,
+    mut rx: mpsc::Receiver<RecItem>,
+) {
+    while let Some(item) = rx.recv().await {
+        // Only leg A (the SIP caller) can carry RFC 2833 DTMF.
+        let leg_dtmf = if item.leg == Leg::A { dtmf_pt } else { None };
+        if let Some(r) = recorder.write().as_mut() {
+            let _ = r.write_sample(item.leg, &item.sample, leg_dtmf, None, Some(codec_hint));
+        }
+    }
 }
 
 /// Media-plane bridge between a SIP-side RTP PC and a sidecar PCM socket.
@@ -74,6 +115,9 @@ pub struct ExternalMediaBridge {
     /// Disconnect cause surfaced to call.rs teardown via `watch_disconnect`.
     pub disconnect_cause:
         Arc<parking_lot::Mutex<crate::proxy::bridge::session::BridgeHangupCause>>,
+    /// Shared call recorder, attached by `call.rs` before `start()`. Leg A =
+    /// SIP caller, leg B = sidecar/agent. `None` when recording disabled.
+    pub recorder: RwLock<Option<SharedRecorder>>,
 }
 
 impl Drop for ExternalMediaBridge {
@@ -106,6 +150,18 @@ impl MediaBridge for ExternalMediaBridge {
                 "external_media: failed to add outbound SIP track — sidecar→SIP will be silent");
         }
 
+        // Recording runs on its own task fed by a bounded channel, so the
+        // codec work + periodic disk flush never block the realtime media
+        // tasks. `try_send` from the media tasks is non-blocking and drops on
+        // backpressure — recording is best-effort, live audio never waits.
+        let rec_tx: Option<mpsc::Sender<RecItem>> =
+            self.recorder.read().clone().map(|recorder| {
+                let (tx, rx) = mpsc::channel::<RecItem>(500);
+                let dtmf_pt = self.sip_dtmf_pt;
+                tokio::spawn(run_recorder(recorder, sip_codec_type, dtmf_pt, rx));
+                tx
+            });
+
         // ── Task A: SIP RTP → sidecar PCM ─────────────────────────────
         {
             let cancel = cancel.clone();
@@ -114,10 +170,12 @@ impl MediaBridge for ExternalMediaBridge {
             let sock = self.sock.clone();
             let dtmf_pt = self.sip_dtmf_pt;
             let codec_type = sip_codec_type;
+            let rec_tx = rec_tx.clone();
             tokio::spawn(async move {
                 tracing::info!(trunk = %trunk_name, codec = ?codec_type,
                     "external_media task A (SIP→sidecar) started");
-                run_sip_to_sidecar(trunk_name.clone(), sip_pc, codec_type, dtmf_pt, sock, cancel)
+                run_sip_to_sidecar(trunk_name.clone(), sip_pc, codec_type, dtmf_pt, sock,
+                    rec_tx, cancel)
                     .await;
                 tracing::info!(trunk = %trunk_name, "external_media task A exited");
             });
@@ -133,7 +191,7 @@ impl MediaBridge for ExternalMediaBridge {
                 tracing::info!(trunk = %trunk_name, codec = ?codec_type, sip_clock_rate,
                     "external_media task B (sidecar→SIP) started");
                 run_sidecar_to_sip(trunk_name.clone(), sock, codec_type, sip_clock_rate, sip_pt,
-                    sip_send, cancel)
+                    sip_send, rec_tx, cancel)
                     .await;
                 tracing::info!(trunk = %trunk_name, "external_media task B exited");
             });
@@ -144,6 +202,10 @@ impl MediaBridge for ExternalMediaBridge {
 
     fn kind(&self) -> BridgeKind {
         BridgeKind::ExternalMedia
+    }
+
+    fn attach_recorder(&self, recorder: SharedRecorder) {
+        *self.recorder.write() = Some(recorder);
     }
 
     fn watch_disconnect(
@@ -171,6 +233,7 @@ async fn run_sip_to_sidecar(
     codec_type: CodecType,
     dtmf_pt: Option<u8>,
     sock: Arc<UdpSocket>,
+    rec_tx: Option<mpsc::Sender<RecItem>>,
     cancel: CancellationToken,
 ) {
     let mut decoder: Box<dyn Decoder> = build_sip_decoder(codec_type);
@@ -216,7 +279,15 @@ async fn run_sip_to_sidecar(
                         break;
                     }
                 };
-                let frame = match sample {
+                // Record the caller leg (leg A) off the hot path — including
+                // DTMF, which the recorder renders via its own DTMF path.
+                // Non-blocking; drops on backpressure.
+                if let Some(tx) = &rec_tx
+                    && matches!(sample, MediaSample::Audio(_))
+                {
+                    let _ = tx.try_send(RecItem { leg: Leg::A, sample: sample.clone() });
+                }
+                let frame = match &sample {
                     MediaSample::Audio(f) => f,
                     MediaSample::Video(_) => continue,
                 };
@@ -266,6 +337,7 @@ async fn run_sidecar_to_sip(
     sip_clock_rate: u32,
     sip_pt: u8,
     sip_send: rustrtc::media::track::SampleStreamSource,
+    rec_tx: Option<mpsc::Sender<RecItem>>,
     cancel: CancellationToken,
 ) {
     let mut encoder: Box<dyn Encoder> = build_sip_encoder(codec_type);
@@ -334,6 +406,14 @@ async fn run_sidecar_to_sip(
                     source_addr: None,
                     raw_packet: None,
                 };
+                // Record the agent leg (leg B) off the hot path, from the same
+                // encoded frame. Non-blocking; drops on backpressure.
+                if let Some(tx) = &rec_tx {
+                    let _ = tx.try_send(RecItem {
+                        leg: Leg::B,
+                        sample: MediaSample::Audio(frame.clone()),
+                    });
+                }
                 if let Err(e) = sip_send.send_audio(frame).await {
                     tracing::debug!(trunk = %trunk_name, error = %e,
                         "SIP send_audio failed — task B exiting");
