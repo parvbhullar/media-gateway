@@ -72,6 +72,28 @@ pub async fn dispatch_external_media(
         .arg(format!("--did={}", ctx.to_user))
         .arg(format!("--caller={}", ctx.from_user))
         .arg(format!("--port={q_port}"));
+    // Forward custom INVITE headers (X-*) as a JSON map in the environment;
+    // the sidecar exposes each as a `sip.h.<Header>` participant attribute
+    // (mirrors livekit/sip's HeadersToAttrs). Env (not argv) so arbitrary
+    // header values need no shell/argparse escaping. The base sip.* attributes
+    // (callID/phoneNumber/trunkPhoneNumber/callStatus) are derived sidecar-side
+    // from --call-id/--caller/--did, so they aren't repeated here.
+    if !ctx.sip_headers.is_empty() {
+        let map: std::collections::BTreeMap<&str, &str> = ctx
+            .sip_headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        match serde_json::to_string(&map) {
+            Ok(json) => {
+                command.env("SIP_SIDECAR_HEADERS", json);
+            }
+            Err(e) => tracing::warn!(
+                trunk = %trunk.name,
+                "failed to serialize sip_headers for sidecar: {e}; skipping"
+            ),
+        }
+    }
     // Backstop: if teardown is never reached (e.g. dispatcher returns Err
     // below), dropping the Child kills the sidecar.
     command.kill_on_drop(true);

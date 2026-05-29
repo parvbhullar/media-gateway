@@ -34,6 +34,7 @@ Usage (normally invoked by rustpbx, but runnable by hand for testing):
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import re
@@ -77,6 +78,34 @@ def room_name_for(call_id: str, did: str) -> str:
     base = call_id or f"sip-{did}"
     safe = re.sub(r"[^A-Za-z0-9._-]", "-", base)
     return f"sip-{safe}"
+
+
+def build_sip_attributes(call_id: str, did: str, caller: str) -> dict[str, str]:
+    """Build the LiveKit `sip.*` participant attributes the agent reads via
+    `participant.attributes`. Mirrors what livekit/sip's SIP service puts on
+    the SIP participant, so agents written against a real LiveKit SIP trunk
+    work unchanged behind this bridge.
+
+    Standard keys are derived from the call params rustpbx passes on argv.
+    Custom `X-*` INVITE headers, if rustpbx forwarded them in the
+    SIP_SIDECAR_HEADERS env (a JSON object), are exposed as `sip.h.<Header>`.
+    """
+    attrs = {
+        "sip.callID": call_id,
+        "sip.callStatus": "active",
+    }
+    if caller:
+        attrs["sip.phoneNumber"] = caller          # inbound: originating number
+    if did:
+        attrs["sip.trunkPhoneNumber"] = did         # the DID that was dialed
+    raw = os.getenv("SIP_SIDECAR_HEADERS")
+    if raw:
+        try:
+            for name, value in json.loads(raw).items():
+                attrs[f"sip.h.{name}"] = str(value)
+        except (ValueError, TypeError, AttributeError) as e:
+            log.warning("ignoring malformed SIP_SIDECAR_HEADERS: %s", e)
+    return attrs
 
 
 class PcmBridgeProtocol(asyncio.DatagramProtocol):
@@ -198,13 +227,21 @@ async def main(call_id: str, did: str, caller: str, port: int) -> None:
         log.info("dispatched agent '%s' → room '%s' (id=%s)", agent_name, room_name, d.id)
 
     # --- 3. join the room as the caller participant ---
+    # kind="sip" + sip.* attributes make us look like a real LiveKit SIP
+    # participant, so an agent's `participant.attributes` / SIP-kind checks
+    # resolve exactly as they would behind livekit/sip.
+    sip_attrs = build_sip_attributes(call_id, did, caller)
     token = (
         api.AccessToken(key, secret)
         .with_identity(f"sip-caller-{caller}")
         .with_name(f"sip-caller-{caller}")
+        .with_kind("sip")
+        .with_attributes(sip_attrs)
         .with_grants(api.VideoGrants(room_join=True, room=room_name))
         .to_jwt()
     )
+    log.info("joining as SIP participant with %d attribute(s): %s",
+             len(sip_attrs), sorted(sip_attrs))
     room = rtc.Room()
 
     @room.on("track_subscribed")

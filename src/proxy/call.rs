@@ -1531,6 +1531,25 @@ impl CallModule {
 
         let ice_servers = self.inner.server.rtp_config.ice_servers.as_deref();
 
+        // Lift custom `X-*` headers off the INVITE so the bridge far-end can
+        // surface them as `sip.h.<Header>` participant attributes (parallels
+        // livekit/sip's HeadersToAttrs). Standard sip.* attributes are derived
+        // far-end from call_id/from/to; this carries only the operator's
+        // custom headers.
+        let sip_headers: Vec<(String, String)> = tx
+            .original
+            .headers
+            .iter()
+            .filter_map(|h| match h {
+                rsipstack::sip::Header::Other(name, value)
+                    if name.len() >= 2 && name[..2].eq_ignore_ascii_case("x-") =>
+                {
+                    Some((name.clone(), value.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+
         let dispatch_ctx = crate::proxy::bridge::common::DispatchContext {
             call_id: cdr_call_id.clone(),
             from_user: cdr_from_number.clone().unwrap_or_default(),
@@ -1542,6 +1561,7 @@ impl CallModule {
             bind_ip: self.inner.server.rtp_config.bind_ip.clone(),
             rtp_start_port: self.inner.server.rtp_config.start_port,
             rtp_end_port: self.inner.server.rtp_config.end_port,
+            sip_headers,
         };
         let dispatch_res = match kind {
             BridgeKind::WebRtc => {

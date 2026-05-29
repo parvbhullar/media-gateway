@@ -37,6 +37,11 @@ pub struct DispatchContext {
     /// inside the operator's firewall-opened range.
     pub rtp_start_port: Option<u16>,
     pub rtp_end_port: Option<u16>,
+    /// Custom SIP headers lifted from the INVITE (e.g. `X-*`), to be exposed
+    /// to the bridge far-end as participant attributes — mirrors
+    /// livekit/sip's `HeadersToAttrs` → `sip.h.<Header>`. Only the
+    /// `external_media` kind consumes this today; empty for other kinds.
+    pub sip_headers: Vec<(String, String)>,
 }
 
 /// Resolve the effective ICE-server list for this trunk.
