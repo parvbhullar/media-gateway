@@ -22,6 +22,7 @@
 //! confined to the adapter (selected by name) and the per-trunk `protocol`
 //! blob it interprets.
 
+pub mod codecs;
 pub mod dispatch;
 pub mod dtmf;
 pub mod media_bridge;

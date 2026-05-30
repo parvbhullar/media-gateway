@@ -8,8 +8,11 @@ use crate::proxy::bridge::signaling::{
     self, NegotiateOutcome, SessionHandle, SignalingContext, WebRtcSignalingAdapter,
 };
 
+use super::codecs::configure_webrtc_bridge_transcoders;
 use super::dispatch::dispatch_webrtc;
 use super::sdp::build_outbound_webrtc_pc;
+
+use crate::media::bridge::{BridgeEndpoint, BridgePeer};
 
 use anyhow::Result;
 use rustrtc::IceServer;
@@ -309,4 +312,62 @@ async fn dispatch_rejects_unknown_adapter() {
         msg.contains("not registered"),
         "expected `not registered` in error, got: {msg}"
     );
+}
+
+// ── Codec-mismatch transcoder wiring (the SIP→WebRTC "deaf call" fix) ───────
+
+/// Build a real `BridgePeer` (two PeerConnections) for transcoder-wiring
+/// tests. The PCs are only needed so `BridgePeer::new` is satisfied; the
+/// transcoder decision is driven entirely by the SDP answers we pass to
+/// `configure_webrtc_bridge_transcoders`.
+async fn test_bridge() -> BridgePeer {
+    let pcmu_offer = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\n\
+                      t=0 0\r\nm=audio 10000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+    let (rtp_pc, _answer, _cap, _dtmf) = build_inbound_rtp_pc(pcmu_offer, &DispatchContext::default())
+        .await
+        .expect("rtp pc");
+    let webrtc_pc = build_outbound_webrtc_pc(None, "opus", None).expect("webrtc pc");
+    BridgePeer::new("codec-test".into(), webrtc_pc, rtp_pc)
+}
+
+const SIP_ANSWER_PCMU: &str = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\n\
+    c=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 10000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+const SIP_ANSWER_OPUS: &str = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\n\
+    c=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 10000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n";
+const WEBRTC_ANSWER_OPUS: &str = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\n\
+    c=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=rtpmap:111 opus/48000/2\r\n";
+
+/// Mismatch (SIP PCMU vs WebRTC Opus) MUST install a transcoder in BOTH
+/// directions — otherwise raw G.711 is forwarded under the Opus PT and the
+/// bot is deaf. This is the regression guard for the reported bug.
+#[tokio::test]
+async fn codec_mismatch_installs_both_transcoders() {
+    let bridge = test_bridge().await;
+    configure_webrtc_bridge_transcoders(&bridge, SIP_ANSWER_PCMU, WEBRTC_ANSWER_OPUS);
+
+    // caller→bot (source = Rtp/SIP) transcodes G.711 → Opus, emitted under
+    // the WebRTC leg's PT (111).
+    assert_eq!(
+        bridge.transcoder_target_pt(BridgeEndpoint::Rtp),
+        Some(111),
+        "SIP→WebRTC leg must transcode to the WebRTC Opus PT"
+    );
+    // bot→caller (source = WebRtc) transcodes Opus → G.711, emitted under
+    // the SIP leg's PT (0 = PCMU).
+    assert_eq!(
+        bridge.transcoder_target_pt(BridgeEndpoint::WebRtc),
+        Some(0),
+        "WebRTC→SIP leg must transcode to the SIP PCMU PT"
+    );
+}
+
+/// Matching codecs (Opus on both legs) must NOT install transcoders —
+/// preserve zero-cost passthrough.
+#[tokio::test]
+async fn matching_codecs_install_no_transcoder() {
+    let bridge = test_bridge().await;
+    configure_webrtc_bridge_transcoders(&bridge, SIP_ANSWER_OPUS, WEBRTC_ANSWER_OPUS);
+
+    assert_eq!(bridge.transcoder_target_pt(BridgeEndpoint::Rtp), None);
+    assert_eq!(bridge.transcoder_target_pt(BridgeEndpoint::WebRtc), None);
 }

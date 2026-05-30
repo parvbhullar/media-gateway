@@ -155,6 +155,7 @@ fn ctx_for(call_id: &str, from_user: &str, to_user: &str) -> DispatchContext {
         call_id: call_id.to_string(),
         from_user: from_user.to_string(),
         to_user: to_user.to_string(),
+        ..Default::default()
     }
 }
 

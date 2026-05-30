@@ -215,6 +215,14 @@ pub async fn dispatch_webrtc(
         .await);
     }
 
+    // Install audio transcoders when the SIP and WebRTC legs negotiated
+    // different codecs (e.g. a G.711 PSTN carrier vs Opus on the bot).
+    // Without this the data plane forwards raw payload bytes under the
+    // destination's PT — sending G.711 labeled as Opus — and strict peers
+    // (aiortc/Pipecat) reject every packet. When the codecs match this is a
+    // no-op and audio passes through untouched.
+    super::codecs::configure_webrtc_bridge_transcoders(&bridge, &sip_sdp_answer, &answer_sdp);
+
     // 6. DTMF pass-through (RFC 2833) — install per-direction sinks. Each
     // sink keys on the PT *the sender* uses on that leg:
     //   * SIP → WebRTC: `sip_dtmf_pt` is the PT the carrier advertised in

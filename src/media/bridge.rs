@@ -890,6 +890,19 @@ impl BridgePeer {
         *timing_slot.write() = None;
     }
 
+    /// Target payload type of the transcoder currently installed for the
+    /// given source endpoint, or `None` if no transcoder is set on that leg.
+    /// Used by the `kind=webrtc` dispatcher's tests to assert that a codec
+    /// mismatch installed the expected transcoders.
+    #[cfg(test)]
+    pub(crate) fn transcoder_target_pt(&self, from_endpoint: BridgeEndpoint) -> Option<u8> {
+        let slot = match from_endpoint {
+            BridgeEndpoint::Rtp => &self.rtp_to_webrtc_transcoder,
+            BridgeEndpoint::WebRtc => &self.webrtc_to_rtp_transcoder,
+        };
+        slot.read().as_ref().map(|tx| tx.target_pt())
+    }
+
     fn output_state(&self, endpoint: BridgeEndpoint) -> &Arc<AsyncMutex<OutputState>> {
         match endpoint {
             BridgeEndpoint::WebRtc => &self.webrtc_output_state,
