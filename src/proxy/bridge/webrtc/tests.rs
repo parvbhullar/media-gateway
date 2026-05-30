@@ -13,7 +13,9 @@ use super::dispatch::dispatch_webrtc;
 use super::sdp::build_outbound_webrtc_pc;
 
 use crate::media::bridge::{BridgeEndpoint, BridgePeer};
+use crate::media::negotiate::MediaNegotiator;
 
+use audio_codec::CodecType;
 use anyhow::Result;
 use rustrtc::IceServer;
 
@@ -318,7 +320,7 @@ async fn dispatch_rejects_unknown_adapter() {
 
 /// Build a real `BridgePeer` (two PeerConnections) for transcoder-wiring
 /// tests. The PCs are only needed so `BridgePeer::new` is satisfied; the
-/// transcoder decision is driven entirely by the SDP answers we pass to
+/// transcoder decision is driven by the codec args we pass to
 /// `configure_webrtc_bridge_transcoders`.
 async fn test_bridge() -> BridgePeer {
     let pcmu_offer = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\n\
@@ -330,20 +332,16 @@ async fn test_bridge() -> BridgePeer {
     BridgePeer::new("codec-test".into(), webrtc_pc, rtp_pc)
 }
 
-const SIP_ANSWER_PCMU: &str = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\n\
-    c=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 10000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
-const SIP_ANSWER_OPUS: &str = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\n\
-    c=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 10000 RTP/AVP 111\r\na=rtpmap:111 opus/48000/2\r\n";
 const WEBRTC_ANSWER_OPUS: &str = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\n\
     c=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=rtpmap:111 opus/48000/2\r\n";
 
-/// Mismatch (SIP PCMU vs WebRTC Opus) MUST install a transcoder in BOTH
+/// Mismatch (SIP PCMA pt 8 vs WebRTC Opus) MUST install a transcoder in BOTH
 /// directions — otherwise raw G.711 is forwarded under the Opus PT and the
 /// bot is deaf. This is the regression guard for the reported bug.
 #[tokio::test]
 async fn codec_mismatch_installs_both_transcoders() {
     let bridge = test_bridge().await;
-    configure_webrtc_bridge_transcoders(&bridge, SIP_ANSWER_PCMU, WEBRTC_ANSWER_OPUS);
+    configure_webrtc_bridge_transcoders(&bridge, CodecType::PCMA, 8, WEBRTC_ANSWER_OPUS);
 
     // caller→bot (source = Rtp/SIP) transcodes G.711 → Opus, emitted under
     // the WebRTC leg's PT (111).
@@ -353,11 +351,11 @@ async fn codec_mismatch_installs_both_transcoders() {
         "SIP→WebRTC leg must transcode to the WebRTC Opus PT"
     );
     // bot→caller (source = WebRtc) transcodes Opus → G.711, emitted under
-    // the SIP leg's PT (0 = PCMU).
+    // the SIP leg's PT (8 = PCMA).
     assert_eq!(
         bridge.transcoder_target_pt(BridgeEndpoint::WebRtc),
-        Some(0),
-        "WebRTC→SIP leg must transcode to the SIP PCMU PT"
+        Some(8),
+        "WebRTC→SIP leg must transcode to the SIP PCMA PT"
     );
 }
 
@@ -366,8 +364,57 @@ async fn codec_mismatch_installs_both_transcoders() {
 #[tokio::test]
 async fn matching_codecs_install_no_transcoder() {
     let bridge = test_bridge().await;
-    configure_webrtc_bridge_transcoders(&bridge, SIP_ANSWER_OPUS, WEBRTC_ANSWER_OPUS);
+    configure_webrtc_bridge_transcoders(&bridge, CodecType::Opus, 111, WEBRTC_ANSWER_OPUS);
 
     assert_eq!(bridge.transcoder_target_pt(BridgeEndpoint::Rtp), None);
     assert_eq!(bridge.transcoder_target_pt(BridgeEndpoint::WebRtc), None);
+}
+
+/// The bug this fix exists for: rustrtc's RTP-mode answer SDP enumerates our
+/// FULL offered set (Opus first), so the answer's first codec is NOT the one
+/// the leg negotiated. The transcoder decision MUST use the authoritative
+/// `negotiated` capability, not a re-parse of the answer SDP — otherwise a
+/// PCMA carrier reads back as Opus, "matches" the Opus bot, and audio is
+/// forwarded raw (deaf). This test reproduces that exact scenario end-to-end.
+#[tokio::test]
+async fn uses_negotiated_codec_not_misleading_answer_sdp() {
+    // Carrier prefers PCMA (listed first) and also offers Opus-on-SIP.
+    let offer = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\n\
+                 t=0 0\r\nm=audio 10000 RTP/AVP 8 111\r\n\
+                 a=rtpmap:8 PCMA/8000\r\na=rtpmap:111 opus/48000/2\r\n";
+    let (rtp_pc, answer_sdp, negotiated, _dtmf) =
+        build_inbound_rtp_pc(offer, &DispatchContext::default())
+            .await
+            .expect("PCMA-preferred offer should negotiate");
+
+    // Authoritative negotiation picked PCMA pt 8 (carrier's first preference).
+    assert_eq!(negotiated.codec_name.to_uppercase(), "PCMA");
+    assert_eq!(negotiated.payload_type, 8);
+
+    // The trap: the answer SDP re-parse reports Opus (our full offered set is
+    // enumerated, Opus first) — proving why re-parsing the answer was wrong.
+    let from_answer = MediaNegotiator::extract_leg_profile(&answer_sdp).audio;
+    assert_eq!(
+        from_answer.map(|c| c.codec),
+        Some(CodecType::Opus),
+        "answer SDP misreports the codec as Opus — must NOT be used for the decision"
+    );
+
+    // The fix: feeding the authoritative negotiated cap still installs the
+    // PCMA↔Opus transcoder (does not get fooled into 'matching' Opus/Opus).
+    let webrtc_pc = build_outbound_webrtc_pc(None, "opus", None).expect("webrtc pc");
+    let bridge = BridgePeer::new("codec-trap".into(), webrtc_pc, rtp_pc);
+    let sip_codec = CodecType::try_from(negotiated.codec_name.as_str()).expect("known codec");
+    configure_webrtc_bridge_transcoders(&bridge, sip_codec, negotiated.payload_type, WEBRTC_ANSWER_OPUS);
+
+    assert_eq!(
+        bridge.transcoder_target_pt(BridgeEndpoint::Rtp),
+        Some(111),
+        "must install PCMA→Opus transcoder despite the answer SDP saying Opus"
+    );
+    assert_eq!(
+        bridge.transcoder_target_pt(BridgeEndpoint::WebRtc),
+        Some(8),
+        "must install Opus→PCMA transcoder toward the SIP PCMA PT"
+    );
 }

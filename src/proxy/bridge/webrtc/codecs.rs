@@ -11,45 +11,54 @@
 //! compare the two negotiated codecs and install a transcoder in each
 //! direction when they differ (or clear both when they match, preserving
 //! zero-cost passthrough).
+//!
+//! The SIP codec is taken from the **authoritative** negotiated capability
+//! that `build_inbound_rtp_pc` already computed — NOT by re-parsing the SIP
+//! answer SDP. rustrtc's RTP-mode answer enumerates our full offered set
+//! (Opus first), so the answer's first codec is *not* what the leg actually
+//! negotiated (see the note in `proxy::bridge::common::build_inbound_rtp_pc`).
+//! The WebRTC codec is still read from the bot's answer, which genuinely
+//! selects a single codec and carries the payload type we must restamp to.
+
+use audio_codec::CodecType;
 
 use crate::media::bridge::{BridgeEndpoint, BridgePeer};
 use crate::media::negotiate::MediaNegotiator;
 
-/// Install (or clear) the bridge's audio transcoders based on the codecs
-/// each leg actually negotiated, read from the two SDP answers:
+/// Install (or clear) the bridge's audio transcoders based on the codec each
+/// leg actually negotiated.
 ///
-/// * `sip_answer_sdp`  — rustpbx's SIP 200-OK answer to the carrier (the
+/// * `sip_codec` / `sip_pt` — the authoritative SIP-leg voice codec from
+///   `build_inbound_rtp_pc`'s returned `AudioCapability` (the
 ///   `BridgeEndpoint::Rtp` leg).
 /// * `webrtc_answer_sdp` — the bot's WebRTC answer (the `BridgeEndpoint::WebRtc`
-///   leg).
+///   leg); its selected codec + payload type are read from this SDP.
 ///
 /// When the codecs differ, a transcoder is set in both directions; when they
 /// match, both transcoders are cleared so audio passes through untouched.
 pub(crate) fn configure_webrtc_bridge_transcoders(
     bridge: &BridgePeer,
-    sip_answer_sdp: &str,
+    sip_codec: CodecType,
+    sip_pt: u8,
     webrtc_answer_sdp: &str,
 ) {
-    let sip = MediaNegotiator::extract_leg_profile(sip_answer_sdp);
-    let web = MediaNegotiator::extract_leg_profile(webrtc_answer_sdp);
-
-    let (Some(sip_audio), Some(web_audio)) = (sip.audio, web.audio) else {
-        // Couldn't determine one leg's codec from its SDP — leave the
-        // transcoders untouched (passthrough). Safer than guessing.
+    let Some(web_audio) = MediaNegotiator::extract_leg_profile(webrtc_answer_sdp).audio else {
+        // Couldn't determine the WebRTC leg's codec from its answer — leave
+        // the transcoders untouched (passthrough). Safer than guessing.
         tracing::debug!(
-            "webrtc bridge: could not extract audio codec from one leg's SDP; \
+            "webrtc bridge: could not extract WebRTC audio codec from answer SDP; \
              leaving transcoders as-is"
         );
         return;
     };
 
-    if sip_audio.codec == web_audio.codec {
+    if sip_codec == web_audio.codec {
         // Same codec on both legs → no transcode needed; clear any stale
         // transcoders so audio passes through byte-for-byte.
         bridge.clear_transcoder(BridgeEndpoint::Rtp);
         bridge.clear_transcoder(BridgeEndpoint::WebRtc);
         tracing::debug!(
-            codec = ?sip_audio.codec,
+            codec = ?sip_codec,
             "webrtc bridge transcoder not needed; SIP and WebRTC legs share a codec"
         );
         return;
@@ -60,19 +69,19 @@ pub(crate) fn configure_webrtc_bridge_transcoders(
     // negotiated (so the re-stamped RTP matches what that peer expects).
     bridge.set_transcoder(
         BridgeEndpoint::Rtp, // caller → bot
-        sip_audio.codec,
+        sip_codec,
         web_audio.codec,
         web_audio.payload_type,
     );
     bridge.set_transcoder(
         BridgeEndpoint::WebRtc, // bot → caller
         web_audio.codec,
-        sip_audio.codec,
-        sip_audio.payload_type,
+        sip_codec,
+        sip_pt,
     );
     tracing::info!(
-        sip_codec = ?sip_audio.codec,
-        sip_pt = sip_audio.payload_type,
+        ?sip_codec,
+        sip_pt,
         webrtc_codec = ?web_audio.codec,
         webrtc_pt = web_audio.payload_type,
         "webrtc bridge transcoder configured for SIP↔WebRTC codec mismatch"

@@ -221,7 +221,23 @@ pub async fn dispatch_webrtc(
     // destination's PT — sending G.711 labeled as Opus — and strict peers
     // (aiortc/Pipecat) reject every packet. When the codecs match this is a
     // no-op and audio passes through untouched.
-    super::codecs::configure_webrtc_bridge_transcoders(&bridge, &sip_sdp_answer, &answer_sdp);
+    //
+    // Use the authoritative `negotiated_sip_cap` for the SIP side — NOT the
+    // answer SDP, which rustrtc fills with our full offered set (Opus first)
+    // and so misreports the actual negotiated codec.
+    match audio_codec::CodecType::try_from(negotiated_sip_cap.codec_name.as_str()) {
+        Ok(sip_codec) => super::codecs::configure_webrtc_bridge_transcoders(
+            &bridge,
+            sip_codec,
+            negotiated_sip_cap.payload_type,
+            &answer_sdp,
+        ),
+        Err(_) => warn!(
+            trunk = %trunk.name,
+            codec = %negotiated_sip_cap.codec_name,
+            "unrecognized SIP codec name; skipping transcoder config (passthrough)"
+        ),
+    }
 
     // 6. DTMF pass-through (RFC 2833) — install per-direction sinks. Each
     // sink keys on the PT *the sender* uses on that leg:
