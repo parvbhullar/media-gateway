@@ -1435,21 +1435,26 @@ impl BridgePeer {
                                             source_addr: a.source_addr,
                                             ..Default::default()
                                         };
-                                        let mut output = tx.transcode(&frame);
+                                        let mut frames = tx.transcode(&frame);
                                         if let Some(ref timing_arc) = transcoder_timing {
                                             if let Some(ref mut timing) = *timing_arc.write() {
-                                                timing.rewrite(
-                                                    &mut output,
-                                                    tx.source_clock_rate(),
-                                                    tx.target_clock_rate(),
-                                                    tx.target_pt(),
-                                                );
+                                                for f in &mut frames {
+                                                    timing.rewrite(
+                                                        f,
+                                                        tx.source_clock_rate(),
+                                                        tx.target_clock_rate(),
+                                                        tx.target_pt(),
+                                                    );
+                                                }
                                             }
                                         }
-                                        Some(MediaSample::Audio(output))
+                                        // 0..N frames: empty when the transcoder is still
+                                        // buffering a sub-frame remainder (send nothing this
+                                        // tick); >1 for multi-frame input packets.
+                                        Some(frames.into_iter().map(MediaSample::Audio).collect::<Vec<_>>())
                                     });
                                     match transcoded {
-                                        Some(ts) => vec![ts],
+                                        Some(ts) => ts,
                                         None => {
                                             // PT-clear is opt-in (external_bridge_mode).
                                             // Rationale: strict peers (aiortc/Pipecat) drop
