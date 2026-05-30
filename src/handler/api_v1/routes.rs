@@ -1,15 +1,22 @@
-//! `/api/v1/routes` — read access to the legacy `rustpbx_routes` table.
+//! `/api/v1/routes` — CRUD for the legacy `rustpbx_routes` table.
 //!
-//! These are the routes the SIP matcher actually consults at runtime
-//! (loaded into `RoutesSnapshot` by `data_context.reload_routes`).
-//! The Phase-6 `/api/v1/routing/tables` endpoints back a separate,
-//! JSON-embedded `supersip_routing_tables` schema that is not yet wired
-//! into the matcher — see `routing_tables.rs` for that surface.
+//! These are the routes the SIP matcher **actually consults at runtime**
+//! (loaded into the routes snapshot by `data_context.reload_routes`, via
+//! `convert_route` in `proxy/data.rs`). Every write here auto-reloads that
+//! snapshot through `refresh_routes_index` — the same auto-reload contract
+//! the DID and gateway endpoints use — so changes take effect on the next
+//! call without a manual reload.
 //!
-//! Read-only for now: list + get. Write operations stay in the console
-//! handler (`/console/routing`) until we promote routes to first-class
-//! v1 CRUD; doing so requires careful auto-reload semantics matching
-//! the DID flow.
+//! A route's `target_trunks` holds **gateway names** (the `name` field of
+//! `/api/v1/gateways` rows), accepted as `[{"trunk_name": "gw"}]`,
+//! `[{"name": "gw"}]`, or bare `["gw"]`. The matcher picks one from the list
+//! using `selection_strategy`, then dispatches based on that gateway's
+//! `kind` (sip / webrtc / livekit / external_media).
+//!
+//! NOTE: the Phase-6 `/api/v1/routing/tables` + `/records` endpoints back a
+//! separate `supersip_routing_tables` schema that is **not yet wired into
+//! the matcher** — those are dormant CRUD surfaces. This legacy table is the
+//! one that drives live routing.
 
 use axum::{
     Json, Router,

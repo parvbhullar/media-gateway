@@ -35,7 +35,8 @@ use crate::models::sip_trunk::{
     self, ActiveModel as TrunkActiveModel, Column as TrunkColumn, Entity as TrunkEntity,
     Model as TrunkModel, SipTransport, SipTrunkConfig, SipTrunkDirection, SipTrunkStatus,
 };
-use crate::proxy::gateway_health::probe_trunk;
+use crate::proxy::gateway_health::ProbeOutcome;
+use crate::proxy::health_probers;
 
 /// Map a `KindValidationError` into the file's existing `ApiError` envelope.
 /// All variants surface as HTTP 400 with the error message carried through;
@@ -162,8 +163,24 @@ async fn trunk_test(
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?
         .ok_or_else(|| ApiError::not_found(format!("gateway '{}' not found", req.name)))?;
-    let endpoint_inner = state.sip_server().inner.endpoint.inner.clone();
-    let outcome = probe_trunk(&endpoint_inner, &row, Duration::from_secs(5)).await;
+    // Probe via the per-kind health-probe registry (same path as the
+    // background gateway-health monitor) so non-SIP kinds — webrtc, livekit
+    // — are tested with their own prober instead of being forced through the
+    // SIP OPTIONS probe (which would always fail to deserialize their
+    // `kind_config`). Kinds with no registered prober (e.g. external_media,
+    // which spawns a local sidecar and has no remote endpoint to reach)
+    // return a clear, non-error explanation rather than a misleading failure.
+    let outcome = match health_probers::lookup(&row.kind) {
+        Some(prober) => prober.probe(&row, Duration::from_secs(5)).await,
+        None => ProbeOutcome {
+            ok: false,
+            latency_ms: 0,
+            detail: format!(
+                "kind '{}' has no liveness probe (not remotely reachable)",
+                row.kind
+            ),
+        },
+    };
     Ok(Json(TrunkTestResp {
         ok: outcome.ok,
         latency_ms: outcome.latency_ms,
