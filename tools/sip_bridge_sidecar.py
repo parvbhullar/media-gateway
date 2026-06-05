@@ -244,12 +244,33 @@ async def main(call_id: str, did: str, caller: str, port: int) -> None:
              len(sip_attrs), sorted(sip_attrs))
     room = rtc.Room()
 
+    # rustpbx is a single-track telephony leg: it expects one 20 ms PCM stream.
+    # An agent may publish more than one audio track (e.g. LiveKit's
+    # BackgroundAudioPlayer publishes a separate "background_audio" ambience
+    # track). Forwarding every track sends two independent frame streams to the
+    # same UDP port, which interleave and play out as jitter / lag between
+    # words. So forward ONLY the agent's primary voice track: skip known
+    # secondary tracks by name and bind to the first voice track we see.
+    forwarding = {"track": None}
+    SECONDARY_TRACK_NAMES = {"background_audio"}
+
     @room.on("track_subscribed")
     def _ts(track: rtc.Track, pub, participant: rtc.RemoteParticipant):
-        if track.kind == rtc.TrackKind.KIND_AUDIO:
-            log.info("subscribed to agent audio from %s — forwarding to rustpbx",
-                     participant.identity)
-            asyncio.create_task(forward_agent_audio(track, transport, rustpbx_addr, stop, ready))
+        if track.kind != rtc.TrackKind.KIND_AUDIO:
+            return
+        name = getattr(pub, "name", "") or ""
+        if name in SECONDARY_TRACK_NAMES:
+            log.info("ignoring secondary audio track '%s' from %s (not forwarded)",
+                     name, participant.identity)
+            return
+        if forwarding["track"] is not None:
+            log.info("already forwarding a voice track; ignoring extra audio track "
+                     "'%s' from %s", name, participant.identity)
+            return
+        forwarding["track"] = track
+        log.info("subscribed to agent audio from %s (track='%s') — forwarding to rustpbx",
+                 participant.identity, name)
+        asyncio.create_task(forward_agent_audio(track, transport, rustpbx_addr, stop, ready))
 
     @room.on("disconnected")
     def _disc(reason=None):
