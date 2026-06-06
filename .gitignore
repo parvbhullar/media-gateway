@@ -26,7 +26,7 @@ Cargo.lock
 .DS_Store
 .env
 cdr/
-*.sqlite3
+*.sqlite3*
 *.generated.toml
 *.bak
 /.idea/
@@ -38,6 +38,7 @@ cdr/
 *.log
 *.txt
 *.sql
+*.json
 #
 # ignore commerce addon files
 # 
@@ -70,3 +71,5 @@ config.toml.test
 docs/qrcode.png
 docs/rustpbx-product-brief.zh.html
 .worktrees/
+tools/go-sidecar/sip_bridge_sidecar
+tools/go-sidecar/sip-bridge-sidecar
