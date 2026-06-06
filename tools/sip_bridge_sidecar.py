@@ -253,6 +253,7 @@ async def main(call_id: str, did: str, caller: str, port: int) -> None:
     # secondary tracks by name and bind to the first voice track we see.
     forwarding = {"track": None}
     SECONDARY_TRACK_NAMES = {"background_audio"}
+    agent_joined = asyncio.Event()
 
     @room.on("track_subscribed")
     def _ts(track: rtc.Track, pub, participant: rtc.RemoteParticipant):
@@ -268,6 +269,7 @@ async def main(call_id: str, did: str, caller: str, port: int) -> None:
                      "'%s' from %s", name, participant.identity)
             return
         forwarding["track"] = track
+        agent_joined.set()
         log.info("subscribed to agent audio from %s (track='%s') — forwarding to rustpbx",
                  participant.identity, name)
         asyncio.create_task(forward_agent_audio(track, transport, rustpbx_addr, stop, ready))
@@ -292,6 +294,21 @@ async def main(call_id: str, did: str, caller: str, port: int) -> None:
     transport.sendto(READY, rustpbx_addr)
     ready.set()   # release any agent-audio forwarders that subscribed early
     log.info("READY → rustpbx %s", rustpbx_addr)
+
+    # Give the agent a window to join and publish its voice track. If it never
+    # arrives (process down, dispatch misconfigured, etc.) tear down rather than
+    # leaving the caller in permanent silence.
+    agent_join_timeout = float(os.getenv("AGENT_JOIN_TIMEOUT", "30"))
+
+    async def _watch_agent_join() -> None:
+        try:
+            await asyncio.wait_for(agent_joined.wait(), timeout=agent_join_timeout)
+        except asyncio.TimeoutError:
+            log.warning("agent '%s' never joined room '%s' within %.0f s — tearing down",
+                        agent_name, room_name, agent_join_timeout)
+            stop.set()
+
+    asyncio.create_task(_watch_agent_join())
 
     # --- 5. run until stop, then tear down ---
     await stop.wait()
