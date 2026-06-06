@@ -333,6 +333,73 @@ impl KindHealthProber for LiveKitProber {
     }
 }
 
+// ── ExternalMediaProber ───────────────────────────────────────────────────────
+
+/// Health probe for `kind="external_media"` trunks.
+///
+/// There is no remote endpoint to ping — the sidecar is a local process
+/// spawned per call. Instead we verify that:
+///   1. `kind_config.command` is parseable and non-empty.
+///   2. The first whitespace-delimited token (the executable path) exists on
+///      the filesystem and is executable by the current process.
+///
+/// This is cheap (a single `std::fs::metadata` + permission bit check) and
+/// correctly reflects the most common failure mode: the sidecar binary was
+/// never deployed or the path in the config is wrong.
+pub struct ExternalMediaProber;
+
+#[async_trait]
+impl KindHealthProber for ExternalMediaProber {
+    async fn probe(&self, trunk: &TrunkModel, _timeout: Duration) -> ProbeOutcome {
+        let cfg = match trunk.external_media() {
+            Ok(c) => c,
+            Err(e) => {
+                return ProbeOutcome {
+                    ok: false,
+                    latency_ms: 0,
+                    detail: format!("invalid kind_config: {e}"),
+                }
+            }
+        };
+
+        let program = cfg.command.split_whitespace().next().unwrap_or("").to_string();
+        if program.is_empty() {
+            return ProbeOutcome {
+                ok: false,
+                latency_ms: 0,
+                detail: "command is empty".into(),
+            };
+        }
+
+        match std::fs::metadata(&program) {
+            Err(e) => ProbeOutcome {
+                ok: false,
+                latency_ms: 0,
+                detail: format!("sidecar binary '{program}' not found: {e}"),
+            },
+            Ok(meta) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if meta.permissions().mode() & 0o111 == 0 {
+                        return ProbeOutcome {
+                            ok: false,
+                            latency_ms: 0,
+                            detail: format!("sidecar binary '{program}' exists but is not executable"),
+                        };
+                    }
+                }
+                let size_kb = meta.len() / 1024;
+                ProbeOutcome {
+                    ok: true,
+                    latency_ms: 0,
+                    detail: format!("sidecar binary '{program}' present ({size_kb} KB)"),
+                }
+            }
+        }
+    }
+}
+
 /// Register the built-in probers. Call once at boot. The SIP endpoint must
 /// be known by then (it's required for SIP probing).
 pub fn register_builtins(
@@ -341,6 +408,7 @@ pub fn register_builtins(
     register("sip", Arc::new(SipProber::new(sip_endpoint)));
     register("webrtc", Arc::new(WebRtcHttpJsonProber::new()));
     register("livekit", Arc::new(LiveKitProber::new()));
+    register("external_media", Arc::new(ExternalMediaProber));
 }
 
 #[cfg(test)]
