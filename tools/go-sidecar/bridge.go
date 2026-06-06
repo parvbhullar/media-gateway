@@ -130,7 +130,7 @@ func Run(ctx context.Context, cfg Config) error {
 	callerTrack, err := lksdk.NewLocalSampleTrack(webrtc.RTPCodecCapability{
 		MimeType:    webrtc.MimeTypeOpus,
 		ClockRate:   48000,
-		Channels:    1,
+		Channels:    2, // WebRTC SDP always declares opus/48000/2 even for mono content
 		SDPFmtpLine: "minptime=10;useinbandfec=1",
 	})
 	if err != nil {
