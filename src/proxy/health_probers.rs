@@ -335,6 +335,27 @@ impl KindHealthProber for LiveKitProber {
 
 // ── ExternalMediaProber ───────────────────────────────────────────────────────
 
+/// Resolve a program name to an absolute path.
+/// - If `name` contains a path separator it is returned as-is.
+/// - Otherwise each directory in `$PATH` is searched in order.
+fn resolve_program(name: &str) -> Option<std::path::PathBuf> {
+    let p = std::path::Path::new(name);
+    if p.components().count() > 1 {
+        // absolute or relative path with directory component
+        return Some(p.to_path_buf());
+    }
+    // bare name — search PATH
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join(name);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
 /// Health probe for `kind="external_media"` trunks.
 ///
 /// There is no remote endpoint to ping — the sidecar is a local process
@@ -371,29 +392,42 @@ impl KindHealthProber for ExternalMediaProber {
             };
         }
 
-        match std::fs::metadata(&program) {
-            Err(e) => ProbeOutcome {
+        // Resolve the binary: absolute paths are checked directly; bare names
+        // (e.g. "python3", "node") are searched across PATH entries.
+        let resolved = resolve_program(&program);
+
+        match resolved {
+            None => ProbeOutcome {
                 ok: false,
                 latency_ms: 0,
-                detail: format!("sidecar binary '{program}' not found: {e}"),
+                detail: format!("sidecar binary '{program}' not found in PATH or filesystem"),
             },
-            Ok(meta) => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    if meta.permissions().mode() & 0o111 == 0 {
-                        return ProbeOutcome {
-                            ok: false,
+            Some(path) => {
+                match std::fs::metadata(&path) {
+                    Err(e) => ProbeOutcome {
+                        ok: false,
+                        latency_ms: 0,
+                        detail: format!("sidecar binary '{program}' not accessible: {e}"),
+                    },
+                    Ok(meta) => {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            if meta.permissions().mode() & 0o111 == 0 {
+                                return ProbeOutcome {
+                                    ok: false,
+                                    latency_ms: 0,
+                                    detail: format!("sidecar binary '{program}' exists but is not executable"),
+                                };
+                            }
+                        }
+                        let size_kb = meta.len() / 1024;
+                        ProbeOutcome {
+                            ok: true,
                             latency_ms: 0,
-                            detail: format!("sidecar binary '{program}' exists but is not executable"),
-                        };
+                            detail: format!("sidecar binary '{program}' present ({size_kb} KB, resolved: {})", path.display()),
+                        }
                     }
-                }
-                let size_kb = meta.len() / 1024;
-                ProbeOutcome {
-                    ok: true,
-                    latency_ms: 0,
-                    detail: format!("sidecar binary '{program}' present ({size_kb} KB)"),
                 }
             }
         }
