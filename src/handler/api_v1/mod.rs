@@ -6,6 +6,7 @@
 
 pub mod auth;
 pub mod calls;                    // Phase 4 Plan 04-01 — CALL-01, CALL-02
+pub mod extensions;
 pub mod cdrs;
 pub mod common;
 pub mod dashboard;
@@ -57,6 +58,7 @@ pub fn api_v1_router(state: AppState) -> Router {
         .merge(calls::router())                    // Phase 4 Plan 04-01 — CALL-01, CALL-02
         .merge(webhooks::router())                 // Phase 7 — WH-01
         .merge(dashboard::router())                // Dashboard summary (mirrors /console/dashboard/data)
+        .merge(extensions::router())               // SIP extensions CRUD
         ;
 
     let protected = protected.layer(middleware::from_fn_with_state(
