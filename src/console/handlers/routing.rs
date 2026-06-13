@@ -458,10 +458,12 @@ fn parse_trunk_assignments(value: Option<Value>) -> Vec<RouteTrunkDocument> {
     match value {
         Some(Value::Array(items)) => items
             .into_iter()
-            .filter_map(|item| {
-                if let Value::Object(mut obj) = item {
+            .filter_map(|item| match item {
+                Value::Object(mut obj) => {
+                    // Accept "name" (console format) or "trunk_name" (api_v1 format).
                     let name = obj
                         .remove("name")
+                        .or_else(|| obj.remove("trunk_name"))
                         .and_then(|v| sanitize_optional_string(v.as_str().map(|s| s.to_string())));
                     let weight = obj
                         .remove("weight")
@@ -469,9 +471,11 @@ fn parse_trunk_assignments(value: Option<Value>) -> Vec<RouteTrunkDocument> {
                         .map(|w| w.clamp(0, MAX_PRIORITY as i64) as i32)
                         .unwrap_or(0);
                     name.map(|n| RouteTrunkDocument { name: n, weight })
-                } else {
-                    None
                 }
+                // Accept bare strings: ["gw_name"] (third api_v1-accepted shape).
+                Value::String(s) => sanitize_optional_string(Some(s))
+                    .map(|n| RouteTrunkDocument { name: n, weight: 0 }),
+                _ => None,
             })
             .collect(),
         _ => Vec::new(),
