@@ -215,6 +215,7 @@ impl RouteDocument {
                 if let Some(notes) = model.notes.clone() {
                     doc.notes = parse_notes_value(Some(notes));
                 }
+                inject_pattern_matchers(&mut doc.matchers, model);
                 doc.ensure_consistency();
                 return doc;
             }
@@ -250,6 +251,7 @@ impl RouteDocument {
             source_trunk: None,
             notes: parse_notes_value(model.notes.clone()),
         };
+        inject_pattern_matchers(&mut doc.matchers, model);
         doc.ensure_consistency();
         doc
     }
@@ -479,6 +481,23 @@ fn parse_trunk_assignments(value: Option<Value>) -> Vec<RouteTrunkDocument> {
             })
             .collect(),
         _ => Vec::new(),
+    }
+}
+
+/// Inject `destination_pattern` → `to.user` and `source_pattern` → `from.user` into
+/// the matchers map so routes created via /api/v1/routes (which use dedicated DB columns)
+/// display their match conditions in the console the same way file-based routes do.
+/// Only inserts if the key is not already present in header_filters.
+fn inject_pattern_matchers(matchers: &mut JsonMap<String, Value>, model: &RoutingModel) {
+    if let Some(ref p) = model.destination_pattern {
+        if !p.is_empty() && !matchers.contains_key("to.user") {
+            matchers.insert("to.user".to_string(), Value::String(p.clone()));
+        }
+    }
+    if let Some(ref p) = model.source_pattern {
+        if !p.is_empty() && !matchers.contains_key("from.user") {
+            matchers.insert("from.user".to_string(), Value::String(p.clone()));
+        }
     }
 }
 
@@ -795,6 +814,18 @@ fn apply_document_to_active(
     active.hash_key = Set(doc.action.hash_key.clone());
     active.header_filters = Set(value_from_map(&doc.matchers));
     active.rewrite_rules = Set(value_from_map(&doc.rewrite));
+    // Keep dedicated pattern columns in sync with matchers so routes edited via the
+    // console remain consistent with what /api/v1/routes and the call resolver see.
+    active.destination_pattern = Set(
+        doc.matchers.get("to.user")
+            .and_then(|v| v.as_str())
+            .and_then(|s| sanitize_optional_string(Some(s.to_string()))),
+    );
+    active.source_pattern = Set(
+        doc.matchers.get("from.user")
+            .and_then(|v| v.as_str())
+            .and_then(|s| sanitize_optional_string(Some(s.to_string()))),
+    );
     active.target_trunks = Set(value_from_trunks(&doc.action.trunks));
     active.source_trunk_id = Set(resolve_trunk_id(trunk_lookup, doc.source_trunk.as_deref()));
     let default_target = doc.action.trunks.first().map(|t| t.name.as_str());
