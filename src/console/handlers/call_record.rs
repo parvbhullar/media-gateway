@@ -11,6 +11,7 @@ use crate::models::{
         Column as DepartmentColumn, Entity as DepartmentEntity, Model as DepartmentModel,
     },
     extension::{Entity as ExtensionEntity, Model as ExtensionModel},
+    routing::{Entity as RoutingEntity, Model as RoutingModel},
     sip_trunk::{Column as SipTrunkColumn, Entity as SipTrunkEntity, Model as SipTrunkModel},
 };
 use axum::{
@@ -1190,6 +1191,7 @@ async fn load_related_context(
     let mut extension_ids = HashSet::new();
     let mut department_ids = HashSet::new();
     let mut sip_trunk_ids = HashSet::new();
+    let mut route_ids = HashSet::new();
 
     for record in records {
         if let Some(id) = record.extension_id {
@@ -1200,6 +1202,9 @@ async fn load_related_context(
         }
         if let Some(id) = record.sip_trunk_id {
             sip_trunk_ids.insert(id);
+        }
+        if let Some(id) = record.route_id {
+            route_ids.insert(id);
         }
     }
 
@@ -1229,6 +1234,26 @@ async fn load_related_context(
             .collect()
     };
 
+    let routes = if route_ids.is_empty() {
+        HashMap::new()
+    } else {
+        let ids: Vec<i64> = route_ids.into_iter().collect();
+        RoutingEntity::find()
+            .filter(crate::models::routing::Column::Id.is_in(ids))
+            .all(db)
+            .await?
+            .into_iter()
+            .map(|model| (model.id, model))
+            .collect()
+    };
+
+    // also pull in the outbound trunk referenced by each route's default_trunk_id
+    for route in routes.values() {
+        if let Some(tid) = route.default_trunk_id {
+            sip_trunk_ids.insert(tid);
+        }
+    }
+
     let sip_trunks = if sip_trunk_ids.is_empty() {
         HashMap::new()
     } else {
@@ -1242,10 +1267,19 @@ async fn load_related_context(
             .collect()
     };
 
+    let local_name = crate::models::system_config::Model::get(db, "site_name")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|row| serde_json::from_str::<String>(&row.value).ok())
+        .unwrap_or_else(|| "RustPBX".to_string());
+
     Ok(RelatedContext {
         extensions,
         departments,
         sip_trunks,
+        routes,
+        local_name,
     })
 }
 
@@ -1253,6 +1287,8 @@ struct RelatedContext {
     extensions: HashMap<i64, ExtensionModel>,
     departments: HashMap<i64, DepartmentModel>,
     sip_trunks: HashMap<i64, SipTrunkModel>,
+    routes: HashMap<i64, RoutingModel>,
+    local_name: String,
 }
 
 fn resolve_cdr_storage(state: &ConsoleState) -> Option<CdrStorage> {
@@ -1657,10 +1693,19 @@ fn build_participants(record: &CallRecordModel, related: &RelatedContext) -> Val
         .and_then(|id| related.extensions.get(&id))
         .map(|ext| ext.extension.clone());
 
-    let gateway_label = record
+    let trunk_label = record
         .sip_gateway
         .clone()
         .unwrap_or_else(|| "External".to_string());
+
+    // RustPBX is always the B2BUA in the middle.
+    // Inbound: external caller arrives via trunk → caller shows trunk, callee shows local.
+    // Outbound: local agent originates → caller shows local, callee shows trunk.
+    let (caller_network, callee_network_default) = if record.direction == "inbound" {
+        (trunk_label.clone(), related.local_name.clone())
+    } else {
+        (related.local_name.clone(), trunk_label.clone())
+    };
 
     let mut participants = Vec::new();
 
@@ -1673,7 +1718,7 @@ fn build_participants(record: &CallRecordModel, related: &RelatedContext) -> Val
             .or_else(|| record.caller_uri.clone()),
         "number": record.from_number.clone(),
         "uri": record.caller_uri.clone(),
-        "network": gateway_label.clone(),
+        "network": caller_network,
     }));
 
     if record.callee_uri.is_some() || record.to_number.is_some() || record.agent_name.is_some() {
@@ -1682,17 +1727,14 @@ fn build_participants(record: &CallRecordModel, related: &RelatedContext) -> Val
             .clone()
             .or_else(|| record.to_number.clone())
             .or_else(|| record.agent_name.clone());
-        let remote_network = record
-            .sip_gateway
-            .clone()
-            .unwrap_or_else(|| "Remote".to_string());
+        let callee_network = callee_network_default.clone();
         participants.push(json!({
             "role": "callee",
             "label": "Callee",
             "name": callee_name,
             "number": record.to_number.clone(),
             "uri": record.callee_uri.clone(),
-            "network": remote_network,
+            "network": callee_network,
         }));
     }
 
@@ -1704,6 +1746,20 @@ fn build_participants(record: &CallRecordModel, related: &RelatedContext) -> Val
             "number": extension_number.clone(),
             "uri": extension_number.clone(),
             "network": "PBX",
+        }));
+    }
+
+    if let Some(route) = record.route_id.and_then(|id| related.routes.get(&id)) {
+        let outbound_trunk = route.default_trunk_id
+            .and_then(|id| related.sip_trunks.get(&id))
+            .map(|t| t.display_name.clone().unwrap_or_else(|| t.name.clone()));
+        participants.push(json!({
+            "role": "proxy",
+            "label": "Proxy Route",
+            "name": route.name.clone(),
+            "number": Value::Null,
+            "uri": Value::Null,
+            "network": outbound_trunk,
         }));
     }
 
