@@ -13,7 +13,7 @@ use std::{
 use tracing::info;
 
 use crate::{
-    call::{DialDirection, RoutingState, policy::PolicyCheckStatus},
+    call::{DialDirection, MatchedRouteContext, RoutingState, policy::PolicyCheckStatus},
     config::{DialplanHints, RouteResult},
     proxy::routing::{ActionType, RouteQueueConfig, RouteRule, SourceTrunk, TrunkConfig},
 };
@@ -282,15 +282,19 @@ async fn match_invite_impl(
                 }
             }
 
-        let hints = if !rule.codecs.is_empty() || rule.disable_ice_servers.is_some() {
+        let hints = {
             let mut hints = DialplanHints::default();
             if !rule.codecs.is_empty() {
                 hints.allow_codecs = Some(rule.codecs.clone());
             }
             hints.disable_ice_servers = rule.disable_ice_servers;
+            if let Some(id) = rule.db_id {
+                hints.extensions.insert(MatchedRouteContext {
+                    id,
+                    name: rule.name.clone(),
+                });
+            }
             Some(hints)
-        } else {
-            None
         };
 
         // Handle based on action type

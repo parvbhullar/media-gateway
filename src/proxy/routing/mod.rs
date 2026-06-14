@@ -291,6 +291,9 @@ pub enum DestConfig {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct RouteRule {
     pub name: String,
+    /// DB primary key — set when the rule was loaded from the database.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub db_id: Option<i64>,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
@@ -333,6 +336,7 @@ impl Default for RouteRule {
     fn default() -> Self {
         Self {
             name: String::new(),
+            db_id: None,
             description: None,
             priority: 0,
             direction: RouteDirection::Any,

@@ -1,5 +1,5 @@
 use crate::{
-    call::{CalleeDisplayName, TransactionCookie, TrunkContext},
+    call::{CalleeDisplayName, MatchedRouteContext, TransactionCookie, TrunkContext},
     callrecord::{
         CallDetails, CallRecord, CallRecordHangupMessage, CallRecordHangupReason,
         CallRecordLastError, CallRecordMedia, CallRecordRewrite, CallRecordSender,
@@ -143,6 +143,12 @@ impl CallReporter {
         } else {
             (None, None)
         };
+        let route_id = self
+            .context
+            .dialplan
+            .extensions
+            .get::<MatchedRouteContext>()
+            .map(|r| r.id);
 
         let mut recorder = Vec::new();
 
@@ -192,6 +198,7 @@ impl CallReporter {
             department_id,
             extension_id,
             sip_trunk_id,
+            route_id,
             sip_gateway,
             recording_url: recording_path_for_db,
             rewrite,

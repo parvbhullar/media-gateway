@@ -135,3 +135,9 @@ pub struct TrunkContext {
     pub name: String,
     pub tenant_id: Option<i64>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchedRouteContext {
+    pub id: i64,
+    pub name: String,
+}

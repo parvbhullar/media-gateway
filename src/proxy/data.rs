@@ -1782,6 +1782,7 @@ fn convert_route(
 
     let route = RouteRule {
         name: model.name,
+        db_id: Some(model.id),
         description: model.description,
         priority: model.priority,
         direction,
