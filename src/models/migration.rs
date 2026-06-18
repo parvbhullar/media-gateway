@@ -44,6 +44,7 @@ impl MigratorTrait for Migrator {
             Box::new(super::migrate_sip_trunks_to_trunks_unified::Migration),
             Box::new(super::add_trunks_last_health_check_at::Migration),
             Box::new(super::fix_sip_trunk_kind_config_booleans::Migration),
+            Box::new(super::add_cdr_status_answer_columns::Migration),
         ]
     }
 }

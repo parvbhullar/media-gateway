@@ -195,6 +195,52 @@ pub enum CallRecordHangupReason {
     Other(String),
 }
 
+impl CallRecordHangupReason {
+    /// Stable lowercase token for DB persistence (CDR `hangup_reason` column).
+    /// `Other(s)` passes through verbatim.
+    ///
+    /// CANONICAL DB FORM — pair only with [`from_db_str`]. This is deliberately
+    /// distinct from the `Display`/`FromStr` impls (which emit `caller`,
+    /// `noAnswer`, …): do NOT round-trip the column through `to_string()` /
+    /// `FromStr` or the two schemes will silently disagree.
+    pub fn as_db_str(&self) -> String {
+        match self {
+            Self::ByCaller => "by_caller".to_string(),
+            Self::ByCallee => "by_callee".to_string(),
+            Self::ByRefer => "by_refer".to_string(),
+            Self::BySystem => "by_system".to_string(),
+            Self::Autohangup => "autohangup".to_string(),
+            Self::NoAnswer => "no_answer".to_string(),
+            Self::NoBalance => "no_balance".to_string(),
+            Self::AnswerMachine => "answer_machine".to_string(),
+            Self::ServerUnavailable => "server_unavailable".to_string(),
+            Self::Canceled => "canceled".to_string(),
+            Self::Rejected => "rejected".to_string(),
+            Self::Failed => "failed".to_string(),
+            Self::Other(s) => s.clone(),
+        }
+    }
+
+    /// Inverse of [`as_db_str`]. Unknown tokens become `Other`.
+    pub fn from_db_str(s: &str) -> Self {
+        match s {
+            "by_caller" => Self::ByCaller,
+            "by_callee" => Self::ByCallee,
+            "by_refer" => Self::ByRefer,
+            "by_system" => Self::BySystem,
+            "autohangup" => Self::Autohangup,
+            "no_answer" => Self::NoAnswer,
+            "no_balance" => Self::NoBalance,
+            "answer_machine" => Self::AnswerMachine,
+            "server_unavailable" => Self::ServerUnavailable,
+            "canceled" => Self::Canceled,
+            "rejected" => Self::Rejected,
+            "failed" => Self::Failed,
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CallRecordHangupMessage {
@@ -932,12 +978,17 @@ impl CallRecordManager {
         table_name: String,
         record: &CallRecord,
     ) -> Result<String> {
-        let db_url = database_url.unwrap_or_else(|| {
-            // Use global database_url from config
-            // This is a placeholder - in production you'd access the global config
-            "sqlite::memory:".to_string()
-        });
-        
+        // CDR-11: never fall back to an ephemeral `sqlite::memory:` DB — that
+        // silently discarded records. CDRs are already persisted to
+        // `rustpbx_call_records` via DatabaseHook regardless of this saver, so
+        // a missing `database_url` here is a misconfiguration, not a default.
+        let db_url = database_url.ok_or_else(|| {
+            anyhow::anyhow!(
+                "CallRecordConfig::Database requires `database_url`; refusing to write CDRs to an \
+                 ephemeral in-memory database"
+            )
+        })?;
+
         let db = crate::models::connect_db(&db_url).await?;
         
         // Create table if not exists

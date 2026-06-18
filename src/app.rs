@@ -349,14 +349,14 @@ impl AppStateBuilder {
             //  - [callrecord] is configured (CDR JSON files / S3), or
             //  - [sipflow.upload] is configured (post-call WAV upload)
             //  - [recording].type exports live recorder WAV after call completion.
-            // DatabaseHook is always included so call records reach the DB.
+            // DatabaseHook is registered once, AFTER the upload hooks below, so
+            // it persists the recording_url they set. The hook chain runs
+            // continue-on-error (callrecord::recv_loop), so a failing upload
+            // hook does not skip the DB write.
             let mut builder = CallRecordManagerBuilder::new()
                 .with_cancel_token(token.child_token())
                 .with_formatter(callrecord_formatter.clone())
-                .with_pending_db(db_conn.clone())
-                .with_hook(Box::new(DatabaseHook {
-                    db: db_conn.clone(),
-                }));
+                .with_pending_db(db_conn.clone());
 
             if let Some(ref callrecord) = config.callrecord {
                 builder = builder.with_config(callrecord.clone());

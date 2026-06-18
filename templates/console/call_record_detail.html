@@ -94,6 +94,12 @@
                             <span x-text="statusReasonLabel(record.status_code)"></span>
                         </span>
                     </template>
+                    <template x-if="record.hangup_reason">
+                        <span
+                            class="inline-flex items-center gap-1 rounded-full bg-slate-100 px-3 py-1 text-[11px] font-semibold text-slate-600">
+                            <span x-text="(record.hangup_reason || '').replace(/_/g, ' ')"></span>
+                        </span>
+                    </template>
                     <span class="inline-flex items-center gap-1 rounded-full px-3 py-1"
                         :class="directionClasses(record.direction)">
                         <svg class="h-3.5 w-3.5" viewBox="0 0 20 20" fill="none" stroke="currentColor"

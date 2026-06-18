@@ -27,7 +27,10 @@ pub struct CdrView {
     pub call_id: String,
     pub direction: String,
     pub status: String,
+    pub status_code: Option<i16>,
+    pub hangup_reason: Option<String>,
     pub started_at: DateTime<Utc>,
+    pub answer_time: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
     pub duration_secs: i32,
     pub from_number: Option<String>,
@@ -46,7 +49,10 @@ impl From<CdrModel> for CdrView {
             call_id: m.call_id,
             direction: m.direction,
             status: m.status,
+            status_code: m.status_code,
+            hangup_reason: m.hangup_reason,
             started_at: m.started_at,
+            answer_time: m.answer_time,
             ended_at: m.ended_at,
             duration_secs: m.duration_secs,
             from_number: m.from_number,
@@ -70,6 +76,9 @@ pub struct CdrListQuery {
     pub direction: Option<String>,
     #[serde(default)]
     pub status: Option<String>,
+    /// Filter by final SIP response code (e.g. 486, 503).
+    #[serde(default)]
+    pub status_code: Option<i16>,
     #[serde(default)]
     pub from_number: Option<String>,
     #[serde(default)]
@@ -117,6 +126,9 @@ async fn list_cdrs(
     }
     if let Some(v) = q.status.as_ref().filter(|s| !s.is_empty()) {
         conds = conds.add(CdrColumn::Status.eq(v.clone()));
+    }
+    if let Some(v) = q.status_code {
+        conds = conds.add(CdrColumn::StatusCode.eq(v));
     }
     if let Some(v) = q.from_number.as_ref().filter(|s| !s.is_empty()) {
         // Prefix match — matches Postman doc ("Filter by caller number prefix").

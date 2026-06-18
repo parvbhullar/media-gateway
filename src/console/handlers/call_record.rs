@@ -1349,11 +1349,18 @@ fn build_record_payload(
     let rewrite_callee_final = callee_uri.clone();
     let rewrite_contact = Option::<String>::None;
     let rewrite_destination = Option::<String>::None;
-    let status_code = Option::<u16>::None;
+    let status_code = record.status_code;
+    // ring_time is not persisted (out of Phase-1 CDR scope).
     let ring_time = Option::<String>::None;
-    let answer_time = Option::<String>::None;
-    let hangup_reason = Option::<String>::None;
-    let hangup_messages = Vec::<Value>::new();
+    let answer_time = record.answer_time.map(|dt| dt.to_rfc3339());
+    let hangup_reason = record.hangup_reason.clone();
+    // hangup_messages live under a reserved key in the metadata JSON (CDR-02b).
+    let hangup_messages: Vec<Value> = record
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("hangup_messages"))
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
 
     json!({
         "id": record.id,
