@@ -1551,8 +1551,12 @@
                 }
             },
             statusCodeText(record) {
-                if (record && record.status_code) {
-                    return String(record.status_code);
+                // Only surface the raw SIP code when it carries signal (a
+                // failure). For answered/2xx calls the human status label
+                // ("Completed") is clearer than a bare "200".
+                const code = record && record.status_code;
+                if (code && (code < 200 || code >= 300)) {
+                    return String(code);
                 }
                 return this.statusLabel(record && record.status ? record.status : '');
             },
