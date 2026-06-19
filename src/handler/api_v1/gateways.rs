@@ -66,20 +66,30 @@ pub struct GatewayView {
     pub health_check_interval_secs: i32,
     /// Full kind-specific config blob (per Phase 8a wire shape).
     pub kind_config: JsonValue,
+    /// Inbound source-IP ACL (leg-A); mirrors the trunk's `allowed_ips` column.
+    pub allowed_ips: Option<Vec<String>>,
+    /// Whether this SIP gateway authenticates the carrier by REGISTER
+    /// (from the SIP `kind_config`).
+    pub register_enabled: bool,
 }
 
 impl GatewayView {
     fn from_model(m: TrunkModel) -> Self {
-        let (proxy_addr, transport) = match m.kind.as_str() {
+        let (proxy_addr, transport, register_enabled) = match m.kind.as_str() {
             "sip" => match m.sip() {
                 Ok(cfg) => (
                     cfg.outbound_proxy.clone().or(cfg.sip_server.clone()),
                     Some(cfg.sip_transport.as_str().to_string()),
+                    cfg.register_enabled,
                 ),
-                Err(_) => (None, None),
+                Err(_) => (None, None, false),
             },
-            _ => (None, None),
+            _ => (None, None, false),
         };
+        let allowed_ips = m
+            .allowed_ips
+            .as_ref()
+            .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok());
         Self {
             name: m.name,
             kind: m.kind.clone(),
@@ -96,6 +106,8 @@ impl GatewayView {
             recovery_threshold: m.recovery_threshold.unwrap_or(2),
             health_check_interval_secs: m.health_check_interval_secs.unwrap_or(30),
             kind_config: m.kind_config,
+            allowed_ips,
+            register_enabled,
         }
     }
 }
@@ -220,6 +232,13 @@ pub struct CreateGatewayRequest {
     pub recovery_threshold: Option<i32>,
     #[serde(default = "default_true")]
     pub is_active: bool,
+    /// Inbound source-IP ACL (leg-A); stored on the trunk's `allowed_ips` column.
+    #[serde(default)]
+    pub allowed_ips: Option<Vec<String>>,
+    /// Dynamic-IP carriers that authenticate by SIP REGISTER. Folds into the
+    /// SIP `kind_config` (`SipTrunkConfig.register_enabled`).
+    #[serde(default)]
+    pub register_enabled: Option<bool>,
     /// Required for `kind != "sip"`. For SIP, optional; if present it is
     /// merged with the legacy top-level fields (legacy fields win on
     /// conflict for back-compat).
@@ -253,6 +272,10 @@ pub struct UpdateGatewayRequest {
     pub recovery_threshold: Option<i32>,
     #[serde(default)]
     pub is_active: Option<bool>,
+    #[serde(default)]
+    pub allowed_ips: Option<Vec<String>>,
+    #[serde(default)]
+    pub register_enabled: Option<bool>,
     #[serde(default)]
     pub kind_config: Option<JsonValue>,
 }
@@ -320,6 +343,9 @@ fn build_kind_and_config_for_create(req: &CreateGatewayRequest) -> ApiResult<(St
         if let Some(v) = normalize_optional_string(req.auth_password.clone()) {
             cfg.auth_password = Some(v);
         }
+        if let Some(v) = req.register_enabled {
+            cfg.register_enabled = v;
+        }
         serde_json::to_value(&cfg)
             .map_err(|e| ApiError::internal(format!("serialize sip config: {e}")))?
     } else {
@@ -378,6 +404,9 @@ fn build_kind_and_config_for_update(
         }
         if let Some(v) = req.auth_password.clone() {
             cfg.auth_password = normalize_optional_string(Some(v));
+        }
+        if let Some(v) = req.register_enabled {
+            cfg.register_enabled = v;
         }
         serde_json::to_value(&cfg)
             .map_err(|e| ApiError::internal(format!("serialize sip config: {e}")))?
@@ -454,6 +483,7 @@ async fn create_gateway(
         created_at: Set(now),
         updated_at: Set(now),
         kind_config: Set(kind_config),
+        allowed_ips: Set(req.allowed_ips.map(|v| serde_json::json!(v))),
         ..Default::default()
     };
     let inserted = am
@@ -498,6 +528,9 @@ async fn update_gateway(
     }
     if let Some(v) = req.is_active {
         am.is_active = Set(v);
+    }
+    if let Some(v) = req.allowed_ips {
+        am.allowed_ips = Set(Some(serde_json::json!(v)));
     }
     am.updated_at = Set(Utc::now());
 
@@ -717,4 +750,45 @@ async fn promote_file_gateway(
 ) -> ApiResult<(StatusCode, Json<GatewayView>)> {
     let inserted = promote_file_gateway_inner(&state, &name).await?;
     Ok((StatusCode::CREATED, Json(GatewayView::from(inserted))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A BYO carrier gateway body (as unpod's `byo_carrier_gateway_body` sends
+    /// it) must parse `allowed_ips` + top-level `register_enabled`, and the
+    /// latter must fold into the SIP `kind_config`. Guards gap #7: these fields
+    /// used to be silently dropped.
+    #[test]
+    fn create_request_parses_allowed_ips_and_folds_register_enabled() {
+        let req: CreateGatewayRequest = serde_json::from_value(serde_json::json!({
+            "name": "org1_x_carrier",
+            "kind": "sip",
+            "direction": "bidirectional",
+            "is_active": true,
+            "allowed_ips": ["1.2.3.4", "5.6.7.8"],
+            "register_enabled": true,
+            "kind_config": {
+                "sip_server": "sip.carrier.example",
+                "sip_transport": "udp"
+            }
+        }))
+        .expect("request parses");
+
+        assert_eq!(
+            req.allowed_ips,
+            Some(vec!["1.2.3.4".to_string(), "5.6.7.8".to_string()])
+        );
+        assert_eq!(req.register_enabled, Some(true));
+
+        let (kind, cfg) =
+            build_kind_and_config_for_create(&req).expect("build kind/config");
+        assert_eq!(kind, "sip");
+        assert_eq!(
+            cfg.get("register_enabled").and_then(|v| v.as_bool()),
+            Some(true),
+            "top-level register_enabled must fold into the SIP kind_config"
+        );
+    }
 }
