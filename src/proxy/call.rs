@@ -873,15 +873,61 @@ impl CallModule {
         } else if let Some(queue_targets) = queue_targets {
             queue_targets
         } else if let Some(option) = preview_forward.as_ref() {
-            let target = Location {
-                aor: option.callee.clone(),
-                destination: option.destination.clone(),
-                credential: option.credential.clone(),
-                headers: option.headers.clone(),
-                contact_raw: Some(option.callee.to_string()),
-                ..Default::default()
-            };
-            DialStrategy::Sequential(vec![target])
+            // On-net forwards (the DID→extension short-circuit and rule-driven
+            // internal forwards) arrive as Forward(callee=ext@realm, dest=None)
+            // with no contact metadata. Resolve the target's live registration
+            // through the locator so we dial the registered contact
+            // (destination/transport/webrtc) instead of DNS of the realm host —
+            // mirroring how queue and agent targets are resolved. Forwards that
+            // already carry an explicit destination (e.g. external trunk
+            // forwards) are dialed as-is.
+            let forward_realm = option.callee.host().to_string();
+            let forward_same_realm = self.inner.server.is_same_realm(&forward_realm).await;
+            if option.destination.is_none() && forward_same_realm {
+                match self.inner.server.locator.lookup(&option.callee).await {
+                    Ok(registrations) if !registrations.is_empty() => {
+                        info!(
+                            target = %option.callee,
+                            resolved_count = registrations.len(),
+                            "Resolved on-net forward target through locator"
+                        );
+                        // The target is registered, so it is not offline; clear
+                        // the marker that the original-DID lookup may have set.
+                        internal_lookup_empty = false;
+                        DialStrategy::Sequential(registrations)
+                    }
+                    Ok(_) => {
+                        warn!(
+                            target = %option.callee,
+                            "On-net forward target not registered; treating as offline"
+                        );
+                        internal_lookup_empty = true;
+                        DialStrategy::Sequential(vec![])
+                    }
+                    Err(error) => {
+                        // A locator/DB failure is infrastructure, not an offline
+                        // callee. Surface it distinctly; behaviour still falls
+                        // back to offline so the caller gets a clean 480.
+                        warn!(
+                            target = %option.callee,
+                            %error,
+                            "Locator lookup failed for on-net forward target; treating as offline"
+                        );
+                        internal_lookup_empty = true;
+                        DialStrategy::Sequential(vec![])
+                    }
+                }
+            } else {
+                let target = Location {
+                    aor: option.callee.clone(),
+                    destination: option.destination.clone(),
+                    credential: option.credential.clone(),
+                    headers: option.headers.clone(),
+                    contact_raw: Some(option.callee.to_string()),
+                    ..Default::default()
+                };
+                DialStrategy::Sequential(vec![target])
+            }
         } else {
             resolve_unhandled_targets(callee_is_same_realm, internal_lookup_empty, locs)?
         };
@@ -3239,6 +3285,29 @@ mod tests {
         }
     }
 
+    /// Simulates the DID→extension short-circuit (and rule-driven internal
+    /// forward): rewrites the callee to an on-net extension and returns a bare
+    /// `Forward(option, None)` with no `destination` and no trunk config —
+    /// exactly what `build_did_extension_route_result` produces.
+    struct ForwardExtensionRouteInvite {
+        extension_uri: String,
+    }
+
+    #[async_trait]
+    impl RouteInvite for ForwardExtensionRouteInvite {
+        async fn route_invite(
+            &self,
+            mut option: InviteOption,
+            _origin: &rsipstack::sip::Request,
+            _direction: &DialDirection,
+            _cookie: &TransactionCookie,
+        ) -> Result<RouteResult> {
+            option.callee = rsipstack::sip::Uri::try_from(self.extension_uri.as_str()).unwrap();
+            option.destination = None;
+            Ok(RouteResult::Forward(option, None))
+        }
+    }
+
     fn replace_to_header(request: &mut rsipstack::sip::Request, to_uri: rsipstack::sip::Uri) {
         request
             .headers
@@ -3370,6 +3439,94 @@ mod tests {
         assert!(
             dialplan.extensions.get::<CalleeOfflineMarker>().is_some(),
             "offline marker should be set"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_resolve_resolves_did_extension_forward_through_locator() {
+        // Regression (I1): a DID→extension short-circuit returns
+        // Forward(callee=ext@realm, destination=None). Without re-resolving the
+        // on-net extension through the locator, the bare target is dialed with
+        // destination=None (DNS of the realm host) and the INVITE never reaches
+        // the registered (NAT'd) softphone. The registered contact's
+        // destination/transport must be used instead — mirroring how queue and
+        // agent targets are resolved.
+        let (server, config) = create_test_server().await;
+
+        // Extension 1001 is registered with a concrete contact destination.
+        let _ = server
+            .locator
+            .register(
+                "1001",
+                Some("rustpbx.com"),
+                Location {
+                    aor: rsipstack::sip::Uri::try_from("sip:1001@rustpbx.com").unwrap(),
+                    expires: 3600,
+                    destination: Some(rsipstack::transport::SipAddr {
+                        r#type: Some(rsipstack::sip::Transport::Udp),
+                        addr: rsipstack::sip::HostWithPort {
+                            host: "203.0.113.7".parse().unwrap(),
+                            port: Some(5062.into()),
+                        },
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        let module = CallModule::new(config, server);
+
+        // Inbound INVITE from an external carrier to the DID.
+        let mut request = crate::proxy::tests::common::create_test_request(
+            rsipstack::sip::Method::Invite,
+            "carrier1",
+            None,
+            "carrier.example",
+            None,
+        );
+        request.uri = rsipstack::sip::Uri::try_from("sip:+14155551212@rustpbx.com").unwrap();
+        replace_to_header(
+            &mut request,
+            rsipstack::sip::Uri::try_from("sip:+14155551212@rustpbx.com").unwrap(),
+        );
+
+        let caller = SipUser {
+            username: "carrier1".to_string(),
+            realm: Some("carrier.example".to_string()),
+            ..Default::default()
+        };
+
+        let dialplan = module
+            .default_resolve(
+                &request,
+                Box::new(ForwardExtensionRouteInvite {
+                    extension_uri: "sip:1001@rustpbx.com".to_string(),
+                }),
+                &caller,
+                &TransactionCookie::default(),
+            )
+            .await
+            .expect("DID→extension forward should not error at resolve time")
+            .expect_dialplan();
+
+        match &dialplan.flow {
+            DialplanFlow::Targets(DialStrategy::Sequential(targets)) => {
+                assert_eq!(targets.len(), 1, "exactly one resolved extension target expected");
+                assert!(
+                    targets[0].destination.is_some(),
+                    "extension target must carry the registered contact destination \
+                     (locator-resolved); got destination=None which would dial DNS of the realm"
+                );
+            }
+            other => panic!("expected Sequential targets, got {:?}", other),
+        }
+        // Note: this also depends on the fix resetting `internal_lookup_empty`
+        // to false on a successful locator hit, so it is not an independent
+        // guard from the destination assertion above — both prove the same
+        // locator re-resolution.
+        assert!(
+            dialplan.extensions.get::<CalleeOfflineMarker>().is_none(),
+            "a registered extension must not be marked offline"
         );
     }
 
