@@ -999,6 +999,12 @@ fn apply_form_to_active_model(
             }
 
             if !is_update {
+                sip_cfg.rewrite_hostport = form.rewrite_hostport.unwrap_or(true);
+            } else if let Some(v) = form.rewrite_hostport {
+                sip_cfg.rewrite_hostport = v;
+            }
+
+            if !is_update {
                 sip_cfg.register_enabled = form.register_enabled.unwrap_or(false);
             } else if let Some(enabled) = form.register_enabled {
                 sip_cfg.register_enabled = enabled;
