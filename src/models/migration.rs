@@ -54,6 +54,15 @@ impl MigratorTrait for Migrator {
             // task 3.1 — org_id tenant-isolation column on rustpbx_dids. MUST be
             // registered here or the column is never created in production.
             Box::new(super::add_org_id_did::Migration),
+            // task 3.1 — org_id tenant-isolation columns on extensions, trunks,
+            // routes, and routing tables (the `did` template replicated). Each
+            // MUST be registered here or the column is never created in
+            // production. `add_org_id_routing` is the additive slice; the
+            // owner→org_id reconcile (drop `owner`) is deferred.
+            Box::new(super::add_org_id_extension::Migration),
+            Box::new(super::add_org_id_trunk::Migration),
+            Box::new(super::add_org_id_routing::Migration),
+            Box::new(super::add_org_id_routing_tables::Migration),
         ]
     }
 }

@@ -1,0 +1,56 @@
+//! task 3.1 — add `org_id` to `rustpbx_routes` for structural tenant
+//! isolation.
+//!
+//! Additive + idempotent (`has_column` guard). Existing rows get `'default'`
+//! via the column default; 3.1b threads the real org_id at write time. Index
+//! `(org_id, name)` backs the `list_by_org`/`get_by_org` lookups. No-op
+//! `down` per the codebase convention (additive, never reversed).
+//!
+//! NOTE: this is the *additive* slice. The legacy free-text `owner` column is
+//! left in place; the owner→org_id reconcile (COALESCE backfill + drop `owner`
+//! + handler rewrite) is deferred to a separate `backfill_org_id_routing`
+//! migration once the crate compiles in CI.
+
+use sea_orm_migration::prelude::*;
+
+#[derive(DeriveMigrationName)]
+pub struct Migration;
+
+#[async_trait::async_trait]
+impl MigrationTrait for Migration {
+    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        let table = "rustpbx_routes";
+
+        if !manager.has_column(table, "org_id").await? {
+            manager
+                .alter_table(
+                    Table::alter()
+                        .table(crate::models::routing::Entity)
+                        .add_column(
+                            ColumnDef::new(crate::models::routing::Column::OrgId)
+                                .text()
+                                .not_null()
+                                .default("default"),
+                        )
+                        .to_owned(),
+                )
+                .await?;
+        }
+
+        manager
+            .create_index(
+                Index::create()
+                    .if_not_exists()
+                    .name("idx_rustpbx_routes_org_id")
+                    .table(crate::models::routing::Entity)
+                    .col(crate::models::routing::Column::OrgId)
+                    .col(crate::models::routing::Column::Name)
+                    .to_owned(),
+            )
+            .await
+    }
+
+    async fn down(&self, _manager: &SchemaManager) -> Result<(), DbErr> {
+        Ok(())
+    }
+}

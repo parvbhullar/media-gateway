@@ -9,6 +9,7 @@
 
 use anyhow::{Result, anyhow, ensure};
 use sea_orm::entity::prelude::*;
+use sea_orm::{ColumnTrait, DatabaseConnection, DbErr, QueryFilter};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
@@ -157,6 +158,9 @@ pub struct Model {
     #[sea_orm(default_value = "0")]
     pub consecutive_successes: i32,
     pub kind_config: Json,
+    /// Owning org (task 3.1 tenant isolation). DB default `'default'` until 3.1b
+    /// threads the real org_id from request context.
+    pub org_id: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -165,6 +169,28 @@ pub enum Relation {}
 impl ActiveModelBehavior for ActiveModel {}
 
 impl Model {
+    /// List trunks owned by `org_id` (task 3.1 tenant isolation).
+    pub async fn list_by_org(
+        db: &DatabaseConnection,
+        org_id: &str,
+    ) -> std::result::Result<Vec<Self>, DbErr> {
+        Entity::find().filter(Column::OrgId.eq(org_id)).all(db).await
+    }
+
+    /// Get a trunk by name, scoped to `org_id` — `None` when the trunk belongs
+    /// to a different org (cross-tenant lookups never resolve).
+    pub async fn get_by_org(
+        db: &DatabaseConnection,
+        org_id: &str,
+        name: &str,
+    ) -> std::result::Result<Option<Self>, DbErr> {
+        Entity::find()
+            .filter(Column::Name.eq(name))
+            .filter(Column::OrgId.eq(org_id))
+            .one(db)
+            .await
+    }
+
     /// Typed view of this row's `kind_config` as a `SipTrunkConfig`.
     /// Errors if `kind != "sip"` or the JSON does not match the schema.
     pub fn sip(&self) -> Result<SipTrunkConfig> {
@@ -703,5 +729,85 @@ impl ExternalMediaTrunkConfig {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod org_id_tests {
+    use super::*;
+    use crate::models::migration::Migrator;
+    use chrono::Utc;
+    use sea_orm::{ActiveModelTrait, ActiveValue::Set, Database};
+    use sea_orm_migration::MigratorTrait;
+
+    async fn fresh() -> DatabaseConnection {
+        let db = Database::connect("sqlite::memory:").await.expect("sqlite");
+        Migrator::up(&db, None).await.expect("migrate");
+        db
+    }
+
+    fn row(name: &str, org: Option<&str>) -> ActiveModel {
+        let now = Utc::now();
+        let mut am = ActiveModel {
+            name: Set(name.to_string()),
+            kind: Set("sip".to_string()),
+            status: Set(TrunkStatus::default()),
+            direction: Set(TrunkDirection::default()),
+            is_active: Set(true),
+            consecutive_failures: Set(0),
+            consecutive_successes: Set(0),
+            kind_config: Set(serde_json::json!({})),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        };
+        // Leave org_id NotSet when None so the column default ('default') applies.
+        if let Some(org) = org {
+            am.org_id = Set(org.to_string());
+        }
+        am
+    }
+
+    #[tokio::test]
+    async fn list_by_org_isolates_tenants() {
+        let db = fresh().await;
+        row("trunk_a", Some("org_a")).insert(&db).await.expect("insert a");
+        row("trunk_b", Some("org_b")).insert(&db).await.expect("insert b");
+        let a = Model::list_by_org(&db, "org_a").await.unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].name, "trunk_a");
+        assert_eq!(a[0].org_id, "org_a");
+    }
+
+    #[tokio::test]
+    async fn get_by_org_rejects_foreign_tenant() {
+        let db = fresh().await;
+        row("trunk_a", Some("org_a")).insert(&db).await.expect("insert a");
+        // The trunk exists but belongs to org_a → a cross-tenant get is None.
+        assert!(
+            Model::get_by_org(&db, "org_b", "trunk_a")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            Model::get_by_org(&db, "org_a", "trunk_a")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_defaults_org_id() {
+        // org_id NotSet → the column default ('default') applies, so existing
+        // write paths keep working until 3.1b threads a real org_id.
+        let db = fresh().await;
+        row("trunk_c", None).insert(&db).await.expect("insert c");
+        let found = Model::get_by_org(&db, "default", "trunk_c")
+            .await
+            .unwrap()
+            .expect("row under default org");
+        assert_eq!(found.org_id, "default");
     }
 }
