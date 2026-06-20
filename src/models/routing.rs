@@ -77,15 +77,15 @@ pub struct Model {
     pub header_filters: Option<Json>,
     pub rewrite_rules: Option<Json>,
     pub target_trunks: Option<Json>,
-    pub owner: Option<String>,
     pub notes: Option<Json>,
     pub metadata: Option<Json>,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
     pub last_deployed_at: Option<DateTimeUtc>,
-    /// Owning org (task 3.1 tenant isolation). DB default `'default'` until 3.1b
-    /// threads the real org_id from request context. Added alongside the legacy
-    /// free-text `owner`; the owner→org_id reconcile (drop `owner`) is deferred.
+    /// Owning org (task 3.1 tenant key). DB default `'default'` until 3.1b
+    /// threads the real org_id from request context. Replaced the legacy
+    /// free-text `owner` column (backfilled + dropped via
+    /// `backfill_org_id_routing`).
     pub org_id: String,
 }
 
@@ -269,7 +269,11 @@ impl MigrationTrait for Migration {
                     .col(json_null(Column::HeaderFilters))
                     .col(json_null(Column::RewriteRules))
                     .col(json_null(Column::TargetTrunks))
-                    .col(string_null(Column::Owner).char_len(120))
+                    // Legacy free-text owner column. The Model no longer maps it
+                    // (so `Column::Owner` is gone) — reference it by Alias so the
+                    // historical schema is still created here, then superseded:
+                    // `backfill_org_id_routing` copies owner→org_id and drops it.
+                    .col(string_null(sea_query::Alias::new("owner")).char_len(120))
                     .col(json_null(Column::Notes))
                     .col(json_null(Column::Metadata))
                     .col(timestamp(Column::CreatedAt).default(Expr::current_timestamp()))

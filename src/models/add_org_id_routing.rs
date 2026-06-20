@@ -6,10 +6,9 @@
 //! `(org_id, name)` backs the `list_by_org`/`get_by_org` lookups. No-op
 //! `down` per the codebase convention (additive, never reversed).
 //!
-//! NOTE: this is the *additive* slice. The legacy free-text `owner` column is
-//! left in place; the owner→org_id reconcile (COALESCE backfill + drop `owner`
-//! + handler rewrite) is deferred to a separate `backfill_org_id_routing`
-//! migration once the crate compiles in CI.
+//! NOTE: this is the *additive* slice — it only adds the `org_id` column. The
+//! owner→org_id reconcile (COALESCE backfill + drop `owner`) is performed by the
+//! separate `backfill_org_id_routing` migration that runs immediately after.
 
 use sea_orm_migration::prelude::*;
 

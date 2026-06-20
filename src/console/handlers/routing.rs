@@ -192,7 +192,9 @@ impl RouteDocument {
                 doc.id = Some(model.id);
                 doc.name = model.name.clone();
                 doc.description = model.description.clone();
-                doc.owner = model.owner.clone();
+                // task 3.1: the legacy `owner` column was superseded by org_id
+                // (backfilled). Surface org_id in the doc's `owner` slot.
+                doc.owner = Some(model.org_id.clone());
                 doc.direction = model.direction;
                 doc.priority = model.priority;
                 doc.disabled = !model.is_active;
@@ -224,7 +226,8 @@ impl RouteDocument {
             id: Some(model.id),
             name: model.name.clone(),
             description: model.description.clone(),
-            owner: model.owner.clone(),
+            // task 3.1: surface org_id in the doc's `owner` slot (owner column dropped).
+            owner: Some(model.org_id.clone()),
             direction: model.direction,
             priority: model.priority,
             disabled: !model.is_active,
@@ -806,7 +809,9 @@ fn apply_document_to_active(
 ) {
     active.name = Set(doc.name.clone());
     active.description = Set(doc.description.clone());
-    active.owner = Set(doc.owner.clone());
+    // task 3.1: `owner` column dropped → org_id is the tenant key. It is left
+    // untouched here (NotSet on create → DB default; unchanged on update) until
+    // 3.1b threads the real org_id from request context.
     active.direction = Set(doc.direction);
     active.priority = Set(doc.priority);
     active.is_active = Set(!doc.disabled);
@@ -905,7 +910,7 @@ pub(crate) async fn query_routing(
                 let mut condition = Condition::any();
                 condition = condition.add(RoutingColumn::Name.contains(trimmed));
                 condition = condition.add(RoutingColumn::Description.contains(trimmed));
-                condition = condition.add(RoutingColumn::Owner.contains(trimmed));
+                condition = condition.add(RoutingColumn::OrgId.contains(trimmed));
                 selector = selector.filter(condition);
             }
         }
@@ -936,10 +941,12 @@ pub(crate) async fn query_routing(
             selector = selector.filter(RoutingColumn::SelectionStrategy.eq(strategy));
         }
 
+        // task 3.1: `owner` column dropped → this filter now matches org_id
+        // (the query param is still named `owner` for console-API stability).
         if let Some(ref owner) = filters.owner {
             let trimmed = owner.trim();
             if !trimmed.is_empty() {
-                selector = selector.filter(RoutingColumn::Owner.contains(trimmed));
+                selector = selector.filter(RoutingColumn::OrgId.contains(trimmed));
             }
         }
     }

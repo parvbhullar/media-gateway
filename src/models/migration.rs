@@ -63,6 +63,10 @@ impl MigratorTrait for Migrator {
             Box::new(super::add_org_id_trunk::Migration),
             Box::new(super::add_org_id_routing::Migration),
             Box::new(super::add_org_id_routing_tables::Migration),
+            // task 3.1 reconcile — backfill org_id from the legacy `owner`
+            // column on rustpbx_routes, then drop `owner`. MUST run AFTER
+            // add_org_id_routing (which creates org_id).
+            Box::new(super::backfill_org_id_routing::Migration),
         ]
     }
 }

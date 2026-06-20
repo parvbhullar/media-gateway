@@ -22,6 +22,7 @@ pub mod add_sip_trunk_rewrite_hostport;
 pub mod add_user_mfa_columns;
 pub mod api_key;
 pub mod backfill_dids_from_sip_trunks;
+pub mod backfill_org_id_routing;
 pub mod call_record;
 
 pub mod call_record_dashboard_index;
