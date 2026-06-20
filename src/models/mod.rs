@@ -19,6 +19,7 @@ pub mod add_rewrite_columns;
 pub mod add_sip_trunk_health_columns;
 pub mod add_sip_trunk_register_columns;
 pub mod add_sip_trunk_rewrite_hostport;
+pub mod add_tenant_id_to_api_keys;
 pub mod add_user_mfa_columns;
 pub mod api_key;
 pub mod backfill_dids_from_sip_trunks;

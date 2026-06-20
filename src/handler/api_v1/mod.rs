@@ -4,6 +4,7 @@
 //! middleware, and the root router that Plans 1+ will nest feature
 //! sub-routers into (gateway health, routing, security, DIDs, etc.).
 
+pub mod admin_keys;               // Phase 3 — 3.2 per-tenant API key admin
 pub mod auth;
 pub mod calls;                    // Phase 4 Plan 04-01 — CALL-01, CALL-02
 pub mod extensions;
@@ -40,6 +41,7 @@ use crate::app::AppState;
 pub fn api_v1_router(state: AppState) -> Router {
     // Sub-routers from later plans register here.
     let protected: Router<AppState> = Router::new()
+        .merge(admin_keys::router())               // Phase 3 — 3.2 per-tenant API key admin
         .merge(gateways::router())
         .merge(dids::router())
         .merge(cdrs::router())

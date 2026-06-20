@@ -67,6 +67,9 @@ impl MigratorTrait for Migrator {
             // column on rustpbx_routes, then drop `owner`. MUST run AFTER
             // add_org_id_routing (which creates org_id).
             Box::new(super::backfill_org_id_routing::Migration),
+            // task 3.2 — tenant_id scoping column on rustpbx_api_keys (the
+            // request-context tenant/org source). MUST be registered here.
+            Box::new(super::add_tenant_id_to_api_keys::Migration),
         ]
     }
 }

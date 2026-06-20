@@ -35,6 +35,19 @@ pub struct IssuedKey {
     pub hash: String,
 }
 
+/// The authenticated caller's tenant, attached to request extensions by
+/// `api_v1_auth_middleware` (task 3.2). Downstream handlers read it via
+/// `Extension<TenantId>` to scope queries. It is sourced ONLY from the
+/// authenticated key row — never from the request body or URL — so it cannot
+/// be spoofed by the caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TenantId(pub i64);
+
+/// The bootstrap admin tenant. Pre-3.2 keys seed to this value (the column
+/// default), so existing operators retain full power and can mint keys for
+/// new tenants. Only callers authenticated as this tenant may mint keys.
+pub const ADMIN_TENANT_ID: i64 = 1;
+
 /// Generate a new API key. Uses 32 random bytes rendered as lowercase hex
 /// under the `rpbx_` prefix, yielding a 69-character plaintext token.
 pub fn issue_api_key() -> IssuedKey {
@@ -65,7 +78,7 @@ pub fn verify_api_key_hash(plaintext: &str, stored_hash: &str) -> bool {
 /// `ApiError` JSON envelope with the appropriate HTTP status.
 pub async fn api_v1_auth_middleware(
     State(state): State<AppState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     let Some(token) = extract_bearer(request.headers()) else {
@@ -96,6 +109,10 @@ pub async fn api_v1_auth_middleware(
         };
         let _ = am.update(&db_clone).await;
     });
+
+    // Attach the caller's tenant from the authenticated key row (NEVER from the
+    // request body/URL) so downstream handlers can scope by it (task 3.2/3.1b).
+    request.extensions_mut().insert(TenantId(row.tenant_id));
 
     next.run(request).await
 }
