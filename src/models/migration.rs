@@ -45,6 +45,10 @@ impl MigratorTrait for Migrator {
             Box::new(super::add_trunks_last_health_check_at::Migration),
             Box::new(super::fix_sip_trunk_kind_config_booleans::Migration),
             Box::new(super::add_cdr_status_answer_columns::Migration),
+            // task 2.1 — durable webhook delivery queue. MUST be registered
+            // here or the table is never created in production (the migrator
+            // runs only this explicit list).
+            Box::new(super::webhook_outbox::Migration),
         ]
     }
 }

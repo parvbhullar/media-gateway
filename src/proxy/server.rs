@@ -672,6 +672,20 @@ impl SipServerBuilder {
                 generated_dir,
                 cancel_for_processor,
             ));
+
+            // task 2.1 — redelivery worker: re-drives outbox rows orphaned by a
+            // crash mid-delivery, so a committed webhook event is never lost.
+            if let Some(db_for_redelivery) = database.clone() {
+                let registry_for_redelivery = webhook_cancel_registry.clone();
+                let generated_dir_redelivery = self.config.generated_dir.clone();
+                let cancel_for_redelivery = cancel_token.child_token();
+                tokio::spawn(crate::proxy::webhook::run_webhook_redelivery_worker(
+                    db_for_redelivery,
+                    registry_for_redelivery,
+                    generated_dir_redelivery,
+                    cancel_for_redelivery,
+                ));
+            }
         }
 
         let inner = Arc::new(SipServerInner {

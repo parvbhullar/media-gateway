@@ -49,6 +49,7 @@ pub mod trunk_group;
 pub mod trunk_group_member;
 pub mod trunk_origination_uris;
 pub mod user;
+pub mod webhook_outbox;
 pub mod webhooks;
 
 pub fn prepare_sqlite_database(database_url: &str) -> Result<()> {
