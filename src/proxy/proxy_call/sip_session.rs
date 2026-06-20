@@ -91,7 +91,8 @@ pub(crate) fn build_call_started_event(
     direction: &str,
 ) -> crate::proxy::webhook::WebhookEvent {
     crate::proxy::webhook::WebhookEvent {
-        event_id: crate::proxy::webhook::new_event_id(),
+        // task 2.2: stable id keyed on the session so a redelivery dedups.
+        event_id: crate::proxy::webhook::derive_event_id(session_id, "call.started"),
         event: "call.started".to_string(),
         timestamp: crate::proxy::webhook::current_unix_timestamp(),
         data: serde_json::json!({
@@ -112,7 +113,8 @@ pub(crate) fn build_call_failed_event(
     sip_code: Option<u16>,
 ) -> crate::proxy::webhook::WebhookEvent {
     crate::proxy::webhook::WebhookEvent {
-        event_id: crate::proxy::webhook::new_event_id(),
+        // task 2.2: stable id keyed on the session so a redelivery dedups.
+        event_id: crate::proxy::webhook::derive_event_id(session_id, "call.failed"),
         event: "call.failed".to_string(),
         timestamp: crate::proxy::webhook::current_unix_timestamp(),
         data: serde_json::json!({

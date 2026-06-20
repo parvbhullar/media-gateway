@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use crate::callrecord::CallRecord;
 use crate::proxy::webhook::{
-    WebhookEvent, WebhookEventSender, current_unix_timestamp, new_event_id,
+    WebhookEvent, WebhookEventSender, current_unix_timestamp, derive_event_id,
 };
 
 /// Build the `call.completed` envelope per D-07. `data` = full CallRecord
@@ -29,7 +29,9 @@ pub fn build_call_completed_event(record: &CallRecord) -> WebhookEvent {
         }
     };
     WebhookEvent {
-        event_id: new_event_id(),
+        // task 2.2: stable id keyed on the call so a redelivery dedups (the
+        // call.completed event is the one unpod bills + dedups on).
+        event_id: derive_event_id(&record.call_id, "call.completed"),
         event: "call.completed".to_string(),
         timestamp: current_unix_timestamp(),
         data,

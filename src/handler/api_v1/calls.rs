@@ -907,7 +907,11 @@ fn maybe_drop_transcribe_marker(
             tracing::info!("dropped transcribe marker: {}", marker);
             if let Some(sender) = webhook_sender {
                 let event = crate::proxy::webhook::WebhookEvent {
-                    event_id: crate::proxy::webhook::new_event_id(),
+                    // task 2.2: stable id keyed on the session so a redelivery dedups.
+                    event_id: crate::proxy::webhook::derive_event_id(
+                        session_id,
+                        "transcribe.requested",
+                    ),
                     event: "transcribe.requested".to_string(),
                     timestamp: crate::proxy::webhook::current_unix_timestamp(),
                     data: serde_json::json!({
@@ -935,7 +939,8 @@ async fn build_recording_completed_event(
         .map(|m| m.len())
         .unwrap_or(0);
     crate::proxy::webhook::WebhookEvent {
-        event_id: crate::proxy::webhook::new_event_id(),
+        // task 2.2: stable id keyed on the session so a redelivery dedups.
+        event_id: crate::proxy::webhook::derive_event_id(session_id, "recording.completed"),
         event: "recording.completed".to_string(),
         timestamp: crate::proxy::webhook::current_unix_timestamp(),
         data: serde_json::json!({
