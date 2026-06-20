@@ -38,14 +38,29 @@ pub struct CdrView {
     pub from_number: Option<String>,
     pub to_number: Option<String>,
     pub sip_gateway: Option<String>,
+    /// Matched route + terminating extension, for call attribution (task 2.4).
+    pub route_id: Option<i64>,
+    pub extension_id: Option<i64>,
     pub caller_uri: Option<String>,
     pub callee_uri: Option<String>,
+    /// Per-leg SIP role map, lifted from the CDR metadata JSON (task 2.4).
+    pub sip_leg_roles: Option<serde_json::Value>,
     pub recording_url: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
+/// Lift the per-leg SIP role map out of the CDR metadata JSON.
+/// `persist_call_record` stores it under this reserved key (CDR-07); `None`
+/// when absent or metadata is null (task 2.4).
+fn leg_roles_from_metadata(metadata: &Option<serde_json::Value>) -> Option<serde_json::Value> {
+    metadata
+        .as_ref()
+        .and_then(|md| md.get("sip_leg_roles").cloned())
+}
+
 impl From<CdrModel> for CdrView {
     fn from(m: CdrModel) -> Self {
+        let sip_leg_roles = leg_roles_from_metadata(&m.metadata);
         Self {
             id: m.id,
             call_id: m.call_id,
@@ -61,8 +76,11 @@ impl From<CdrModel> for CdrView {
             from_number: m.from_number,
             to_number: m.to_number,
             sip_gateway: m.sip_gateway,
+            route_id: m.route_id,
+            extension_id: m.extension_id,
             caller_uri: m.caller_uri,
             callee_uri: m.callee_uri,
+            sip_leg_roles,
             recording_url: m.recording_url,
             created_at: m.created_at,
         }
@@ -216,4 +234,26 @@ async fn cdr_sip_flow_stub(Path(_id): Path<i64>) -> ApiResult<StatusCode> {
     Err(ApiError::not_implemented(
         "sip flow retrieval not implemented",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn leg_roles_extracted_from_metadata() {
+        let meta = serde_json::json!({
+            "sip_leg_roles": {"leg-a": "caller", "leg-b": "callee"},
+            "other": "x",
+        });
+        let roles = leg_roles_from_metadata(&Some(meta)).expect("present");
+        assert_eq!(roles["leg-a"], "caller");
+        assert_eq!(roles["leg-b"], "callee");
+    }
+
+    #[test]
+    fn leg_roles_none_when_absent_or_null() {
+        assert!(leg_roles_from_metadata(&None).is_none());
+        assert!(leg_roles_from_metadata(&Some(serde_json::json!({"other": "x"}))).is_none());
+    }
 }
