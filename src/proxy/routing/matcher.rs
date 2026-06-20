@@ -1248,12 +1248,16 @@ pub(crate) fn apply_trunk_config(option: &mut InviteOption, trunk: &TrunkConfig)
         addr: dest_uri.host_with_port.clone(),
     });
 
-    // Save original caller before potential rewrite for P-Asserted-Identity header
+    // Original caller, preserved for the P-Asserted-Identity header below.
     let original_caller = option.caller.clone();
 
     if trunk.rewrite_hostport {
+        // Rewrite only the Request-URI/callee host to the trunk destination so
+        // the INVITE is addressed to the trunk. The From/caller is deliberately
+        // NOT rewritten here: the outbound leg presents rustpbx's own external
+        // SIP address as the From host (standard B2BUA identity), and the
+        // original caller is carried in P-Asserted-Identity below.
         option.callee.host_with_port = dest_uri.host_with_port.clone();
-        option.caller.host_with_port = dest_uri.host_with_port.clone();
     }
 
     // Stamp the transport onto the callee URI so downstream CANCEL/BYE/ACK
@@ -1408,4 +1412,87 @@ pub fn build_did_extension_route_result(
 ) -> Result<RouteResult> {
     option.callee = update_uri_user(&option.callee, extension)?;
     Ok(RouteResult::Forward(option, None))
+}
+
+#[cfg(test)]
+mod trunk_config_tests {
+    use super::*;
+    use rsipstack::sip::Uri;
+
+    fn invite_with(caller: &str, callee: &str) -> InviteOption {
+        InviteOption {
+            caller: Uri::try_from(caller).unwrap(),
+            callee: Uri::try_from(callee).unwrap(),
+            ..Default::default()
+        }
+    }
+
+    /// With `rewrite_hostport = true`, only the Request-URI/callee host is
+    /// rewritten to the trunk destination. The From/caller host must be left
+    /// untouched — the outbound leg sets the From to rustpbx's external SIP
+    /// address (B2BUA identity), and the original caller is carried in
+    /// P-Asserted-Identity. Regression for the bug where an outbound trunk
+    /// INVITE leaked the upstream caller's host into the From.
+    #[test]
+    fn rewrite_hostport_rewrites_callee_but_not_caller() {
+        let mut option = invite_with(
+            "sip:+919228883071@44.229.228.186:5060",
+            "sip:917011324474@example.invalid:5060",
+        );
+        let trunk = TrunkConfig {
+            dest: "sip:159.65.144.179:5060".to_string(),
+            rewrite_hostport: true,
+            ..Default::default()
+        };
+
+        apply_trunk_config(&mut option, &trunk).unwrap();
+
+        assert_eq!(
+            option.callee.host().to_string(),
+            "159.65.144.179",
+            "callee/Request-URI host must be rewritten to the trunk destination"
+        );
+        assert_eq!(
+            option.caller.host().to_string(),
+            "44.229.228.186",
+            "caller/From host must NOT be rewritten by apply_trunk_config"
+        );
+        assert_eq!(
+            option.caller.user().unwrap_or_default(),
+            "+919228883071",
+            "caller user part must be preserved"
+        );
+    }
+
+    /// P-Asserted-Identity carries the original (un-rewritten) caller so the
+    /// downstream carrier still sees the true source identity.
+    #[test]
+    fn trunk_with_auth_adds_pai_with_original_caller() {
+        let mut option = invite_with(
+            "sip:+919228883071@44.229.228.186:5060",
+            "sip:917011324474@example.invalid:5060",
+        );
+        let trunk = TrunkConfig {
+            dest: "sip:159.65.144.179:5060".to_string(),
+            rewrite_hostport: true,
+            username: Some("user".to_string()),
+            password: Some("pass".to_string()),
+            ..Default::default()
+        };
+
+        apply_trunk_config(&mut option, &trunk).unwrap();
+
+        let headers = option.headers.expect("headers populated");
+        let pai = headers.iter().find_map(|h| match h {
+            rsipstack::sip::Header::Other(name, value) if name == "P-Asserted-Identity" => {
+                Some(value.clone())
+            }
+            _ => None,
+        });
+        assert_eq!(
+            pai.as_deref(),
+            Some("<sip:+919228883071@44.229.228.186:5060>"),
+            "P-Asserted-Identity must carry the original caller identity"
+        );
+    }
 }

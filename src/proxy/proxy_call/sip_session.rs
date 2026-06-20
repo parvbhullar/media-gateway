@@ -2393,6 +2393,15 @@ impl SipSession {
             .map(|c| c.uri.clone())
             .unwrap_or_else(|| caller.clone());
 
+        // Present rustpbx's own external SIP address (the same host:port we
+        // advertise in Contact) as the From host, keeping the original caller's
+        // user part — standard B2BUA behaviour. The true caller identity is
+        // preserved in P-Asserted-Identity. When no external contact is known
+        // (fallback above), host_with_port equals the caller's, so From is
+        // unchanged.
+        let mut from_uri = caller.clone();
+        from_uri.host_with_port = contact_uri.host_with_port.clone();
+
         let callee_call_id = self.context.dialplan.call_id.clone().unwrap_or_else(|| {
             rsipstack::transaction::make_call_id(
                 self.server.endpoint.inner.option.callid_suffix.as_deref(),
@@ -2419,7 +2428,7 @@ impl SipSession {
         let mut invite_option = InviteOption {
             caller_display_name: self.context.dialplan.caller_display_name.clone(),
             callee: callee_uri.clone(),
-            caller: caller.clone(),
+            caller: from_uri,
             content_type,
             offer,
             destination: target.destination.clone(),
@@ -5944,9 +5953,15 @@ impl SipSession {
             .map(|c| c.uri.clone())
             .unwrap_or_else(|| caller.clone());
 
+        // Present rustpbx's own external SIP address as the From host (same as
+        // Contact), keeping the original caller's user part — standard B2BUA
+        // behaviour, matching try_single_target.
+        let mut from_uri = caller.clone();
+        from_uri.host_with_port = contact.host_with_port.clone();
+
         let invite_option = rsipstack::dialog::invitation::InviteOption {
             callee: callee_uri.clone(),
-            caller: caller.clone(),
+            caller: from_uri,
             contact: contact.clone(),
             content_type: Some("application/sdp".to_string()),
             offer: Some(sdp_offer.into_bytes()),
