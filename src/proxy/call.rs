@@ -873,17 +873,20 @@ impl CallModule {
         } else if let Some(queue_targets) = queue_targets {
             queue_targets
         } else if let Some(option) = preview_forward.as_ref() {
-            // On-net forwards (the DID→extension short-circuit and rule-driven
-            // internal forwards) arrive as Forward(callee=ext@realm, dest=None)
-            // with no contact metadata. Resolve the target's live registration
-            // through the locator so we dial the registered contact
-            // (destination/transport/webrtc) instead of DNS of the realm host —
-            // mirroring how queue and agent targets are resolved. Forwards that
-            // already carry an explicit destination (e.g. external trunk
-            // forwards) are dialed as-is.
+            // On-net forwards from the routing layer (the DID→extension
+            // short-circuit and rule-driven internal forwards) arrive as
+            // Forward(callee=ext@realm, dest=None) with no contact metadata.
+            // Resolve the target's live registration through the locator so we
+            // dial the registered contact (destination/transport/webrtc)
+            // instead of DNS of the realm host — mirroring how queue and agent
+            // targets are resolved. Two cases are deliberately excluded and
+            // dialed as-is: forwards that already carry an explicit destination
+            // (e.g. external trunk forwards), and call-forwarding-always
+            // (`always_forwarding`), which has its own offline-bypass semantics
+            // and must not be subjected to the locator offline check.
             let forward_realm = option.callee.host().to_string();
             let forward_same_realm = self.inner.server.is_same_realm(&forward_realm).await;
-            if option.destination.is_none() && forward_same_realm {
+            if !always_forwarding && option.destination.is_none() && forward_same_realm {
                 match self.inner.server.locator.lookup(&option.callee).await {
                     Ok(registrations) if !registrations.is_empty() => {
                         info!(
@@ -3509,6 +3512,7 @@ mod tests {
             .expect("DID→extension forward should not error at resolve time")
             .expect_dialplan();
 
+        use crate::call::DialplanFlow;
         match &dialplan.flow {
             DialplanFlow::Targets(DialStrategy::Sequential(targets)) => {
                 assert_eq!(targets.len(), 1, "exactly one resolved extension target expected");
