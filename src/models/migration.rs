@@ -45,6 +45,9 @@ impl MigratorTrait for Migrator {
             Box::new(super::add_trunks_last_health_check_at::Migration),
             Box::new(super::fix_sip_trunk_kind_config_booleans::Migration),
             Box::new(super::add_cdr_status_answer_columns::Migration),
+            // task 3.1 — org_id tenant-isolation column on rustpbx_dids. MUST be
+            // registered here or the column is never created in production.
+            Box::new(super::add_org_id_did::Migration),
         ]
     }
 }
