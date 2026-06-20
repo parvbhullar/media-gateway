@@ -33,6 +33,8 @@ pub struct CdrView {
     pub answer_time: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
     pub duration_secs: i32,
+    /// Answered (billable) seconds; NULL for unanswered calls (task 2.3).
+    pub billable_duration_secs: Option<i32>,
     pub from_number: Option<String>,
     pub to_number: Option<String>,
     pub sip_gateway: Option<String>,
@@ -55,6 +57,7 @@ impl From<CdrModel> for CdrView {
             answer_time: m.answer_time,
             ended_at: m.ended_at,
             duration_secs: m.duration_secs,
+            billable_duration_secs: m.billable_duration_secs,
             from_number: m.from_number,
             to_number: m.to_number,
             sip_gateway: m.sip_gateway,

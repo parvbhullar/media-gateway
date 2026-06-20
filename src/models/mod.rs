@@ -4,6 +4,7 @@ use sea_orm_migration::{MigratorTrait, SchemaManager};
 use std::collections::HashSet;
 use std::time::Duration;
 
+pub mod add_cdr_billable_duration_column;
 pub mod add_cdr_status_answer_columns;
 pub mod add_did_trunk_group_name_column;
 pub mod add_leg_timeline_column;

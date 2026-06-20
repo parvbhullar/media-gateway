@@ -947,6 +947,11 @@ async fn build_recording_completed_event(
             "session_id": session_id,
             "recording_path": recording_path,
             "format": format,
+            // TODO(2.3): recording-file duration needs the recorder's measured
+            // length (or an ffprobe decode) threaded here; the persisted CDR
+            // already carries recording_duration_secs from details, but this
+            // webhook field stays 0 until that plumbing lands. Distinct from the
+            // call's billable_duration_secs (answered span), which IS now set.
             "duration_secs": 0,
             "size_bytes": size_bytes,
         }),

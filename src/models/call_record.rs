@@ -68,6 +68,10 @@ pub async fn persist_call_record(
     let transcript_language = details.transcript_language.clone();
     let tags = details.tags.clone();
     let duration_secs = (record.end_time - record.start_time).num_seconds().max(0) as i32;
+    // task 2.3: billable (answered) seconds — NULL when the call never answered.
+    let billable_duration_secs = record
+        .answer_time
+        .map(|ans| (record.end_time - ans).num_seconds().max(0) as i32);
 
     let caller_uri = normalize_endpoint_uri(&record.caller);
     let callee_uri = normalize_endpoint_uri(&record.callee);
@@ -125,6 +129,7 @@ pub async fn persist_call_record(
         ended_at: Set(Some(record.end_time)),
         answer_time: Set(record.answer_time),
         duration_secs: Set(duration_secs),
+        billable_duration_secs: Set(billable_duration_secs),
         from_number: Set(from_number.clone()),
         to_number: Set(to_number.clone()),
         caller_name: Set(caller_name.clone()),
@@ -292,6 +297,10 @@ pub struct Model {
     /// Billable duration = ended_at - answer_time; PDD = answer_time - started_at.
     pub answer_time: Option<DateTimeUtc>,
     pub duration_secs: i32,
+    /// Answered (billable) seconds: `ended_at − answer_time`, clamped ≥ 0; NULL
+    /// for unanswered calls (task 2.3). `duration_secs` remains wall-clock
+    /// (`ended_at − started_at`), so billing reads this column, not that one.
+    pub billable_duration_secs: Option<i32>,
     pub from_number: Option<String>,
     pub to_number: Option<String>,
     pub caller_name: Option<String>,
@@ -609,6 +618,7 @@ mod cdr_phase1_tests {
             ended_at: Some(now),
             answer_time: Some(now),
             duration_secs: 10,
+            billable_duration_secs: Some(10),
             from_number: Some("1001".to_string()),
             to_number: Some("2002".to_string()),
             caller_name: None,

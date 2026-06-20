@@ -49,6 +49,8 @@ impl MigratorTrait for Migrator {
             // here or the table is never created in production (the migrator
             // runs only this explicit list).
             Box::new(super::webhook_outbox::Migration),
+            // task 2.3 — billable (answered) duration column on call records.
+            Box::new(super::add_cdr_billable_duration_column::Migration),
         ]
     }
 }
