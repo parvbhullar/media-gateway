@@ -51,6 +51,9 @@ impl MigratorTrait for Migrator {
             Box::new(super::webhook_outbox::Migration),
             // task 2.3 — billable (answered) duration column on call records.
             Box::new(super::add_cdr_billable_duration_column::Migration),
+            // task 3.1 — org_id tenant-isolation column on rustpbx_dids. MUST be
+            // registered here or the column is never created in production.
+            Box::new(super::add_org_id_did::Migration),
         ]
     }
 }

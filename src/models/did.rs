@@ -66,6 +66,10 @@ pub struct Model {
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
     pub trunk_group_name: Option<String>,
+    /// Owning org (task 3.1 tenant isolation). DB default `'default'` until 3.1b
+    /// threads the real org_id from request context; `upsert` leaves it NotSet
+    /// so the column default applies and an upsert never rewrites it.
+    pub org_id: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -123,6 +127,27 @@ impl Model {
 
     pub async fn list_all(db: &DatabaseConnection) -> Result<Vec<Self>, DbErr> {
         Entity::find().all(db).await
+    }
+
+    /// List DIDs owned by `org_id` (task 3.1 tenant isolation).
+    pub async fn list_by_org(
+        db: &DatabaseConnection,
+        org_id: &str,
+    ) -> Result<Vec<Self>, DbErr> {
+        Entity::find().filter(Column::OrgId.eq(org_id)).all(db).await
+    }
+
+    /// Get a DID by number, scoped to `org_id` — `None` when the number belongs
+    /// to a different org (cross-tenant lookups never resolve).
+    pub async fn get_by_org(
+        db: &DatabaseConnection,
+        org_id: &str,
+        number: &str,
+    ) -> Result<Option<Self>, DbErr> {
+        Entity::find_by_id(number.to_owned())
+            .filter(Column::OrgId.eq(org_id))
+            .one(db)
+            .await
     }
 
     pub async fn list_by_trunk(
@@ -266,5 +291,97 @@ impl MigrationTrait for Migration {
         manager
             .drop_table(Table::drop().table(Entity).to_owned())
             .await
+    }
+}
+
+#[cfg(test)]
+mod org_id_tests {
+    use super::*;
+    use sea_orm::{ActiveModelTrait, Database};
+    use sea_orm_migration::MigratorTrait;
+
+    /// Runs the base table + the org_id ADD migration (task 3.1).
+    struct TestMigrator;
+    #[async_trait::async_trait]
+    impl MigratorTrait for TestMigrator {
+        fn migrations() -> Vec<Box<dyn MigrationTrait>> {
+            vec![
+                Box::new(Migration),
+                Box::new(crate::models::add_org_id_did::Migration),
+            ]
+        }
+    }
+
+    async fn fresh() -> DatabaseConnection {
+        let db = Database::connect("sqlite::memory:").await.expect("sqlite");
+        TestMigrator::up(&db, None).await.expect("migrate");
+        db
+    }
+
+    async fn insert_did(db: &DatabaseConnection, number: &str, org: &str) {
+        let now = Utc::now();
+        ActiveModel {
+            number: Set(number.to_string()),
+            org_id: Set(org.to_string()),
+            enabled: Set(true),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("insert did");
+    }
+
+    #[tokio::test]
+    async fn list_by_org_isolates_tenants() {
+        let db = fresh().await;
+        insert_did(&db, "+15551110000", "org_a").await;
+        insert_did(&db, "+15552220000", "org_b").await;
+        let a = Model::list_by_org(&db, "org_a").await.unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].number, "+15551110000");
+        assert_eq!(a[0].org_id, "org_a");
+    }
+
+    #[tokio::test]
+    async fn get_by_org_rejects_foreign_tenant() {
+        let db = fresh().await;
+        insert_did(&db, "+15551110000", "org_a").await;
+        // The number exists but belongs to org_a → a cross-tenant get is None.
+        assert!(
+            Model::get_by_org(&db, "org_b", "+15551110000")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            Model::get_by_org(&db, "org_a", "+15551110000")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_defaults_org_id() {
+        // upsert leaves org_id NotSet → the column default ('default') applies,
+        // so existing write paths keep working until 3.1b threads a real org_id.
+        let db = fresh().await;
+        Model::upsert(
+            &db,
+            NewDid {
+                number: "+15553330000".to_string(),
+                trunk_name: None,
+                extension_number: None,
+                failover_trunk: None,
+                label: None,
+                enabled: true,
+            },
+        )
+        .await
+        .unwrap();
+        let row = Model::get(&db, "+15553330000").await.unwrap().unwrap();
+        assert_eq!(row.org_id, "default");
     }
 }
