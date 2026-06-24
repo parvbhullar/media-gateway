@@ -1309,6 +1309,69 @@ pub struct CdrData {
     pub storage: Option<CdrStorage>,
 }
 
+/// Human outcome classification for a call, derived from the final SIP code,
+/// whether the callee alerted (`rang`), and the recorded hangup messages.
+/// Mirrors the logic in scripts/qa_call_records_csv.py.
+struct ErrorReason {
+    key: &'static str,
+    detail: Option<String>,
+}
+
+/// Reason text from the hangup_message whose `code` matches the final status
+/// code; falls back to the last recorded message. Same selection errorOrigin
+/// uses on the frontend.
+fn extract_hangup_detail(hangup_messages: &[Value], code: i16) -> Option<String> {
+    hangup_messages
+        .iter()
+        .find(|m| m.get("code").and_then(|c| c.as_i64()) == Some(code as i64))
+        .or_else(|| hangup_messages.last())
+        .and_then(|m| m.get("reason"))
+        .and_then(|r| r.as_str())
+        .map(|s| s.to_string())
+}
+
+/// `None` => answered/normal call (no error reason). Otherwise a stable key
+/// plus optional detail text.
+fn classify_error_reason(
+    status: &str,
+    status_code: Option<i16>,
+    rang: bool,
+    hangup_messages: &[Value],
+) -> Option<ErrorReason> {
+    let code = status_code.unwrap_or(0);
+    let _ = status; // 2xx is authoritative; status string kept for signature parity
+    if (200..300).contains(&code) {
+        return None;
+    }
+    let key = match code {
+        480 => {
+            if rang {
+                "rang_no_answer"
+            } else {
+                "temporarily_unavailable"
+            }
+        }
+        503 => {
+            if rang {
+                "service_unavailable_after_ring"
+            } else {
+                "service_unavailable_upstream"
+            }
+        }
+        486 => "busy",
+        487 => "caller_cancelled",
+        404 | 604 => "unroutable",
+        408 => "no_answer_timeout",
+        500 | 502 => "server_error",
+        401 | 403 | 407 => "rejected",
+        _ => "failed",
+    };
+    Some(ErrorReason {
+        key,
+        detail: extract_hangup_detail(hangup_messages, code),
+    })
+}
+
 fn build_record_payload(
     record: &CallRecordModel,
     related: &RelatedContext,
@@ -1350,8 +1413,7 @@ fn build_record_payload(
     let rewrite_contact = Option::<String>::None;
     let rewrite_destination = Option::<String>::None;
     let status_code = record.status_code;
-    // ring_time is not persisted (out of Phase-1 CDR scope).
-    let ring_time = Option::<String>::None;
+    let ring_time = record.ring_time.map(|dt| dt.to_rfc3339());
     let answer_time = record.answer_time.map(|dt| dt.to_rfc3339());
     let hangup_reason = record.hangup_reason.clone();
     // hangup_messages live under a reserved key in the metadata JSON (CDR-02b).
@@ -1361,6 +1423,23 @@ fn build_record_payload(
         .and_then(|m| m.get("hangup_messages"))
         .and_then(|v| v.as_array().cloned())
         .unwrap_or_default();
+
+    // "rang" = callee alerted. ring_time is authoritative; for legacy rows
+    // (NULL ring_time) fall back to answered-or-elapsed>3s.
+    let rang = record.ring_time.is_some()
+        || record.answer_time.is_some()
+        || record
+            .ended_at
+            .map(|end| (end - record.started_at).num_seconds() > 3)
+            .unwrap_or(false);
+    let error_reason = classify_error_reason(
+        &record.status,
+        record.status_code,
+        rang,
+        &hangup_messages,
+    );
+    let error_reason_key = error_reason.as_ref().map(|r| r.key);
+    let error_reason_detail = error_reason.and_then(|r| r.detail);
 
     json!({
         "id": record.id,
@@ -1393,6 +1472,8 @@ fn build_record_payload(
         "status_code": status_code,
         "hangup_reason": hangup_reason,
         "hangup_messages": hangup_messages,
+        "error_reason": error_reason_key,
+        "error_reason_detail": error_reason_detail,
         "rewrite": {
             "caller": {
                 "original": rewrite_caller_original,
@@ -1922,6 +2003,190 @@ mod tests {
             .expect("related context");
         let payload = build_record_payload(&record, &related, &state, None);
         assert_eq!(payload["id"], 1);
+    }
+
+    #[tokio::test]
+    async fn ring_time_round_trips_through_db() {
+        let db = setup_db().await;
+        let ring = Utc::now();
+        let record = call_record::ActiveModel {
+            call_id: Set("ring-rt-1".into()),
+            direction: Set("outbound".into()),
+            status: Set("failed".into()),
+            status_code: Set(Some(480)),
+            started_at: Set(Utc::now()),
+            ring_time: Set(Some(ring)),
+            duration_secs: Set(20),
+            has_transcript: Set(false),
+            transcript_status: Set("pending".into()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("insert call record");
+        assert!(record.ring_time.is_some());
+    }
+
+    #[test]
+    fn classify_answered_is_none() {
+        assert!(classify_error_reason("completed", Some(200), true, &[]).is_none());
+        // any 2xx counts as answered regardless of status string
+        assert!(classify_error_reason("failed", Some(204), false, &[]).is_none());
+    }
+
+    #[test]
+    fn classify_480_splits_on_ring() {
+        assert_eq!(
+            classify_error_reason("failed", Some(480), true, &[]).unwrap().key,
+            "rang_no_answer"
+        );
+        assert_eq!(
+            classify_error_reason("failed", Some(480), false, &[]).unwrap().key,
+            "temporarily_unavailable"
+        );
+    }
+
+    #[test]
+    fn classify_503_splits_on_ring() {
+        assert_eq!(
+            classify_error_reason("failed", Some(503), true, &[]).unwrap().key,
+            "service_unavailable_after_ring"
+        );
+        assert_eq!(
+            classify_error_reason("failed", Some(503), false, &[]).unwrap().key,
+            "service_unavailable_upstream"
+        );
+    }
+
+    #[test]
+    fn classify_simple_codes() {
+        let cases = [
+            (486, "busy"),
+            (487, "caller_cancelled"),
+            (404, "unroutable"),
+            (604, "unroutable"),
+            (408, "no_answer_timeout"),
+            (500, "server_error"),
+            (502, "server_error"),
+            (401, "rejected"),
+            (403, "rejected"),
+            (407, "rejected"),
+            (481, "failed"),
+        ];
+        for (code, key) in cases {
+            assert_eq!(
+                classify_error_reason("failed", Some(code), false, &[]).unwrap().key,
+                key,
+                "code {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_extracts_matching_detail() {
+        let msgs = vec![
+            json!({"code": 487, "reason": "Caller cancelled"}),
+            json!({"code": 500, "reason": "Internal Error"}),
+        ];
+        let r = classify_error_reason("failed", Some(500), true, &msgs).unwrap();
+        assert_eq!(r.key, "server_error");
+        assert_eq!(r.detail.as_deref(), Some("Internal Error"));
+    }
+
+    #[test]
+    fn classify_detail_falls_back_to_last_message() {
+        let msgs = vec![json!({"code": 480, "reason": "Temporarily Unavailable"})];
+        // final code 503 has no exact match → use last message's reason
+        let r = classify_error_reason("failed", Some(503), false, &msgs).unwrap();
+        assert_eq!(r.detail.as_deref(), Some("Temporarily Unavailable"));
+    }
+
+    #[tokio::test]
+    async fn payload_has_error_reason_for_failure_and_null_for_answered() {
+        let db = setup_db().await;
+        let state = create_console_state(db.clone()).await;
+
+        let failed = call_record::ActiveModel {
+            call_id: Set("er-480".into()),
+            direction: Set("outbound".into()),
+            status: Set("failed".into()),
+            status_code: Set(Some(480)),
+            started_at: Set(Utc::now()),
+            ring_time: Set(Some(Utc::now())),
+            duration_secs: Set(20),
+            has_transcript: Set(false),
+            transcript_status: Set("pending".into()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("insert failed record");
+
+        let answered = call_record::ActiveModel {
+            call_id: Set("er-200".into()),
+            direction: Set("outbound".into()),
+            status: Set("completed".into()),
+            status_code: Set(Some(200)),
+            started_at: Set(Utc::now()),
+            answer_time: Set(Some(Utc::now())),
+            duration_secs: Set(42),
+            has_transcript: Set(false),
+            transcript_status: Set("pending".into()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("insert answered record");
+
+        let related = load_related_context(&db, &[failed.clone(), answered.clone()])
+            .await
+            .expect("related context");
+
+        let p_fail = build_record_payload(&failed, &related, &state, None);
+        assert_eq!(p_fail["error_reason"], "rang_no_answer");
+
+        let p_ok = build_record_payload(&answered, &related, &state, None);
+        assert!(p_ok["error_reason"].is_null());
+    }
+
+    #[tokio::test]
+    async fn payload_surfaces_server_error_detail() {
+        let db = setup_db().await;
+        let state = create_console_state(db.clone()).await;
+
+        let record = call_record::ActiveModel {
+            call_id: Set("er-500".into()),
+            direction: Set("outbound".into()),
+            status: Set("failed".into()),
+            status_code: Set(Some(500)),
+            started_at: Set(Utc::now()),
+            ring_time: Set(Some(Utc::now())),
+            duration_secs: Set(10),
+            has_transcript: Set(false),
+            transcript_status: Set("pending".into()),
+            metadata: Set(Some(json!({
+                "hangup_messages": [{"code": 500, "reason": "Internal Error"}]
+            }))),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("insert 500 record");
+
+        let related = load_related_context(&db, &[record.clone()])
+            .await
+            .expect("related context");
+        let payload = build_record_payload(&record, &related, &state, None);
+        assert_eq!(payload["error_reason"], "server_error");
+        assert_eq!(payload["error_reason_detail"], "Internal Error");
     }
 
     #[tokio::test]

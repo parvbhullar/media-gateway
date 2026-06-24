@@ -9,6 +9,7 @@ pub mod add_did_trunk_group_name_column;
 pub mod add_leg_timeline_column;
 pub mod add_media_config_column;
 pub mod add_metadata_column;
+pub mod add_ring_time_column;
 pub mod add_rewrite_columns;
 pub mod add_sip_trunk_health_columns;
 pub mod add_sip_trunk_register_columns;

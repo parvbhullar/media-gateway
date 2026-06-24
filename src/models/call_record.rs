@@ -124,6 +124,7 @@ pub async fn persist_call_record(
         started_at: Set(record.start_time),
         ended_at: Set(Some(record.end_time)),
         answer_time: Set(record.answer_time),
+        ring_time: Set(record.ring_time),
         duration_secs: Set(duration_secs),
         from_number: Set(from_number.clone()),
         to_number: Set(to_number.clone()),
@@ -164,6 +165,7 @@ pub async fn persist_call_record(
                     Column::HangupReason,
                     Column::StartedAt,
                     Column::EndedAt,
+                    Column::RingTime,
                     Column::AnswerTime,
                     Column::DurationSecs,
                     Column::FromNumber,
@@ -291,6 +293,9 @@ pub struct Model {
     /// When the call was answered (200 OK). NULL for unanswered calls.
     /// Billable duration = ended_at - answer_time; PDD = answer_time - started_at.
     pub answer_time: Option<DateTimeUtc>,
+    /// When the callee started alerting (180/183 received). NULL for rows
+    /// written before this column existed, or calls that never rang.
+    pub ring_time: Option<DateTimeUtc>,
     pub duration_secs: i32,
     pub from_number: Option<String>,
     pub to_number: Option<String>,
@@ -566,7 +571,7 @@ impl From<Model> for CallRecord {
         CallRecord {
             call_id: val.call_id,
             start_time: val.started_at,
-            ring_time: None, // ring_time not persisted (out of Phase-1 scope)
+            ring_time: val.ring_time,
             answer_time: val.answer_time,
             end_time: val.ended_at.unwrap_or(val.started_at),
             caller: val
@@ -608,6 +613,7 @@ mod cdr_phase1_tests {
             started_at: now,
             ended_at: Some(now),
             answer_time: Some(now),
+            ring_time: None,
             duration_secs: 10,
             from_number: Some("1001".to_string()),
             to_number: Some("2002".to_string()),
@@ -677,15 +683,36 @@ mod cdr_phase1_tests {
         m.metadata = Some(serde_json::json!({
             "tenant": "acme",
             "sip_leg_roles": { "call-1": "caller" },
-            "hangup_messages": [ { "code": 503, "reason": "busy" } ],
+            "hangup_messages": [
+                {
+                    "code": 500,
+                    "reason": "Server Internal Error",
+                    "target": "callee",
+                    "endpoint": "103.146.242.234:5060"
+                },
+                // legacy row shape (no target/endpoint) still deserializes
+                { "code": 503, "reason": "busy" }
+            ],
         }));
         let rec: CallRecord = m.into();
         assert_eq!(
             rec.sip_leg_roles.get("call-1").map(|s| s.as_str()),
             Some("caller")
         );
-        assert_eq!(rec.hangup_messages.len(), 1);
-        assert_eq!(rec.hangup_messages[0].code, 503);
+        assert_eq!(rec.hangup_messages.len(), 2);
+        assert_eq!(rec.hangup_messages[0].code, 500);
+        assert_eq!(
+            rec.hangup_messages[0].target.as_deref(),
+            Some("callee"),
+            "leg side should round-trip"
+        );
+        assert_eq!(
+            rec.hangup_messages[0].endpoint.as_deref(),
+            Some("103.146.242.234:5060"),
+            "downstream hop should round-trip"
+        );
+        assert_eq!(rec.hangup_messages[1].code, 503);
+        assert_eq!(rec.hangup_messages[1].endpoint, None);
         let md = rec.details.metadata.expect("string metadata preserved");
         assert_eq!(md.get("tenant").map(|s| s.as_str()), Some("acme"));
         assert!(!md.contains_key("sip_leg_roles"));
