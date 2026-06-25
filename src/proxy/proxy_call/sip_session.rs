@@ -2561,6 +2561,9 @@ impl SipSession {
                                     let reason = crate::proxy::proxy_call::callee_reason::callee_reason_text(
                                         get_header_value(&resp.headers, "Reason"),
                                     );
+                                    // The carrier leg returned a final non-2xx: this is an
+                                    // upstream failure, not our SBC's own error.
+                                    self.failure_source = Some(FailureSource::Upstream);
                                     Err((code, reason))
                                 }
                             } else {
