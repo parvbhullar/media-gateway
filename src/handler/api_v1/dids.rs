@@ -46,6 +46,8 @@ use crate::models::did::{
 #[derive(Debug, Serialize)]
 pub struct DidView {
     pub number: String,
+    /// Owning org (tenancy). Lets an admin list numbers per org.
+    pub org_id: String,
     pub trunk_name: Option<String>,
     pub extension_number: Option<String>,
     pub failover_trunk: Option<String>,
@@ -59,6 +61,7 @@ impl From<DidModel> for DidView {
     fn from(m: DidModel) -> Self {
         Self {
             number: m.number,
+            org_id: m.org_id,
             trunk_name: m.trunk_name,
             extension_number: m.extension_number,
             failover_trunk: m.failover_trunk,
@@ -85,6 +88,9 @@ pub struct DidListQuery {
     pub q: Option<String>,
     #[serde(default)]
     pub unassigned: Option<bool>,
+    /// Filter to one owning org (tenancy / admin per-org number listing).
+    #[serde(default)]
+    pub org_id: Option<String>,
 }
 
 impl DidListQuery {
@@ -198,6 +204,9 @@ async fn list_dids(
                 .add(DidColumn::Number.like(like.clone()))
                 .add(DidColumn::Label.like(like)),
         );
+    }
+    if let Some(org) = q.org_id.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        conds = conds.add(DidColumn::OrgId.eq(org));
     }
 
     let paginator = DidEntity::find()
