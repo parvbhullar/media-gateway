@@ -247,8 +247,16 @@ pub struct CallRecordHangupMessage {
     pub code: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Which leg/side produced this status: "caller", "callee", "b2bua", or
+    /// "auth" (an inbound INVITE rejected for failed authentication).
+    /// Drives the leg label shown in the console.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    /// The concrete SIP endpoint (host:port) that sent the status, e.g. the
+    /// downstream trunk that returned a 500. Lets the console show which hop
+    /// actually rejected the call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

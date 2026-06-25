@@ -103,6 +103,7 @@ impl CallReporter {
                     code: u16::from(code.clone()),
                     reason: reason.clone(),
                     target: None,
+                    endpoint: None,
                 });
             }
 

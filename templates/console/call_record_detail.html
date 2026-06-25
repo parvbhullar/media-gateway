@@ -126,6 +126,12 @@
                                     x-text="hangupTargetLabel(msg.target)"></span>
                                 <span class="font-mono text-rose-600" x-text="msg.code"></span>
                                 <span class="text-slate-600" x-text="msg.reason || statusReasonLabel(msg.code)"></span>
+                                <template x-if="msg.endpoint">
+                                    <span class="inline-flex items-center gap-1 font-mono text-slate-400">
+                                        <span aria-hidden="true">·</span>
+                                        <span x-text="msg.endpoint"></span>
+                                    </span>
+                                </template>
                             </div>
                         </template>
                     </div>
@@ -2037,6 +2043,9 @@
                 }
                 if (normalized === 'b2bua') {
                     return td.hangup_b2bua_leg || 'B2BUA leg';
+                }
+                if (normalized === 'auth') {
+                    return td.hangup_auth_leg || 'Auth rejected';
                 }
                 return target;
             },

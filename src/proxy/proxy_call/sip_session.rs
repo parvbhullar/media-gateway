@@ -2541,10 +2541,45 @@ impl SipSession {
                                 } else {
 
                                     let code = StatusCode::from(resp.status_code.code());
+                                    // Prefer the Q.850 Reason header (richer, e.g. the
+                                    // trunk's cause text); fall back to the canonical
+                                    // status-line phrase for the code.
+                                    let reason = resp
+                                        .reason_phrase()
+                                        .map(|r| r.to_string())
+                                        .or_else(|| Some(resp.status_code.text().to_string()));
+                                    // The concrete downstream hop that rejected us, so
+                                    // the CDR/console can show "500 from <trunk>".
+                                    let endpoint = target
+                                        .destination
+                                        .as_ref()
+                                        .map(|d| d.addr.to_string())
+                                        .unwrap_or_else(|| callee_uri.host_with_port.to_string());
+                                    warn!(
+                                        session_id = %self.context.session_id,
+                                        code = code.code(),
+                                        ?reason,
+                                        %endpoint,
+                                        "Callee leg returned non-2xx final response"
+                                    );
+                                    self.hangup_messages.push(SessionHangupMessage {
+                                        code: code.code(),
+                                        reason: reason.clone(),
+                                        target: Some("callee".to_string()),
+                                        endpoint: Some(endpoint),
+                                    });
 
-                                    Err((code, None))
+                                    Err((code, reason))
                                 }
                             } else {
+                                // Do NOT record a hangup message here. The
+                                // "no final response" case is remapped below
+                                // (map_callee_terminated_reason) to an accurate
+                                // status — e.g. 403 for an unanswerable trunk
+                                // auth challenge. Pushing a hardcoded 500 entry
+                                // now would contradict that remapped status in
+                                // the CDR. The reporter synthesises a consistent
+                                // hangup message from the final last_error.
                                 Err((StatusCode::ServerInternalError, Some("No response from callee".to_string())))
                             }
                         }
@@ -2616,6 +2651,38 @@ impl SipSession {
                     }
                 }
             }
+        };
+
+        // rsipstack reports several terminal failures — notably an auth
+        // challenge we can't answer — as `Ok((_, None))`, which the loop above
+        // turns into a blanket `500 / "No response from callee"`. The real
+        // cause is carried as a `Terminated` dialog state on the callee
+        // channel. Drain any pending states and, if the dialog terminated for a
+        // concrete reason, surface an accurate status to the caller instead.
+        let result = match result {
+            Err((StatusCode::ServerInternalError, ref reason))
+                if reason.as_deref() == Some("No response from callee") =>
+            {
+                let mut mapped = None;
+                while let Ok(state) = callee_state_rx.try_recv() {
+                    if let DialogState::Terminated(_, reason) = state {
+                        mapped = Some(map_callee_terminated_reason(&reason));
+                    }
+                }
+                match mapped {
+                    Some((code, msg)) => {
+                        warn!(
+                            session_id = %self.context.session_id,
+                            status = %code,
+                            reason = %msg,
+                            "Callee dialog terminated without a final response; surfacing mapped status"
+                        );
+                        Err((code, Some(msg)))
+                    }
+                    None => result,
+                }
+            }
+            other => other,
         };
 
         let (dialog_id, response): (DialogId, Option<rsipstack::sip::Response>) = result?;
@@ -8574,6 +8641,51 @@ impl SipSession {
             Ok(None) => Err(anyhow!("re-INVITE timed out")),
             Err(e) => Err(anyhow!("re-INVITE failed: {}", e)),
         }
+    }
+}
+
+/// Map a terminated callee dialog reason to a truthful SIP status for the
+/// caller leg.
+///
+/// rsipstack's `process_invite` returns `Ok((_, None))` (no final response)
+/// in several terminal cases — most notably when the upstream answers a
+/// 401/407 auth challenge but we hold no trunk credential to satisfy it, the
+/// challenge response is dropped and only a `Terminated(ProxyAuthRequired)`
+/// dialog state is emitted. Without this mapping every such case collapses
+/// into a misleading `500 / "No response from callee"`. Here we translate the
+/// terminated reason into an accurate status so the caller (e.g. an upstream
+/// switch) sees the real cause.
+fn map_callee_terminated_reason(
+    reason: &rsipstack::dialog::dialog::TerminatedReason,
+) -> (StatusCode, String) {
+    use rsipstack::dialog::dialog::TerminatedReason;
+    match reason {
+        TerminatedReason::ProxyAuthRequired => (
+            StatusCode::Forbidden,
+            "Upstream trunk requires authentication (missing or invalid trunk credentials)"
+                .to_string(),
+        ),
+        TerminatedReason::Timeout => {
+            (StatusCode::RequestTimeout, "No response from callee".to_string())
+        }
+        TerminatedReason::UacBusy | TerminatedReason::UasBusy => {
+            (StatusCode::BusyHere, "Callee busy".to_string())
+        }
+        TerminatedReason::UasDecline => (StatusCode::Decline, "Callee declined".to_string()),
+        TerminatedReason::UacCancel => {
+            (StatusCode::RequestTerminated, "Call cancelled".to_string())
+        }
+        TerminatedReason::ProxyError(code)
+        | TerminatedReason::UacOther(code)
+        | TerminatedReason::UasOther(code) => {
+            (code.clone(), format!("Callee returned {}", code))
+        }
+        // UacBye/UasBye and any future variants pre-answer are unexpected here;
+        // fall back to the original generic behaviour.
+        _ => (
+            StatusCode::ServerInternalError,
+            "No response from callee".to_string(),
+        ),
     }
 }
 

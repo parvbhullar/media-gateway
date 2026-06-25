@@ -1,20 +1,27 @@
 use super::{
     ProxyAction, ProxyModule,
+    auth_rejection_limiter::AuthRejectionRateLimiter,
     dialog_auth_cache::{AuthCacheKey, DialogAuthCache},
     server::SipServerRef,
 };
 use crate::call::cookie::SpamResult;
 use crate::call::user::SipUser;
 use crate::call::{CalleeDisplayName, TransactionCookie, TrunkContext};
+use crate::callrecord::{
+    CallDetails, CallRecord, CallRecordHangupMessage, CallRecordHangupReason, CallRecordLastError,
+};
 use crate::config::ProxyConfig;
+use crate::models::call_record::extract_sip_username;
 use anyhow::{Error, Result};
 use async_trait::async_trait;
+use chrono::Utc;
 use rsipstack::dialog::authenticate::verify_digest;
 use rsipstack::sip::Header;
 use rsipstack::sip::headers::{ProxyAuthenticate, WwwAuthenticate};
 use rsipstack::sip::prelude::{HeadersExt, ToTypedHeader};
 use rsipstack::sip::typed::Authorization;
 use rsipstack::transaction::transaction::Transaction;
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -71,6 +78,9 @@ pub trait AuthBackend: Send + Sync {
 pub struct AuthModule {
     server: SipServerRef,
     dialog_auth_cache: Option<DialogAuthCache>,
+    /// Bounds how many auth-rejection CDRs a single source IP can write,
+    /// preventing a unique-Call-ID flood from amplifying into unbounded DB rows.
+    rejection_limiter: AuthRejectionRateLimiter,
 }
 
 impl AuthModule {
@@ -91,6 +101,7 @@ impl AuthModule {
         Self {
             server,
             dialog_auth_cache,
+            rejection_limiter: AuthRejectionRateLimiter::default(),
         }
     }
 
@@ -189,6 +200,88 @@ impl AuthModule {
     /// Get the source address from the transaction
     fn get_source_addr(&self, tx: &Transaction) -> Option<rsipstack::transport::SipAddr> {
         tx.connection.as_ref().map(|conn| conn.get_addr().clone())
+    }
+
+    /// True when the request carried credentials (an Authorization or
+    /// Proxy-Authorization header). Used to distinguish a genuine auth
+    /// failure (credentials presented but rejected) from the routine first
+    /// challenge every normal call receives before retrying with credentials.
+    fn request_has_auth_credentials(tx: &Transaction) -> bool {
+        tx.original.headers.iter().any(|h| {
+            matches!(h, Header::Authorization(_) | Header::ProxyAuthorization(_))
+        })
+    }
+
+    /// Persist a minimal call-record for an inbound INVITE that presented
+    /// credentials which failed authentication (e.g. an unprovisioned user).
+    /// Without this the attempt vanishes: auth aborts the module pipeline
+    /// before the CallModule that normally emits CDRs. The record is keyed on
+    /// the inbound SIP Call-ID — the same key a successful call uses — so if
+    /// the provider later re-INVITEs with valid credentials, that call's CDR
+    /// upserts (supersedes) this row.
+    ///
+    /// Caveat: this relies on the authenticated retry reusing the same Call-ID
+    /// (which RFC 3261 requires for the same call attempt, and LiveKit/Vapi do).
+    /// A UA that mints a fresh Call-ID per attempt would leave this row
+    /// un-superseded — an orphaned but not incorrect "failed attempt".
+    /// Source IP of the request, used as the rate-limit key. Requests whose
+    /// source is a domain or unknown share a single catch-all bucket
+    /// (`0.0.0.0`) so they remain bounded too.
+    fn source_ip(&self, tx: &Transaction) -> IpAddr {
+        use rsipstack::sip::uri::Host;
+        match self.get_source_addr(tx).map(|a| a.addr.host) {
+            Some(Host::IpAddr(ip)) => ip,
+            _ => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        }
+    }
+
+    async fn record_auth_rejection(
+        &self,
+        tx: &Transaction,
+        status_code: &rsipstack::sip::StatusCode,
+    ) {
+        let Some(sender) = self.server.callrecord_sender.as_ref() else {
+            return;
+        };
+
+        // Throttle per source IP so a flood of unique-Call-ID INVITEs can't
+        // amplify into unbounded CDR rows. The 407 is still sent regardless.
+        let source_ip = self.source_ip(tx);
+        if !self.rejection_limiter.allow(source_ip).await {
+            debug!(%source_ip, "auth-rejection CDR suppressed: per-source rate limit");
+            return;
+        }
+
+        let call_id = tx
+            .original
+            .call_id_header()
+            .map(|h| h.value().to_string())
+            .unwrap_or_default();
+        if call_id.is_empty() {
+            return;
+        }
+
+        let caller = tx
+            .original
+            .from_header()
+            .ok()
+            .and_then(|h| h.uri().ok())
+            .map(|u| u.to_string())
+            .unwrap_or_default();
+        let callee = tx
+            .original
+            .to_header()
+            .ok()
+            .and_then(|h| h.uri().ok())
+            .map(|u| u.to_string())
+            .unwrap_or_default();
+        let endpoint = self.get_source_addr(tx).map(|a| a.addr.to_string());
+        let record =
+            build_auth_rejection_record(call_id, &caller, &callee, endpoint, status_code, Utc::now());
+
+        if sender.send(record).is_err() {
+            debug!("auth-rejection CDR not recorded: call_record channel closed");
+        }
     }
 
     /// Extract cache key (call_id, from_tag) from a transaction.
@@ -479,6 +572,15 @@ impl ProxyModule for AuthModule {
                     %source,
                     "Authentication failed, sending challenge"
                 );
+                // Record a CDR for INVITEs that presented credentials which
+                // failed (e.g. an unprovisioned user). The routine no-creds
+                // first challenge is skipped — that call still succeeds on its
+                // authenticated re-INVITE and is logged normally.
+                if tx.original.method == rsipstack::sip::Method::Invite
+                    && Self::request_has_auth_credentials(tx)
+                {
+                    self.record_auth_rejection(tx, &status_code).await;
+                }
                 tx.reply_with(status_code, headers, None).await.ok();
                 Ok(ProxyAction::Abort)
             }
@@ -490,5 +592,91 @@ impl ProxyModule for AuthModule {
                 Err(anyhow::anyhow!("Authentication error: {}", e))
             }
         }
+    }
+}
+
+/// Build the minimal call-record emitted when an inbound INVITE fails
+/// authentication. Pure (no I/O) so it can be unit-tested. `call_id` is the
+/// inbound SIP Call-ID, which a later successful re-INVITE shares — letting
+/// the success CDR supersede this row via the upsert keyed on `call_id`.
+fn build_auth_rejection_record(
+    call_id: String,
+    caller: &str,
+    callee: &str,
+    endpoint: Option<String>,
+    status_code: &rsipstack::sip::StatusCode,
+    now: chrono::DateTime<Utc>,
+) -> CallRecord {
+    let code = status_code.code();
+    let reason = status_code.text().to_string();
+    CallRecord {
+        call_id,
+        start_time: now,
+        ring_time: None,
+        answer_time: None,
+        end_time: now,
+        caller: caller.to_string(),
+        callee: callee.to_string(),
+        status_code: code,
+        hangup_reason: Some(CallRecordHangupReason::Rejected),
+        hangup_messages: vec![CallRecordHangupMessage {
+            code,
+            reason: Some(reason.clone()),
+            target: Some("auth".to_string()),
+            endpoint,
+        }],
+        recorder: vec![],
+        sip_leg_roles: HashMap::new(),
+        leg_timeline: crate::callrecord::LegTimeline::default(),
+        details: CallDetails {
+            direction: "inbound".to_string(),
+            status: "failed".to_string(),
+            from_number: extract_sip_username(caller),
+            to_number: extract_sip_username(callee),
+            last_error: Some(CallRecordLastError {
+                code,
+                reason: Some(reason),
+            }),
+            ..Default::default()
+        },
+        extensions: http::Extensions::new(),
+    }
+}
+
+#[cfg(test)]
+mod auth_rejection_tests {
+    use super::*;
+
+    #[test]
+    fn auth_rejection_record_has_leg_origin_and_endpoint() {
+        let rec = build_auth_rejection_record(
+            "call-abc@provider".to_string(),
+            "sip:+918071539101@44.238.177.138:5060",
+            "sip:+919311429006@sip-lb1.unpod.tel",
+            Some("44.238.177.138:5060".to_string()),
+            &rsipstack::sip::StatusCode::ProxyAuthenticationRequired,
+            Utc::now(),
+        );
+
+        assert_eq!(rec.call_id, "call-abc@provider");
+        assert_eq!(rec.status_code, 407);
+        assert_eq!(rec.details.direction, "inbound");
+        assert_eq!(rec.details.status, "failed");
+        assert_eq!(rec.details.from_number.as_deref(), Some("+918071539101"));
+        assert_eq!(rec.details.to_number.as_deref(), Some("+919311429006"));
+        assert!(matches!(
+            rec.hangup_reason,
+            Some(CallRecordHangupReason::Rejected)
+        ));
+        assert_eq!(rec.answer_time, None, "auth-rejected call never answered");
+
+        let msg = rec.hangup_messages.first().expect("one hangup message");
+        assert_eq!(msg.code, 407);
+        assert_eq!(msg.target.as_deref(), Some("auth"));
+        assert_eq!(msg.endpoint.as_deref(), Some("44.238.177.138:5060"));
+        assert_eq!(
+            rec.details.last_error.as_ref().map(|e| e.code),
+            Some(407)
+        );
     }
 }

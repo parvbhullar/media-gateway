@@ -40,6 +40,7 @@ pub struct SessionHangupMessage {
     pub code: u16,
     pub reason: Option<String>,
     pub target: Option<String>,
+    pub endpoint: Option<String>,
 }
 
 impl From<&SessionHangupMessage> for CallRecordHangupMessage {
@@ -48,6 +49,7 @@ impl From<&SessionHangupMessage> for CallRecordHangupMessage {
             code: message.code,
             reason: message.reason.clone(),
             target: message.target.clone(),
+            endpoint: message.endpoint.clone(),
         }
     }
 }
