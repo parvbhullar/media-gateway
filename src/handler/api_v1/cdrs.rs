@@ -29,6 +29,10 @@ pub struct CdrView {
     pub status: String,
     pub status_code: Option<i16>,
     pub hangup_reason: Option<String>,
+    /// Failure origin: "sbc" | "upstream" | "caller"; null for a successful or
+    /// clean-hangup call. Lets a consumer tell an SBC-side 503 from a carrier
+    /// 503 (503-attribution).
+    pub failure_source: Option<String>,
     pub started_at: DateTime<Utc>,
     pub answer_time: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
@@ -68,6 +72,7 @@ impl From<CdrModel> for CdrView {
             status: m.status,
             status_code: m.status_code,
             hangup_reason: m.hangup_reason,
+            failure_source: m.failure_source,
             started_at: m.started_at,
             answer_time: m.answer_time,
             ended_at: m.ended_at,
@@ -100,6 +105,10 @@ pub struct CdrListQuery {
     /// Filter by final SIP response code (e.g. 486, 503).
     #[serde(default)]
     pub status_code: Option<i16>,
+    /// Filter by failure origin ("sbc" | "upstream" | "caller"), e.g. to count
+    /// SBC-side 503s vs carrier 503s (503-attribution).
+    #[serde(default)]
+    pub failure_source: Option<String>,
     #[serde(default)]
     pub from_number: Option<String>,
     #[serde(default)]
@@ -150,6 +159,9 @@ async fn list_cdrs(
     }
     if let Some(v) = q.status_code {
         conds = conds.add(CdrColumn::StatusCode.eq(v));
+    }
+    if let Some(v) = q.failure_source.as_ref().filter(|s| !s.is_empty()) {
+        conds = conds.add(CdrColumn::FailureSource.eq(v.clone()));
     }
     if let Some(v) = q.from_number.as_ref().filter(|s| !s.is_empty()) {
         // Prefix match — matches Postman doc ("Filter by caller number prefix").
