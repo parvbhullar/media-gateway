@@ -61,7 +61,6 @@ pub struct GatewayView {
     pub is_active: bool,
     pub max_concurrent: Option<i32>,
     pub max_cps: Option<i32>,
-    pub allowed_ips: Option<JsonValue>,
     pub last_health_check_at: Option<chrono::DateTime<chrono::Utc>>,
     pub consecutive_failures: i32,
     pub consecutive_successes: i32,
@@ -106,7 +105,6 @@ impl GatewayView {
             is_active: m.is_active,
             max_concurrent: m.max_concurrent,
             max_cps: m.max_cps,
-            allowed_ips: m.allowed_ips,
             last_health_check_at: m.last_health_check_at,
             consecutive_failures: m.consecutive_failures,
             consecutive_successes: m.consecutive_successes,
@@ -510,7 +508,6 @@ async fn create_gateway(
         created_at: Set(now),
         updated_at: Set(now),
         kind_config: Set(kind_config),
-        allowed_ips: Set(req.allowed_ips.map(|v| serde_json::json!(v))),
         ..Default::default()
     };
     let inserted = am

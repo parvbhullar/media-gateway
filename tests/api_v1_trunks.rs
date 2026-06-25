@@ -1029,6 +1029,7 @@ async fn delete_trunk_blocked_by_did_reference_returns_409() {
     let now = Utc::now();
     let did_am = did::ActiveModel {
         number: Set("+15551234567".to_string()),
+        org_id: Set("default".to_string()),
         trunk_name: Set(None),
         extension_number: Set(None),
         failover_trunk: Set(None),
@@ -1114,7 +1115,7 @@ async fn delete_trunk_blocked_by_route_reference_returns_409() {
         header_filters: Set(None),
         rewrite_rules: Set(None),
         target_trunks: Set(Some(json!(["tg-route-block"]))),
-        owner: Set(None),
+        org_id: Set("default".to_string()),
         notes: Set(None),
         metadata: Set(None),
         created_at: Set(now),
@@ -1198,7 +1199,7 @@ async fn delete_trunk_not_blocked_by_unrelated_route_returns_204() {
         header_filters: Set(None),
         rewrite_rules: Set(None),
         target_trunks: Set(Some(json!(["some-other-tg"]))),
-        owner: Set(None),
+        org_id: Set("default".to_string()),
         notes: Set(None),
         metadata: Set(None),
         created_at: Set(now),
