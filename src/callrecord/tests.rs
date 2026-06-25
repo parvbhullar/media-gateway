@@ -305,3 +305,34 @@ fn test_call_record_filename_sanitization() {
     assert!(!filename.contains("/"));
     assert!(!filename.contains("|"));
 }
+
+#[test]
+fn call_record_serializes_failure_source_as_camel_case_token() {
+    let mut record = CallRecord {
+        call_id: "fs_call".to_string(),
+        status_code: 503,
+        ..Default::default()
+    };
+    record.details.failure_source = Some(FailureSource::Sbc);
+
+    let json = serde_json::to_value(&record).expect("serialize");
+    // Flattened from CallDetails to a top-level camelCase key with a snake_case token.
+    assert_eq!(json["failureSource"], "sbc");
+}
+
+#[test]
+fn call_record_failure_source_is_null_when_absent() {
+    // Flattened CallDetails Option fields serialize as JSON null (see the
+    // sibling `lastError`), so failureSource is null — not the failure token —
+    // for a successful or clean-hangup call. Consumers treat null as
+    // "no attribution".
+    let record = CallRecord {
+        call_id: "fs_none".to_string(),
+        ..Default::default()
+    };
+    let json = serde_json::to_value(&record).expect("serialize");
+    assert!(
+        json["failureSource"].is_null(),
+        "failureSource must be null when None, got {json:?}"
+    );
+}

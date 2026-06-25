@@ -91,6 +91,9 @@ pub struct CallDetails {
     #[serde(default)]
     pub rewrite: CallRecordRewrite,
     pub last_error: Option<CallRecordLastError>,
+    /// Originating side of a call failure (SBC vs upstream carrier vs caller),
+    /// for 503/error attribution. `None` for a successful or clean-hangup call.
+    pub failure_source: Option<FailureSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, String>>,
 }

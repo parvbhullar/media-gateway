@@ -565,6 +565,8 @@ impl From<Model> for CallRecord {
                 destination: None,
             },
             last_error: None,
+            // Populated from the persisted column in a later slice (read path).
+            failure_source: None,
         };
 
         let leg_timeline = val

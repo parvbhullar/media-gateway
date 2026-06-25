@@ -152,6 +152,10 @@ impl CallSessionBuilder {
             ring_time: None,
             answer_time: None,
             last_error: Some((code, reason)),
+            // report_failure is the SBC's own pre-bridge rejection path
+            // (no route, capacity exhausted, unsupported trunk kind, dispatch
+            // failure) — always a self-generated failure.
+            failure_source: Some(crate::callrecord::FailureSource::Sbc),
             hangup_reason: Some(crate::callrecord::CallRecordHangupReason::Failed),
             hangup_messages: vec![],
             // callee_hangup_reason: None,
