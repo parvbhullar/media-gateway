@@ -2556,8 +2556,12 @@ impl SipSession {
                                 } else {
 
                                     let code = StatusCode::from(resp.status_code.code());
-
-                                    Err((code, None))
+                                    // Preserve the carrier's RFC 3326 Reason header (its
+                                    // detailed cause) on the CDR, instead of only the code.
+                                    let reason = crate::proxy::proxy_call::callee_reason::callee_reason_text(
+                                        get_header_value(&resp.headers, "Reason"),
+                                    );
+                                    Err((code, reason))
                                 }
                             } else {
                                 Err((StatusCode::ServerInternalError, Some("No response from callee".to_string())))
