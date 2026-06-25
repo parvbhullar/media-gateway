@@ -212,6 +212,17 @@ impl AuthModule {
         })
     }
 
+    /// Source IP of the request, used as the rate-limit key. Requests whose
+    /// source is a domain or unknown share a single catch-all bucket
+    /// (`0.0.0.0`) so they remain bounded too.
+    fn source_ip(&self, tx: &Transaction) -> IpAddr {
+        use rsipstack::sip::uri::Host;
+        match self.get_source_addr(tx).map(|a| a.addr.host) {
+            Some(Host::IpAddr(ip)) => ip,
+            _ => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        }
+    }
+
     /// Persist a minimal call-record for an inbound INVITE that presented
     /// credentials which failed authentication (e.g. an unprovisioned user).
     /// Without this the attempt vanishes: auth aborts the module pipeline
@@ -224,17 +235,6 @@ impl AuthModule {
     /// (which RFC 3261 requires for the same call attempt, and LiveKit/Vapi do).
     /// A UA that mints a fresh Call-ID per attempt would leave this row
     /// un-superseded — an orphaned but not incorrect "failed attempt".
-    /// Source IP of the request, used as the rate-limit key. Requests whose
-    /// source is a domain or unknown share a single catch-all bucket
-    /// (`0.0.0.0`) so they remain bounded too.
-    fn source_ip(&self, tx: &Transaction) -> IpAddr {
-        use rsipstack::sip::uri::Host;
-        match self.get_source_addr(tx).map(|a| a.addr.host) {
-            Some(Host::IpAddr(ip)) => ip,
-            _ => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-        }
-    }
-
     async fn record_auth_rejection(
         &self,
         tx: &Transaction,
