@@ -6,6 +6,9 @@ use axum::{
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use rustpbx::models::call_record::{self, ActiveModel as CdrAm};
+use rustpbx::models::sip_trunk::{
+    self, SipTransport, SipTrunkConfig, SipTrunkDirection, SipTrunkStatus,
+};
 use sea_orm::{ActiveModelTrait, Set};
 use serde_json::Value;
 use tower::ServiceExt;
@@ -426,4 +429,125 @@ async fn list_cdrs_exposes_and_filters_failure_source() {
     assert_eq!(body["items"][0]["failure_source"], "sbc");
     assert_eq!(body["items"][0]["status_code"], 503);
     assert_eq!(body["items"][0]["call_id"], "call-sbc");
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/cdrs/summary — aggregated counts (per status / per source / per
+// trunk via filter)
+// ---------------------------------------------------------------------------
+
+async fn insert_trunk(state: &rustpbx::app::AppState, name: &str) -> sip_trunk::Model {
+    let now = Utc::now();
+    let cfg = SipTrunkConfig {
+        sip_server: Some("sip.example.com:5060".to_string()),
+        sip_transport: SipTransport::Udp,
+        register_enabled: false,
+        rewrite_hostport: true,
+        ..Default::default()
+    };
+    let am = sip_trunk::ActiveModel {
+        name: Set(name.to_string()),
+        kind: Set("sip".into()),
+        display_name: Set(Some(name.to_string())),
+        direction: Set(SipTrunkDirection::Outbound),
+        status: Set(SipTrunkStatus::Healthy),
+        is_active: Set(true),
+        consecutive_failures: Set(0),
+        consecutive_successes: Set(0),
+        kind_config: Set(serde_json::to_value(&cfg).unwrap()),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    };
+    am.insert(state.db()).await.expect("insert trunk")
+}
+
+async fn seed_cdr_full(
+    state: &rustpbx::app::AppState,
+    call_id: &str,
+    status: &str,
+    status_code: i16,
+    failure_source: Option<&str>,
+    sip_trunk_id: Option<i64>,
+) {
+    let now = Utc::now();
+    let am = CdrAm {
+        call_id: Set(call_id.to_string()),
+        direction: Set("outbound".to_string()),
+        status: Set(status.to_string()),
+        status_code: Set(Some(status_code)),
+        failure_source: Set(failure_source.map(String::from)),
+        sip_trunk_id: Set(sip_trunk_id),
+        started_at: Set(now),
+        ended_at: Set(Some(now)),
+        duration_secs: Set(0),
+        has_transcript: Set(false),
+        transcript_status: Set("none".to_string()),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    };
+    am.insert(state.db()).await.expect("seed cdr full");
+}
+
+#[tokio::test]
+async fn cdr_summary_aggregates_status_and_failure_source() {
+    let (state, token) = test_state_with_api_key("cdr-summary").await;
+    seed_cdr_full(&state, "c1", "completed", 200, None, None).await;
+    seed_cdr_full(&state, "c2", "failed", 503, Some("sbc"), None).await;
+    seed_cdr_full(&state, "c3", "failed", 503, Some("upstream"), None).await;
+    seed_cdr_full(&state, "c4", "failed", 486, Some("upstream"), None).await;
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/cdrs/summary")
+                .header(header::AUTHORIZATION, bearer(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+
+    assert_eq!(body["total"], 4);
+    assert_eq!(body["answered"], 1);
+    assert_eq!(body["failed"], 3);
+    // SIP-code breakdown.
+    assert_eq!(body["by_status_code"]["503"], 2);
+    assert_eq!(body["by_status_code"]["486"], 1);
+    assert_eq!(body["by_status_code"]["200"], 1);
+    // Ours-vs-carrier breakdown.
+    assert_eq!(body["by_failure_source"]["sbc"], 1);
+    assert_eq!(body["by_failure_source"]["upstream"], 2);
+    assert_eq!(body["by_failure_source"]["none"], 1);
+}
+
+#[tokio::test]
+async fn cdr_summary_filters_by_trunk() {
+    let (state, token) = test_state_with_api_key("cdr-summary-trunk").await;
+    let trunk_a = insert_trunk(&state, "summary-trunk-a").await;
+    let trunk_b = insert_trunk(&state, "summary-trunk-b").await;
+    seed_cdr_full(&state, "t1", "completed", 200, None, Some(trunk_a.id)).await;
+    seed_cdr_full(&state, "t2", "failed", 503, Some("sbc"), Some(trunk_a.id)).await;
+    seed_cdr_full(&state, "t3", "failed", 486, Some("upstream"), Some(trunk_b.id)).await;
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(&format!("/api/v1/cdrs/summary?sip_trunk_id={}", trunk_a.id))
+                .header(header::AUTHORIZATION, bearer(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["total"], 2, "only trunk 7's calls");
+    assert_eq!(body["by_status_code"]["503"], 1);
+    assert!(body["by_status_code"].get("486").is_none());
 }

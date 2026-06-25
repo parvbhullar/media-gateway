@@ -11,7 +11,10 @@ use axum::{
     routing::get,
 };
 use chrono::{DateTime, Utc};
-use sea_orm::{ColumnTrait, Condition, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder};
+use sea_orm::{
+    ColumnTrait, Condition, EntityTrait, FromQueryResult, PaginatorTrait, QueryFilter, QueryOrder,
+    QuerySelect,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::app::AppState;
@@ -42,6 +45,8 @@ pub struct CdrView {
     pub from_number: Option<String>,
     pub to_number: Option<String>,
     pub sip_gateway: Option<String>,
+    /// Terminating trunk id, for per-trunk attribution/summary.
+    pub sip_trunk_id: Option<i64>,
     /// Matched route + terminating extension, for call attribution (task 2.4).
     pub route_id: Option<i64>,
     pub extension_id: Option<i64>,
@@ -81,6 +86,7 @@ impl From<CdrModel> for CdrView {
             from_number: m.from_number,
             to_number: m.to_number,
             sip_gateway: m.sip_gateway,
+            sip_trunk_id: m.sip_trunk_id,
             route_id: m.route_id,
             extension_id: m.extension_id,
             caller_uri: m.caller_uri,
@@ -136,6 +142,7 @@ impl CdrListQuery {
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/cdrs", get(list_cdrs))
+        .route("/cdrs/summary", get(cdr_summary))
         .route("/cdrs/{id}", get(get_cdr).delete(delete_cdr))
         .route("/cdrs/{id}/recording", get(cdr_recording_stub))
         .route("/cdrs/{id}/sip-flow", get(cdr_sip_flow_stub))
@@ -206,6 +213,148 @@ async fn list_cdrs(
         page_size,
         total,
     )))
+}
+
+/// Filters for the aggregated CDR summary. Mirror the list filters plus a
+/// per-trunk filter, so a caller gets a per-number summary via `number=` and a
+/// per-trunk summary via `sip_trunk_id=`, both over an optional time window.
+#[derive(Debug, Deserialize)]
+pub struct CdrSummaryQuery {
+    #[serde(default)]
+    pub start_date: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub end_date: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub direction: Option<String>,
+    #[serde(default)]
+    pub from_number: Option<String>,
+    #[serde(default)]
+    pub to_number: Option<String>,
+    /// Substring match against either from_number or to_number.
+    #[serde(default)]
+    pub number: Option<String>,
+    #[serde(default)]
+    pub sip_trunk_id: Option<i64>,
+}
+
+/// Aggregated CDR counts: totals plus a per-SIP-code and per-failure-source
+/// (sbc vs carrier) breakdown for the filtered window — the data behind a
+/// "how many calls, how many failed, how many 503s and whose fault" summary.
+#[derive(Debug, Serialize)]
+pub struct CdrSummaryResponse {
+    pub total: i64,
+    pub answered: i64,
+    pub failed: i64,
+    pub by_status_code: std::collections::BTreeMap<String, i64>,
+    pub by_failure_source: std::collections::BTreeMap<String, i64>,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct StatusCodeCount {
+    status_code: Option<i16>,
+    cnt: i64,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct FailureSourceCount {
+    failure_source: Option<String>,
+    cnt: i64,
+}
+
+fn summary_conditions(q: &CdrSummaryQuery) -> Condition {
+    let mut conds = Condition::all();
+    if let Some(v) = q.direction.as_ref().filter(|s| !s.is_empty()) {
+        conds = conds.add(CdrColumn::Direction.eq(v.clone()));
+    }
+    if let Some(v) = q.from_number.as_ref().filter(|s| !s.is_empty()) {
+        conds = conds.add(CdrColumn::FromNumber.like(format!("{}%", v)));
+    }
+    if let Some(v) = q.to_number.as_ref().filter(|s| !s.is_empty()) {
+        conds = conds.add(CdrColumn::ToNumber.like(format!("{}%", v)));
+    }
+    if let Some(v) = q.number.as_ref().filter(|s| !s.is_empty()) {
+        let pat = format!("%{}%", v);
+        conds = conds.add(
+            Condition::any()
+                .add(CdrColumn::FromNumber.like(pat.clone()))
+                .add(CdrColumn::ToNumber.like(pat)),
+        );
+    }
+    if let Some(v) = q.sip_trunk_id {
+        conds = conds.add(CdrColumn::SipTrunkId.eq(v));
+    }
+    if let Some(v) = q.start_date {
+        conds = conds.add(CdrColumn::StartedAt.gte(v));
+    }
+    if let Some(v) = q.end_date {
+        conds = conds.add(CdrColumn::StartedAt.lte(v));
+    }
+    conds
+}
+
+async fn cdr_summary(
+    State(state): State<AppState>,
+    Query(q): Query<CdrSummaryQuery>,
+) -> ApiResult<Json<CdrSummaryResponse>> {
+    let db = state.db();
+    let conds = summary_conditions(&q);
+
+    let to_internal = |e: sea_orm::DbErr| ApiError::internal(e.to_string());
+
+    let total = CdrEntity::find()
+        .filter(conds.clone())
+        .count(db)
+        .await
+        .map_err(to_internal)? as i64;
+    let answered = CdrEntity::find()
+        .filter(conds.clone())
+        .filter(CdrColumn::Status.is_in(["answered", "completed"]))
+        .count(db)
+        .await
+        .map_err(to_internal)? as i64;
+
+    let code_rows = CdrEntity::find()
+        .filter(conds.clone())
+        .select_only()
+        .column(CdrColumn::StatusCode)
+        .column_as(CdrColumn::Id.count(), "cnt")
+        .group_by(CdrColumn::StatusCode)
+        .into_model::<StatusCodeCount>()
+        .all(db)
+        .await
+        .map_err(to_internal)?;
+    let mut by_status_code = std::collections::BTreeMap::new();
+    for row in code_rows {
+        if let Some(code) = row.status_code {
+            by_status_code.insert(code.to_string(), row.cnt);
+        }
+    }
+
+    let src_rows = CdrEntity::find()
+        .filter(conds.clone())
+        .select_only()
+        .column(CdrColumn::FailureSource)
+        .column_as(CdrColumn::Id.count(), "cnt")
+        .group_by(CdrColumn::FailureSource)
+        .into_model::<FailureSourceCount>()
+        .all(db)
+        .await
+        .map_err(to_internal)?;
+    let mut by_failure_source = std::collections::BTreeMap::new();
+    for row in src_rows {
+        by_failure_source.insert(
+            row.failure_source.unwrap_or_else(|| "none".to_string()),
+            row.cnt,
+        );
+    }
+
+    Ok(Json(CdrSummaryResponse {
+        total,
+        answered,
+        failed: total - answered,
+        by_status_code,
+        by_failure_source,
+    }))
 }
 
 async fn get_cdr(
