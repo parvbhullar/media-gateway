@@ -1,5 +1,5 @@
 use crate::call::{DialDirection, Dialplan, TransactionCookie};
-use crate::callrecord::{CallRecordHangupMessage, CallRecordHangupReason};
+use crate::callrecord::{CallRecordHangupMessage, CallRecordHangupReason, FailureSource};
 use crate::proxy::active_call_registry::{
     ActiveProxyCallEntry, ActiveProxyCallRegistry, ActiveProxyCallStatus,
 };
@@ -19,6 +19,7 @@ pub struct CallSessionRecordSnapshot {
     pub ring_time: Option<Instant>,
     pub answer_time: Option<Instant>,
     pub last_error: Option<(StatusCode, Option<String>)>,
+    pub failure_source: Option<FailureSource>,
     pub hangup_reason: Option<CallRecordHangupReason>,
     pub hangup_messages: Vec<CallRecordHangupMessage>,
     pub original_caller: Option<String>,

@@ -12,6 +12,11 @@ use serde::{Deserialize, Serialize};
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = true)]
     pub id: i64,
+    /// Owning tenant (task 3.2). Existing keys seed to `1` (the bootstrap admin
+    /// tenant). The auth middleware attaches this to request extensions as the
+    /// org_id source for downstream per-tenant enforcement (3.1b). Added by the
+    /// `add_tenant_id_to_api_keys` migration.
+    pub tenant_id: i64,
     #[sea_orm(unique)]
     pub name: String,
     /// Lowercase hex SHA-256 of the plaintext token. 64 chars.

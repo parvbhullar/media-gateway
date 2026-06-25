@@ -295,6 +295,8 @@ async fn create_extension(
     let now = Utc::now();
     let active = ExtActive {
         id: ActiveValue::NotSet,
+        // org_id left unset → DB default ('default') until 3.1b threads the real org_id
+        org_id: ActiveValue::NotSet,
         extension: Set(ext),
         display_name: Set(req.display_name),
         email: Set(req.email),

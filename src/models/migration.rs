@@ -46,6 +46,33 @@ impl MigratorTrait for Migrator {
             Box::new(super::add_trunks_last_health_check_at::Migration),
             Box::new(super::fix_sip_trunk_kind_config_booleans::Migration),
             Box::new(super::add_cdr_status_answer_columns::Migration),
+            // task 2.1 — durable webhook delivery queue. MUST be registered
+            // here or the table is never created in production (the migrator
+            // runs only this explicit list).
+            Box::new(super::webhook_outbox::Migration),
+            // task 2.3 — billable (answered) duration column on call records.
+            Box::new(super::add_cdr_billable_duration_column::Migration),
+            // task 3.1 — org_id tenant-isolation column on rustpbx_dids. MUST be
+            // registered here or the column is never created in production.
+            Box::new(super::add_org_id_did::Migration),
+            // task 3.1 — org_id tenant-isolation columns on extensions, trunks,
+            // routes, and routing tables (the `did` template replicated). Each
+            // MUST be registered here or the column is never created in
+            // production. `add_org_id_routing` is the additive slice; the
+            // owner→org_id reconcile (drop `owner`) is deferred.
+            Box::new(super::add_org_id_extension::Migration),
+            Box::new(super::add_org_id_trunk::Migration),
+            Box::new(super::add_org_id_routing::Migration),
+            Box::new(super::add_org_id_routing_tables::Migration),
+            // task 3.1 reconcile — backfill org_id from the legacy `owner`
+            // column on rustpbx_routes, then drop `owner`. MUST run AFTER
+            // add_org_id_routing (which creates org_id).
+            Box::new(super::backfill_org_id_routing::Migration),
+            // task 3.2 — tenant_id scoping column on rustpbx_api_keys (the
+            // request-context tenant/org source). MUST be registered here.
+            Box::new(super::add_tenant_id_to_api_keys::Migration),
+            // 503-attribution — failure_source column on rustpbx_call_records.
+            Box::new(super::add_cdr_failure_source_column::Migration),
         ]
     }
 }

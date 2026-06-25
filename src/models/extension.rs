@@ -1,5 +1,5 @@
 use sea_orm::entity::prelude::*;
-use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr, QueryFilter};
+use sea_orm::{ActiveValue::Set, ConnectionTrait, DatabaseConnection, DbErr, QueryFilter};
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::schema::{
     boolean, integer_null, string, string_null, text_null, timestamp, timestamp_null,
@@ -36,6 +36,9 @@ pub struct Model {
     pub created_at: DateTimeUtc,
     #[sea_orm(column_type = "DateTime", default_value = "CURRENT_TIMESTAMP")]
     pub updated_at: DateTimeUtc,
+    /// Owning org (task 3.1 tenant isolation). DB default `'default'` until 3.1b
+    /// threads the real org_id from request context.
+    pub org_id: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter)]
@@ -58,6 +61,30 @@ impl Related<super::department::Entity> for Entity {
 }
 
 impl ActiveModelBehavior for ActiveModel {}
+
+impl Model {
+    /// List extensions owned by `org_id` (task 3.1 tenant isolation).
+    pub async fn list_by_org(
+        db: &DatabaseConnection,
+        org_id: &str,
+    ) -> Result<Vec<Self>, DbErr> {
+        Entity::find().filter(Column::OrgId.eq(org_id)).all(db).await
+    }
+
+    /// Get an extension by its number, scoped to `org_id` — `None` when the
+    /// extension belongs to a different org (cross-tenant lookups never resolve).
+    pub async fn get_by_org(
+        db: &DatabaseConnection,
+        org_id: &str,
+        extension: &str,
+    ) -> Result<Option<Self>, DbErr> {
+        Entity::find()
+            .filter(Column::Extension.eq(extension))
+            .filter(Column::OrgId.eq(org_id))
+            .one(db)
+            .await
+    }
+}
 
 impl Entity {
     pub async fn find_by_id_with_departments<C>(
@@ -176,6 +203,81 @@ mod tests {
 
         assert_eq!(result.1.len(), 1, "extension should have one department");
         assert_eq!(result.1[0].id, sales.id);
+    }
+}
+
+#[cfg(test)]
+mod org_id_tests {
+    use super::*;
+    use crate::models::migration::Migrator;
+    use sea_orm::{ActiveModelTrait, Database};
+    use sea_orm_migration::MigratorTrait;
+
+    async fn fresh() -> DatabaseConnection {
+        let db = Database::connect("sqlite::memory:").await.expect("sqlite");
+        Migrator::up(&db, None).await.expect("migrate");
+        db
+    }
+
+    async fn insert_extension(db: &DatabaseConnection, ext: &str, org: &str) {
+        ActiveModel {
+            extension: Set(ext.to_string()),
+            org_id: Set(org.to_string()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("insert extension");
+    }
+
+    #[tokio::test]
+    async fn list_by_org_isolates_tenants() {
+        let db = fresh().await;
+        insert_extension(&db, "1001", "org_a").await;
+        insert_extension(&db, "2001", "org_b").await;
+        let a = Model::list_by_org(&db, "org_a").await.unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].extension, "1001");
+        assert_eq!(a[0].org_id, "org_a");
+    }
+
+    #[tokio::test]
+    async fn get_by_org_rejects_foreign_tenant() {
+        let db = fresh().await;
+        insert_extension(&db, "1001", "org_a").await;
+        // The extension exists but belongs to org_a → a cross-tenant get is None.
+        assert!(
+            Model::get_by_org(&db, "org_b", "1001")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            Model::get_by_org(&db, "org_a", "1001")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_defaults_org_id() {
+        // A plain insert leaves org_id NotSet → the column default ('default')
+        // applies, so existing write paths keep working until 3.1b threads a
+        // real org_id.
+        let db = fresh().await;
+        ActiveModel {
+            extension: Set("3001".to_string()),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("insert extension");
+        let row = Model::get_by_org(&db, "default", "3001")
+            .await
+            .unwrap()
+            .expect("row under default org");
+        assert_eq!(row.org_id, "default");
     }
 }
 

@@ -25,13 +25,48 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use chrono::{Duration as ChronoDuration, Utc};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set,
+};
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
 use super::signer;
 use super::{WebhookCancelRegistry, WebhookEvent, WebhookEventSender, current_unix_timestamp};
+use crate::models::webhook_outbox::{
+    ActiveModel as OutboxAm, Column as OutboxColumn, Entity as OutboxEntity, STATUS_DELIVERED,
+    STATUS_FAILED, STATUS_PENDING,
+};
 use crate::models::webhooks::{Column as WhColumn, Entity as WhEntity, Model as WhModel};
+
+/// Lease (seconds) stamped on a `pending` outbox row at enqueue. The redelivery
+/// worker only re-drives a `pending` row after its lease expires — long enough
+/// (300s ≫ the ~36s worst-case in-process retry span) that a live delivery
+/// reaches its terminal state first, so the worker only ever recovers rows
+/// orphaned by a process crash.
+const OUTBOX_LEASE_SECS: i64 = 300;
+/// How often the redelivery worker scans for orphaned `pending` rows.
+const REDELIVERY_INTERVAL: Duration = Duration::from_secs(60);
+/// Max worker re-drives before a perpetually-orphaned row is failed (repeated
+/// crashes only; an endpoint that merely errors is failed in-process).
+const OUTBOX_MAX_ATTEMPTS: i32 = 10;
+/// Per-tick batch cap on the worker scan.
+const OUTBOX_BATCH: u64 = 100;
+
+/// Terminal classification returned by [`deliver_webhook`] so the caller can
+/// finalize the durable outbox row (task 2.1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum DeliveryOutcome {
+    /// A 2xx was received.
+    Delivered,
+    /// Permanent failure or retries exhausted (disk fallback written).
+    Failed(String),
+    /// Cancelled or the webhook was deactivated mid-flight — no terminal mark;
+    /// the row stays `pending` for the worker / operator (D-31/D-32).
+    Aborted,
+}
 
 // ─── Helpers (Task 1) ────────────────────────────────────────────────────
 
@@ -278,7 +313,7 @@ pub(super) async fn deliver_webhook(
     cancel_registry: Arc<WebhookCancelRegistry>,
     generated_dir: String,
     client: reqwest::Client,
-) {
+) -> DeliveryOutcome {
     deliver_webhook_with_schedule(
         webhook,
         event,
@@ -304,7 +339,7 @@ pub(super) async fn deliver_webhook_with_schedule(
     generated_dir: String,
     client: reqwest::Client,
     schedule: &'static [Duration],
-) {
+) -> DeliveryOutcome {
     let token = cancel_registry.insert(&webhook.id);
     let request_id = uuid::Uuid::new_v4().to_string();
     let mut attempts: Vec<AttemptLog> = Vec::new();
@@ -321,7 +356,7 @@ pub(super) async fn deliver_webhook_with_schedule(
         let outcome = tokio::select! {
             _ = token.cancelled() => {
                 // D-31 / D-34 cancel: exit silently, no disk fallback.
-                return;
+                return DeliveryOutcome::Aborted;
             }
             res = perform_attempt(&client, &current_webhook, &event, &envelope_body, &request_id) => res,
         };
@@ -332,7 +367,7 @@ pub(super) async fn deliver_webhook_with_schedule(
         match verdict {
             Verdict::Success => {
                 cancel_registry.remove(&current_webhook.id);
-                return;
+                return DeliveryOutcome::Delivered;
             }
             Verdict::PermanentFail => break,
             Verdict::Retry => {
@@ -349,7 +384,7 @@ pub(super) async fn deliver_webhook_with_schedule(
                     sleep_for = ra; // D-22
                 }
                 tokio::select! {
-                    _ = token.cancelled() => return,
+                    _ = token.cancelled() => return DeliveryOutcome::Aborted,
                     _ = tokio::time::sleep(sleep_for) => {}
                 }
                 // D-32 pre-flight DB recheck.
@@ -361,7 +396,7 @@ pub(super) async fn deliver_webhook_with_schedule(
                     _ => {
                         // missing or deactivated → abort, no fallback.
                         cancel_registry.remove(&current_webhook.id);
-                        return;
+                        return DeliveryOutcome::Aborted;
                     }
                 }
             }
@@ -379,6 +414,78 @@ pub(super) async fn deliver_webhook_with_schedule(
     )
     .await;
     cancel_registry.remove(&current_webhook.id);
+    DeliveryOutcome::Failed(failure_reason(&attempts))
+}
+
+/// Summarize the last attempt for the outbox `last_error` column.
+fn failure_reason(attempts: &[AttemptLog]) -> String {
+    match attempts.last() {
+        Some(a) => match (a.status_code, &a.error) {
+            (Some(s), _) => format!("status {s}"),
+            (None, Some(e)) => e.clone(),
+            (None, None) => "delivery failed".to_string(),
+        },
+        None => "delivery failed".to_string(),
+    }
+}
+
+// ─── Durable outbox helpers (task 2.1) ───────────────────────────────────────
+
+/// Insert a `pending` outbox row before delivery is attempted, returning its
+/// id (or `None`, logged, on DB error — enqueue is best-effort and must not
+/// break the fast path). `attempt_count` starts at 1 (the in-process delivery).
+pub(super) async fn outbox_insert_pending(
+    db: &DatabaseConnection,
+    webhook_id: &str,
+    event: &WebhookEvent,
+    envelope_body: &str,
+) -> Option<String> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let now = Utc::now();
+    let am = OutboxAm {
+        id: Set(id.clone()),
+        webhook_id: Set(webhook_id.to_string()),
+        event_id: Set(event.event_id.clone()),
+        event_name: Set(event.event.clone()),
+        envelope: Set(envelope_body.to_string()),
+        status: Set(STATUS_PENDING.to_string()),
+        attempt_count: Set(1),
+        last_error: Set(None),
+        next_retry_at: Set(now + ChronoDuration::seconds(OUTBOX_LEASE_SECS)),
+        created_at: Set(now),
+        updated_at: Set(now),
+    };
+    match am.insert(db).await {
+        Ok(_) => Some(id),
+        Err(e) => {
+            tracing::error!("webhook outbox insert failed: {e}");
+            None
+        }
+    }
+}
+
+/// Advance a row to its terminal state after delivery. `Aborted` leaves the row
+/// `pending` (cancel/deactivate is operator-driven, not a delivery failure).
+pub(super) async fn outbox_finalize(
+    db: &DatabaseConnection,
+    outbox_id: &str,
+    outcome: &DeliveryOutcome,
+) {
+    let (status, err) = match outcome {
+        DeliveryOutcome::Delivered => (STATUS_DELIVERED, None),
+        DeliveryOutcome::Failed(e) => (STATUS_FAILED, Some(e.clone())),
+        DeliveryOutcome::Aborted => return,
+    };
+    let am = OutboxAm {
+        id: Set(outbox_id.to_string()),
+        status: Set(status.to_string()),
+        last_error: Set(err),
+        updated_at: Set(Utc::now()),
+        ..Default::default()
+    };
+    if let Err(e) = am.update(db).await {
+        tracing::error!("webhook outbox finalize failed for {outbox_id}: {e}");
+    }
 }
 
 // ─── Test-event helper (07-05 D-28..D-30) ────────────────────────────────
@@ -470,16 +577,154 @@ pub async fn run_webhook_processor(
             let task_registry = cancel_registry.clone();
             let task_dir = generated_dir.clone();
             let task_client = client.clone();
-            tokio::spawn(deliver_webhook(
+            // task 2.1: durable record BEFORE delivery (synchronous insert +
+            // spawn — broadcast stays the fast path). A crash between here and
+            // a terminal mark leaves a `pending` row the worker recovers.
+            let outbox_id =
+                outbox_insert_pending(&db, &webhook.id, &event, &envelope_body).await;
+            let finalize_db = db.clone();
+            tokio::spawn(async move {
+                let outcome = deliver_webhook(
+                    webhook,
+                    task_event,
+                    task_body,
+                    task_db,
+                    task_registry,
+                    task_dir,
+                    task_client,
+                )
+                .await;
+                if let Some(oid) = outbox_id {
+                    outbox_finalize(&finalize_db, &oid, &outcome).await;
+                }
+            });
+        }
+    }
+}
+
+// ─── Redelivery worker (task 2.1) ────────────────────────────────────────────
+
+/// Re-drive `pending` outbox rows whose lease has expired — i.e. rows orphaned
+/// when the process crashed mid-delivery. Spawned at server boot beside
+/// [`run_webhook_processor`]. Runs every [`REDELIVERY_INTERVAL`] until `cancel`
+/// fires. Redelivery is safe to repeat: the stable `event_id` (2.2) lets the
+/// receiver dedup, so the worker favours liveness over exactly-once.
+pub async fn run_webhook_redelivery_worker(
+    db: DatabaseConnection,
+    cancel_registry: Arc<WebhookCancelRegistry>,
+    generated_dir: String,
+    cancel: CancellationToken,
+) {
+    let client = reqwest::Client::builder()
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => break,
+            _ = tokio::time::sleep(REDELIVERY_INTERVAL) => {}
+        }
+        redeliver_due_rows(&db, &cancel_registry, &generated_dir, &client).await;
+    }
+}
+
+/// One scan-and-redrive pass: claim each due `pending` row (re-lease + bump),
+/// then spawn a delivery that finalizes the row. Extracted from the worker loop
+/// so it is unit-testable without the [`REDELIVERY_INTERVAL`] sleep.
+pub(super) async fn redeliver_due_rows(
+    db: &DatabaseConnection,
+    cancel_registry: &Arc<WebhookCancelRegistry>,
+    generated_dir: &str,
+    client: &reqwest::Client,
+) {
+    let now = Utc::now();
+    let due = match OutboxEntity::find()
+        .filter(OutboxColumn::Status.eq(STATUS_PENDING))
+        .filter(OutboxColumn::NextRetryAt.lte(now))
+        .order_by_asc(OutboxColumn::NextRetryAt)
+        .limit(OUTBOX_BATCH)
+        .all(db)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("webhook redelivery scan failed: {e}");
+            return;
+        }
+    };
+
+    for row in due {
+        // Repeated-crash backstop: fail a row re-driven too many times.
+        if row.attempt_count >= OUTBOX_MAX_ATTEMPTS {
+            outbox_fail_row(db, &row.id, "max redelivery attempts exceeded").await;
+            continue;
+        }
+        // Re-lease + bump BEFORE re-driving so the next tick can't double-grab.
+        let leased = OutboxAm {
+            id: Set(row.id.clone()),
+            attempt_count: Set(row.attempt_count + 1),
+            next_retry_at: Set(now + ChronoDuration::seconds(OUTBOX_LEASE_SECS)),
+            updated_at: Set(now),
+            ..Default::default()
+        };
+        if let Err(e) = leased.update(db).await {
+            tracing::error!("webhook redelivery re-lease failed for {}: {e}", row.id);
+            continue;
+        }
+
+        // Webhook must still exist + be active, else the row is terminal.
+        let webhook = match WhEntity::find_by_id(row.webhook_id.clone()).one(db).await {
+            Ok(Some(w)) if w.is_active => w,
+            _ => {
+                outbox_fail_row(db, &row.id, "webhook missing or inactive").await;
+                continue;
+            }
+        };
+
+        // The POST body is the stored envelope verbatim; deliver_webhook only
+        // reads `event.event` (header) + `event.event_id` (fallback filename),
+        // so `data` is left Null (unused by delivery).
+        let event = WebhookEvent {
+            event_id: row.event_id.clone(),
+            event: row.event_name.clone(),
+            timestamp: current_unix_timestamp(),
+            data: serde_json::Value::Null,
+        };
+        let envelope_body = row.envelope.clone();
+        let task_db = db.clone();
+        let finalize_db = db.clone();
+        let task_registry = cancel_registry.clone();
+        let task_dir = generated_dir.to_string();
+        let task_client = client.clone();
+        let outbox_id = row.id.clone();
+        tokio::spawn(async move {
+            let outcome = deliver_webhook(
                 webhook,
-                task_event,
-                task_body,
+                event,
+                envelope_body,
                 task_db,
                 task_registry,
                 task_dir,
                 task_client,
-            ));
-        }
+            )
+            .await;
+            outbox_finalize(&finalize_db, &outbox_id, &outcome).await;
+        });
+    }
+}
+
+/// Mark a row `failed` with a reason (worker-side terminal: missing webhook,
+/// max attempts). Best-effort; logs on DB error.
+async fn outbox_fail_row(db: &DatabaseConnection, outbox_id: &str, reason: &str) {
+    let am = OutboxAm {
+        id: Set(outbox_id.to_string()),
+        status: Set(STATUS_FAILED.to_string()),
+        last_error: Set(Some(reason.to_string())),
+        updated_at: Set(Utc::now()),
+        ..Default::default()
+    };
+    if let Err(e) = am.update(db).await {
+        tracing::error!("webhook outbox fail-mark failed for {outbox_id}: {e}");
     }
 }
 
@@ -734,7 +979,11 @@ mod tests {
     #[async_trait::async_trait]
     impl MigratorTrait for TestMigrator {
         fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-            vec![Box::new(crate::models::webhooks::Migration)]
+            vec![
+                Box::new(crate::models::webhooks::Migration),
+                // task 2.1: outbox table so the durable enqueue path runs in tests.
+                Box::new(crate::models::webhook_outbox::Migration),
+            ]
         }
     }
 
@@ -1178,5 +1427,186 @@ mod tests {
 
         cancel.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+
+    // ─── outbox + redelivery (task 2.1) ─────────────────────────────────
+
+    async fn insert_outbox_row(
+        db: &DatabaseConnection,
+        id: &str,
+        webhook_id: &str,
+        next_retry_at: chrono::DateTime<Utc>,
+        attempt_count: i32,
+    ) {
+        let now = Utc::now();
+        let am = OutboxAm {
+            id: Set(id.to_string()),
+            webhook_id: Set(webhook_id.to_string()),
+            event_id: Set(format!("evt_{id}")),
+            event_name: Set("call.completed".to_string()),
+            envelope: Set(r#"{"event":"call.completed","data":{}}"#.to_string()),
+            status: Set(STATUS_PENDING.to_string()),
+            attempt_count: Set(attempt_count),
+            last_error: Set(None),
+            next_retry_at: Set(next_retry_at),
+            created_at: Set(now),
+            updated_at: Set(now),
+        };
+        am.insert(db).await.expect("insert outbox row");
+    }
+
+    async fn outbox_status(db: &DatabaseConnection, id: &str) -> Option<String> {
+        OutboxEntity::find_by_id(id.to_string())
+            .one(db)
+            .await
+            .expect("query outbox")
+            .map(|r| r.status)
+    }
+
+    #[tokio::test]
+    async fn outbox_insert_pending_persists_row() {
+        let db = fresh_sqlite().await;
+        let id = outbox_insert_pending(&db, "wh-x", &fixture_event(), r#"{"a":1}"#)
+            .await
+            .expect("insert returns id");
+        let row = OutboxEntity::find_by_id(id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, STATUS_PENDING);
+        assert_eq!(row.attempt_count, 1);
+        assert_eq!(row.event_id, "evt_test");
+        assert_eq!(row.webhook_id, "wh-x");
+    }
+
+    #[tokio::test]
+    async fn outbox_finalize_marks_delivered_and_failed() {
+        let db = fresh_sqlite().await;
+        let id = outbox_insert_pending(&db, "wh-x", &fixture_event(), "{}")
+            .await
+            .unwrap();
+        outbox_finalize(&db, &id, &DeliveryOutcome::Delivered).await;
+        assert_eq!(outbox_status(&db, &id).await.as_deref(), Some(STATUS_DELIVERED));
+
+        let id2 = outbox_insert_pending(&db, "wh-y", &fixture_event(), "{}")
+            .await
+            .unwrap();
+        outbox_finalize(&db, &id2, &DeliveryOutcome::Failed("status 400".into())).await;
+        let row = OutboxEntity::find_by_id(id2).one(&db).await.unwrap().unwrap();
+        assert_eq!(row.status, STATUS_FAILED);
+        assert_eq!(row.last_error.as_deref(), Some("status 400"));
+    }
+
+    #[tokio::test]
+    async fn outbox_finalize_aborted_leaves_pending() {
+        // cancel/deactivate must NOT terminalize the row (D-31/D-32).
+        let db = fresh_sqlite().await;
+        let id = outbox_insert_pending(&db, "wh-x", &fixture_event(), "{}")
+            .await
+            .unwrap();
+        outbox_finalize(&db, &id, &DeliveryOutcome::Aborted).await;
+        assert_eq!(outbox_status(&db, &id).await.as_deref(), Some(STATUS_PENDING));
+    }
+
+    #[tokio::test]
+    async fn redeliver_redrives_pending_past_lease() {
+        let (url, hits, _) = spawn_mock(vec![200], None).await;
+        let db = fresh_sqlite().await;
+        insert_webhook(&db, "wh-rd", &url, 3, 5000, serde_json::json!([]), true).await;
+        // Lease already expired (1h ago) → orphaned, must be re-driven.
+        insert_outbox_row(&db, "ob-rd", "wh-rd", Utc::now() - ChronoDuration::hours(1), 1)
+            .await;
+        let registry = Arc::new(WebhookCancelRegistry::new());
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_string_lossy().into_owned();
+        let client = test_client();
+
+        redeliver_due_rows(&db, &registry, &dir_str, &client).await;
+
+        for _ in 0..200 {
+            if hits.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "row past lease is re-driven");
+        for _ in 0..200 {
+            if outbox_status(&db, "ob-rd").await.as_deref() == Some(STATUS_DELIVERED) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            outbox_status(&db, "ob-rd").await.as_deref(),
+            Some(STATUS_DELIVERED),
+            "re-driven row finalizes delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn redeliver_skips_future_lease() {
+        let (url, hits, _) = spawn_mock(vec![200], None).await;
+        let db = fresh_sqlite().await;
+        insert_webhook(&db, "wh-fut", &url, 3, 5000, serde_json::json!([]), true).await;
+        // Lease in the future → a live delivery is presumed in-flight; skip.
+        insert_outbox_row(&db, "ob-fut", "wh-fut", Utc::now() + ChronoDuration::hours(1), 1)
+            .await;
+        let registry = Arc::new(WebhookCancelRegistry::new());
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_string_lossy().into_owned();
+        let client = test_client();
+
+        redeliver_due_rows(&db, &registry, &dir_str, &client).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "future-lease row untouched");
+        assert_eq!(outbox_status(&db, "ob-fut").await.as_deref(), Some(STATUS_PENDING));
+    }
+
+    #[tokio::test]
+    async fn redeliver_fails_row_when_webhook_missing() {
+        let db = fresh_sqlite().await;
+        // Pending row pointing at a webhook that no longer exists.
+        insert_outbox_row(&db, "ob-orphan", "wh-gone", Utc::now() - ChronoDuration::hours(1), 1)
+            .await;
+        let registry = Arc::new(WebhookCancelRegistry::new());
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_string_lossy().into_owned();
+        let client = test_client();
+
+        redeliver_due_rows(&db, &registry, &dir_str, &client).await;
+
+        assert_eq!(
+            outbox_status(&db, "ob-orphan").await.as_deref(),
+            Some(STATUS_FAILED),
+            "row whose webhook is gone is failed, not re-driven forever"
+        );
+    }
+
+    #[tokio::test]
+    async fn redeliver_fails_row_at_max_attempts() {
+        let (url, hits, _) = spawn_mock(vec![200], None).await;
+        let db = fresh_sqlite().await;
+        insert_webhook(&db, "wh-max", &url, 3, 5000, serde_json::json!([]), true).await;
+        // attempt_count at the cap → backstop fails it without re-driving.
+        insert_outbox_row(
+            &db,
+            "ob-max",
+            "wh-max",
+            Utc::now() - ChronoDuration::hours(1),
+            OUTBOX_MAX_ATTEMPTS,
+        )
+        .await;
+        let registry = Arc::new(WebhookCancelRegistry::new());
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_string_lossy().into_owned();
+        let client = test_client();
+
+        redeliver_due_rows(&db, &registry, &dir_str, &client).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "capped row is not re-driven");
+        assert_eq!(outbox_status(&db, "ob-max").await.as_deref(), Some(STATUS_FAILED));
     }
 }

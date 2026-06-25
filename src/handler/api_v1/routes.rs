@@ -58,7 +58,8 @@ pub struct RouteView {
     pub header_filters: Option<Value>,
     pub rewrite_rules: Option<Value>,
     pub target_trunks: Option<Value>,
-    pub owner: Option<String>,
+    /// Owning org (task 3.1 tenant key; replaced the legacy free-text `owner`).
+    pub org_id: String,
     pub notes: Option<Value>,
     pub metadata: Option<Value>,
     pub created_at: DateTime<Utc>,
@@ -90,7 +91,7 @@ impl From<RouteModel> for RouteView {
             header_filters: m.header_filters,
             rewrite_rules: m.rewrite_rules,
             target_trunks: m.target_trunks,
-            owner: m.owner,
+            org_id: m.org_id,
             notes: m.notes,
             metadata: m.metadata,
             created_at: m.created_at,
@@ -156,8 +157,8 @@ pub struct CreateRouteRequest {
     pub rewrite_rules: Option<Value>,
     #[serde(default)]
     pub target_trunks: Option<Value>,
-    #[serde(default)]
-    pub owner: Option<String>,
+    // `owner` removed (task 3.1): org_id is the tenant key and is system-managed
+    // (defaults until 3.1b threads request-context org); not client-settable.
     #[serde(default)]
     pub notes: Option<Value>,
     #[serde(default)]
@@ -196,8 +197,7 @@ pub struct UpdateRouteRequest {
     pub rewrite_rules: Option<Option<Value>>,
     #[serde(default)]
     pub target_trunks: Option<Option<Value>>,
-    #[serde(default)]
-    pub owner: Option<Option<String>>,
+    // `owner` removed (task 3.1): org_id is system-managed, not client-settable.
     #[serde(default)]
     pub notes: Option<Option<Value>>,
     #[serde(default)]
@@ -336,7 +336,9 @@ async fn create_route(
         header_filters: ActiveValue::Set(req.header_filters),
         rewrite_rules: ActiveValue::Set(req.rewrite_rules),
         target_trunks: ActiveValue::Set(req.target_trunks),
-        owner: ActiveValue::Set(req.owner),
+        // org_id left NotSet → DB default ('default') applies until 3.1b threads
+        // the real org_id from request context.
+        org_id: ActiveValue::NotSet,
         notes: ActiveValue::Set(req.notes),
         metadata: ActiveValue::Set(req.metadata),
         created_at: ActiveValue::Set(now),
@@ -432,9 +434,7 @@ async fn update_route(
     if let Some(v) = req.target_trunks {
         active.target_trunks = ActiveValue::Set(v);
     }
-    if let Some(v) = req.owner {
-        active.owner = ActiveValue::Set(v);
-    }
+    // `owner` removed (task 3.1): org_id is system-managed, not updatable here.
     if let Some(v) = req.notes {
         active.notes = ActiveValue::Set(v);
     }

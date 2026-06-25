@@ -4,19 +4,28 @@ use sea_orm_migration::{MigratorTrait, SchemaManager};
 use std::collections::HashSet;
 use std::time::Duration;
 
+pub mod add_cdr_billable_duration_column;
+pub mod add_cdr_failure_source_column;
 pub mod add_cdr_status_answer_columns;
 pub mod add_did_trunk_group_name_column;
 pub mod add_leg_timeline_column;
 pub mod add_media_config_column;
 pub mod add_metadata_column;
+pub mod add_org_id_did;
+pub mod add_org_id_extension;
+pub mod add_org_id_routing;
+pub mod add_org_id_routing_tables;
+pub mod add_org_id_trunk;
 pub mod add_ring_time_column;
 pub mod add_rewrite_columns;
 pub mod add_sip_trunk_health_columns;
 pub mod add_sip_trunk_register_columns;
 pub mod add_sip_trunk_rewrite_hostport;
+pub mod add_tenant_id_to_api_keys;
 pub mod add_user_mfa_columns;
 pub mod api_key;
 pub mod backfill_dids_from_sip_trunks;
+pub mod backfill_org_id_routing;
 pub mod call_record;
 
 pub mod call_record_dashboard_index;
@@ -50,6 +59,7 @@ pub mod trunk_group;
 pub mod trunk_group_member;
 pub mod trunk_origination_uris;
 pub mod user;
+pub mod webhook_outbox;
 pub mod webhooks;
 
 pub fn prepare_sqlite_database(database_url: &str) -> Result<()> {

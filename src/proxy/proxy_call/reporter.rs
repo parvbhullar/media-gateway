@@ -204,6 +204,7 @@ impl CallReporter {
             recording_url: recording_path_for_db,
             rewrite,
             last_error,
+            failure_source: snapshot.failure_source,
             metadata: snapshot
                 .extensions
                 .get::<HashMap<String, String>>()
@@ -419,6 +420,7 @@ mod tests {
             ring_time: None,
             answer_time: None,
             last_error: None,
+            failure_source: None,
             hangup_reason: None,
             hangup_messages: vec![],
             original_caller: None,

@@ -10,6 +10,7 @@ use axum::{
     body::Body,
     http::{Request, StatusCode, header},
 };
+use sea_orm::{ActiveModelTrait, Set};
 use serde_json::Value;
 use tower::ServiceExt;
 
@@ -53,6 +54,45 @@ async fn seed_did(
 // ---------------------------------------------------------------------------
 // GET /api/v1/dids
 // ---------------------------------------------------------------------------
+
+async fn seed_did_with_org(state: &rustpbx::app::AppState, number: &str, org_id: &str) {
+    let now = chrono::Utc::now();
+    rustpbx::models::did::ActiveModel {
+        number: Set(number.to_string()),
+        org_id: Set(org_id.to_string()),
+        enabled: Set(true),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .insert(state.db())
+    .await
+    .expect("seed did with org");
+}
+
+#[tokio::test]
+async fn list_dids_filters_and_exposes_org_id() {
+    let (state, token) = test_state_with_api_key("dids-org-filter").await;
+    seed_did_with_org(&state, "+15550000007", "org7").await;
+    seed_did_with_org(&state, "+15550000009", "org9").await;
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/dids?org_id=org7")
+                .header(header::AUTHORIZATION, bearer(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["total"], 1, "org_id=org7 must exclude org9's number");
+    assert_eq!(body["items"][0]["org_id"], "org7");
+    assert_eq!(body["items"][0]["number"], "+15550000007");
+}
 
 #[tokio::test]
 async fn list_dids_requires_auth() {

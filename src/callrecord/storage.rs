@@ -15,21 +15,34 @@ use std::path::PathBuf;
 
 use crate::callrecord::CallRecord;
 use crate::proxy::webhook::{
-    WebhookEvent, WebhookEventSender, current_unix_timestamp, new_event_id,
+    WebhookEvent, WebhookEventSender, current_unix_timestamp, derive_event_id,
 };
 
 /// Build the `call.completed` envelope per D-07. `data` = full CallRecord
 /// JSON (existing serializer, no translation).
 pub fn build_call_completed_event(record: &CallRecord) -> WebhookEvent {
-    let data = match serde_json::to_value(record) {
+    let mut data = match serde_json::to_value(record) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!("call.completed serialize failed: {}", e);
             serde_json::Value::Null
         }
     };
+    // task 2.3: surface billable (answered) seconds in the payload (NULL when
+    // unanswered) so unpod bills off this, not the wall-clock duration.
+    if let Some(obj) = data.as_object_mut() {
+        let billable = record
+            .answer_time
+            .map(|ans| (record.end_time - ans).num_seconds().max(0));
+        obj.insert(
+            "billable_duration_secs".to_string(),
+            serde_json::json!(billable),
+        );
+    }
     WebhookEvent {
-        event_id: new_event_id(),
+        // task 2.2: stable id keyed on the call so a redelivery dedups (the
+        // call.completed event is the one unpod bills + dedups on).
+        event_id: derive_event_id(&record.call_id, "call.completed"),
         event: "call.completed".to_string(),
         timestamp: current_unix_timestamp(),
         data,
@@ -159,6 +172,29 @@ mod webhook_emit_tests {
         assert!(ev.timestamp > 0);
         // CallRecord uses #[serde(rename_all = "camelCase")] so call_id → callId.
         assert_eq!(ev.data["callId"], "call-abc");
+    }
+
+    #[test]
+    fn build_call_completed_event_sets_billable_when_answered() {
+        // billable = ended − answered = 15s, NOT the 20s wall-clock span.
+        let mut rec = fixture_record();
+        let start = Utc::now();
+        rec.start_time = start;
+        rec.answer_time = Some(start + chrono::Duration::seconds(5));
+        rec.end_time = start + chrono::Duration::seconds(20);
+        let ev = build_call_completed_event(&rec);
+        assert_eq!(ev.data["billable_duration_secs"], 15);
+    }
+
+    #[test]
+    fn build_call_completed_event_billable_null_when_unanswered() {
+        let mut rec = fixture_record();
+        let start = Utc::now();
+        rec.start_time = start;
+        rec.answer_time = None;
+        rec.end_time = start + chrono::Duration::seconds(20);
+        let ev = build_call_completed_event(&rec);
+        assert!(ev.data["billable_duration_secs"].is_null());
     }
 
     #[test]

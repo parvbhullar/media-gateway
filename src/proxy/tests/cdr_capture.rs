@@ -355,6 +355,7 @@ mod tests {
                 tags: None,
                 rewrite: Default::default(),
                 last_error: None,
+                failure_source: None,
                 metadata: None,
             },
             extensions: http::Extensions::new(),
