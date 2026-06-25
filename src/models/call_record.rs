@@ -9,7 +9,7 @@ use sea_orm_migration::sea_query::{ColumnDef, ForeignKeyAction as MigrationForei
 use sea_query::Expr;
 use serde::{Deserialize, Serialize};
 
-use crate::callrecord::{CallRecord, CallRecordHook};
+use crate::callrecord::{CallRecord, CallRecordHook, FailureSource};
 
 // CallRecordPersistArgs removed
 
@@ -125,6 +125,7 @@ pub async fn persist_call_record(
         // status_code 0 means "no SIP code captured" → store NULL.
         status_code: Set((record.status_code != 0).then_some(record.status_code as i16)),
         hangup_reason: Set(record.hangup_reason.as_ref().map(|r| r.as_db_str())),
+        failure_source: Set(details.failure_source.map(|f| f.as_db_str().to_string())),
         started_at: Set(record.start_time),
         ended_at: Set(Some(record.end_time)),
         answer_time: Set(record.answer_time),
@@ -291,6 +292,9 @@ pub struct Model {
     /// Stable hangup-reason token (e.g. "by_caller", "no_answer"). See
     /// `CallRecordHangupReason::as_db_str`.
     pub hangup_reason: Option<String>,
+    /// Failure-origin token ("sbc" | "upstream" | "caller"); NULL for a
+    /// successful or clean-hangup call. See `FailureSource::as_db_str`.
+    pub failure_source: Option<String>,
     pub started_at: DateTimeUtc,
     pub ended_at: Option<DateTimeUtc>,
     /// When the call was answered (200 OK). NULL for unanswered calls.
@@ -565,8 +569,10 @@ impl From<Model> for CallRecord {
                 destination: None,
             },
             last_error: None,
-            // Populated from the persisted column in a later slice (read path).
-            failure_source: None,
+            failure_source: val
+                .failure_source
+                .as_deref()
+                .and_then(FailureSource::from_db_str),
         };
 
         let leg_timeline = val
@@ -604,7 +610,7 @@ impl From<Model> for CallRecord {
 #[cfg(test)]
 mod cdr_phase1_tests {
     use super::*;
-    use crate::callrecord::{CallRecord, CallRecordHangupReason};
+    use crate::callrecord::{CallRecord, CallRecordHangupReason, FailureSource};
 
     fn sample_model() -> Model {
         let now = chrono::Utc::now();
@@ -616,6 +622,7 @@ mod cdr_phase1_tests {
             status: "completed".to_string(),
             status_code: Some(200),
             hangup_reason: Some("by_callee".to_string()),
+            failure_source: None,
             started_at: now,
             ended_at: Some(now),
             answer_time: Some(now),
@@ -681,6 +688,27 @@ mod cdr_phase1_tests {
         let rec: CallRecord = m.into();
         assert_eq!(rec.status_code, 0);
         assert_eq!(rec.answer_time, None);
+    }
+
+    #[test]
+    fn from_model_maps_failure_source() {
+        let mut m = sample_model();
+        m.failure_source = Some("upstream".to_string());
+        let rec: CallRecord = m.into();
+        assert_eq!(rec.details.failure_source, Some(FailureSource::Upstream));
+    }
+
+    #[test]
+    fn from_model_failure_source_none_and_unknown_become_none() {
+        let mut m = sample_model();
+        m.failure_source = None;
+        let rec: CallRecord = m.clone().into();
+        assert_eq!(rec.details.failure_source, None);
+
+        // An unrecognized token must not panic; it maps to None.
+        m.failure_source = Some("garbage".to_string());
+        let rec2: CallRecord = m.into();
+        assert_eq!(rec2.details.failure_source, None);
     }
 
     #[test]

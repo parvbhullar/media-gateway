@@ -70,6 +70,8 @@ impl MigratorTrait for Migrator {
             // task 3.2 — tenant_id scoping column on rustpbx_api_keys (the
             // request-context tenant/org source). MUST be registered here.
             Box::new(super::add_tenant_id_to_api_keys::Migration),
+            // 503-attribution — failure_source column on rustpbx_call_records.
+            Box::new(super::add_cdr_failure_source_column::Migration),
         ]
     }
 }
