@@ -280,7 +280,7 @@ pub struct SipTrunkConfig {
     /// `[["Header-Name", "value"], ...]`.
     #[serde(default)]
     pub register_extra_headers: Option<Vec<(String, String)>>,
-    #[serde(default, deserialize_with = "bool_from_anything")]
+    #[serde(default = "default_true", deserialize_with = "bool_from_anything")]
     pub rewrite_hostport: bool,
     #[serde(default)]
     pub did_numbers: Option<Value>,

@@ -248,6 +248,32 @@ default('RustPBX') }}{% endblock %}
                                     x-text="form.is_active ? t.sip_trunk_detail?.status_enabled : t.sip_trunk_detail?.status_disabled"></span>
                             </button>
                         </div>
+                        <div class="flex flex-col gap-2">
+                            <span class="flex items-center gap-1.5 text-sm font-medium text-slate-700">
+                                {{ "sip_trunk_detail.field_rewrite_hostport" | t }}
+                                <span class="group relative">
+                                    <svg class="h-3.5 w-3.5 cursor-help text-slate-400" viewBox="0 0 20 20" fill="currentColor">
+                                        <path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a.75.75 0 000 1.5h.253a.25.25 0 01.244.304l-.459 2.066A1.75 1.75 0 0010.747 15H11a.75.75 0 000-1.5h-.253a.25.25 0 01-.244-.304l.459-2.066A1.75 1.75 0 009.253 9H9z" clip-rule="evenodd" />
+                                    </svg>
+                                    <span class="pointer-events-none absolute left-5 top-0 z-10 hidden w-72 rounded-lg bg-slate-800 px-3 py-2 text-xs font-normal leading-relaxed text-white shadow-lg group-hover:block">
+                                        {{ "sip_trunk_detail.field_rewrite_hostport_hint" | t }}
+                                    </span>
+                                </span>
+                            </span>
+                            <button type="button" @click="form.rewrite_hostport = !form.rewrite_hostport"
+                                class="inline-flex items-center gap-2 rounded-lg px-3 py-1 text-xs font-semibold ring-2 transition"
+                                :class="form.rewrite_hostport ? 'bg-emerald-50 text-emerald-600 ring-emerald-200' : 'bg-slate-100 text-slate-500 ring-slate-200'">
+                                <svg class="h-3.5 w-3.5" viewBox="0 0 20 20" fill="none" stroke="currentColor"
+                                    stroke-width="1.6">
+                                    <path stroke-linecap="round" stroke-linejoin="round" d="M5 10l4 4 6-8"
+                                        x-show="form.rewrite_hostport"></path>
+                                    <path stroke-linecap="round" stroke-linejoin="round" d="M6 6l8 8M6 14l8-8"
+                                        x-show="!form.rewrite_hostport"></path>
+                                </svg>
+                                <span
+                                    x-text="form.rewrite_hostport ? t.sip_trunk_detail?.status_enabled : t.sip_trunk_detail?.status_disabled"></span>
+                            </button>
+                        </div>
                     </div>
                     <label class="mt-4 flex flex-col gap-2 text-sm font-medium text-slate-700">
                         {{ "sip_trunk_detail.field_description" | t }}
@@ -1062,6 +1088,7 @@ default('RustPBX') }}{% endblock %}
                 incoming_to_user_prefix: '',
                 metadata: '',
                 is_active: true,
+                rewrite_hostport: true,
                 register_enabled: false,
                 register_expires: '',
                 register_extra_headers: '',
@@ -1198,6 +1225,7 @@ default('RustPBX') }}{% endblock %}
                 this.form.incoming_to_user_prefix = model.incoming_to_user_prefix || '';
                 this.form.metadata = this.formatJson(model.metadata);
                 this.form.is_active = model.is_active !== false;
+                this.form.rewrite_hostport = model.rewrite_hostport !== false;
                 this.form.register_enabled = model.register_enabled === true;
                 this.form.register_expires = model.register_expires != null ? String(model.register_expires) : '';
                 this.form.register_extra_headers = this.formatJson(model.register_extra_headers);
@@ -1533,6 +1561,7 @@ default('RustPBX') }}{% endblock %}
                 params.set('incoming_to_user_prefix', this.form.incoming_to_user_prefix.trim());
                 params.set('metadata', this.form.metadata.trim());
                 params.set('is_active', this.form.is_active ? 'true' : 'false');
+                params.set('rewrite_hostport', this.form.rewrite_hostport ? 'true' : 'false');
                 params.set('register_enabled', this.form.register_enabled ? 'true' : 'false');
                 if (this.form.register_expires !== '' && this.form.register_expires != null) {
                     const expNum = Number(this.form.register_expires);

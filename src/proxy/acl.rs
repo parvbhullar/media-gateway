@@ -1,6 +1,7 @@
 use super::{ProxyAction, ProxyModule, server::SipServerRef};
 use crate::call::{TransactionCookie, TrunkContext};
-use crate::{config::ProxyConfig, proxy::routing::TrunkConfig};
+use crate::models::trunk::TrunkDirection as ModelTrunkDirection;
+use crate::{config::ProxyConfig, proxy::routing::{TrunkConfig, TrunkDirection as RoutingTrunkDirection}};
 use anyhow::Result;
 use async_trait::async_trait;
 use rsipstack::sip::prelude::HeadersExt;
@@ -148,6 +149,14 @@ impl AclModule {
         Self::with_server(config, None)
     }
 
+    fn routing_to_model_direction(d: RoutingTrunkDirection) -> ModelTrunkDirection {
+        match d {
+            RoutingTrunkDirection::Inbound => ModelTrunkDirection::Inbound,
+            RoutingTrunkDirection::Outbound => ModelTrunkDirection::Outbound,
+            RoutingTrunkDirection::Bidirectional => ModelTrunkDirection::Bidirectional,
+        }
+    }
+
     pub async fn is_from_trunk_context(&self, addr: &IpAddr) -> Option<TrunkContext> {
         if let Some(server) = &self.inner.server {
             let trunks = server.data_context.trunks_snapshot();
@@ -157,6 +166,7 @@ impl AclModule {
                         id: trunk.id,
                         name: name.clone(),
                         tenant_id: None,
+                        direction: trunk.direction.map(Self::routing_to_model_direction).unwrap_or_default(),
                     });
                 }
             }
@@ -176,6 +186,7 @@ impl AclModule {
                     id: trunk.id,
                     name,
                     tenant_id: None,
+                    direction: trunk.direction.map(Self::routing_to_model_direction).unwrap_or_default(),
                 });
             }
         }

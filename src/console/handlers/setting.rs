@@ -1989,7 +1989,11 @@ pub(crate) async fn update_proxy_settings(
     if let Some(backends) = payload.user_backends {
         let toml_s = toml::to_string(&json!({ "b": backends })).unwrap_or_default();
         if let Ok(new_doc) = toml_s.parse::<DocumentMut>() {
-            table["user_backends"] = new_doc["b"].clone();
+            if let Some(item) = new_doc.get("b") {
+                table["user_backends"] = item.clone();
+            } else {
+                table.remove("user_backends");
+            }
         }
         overrides.push(("proxy.user_backends", serde_json::to_value(&backends).unwrap_or_default()));
         modified = true;

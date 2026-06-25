@@ -5,6 +5,7 @@ use crate::call::{
     RoutingState, SipUser, TransactionCookie, TrunkContext,
 };
 use crate::config::{ProxyConfig, RouteResult};
+use crate::models::trunk::TrunkDirection;
 use crate::media::{Track, recorder::RecorderOption};
 use crate::proxy::active_call_registry::{ActiveProxyCallEntry, ActiveProxyCallStatus};
 use crate::proxy::data::ProxyDataContext;
@@ -570,6 +571,51 @@ impl CallModule {
         Self { inner }
     }
 
+    /// Decide whether `callee_uri` resolves to a destination this server hosts
+    /// (a known enabled DID, a local extension, or a callee registered on a
+    /// cluster peer). Used to disambiguate the routing direction for calls
+    /// arriving on a `bidirectional` trunk, where the realm check alone cannot
+    /// tell inbound DID termination apart from outbound PSTN routing.
+    async fn is_local_callee_destination(
+        &self,
+        callee_uri: &rsipstack::sip::Uri,
+        callee_realm: &str,
+        original: &rsipstack::sip::Request,
+    ) -> bool {
+        let callee_user = callee_uri.user().unwrap_or_default();
+        if callee_user.is_empty() {
+            return false;
+        }
+
+        // 1. Known, enabled DID hosted on this system → inbound termination.
+        let did_index = self.inner.server.data_context.did_index();
+        let default_country = self.inner.server.data_context.did_default_country();
+        let region_upper = default_country.as_deref().map(|c| c.to_ascii_uppercase());
+        if let Ok(normalized) = crate::models::did::normalize_did(callee_user, region_upper.as_deref())
+            && let Some(entry) = did_index.lookup(&normalized)
+            && entry.enabled
+        {
+            return true;
+        }
+
+        // 2. Local extension/user.
+        if let Ok(Some(_)) = self
+            .inner
+            .server
+            .user_backend
+            .get_user(callee_user, Some(callee_realm), Some(original))
+            .await
+        {
+            return true;
+        }
+
+        // 3. Callee registered on a shared-locator cluster peer.
+        matches!(
+            self.inner.server.locator.lookup(callee_uri).await,
+            Ok(locs) if !locs.is_empty()
+        )
+    }
+
     async fn default_resolve(
         &self,
         original: &rsipstack::sip::Request,
@@ -641,7 +687,26 @@ impl CallModule {
         } else if caller_is_same_realm && !callee_is_same_realm {
             DialDirection::Outbound
         } else if !caller_is_same_realm && callee_is_same_realm {
-            DialDirection::Inbound
+            // External caller, callee on our server. Classify by the source trunk's
+            // configured direction so outbound route rules are evaluated for trunks
+            // that originate calls (e.g. VAPI). Without a trunk this stays Inbound.
+            match cookie.get_extension::<TrunkContext>().map(|ctx| ctx.direction) {
+                Some(TrunkDirection::Outbound) => DialDirection::Outbound,
+                Some(TrunkDirection::Inbound) | None => DialDirection::Inbound,
+                Some(TrunkDirection::Bidirectional) => {
+                    // Ambiguous: a bidirectional trunk carries both inbound DID
+                    // termination and outbound routing. Disambiguate by the callee —
+                    // a destination we host is inbound, anything else routes out.
+                    if self
+                        .is_local_callee_destination(&callee_uri, &callee_realm, original)
+                        .await
+                    {
+                        DialDirection::Inbound
+                    } else {
+                        DialDirection::Outbound
+                    }
+                }
+            }
         } else {
             if is_from_trunk {
                 // If the call comes from a trunk, we can allow it to reach an internal destination even if the callee realm doesn't match, as long as the caller realm also doesn't match (to prevent external-to-external calls).
@@ -2062,10 +2127,13 @@ impl CallModule {
         reason: Option<String>,
         extensions: Option<HashMap<String, String>>,
     ) {
-        let direction = if cookie.get_extension::<TrunkContext>().is_some() {
-            DialDirection::Inbound
-        } else {
-            DialDirection::Internal
+        // Mirror the direction classification used in default_resolve so failure
+        // CDRs are labeled consistently. Outbound trunks (and the outbound side of
+        // bidirectional trunks) report Outbound; everything else stays Inbound.
+        let direction = match cookie.get_extension::<TrunkContext>().map(|ctx| ctx.direction) {
+            Some(TrunkDirection::Outbound) => DialDirection::Outbound,
+            Some(_) => DialDirection::Inbound,
+            None => DialDirection::Internal,
         };
         let session_id = tx.original.call_id_header().map_or_else(
             |_| uuid::Uuid::new_v4().to_string(),
@@ -3676,6 +3744,7 @@ mod tests {
             id: Some(1),
             name: "wholesale-trunk".to_string(),
             tenant_id: Some(100),
+            direction: TrunkDirection::Bidirectional,
         });
 
         let dialplan = module

@@ -51,6 +51,7 @@ pub struct GatewayView {
     pub name: String,
     pub kind: String,
     pub display_name: Option<String>,
+    pub description: Option<String>,
     pub direction: String,
     /// Legacy SIP convenience field (populated only when `kind == "sip"`).
     pub proxy_addr: Option<String>,
@@ -58,6 +59,9 @@ pub struct GatewayView {
     pub transport: Option<String>,
     pub status: String,
     pub is_active: bool,
+    pub max_concurrent: Option<i32>,
+    pub max_cps: Option<i32>,
+    pub allowed_ips: Option<JsonValue>,
     pub last_health_check_at: Option<chrono::DateTime<chrono::Utc>>,
     pub consecutive_failures: i32,
     pub consecutive_successes: i32,
@@ -94,11 +98,15 @@ impl GatewayView {
             name: m.name,
             kind: m.kind.clone(),
             display_name: m.display_name,
+            description: m.description,
             direction: m.direction.as_str().to_string(),
             proxy_addr,
             transport,
             status: m.status.as_str().to_string(),
             is_active: m.is_active,
+            max_concurrent: m.max_concurrent,
+            max_cps: m.max_cps,
+            allowed_ips: m.allowed_ips,
             last_health_check_at: m.last_health_check_at,
             consecutive_failures: m.consecutive_failures,
             consecutive_successes: m.consecutive_successes,
@@ -212,6 +220,8 @@ pub struct CreateGatewayRequest {
     #[serde(default)]
     pub display_name: Option<String>,
     #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
     pub direction: Option<SipTrunkDirection>,
     // Legacy top-level SIP fields (folded into kind_config when kind == "sip")
     #[serde(default)]
@@ -232,9 +242,16 @@ pub struct CreateGatewayRequest {
     pub recovery_threshold: Option<i32>,
     #[serde(default = "default_true")]
     pub is_active: bool,
-    /// Inbound source-IP ACL (leg-A); stored on the trunk's `allowed_ips` column.
+    /// Soft limit on concurrent calls through this gateway. null = unlimited.
     #[serde(default)]
-    pub allowed_ips: Option<Vec<String>>,
+    pub max_concurrent: Option<i32>,
+    /// Soft limit on calls per second (CPS). null = unlimited.
+    #[serde(default)]
+    pub max_cps: Option<i32>,
+    /// JSON array of IP addresses / CIDR blocks allowed to send inbound SIP
+    /// to this trunk. null = accept from any source.
+    #[serde(default)]
+    pub allowed_ips: Option<JsonValue>,
     /// Dynamic-IP carriers that authenticate by SIP REGISTER. Folds into the
     /// SIP `kind_config` (`SipTrunkConfig.register_enabled`).
     #[serde(default)]
@@ -252,6 +269,8 @@ pub struct UpdateGatewayRequest {
     pub kind: Option<String>,
     #[serde(default)]
     pub display_name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
     #[serde(default)]
     pub direction: Option<SipTrunkDirection>,
     #[serde(default)]
@@ -273,7 +292,11 @@ pub struct UpdateGatewayRequest {
     #[serde(default)]
     pub is_active: Option<bool>,
     #[serde(default)]
-    pub allowed_ips: Option<Vec<String>>,
+    pub max_concurrent: Option<i32>,
+    #[serde(default)]
+    pub max_cps: Option<i32>,
+    #[serde(default)]
+    pub allowed_ips: Option<JsonValue>,
     #[serde(default)]
     pub register_enabled: Option<bool>,
     #[serde(default)]
@@ -472,9 +495,13 @@ async fn create_gateway(
         name: Set(req.name.clone()),
         kind: Set(kind),
         display_name: Set(normalize_optional_string(req.display_name)),
+        description: Set(normalize_optional_string(req.description)),
         direction: Set(req.direction.unwrap_or_default()),
         status: Set(SipTrunkStatus::default()),
         is_active: Set(req.is_active),
+        max_concurrent: Set(req.max_concurrent),
+        max_cps: Set(req.max_cps),
+        allowed_ips: Set(req.allowed_ips),
         health_check_interval_secs: Set(req.health_check_interval_secs),
         failure_threshold: Set(req.failure_threshold),
         recovery_threshold: Set(req.recovery_threshold),
@@ -514,6 +541,9 @@ async fn update_gateway(
     if let Some(v) = req.display_name {
         am.display_name = Set(normalize_optional_string(Some(v)));
     }
+    if let Some(v) = req.description {
+        am.description = Set(normalize_optional_string(Some(v)));
+    }
     if let Some(v) = req.direction {
         am.direction = Set(v);
     }
@@ -529,8 +559,14 @@ async fn update_gateway(
     if let Some(v) = req.is_active {
         am.is_active = Set(v);
     }
-    if let Some(v) = req.allowed_ips {
-        am.allowed_ips = Set(Some(serde_json::json!(v)));
+    if req.max_concurrent.is_some() {
+        am.max_concurrent = Set(req.max_concurrent);
+    }
+    if req.max_cps.is_some() {
+        am.max_cps = Set(req.max_cps);
+    }
+    if req.allowed_ips.is_some() {
+        am.allowed_ips = Set(req.allowed_ips);
     }
     am.updated_at = Set(Utc::now());
 
@@ -778,7 +814,7 @@ mod tests {
 
         assert_eq!(
             req.allowed_ips,
-            Some(vec!["1.2.3.4".to_string(), "5.6.7.8".to_string()])
+            Some(serde_json::json!(["1.2.3.4", "5.6.7.8"]))
         );
         assert_eq!(req.register_enabled, Some(true));
 
