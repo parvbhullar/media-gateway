@@ -168,6 +168,7 @@ pub async fn dispatch_livekit(
             // (server picks its own; matches not-set semantics).
             restart_policy: 0,
             deployment: String::new(),
+            attributes: std::collections::HashMap::new(),
         };
         match agent_client.create_dispatch(req).await {
             Ok(_dispatch) => {
