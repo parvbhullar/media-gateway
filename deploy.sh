@@ -11,7 +11,7 @@ fi
 
 # ── Config (override in .env.local) ───────────────────────────────────────────
 SERVER_DIR="${SERVER_DIR:-/opt/rustpbx}"
-SERVICE_NAME="${SERVICE_NAME:-rustpbx}"
+SERVICE_NAME="${SERVICE_NAME:-rustpbx.service}"
 DEPLOY_BRANCH="${DEPLOY_BRANCH:-main}"
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -58,3 +58,6 @@ echo "==> Uploading binary..."
 rsync -avz --progress -e "ssh $SSH_OPTS" "$BINARY" "${SERVER_USER}@${SERVER_HOST}:${SERVER_DIR}/rustpbx"
 
 echo "==> Deploy complete."
+echo "==> Restarting service..."
+ssh $SSH_OPTS "${SERVER_USER}@${SERVER_HOST}" "sudo systemctl restart ${SERVICE_NAME}
+echo 'Done.'"
