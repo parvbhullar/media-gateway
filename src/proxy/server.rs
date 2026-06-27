@@ -1161,7 +1161,7 @@ impl SipServerInner {
         Some(rsipstack::sip::Uri {
             scheme: transport.map(|t| t.sip_scheme()),
             auth: Some(Auth {
-                user: "rustpbx".to_string(),
+                user: crate::version::brand_sip_user(),
                 password: None,
             }),
             host_with_port,

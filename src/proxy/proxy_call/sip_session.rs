@@ -6568,7 +6568,7 @@ impl SipSession {
             .caller_contact
             .clone()
             .map(|c| c.to_string())
-            .unwrap_or_else(|| "sip:rustpbx@localhost".to_string());
+            .unwrap_or_else(|| format!("sip:{}@localhost", crate::version::brand_sip_user()));
         let headers = vec![rsipstack::sip::Header::Other(
             "Referred-By".to_string(),
             format!("<{}>", referred_by),

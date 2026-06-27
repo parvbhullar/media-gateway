@@ -60,6 +60,14 @@ ws_handler= "/ws"
 ami_path = "/ami/v1"
 ice_servers_path = "/iceservers"
 media_proxy = "auto"
+# Service identity (User-Agent + Contact). The on-the-wire identity defaults to
+# the SuperSBC brand and is built as "{brand}/{version} (built {date})".
+# Set the brand token at deploy time with the SUPERSBC_USER_AGENT env var
+# (default: SuperSBC), e.g. `SUPERSBC_USER_AGENT=SuperSBC`. It drives the SIP
+# User-Agent, the webhook User-Agent, and the SIP Contact user-part.
+# To pin the SIP User-Agent to a literal value (overrides the env-derived
+# default for the SIP leg only), uncomment:
+# useragent = "SuperSBC/1.0"
 # session_timer = true
 # session_timer_always = false # Keep refreshing even if peer does not negotiate session timer
 # Base directory for generated routing/trunk/ACL files

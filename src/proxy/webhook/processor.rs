@@ -129,7 +129,7 @@ pub(super) fn build_request_headers(
 ) -> Vec<(&'static str, String)> {
     vec![
         ("Content-Type", "application/json; charset=utf-8".to_string()),
-        ("User-Agent", format!("supersip/{}", env!("CARGO_PKG_VERSION"))),
+        ("User-Agent", crate::version::get_useragent()),
         ("X-Webhook-Event", event_name.to_string()),
         // D-16 known weakness (T-07-04-01): plaintext secret.
         ("X-Webhook-Secret", webhook.secret.clone()),
@@ -849,11 +849,10 @@ mod tests {
             map.get("Content-Type").map(String::as_str),
             Some("application/json; charset=utf-8")
         );
-        assert!(
-            map.get("User-Agent")
-                .map(|v| v.starts_with("supersip/"))
-                .unwrap_or(false)
-        );
+        // Webhook UA must match the SIP endpoint UA exactly (one identity
+        // across the project — see change add-supersbc-user-agent).
+        let expected_ua = crate::version::get_useragent();
+        assert_eq!(map.get("User-Agent"), Some(&expected_ua));
         assert_eq!(
             map.get("X-Webhook-Event").map(String::as_str),
             Some("call.completed")

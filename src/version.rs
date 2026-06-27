@@ -28,12 +28,53 @@ pub fn get_short_version() -> &'static str {
     SHORT_VERSION
 }
 
-pub fn get_useragent() -> String {
+/// Default brand token when `SUPERSBC_USER_AGENT` is unset.
+const DEFAULT_BRAND: &str = "SuperSBC";
+
+/// Env var holding the brand *token* (e.g. `SuperSBC`); the `/{version} (built
+/// {date})` suffix is added by [`get_useragent`], so the token alone is enough.
+const BRAND_ENV: &str = "SUPERSBC_USER_AGENT";
+
+/// Resolve a brand token from a raw env value. Pure (no global state) so it is
+/// trivially testable; blank/whitespace-only falls back to [`DEFAULT_BRAND`].
+fn brand_from(raw: Option<String>) -> String {
+    raw.map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_BRAND.to_string())
+}
+
+/// Brand token for on-the-wire identity. Runtime-overridable via the
+/// `SUPERSBC_USER_AGENT` env var.
+pub fn brand() -> String {
+    brand_from(std::env::var(BRAND_ENV).ok())
+}
+
+/// Format a full User-Agent for a given brand token. Pure core of
+/// [`get_useragent`]; version and build date are compile-time.
+fn useragent_with(brand: &str) -> String {
     format!(
-        "rustpbx/{} (built {})",
+        "{}/{} (built {})",
+        brand,
         env!("CARGO_PKG_VERSION"),
         env!("BUILD_DATE")
     )
+}
+
+/// Full User-Agent string, emitted identically across the SIP and webhook
+/// surfaces: `{brand}/{version} (built {date})`.
+pub fn get_useragent() -> String {
+    useragent_with(&brand())
+}
+
+/// Normalize a brand token to a SIP-safe URI user-part (lowercased, whitespace
+/// removed). Pure core of [`brand_sip_user`].
+fn sip_user_from(brand: &str) -> String {
+    brand.to_lowercase().split_whitespace().collect()
+}
+
+/// SIP-safe user-part for the Contact URI, derived from the brand token.
+pub fn brand_sip_user() -> String {
+    sip_user_from(&brand())
 }
 
 // ─── Update check ────────────────────────────────────────────────────────────
@@ -152,4 +193,62 @@ pub fn spawn_update_checker(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn brand_defaults_when_unset() {
+        assert_eq!(brand_from(None), DEFAULT_BRAND);
+    }
+
+    #[test]
+    fn brand_honors_override_and_trims() {
+        assert_eq!(brand_from(Some("supersbc".to_string())), "supersbc");
+        assert_eq!(brand_from(Some("  AcmeSBC  ".to_string())), "AcmeSBC");
+    }
+
+    #[test]
+    fn brand_blank_falls_back_to_default() {
+        assert_eq!(brand_from(Some(String::new())), DEFAULT_BRAND);
+        assert_eq!(brand_from(Some("   ".to_string())), DEFAULT_BRAND);
+    }
+
+    #[test]
+    fn useragent_shape_for_default_brand() {
+        let expected = format!(
+            "SuperSBC/{} (built {})",
+            env!("CARGO_PKG_VERSION"),
+            env!("BUILD_DATE")
+        );
+        assert_eq!(useragent_with("SuperSBC"), expected);
+    }
+
+    #[test]
+    fn useragent_reflects_override_brand() {
+        let ua = useragent_with("AcmeSBC");
+        assert!(ua.starts_with("AcmeSBC/"), "got: {ua}");
+        assert!(ua.contains(env!("CARGO_PKG_VERSION")));
+        assert!(ua.contains("(built "));
+    }
+
+    #[test]
+    fn sip_user_is_lowercase_and_whitespace_free() {
+        assert_eq!(sip_user_from("SuperSBC"), "supersbc");
+        assert_eq!(sip_user_from("Super SBC"), "supersbc");
+        assert_eq!(sip_user_from("  Acme  SBC "), "acmesbc");
+    }
+
+    #[test]
+    fn live_default_identity_is_consistent() {
+        // Only meaningful when the override is absent (e.g. local/CI without the
+        // var); guards against failing in environments that set a brand.
+        if std::env::var(BRAND_ENV).is_err() {
+            assert_eq!(brand(), DEFAULT_BRAND);
+            assert_eq!(get_useragent(), useragent_with(DEFAULT_BRAND));
+            assert_eq!(brand_sip_user(), "supersbc");
+        }
+    }
 }
