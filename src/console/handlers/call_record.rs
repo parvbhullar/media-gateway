@@ -1312,9 +1312,9 @@ pub struct CdrData {
 /// Human outcome classification for a call, derived from the final SIP code,
 /// whether the callee alerted (`rang`), and the recorded hangup messages.
 /// Mirrors the logic in scripts/qa_call_records_csv.py.
-struct ErrorReason {
-    key: &'static str,
-    detail: Option<String>,
+pub(crate) struct ErrorReason {
+    pub(crate) key: &'static str,
+    pub(crate) detail: Option<String>,
 }
 
 /// Reason text from the hangup_message whose `code` matches the final status
@@ -1332,7 +1332,7 @@ fn extract_hangup_detail(hangup_messages: &[Value], code: i16) -> Option<String>
 
 /// `None` => answered/normal call (no error reason). Otherwise a stable key
 /// plus optional detail text.
-fn classify_error_reason(
+pub(crate) fn classify_error_reason(
     status: &str,
     status_code: Option<i16>,
     rang: bool,
