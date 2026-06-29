@@ -77,6 +77,17 @@ pub fn brand_sip_user() -> String {
     sip_user_from(&brand())
 }
 
+/// SIP-safe user-part derived from a literal `User-Agent` string (e.g.
+/// `"AcmeSBC/1.0"` → `"acmesbc"`). Falls back to [`brand_sip_user`] when
+/// `ua` is `None`. Used to keep the Contact user-part consistent with a
+/// config-pinned `useragent` value.
+pub fn brand_sip_user_from_ua(ua: Option<&str>) -> String {
+    match ua {
+        Some(s) => sip_user_from(s.split('/').next().unwrap_or(DEFAULT_BRAND)),
+        None => brand_sip_user(),
+    }
+}
+
 // ─── Update check ────────────────────────────────────────────────────────────
 
 /// Response from the miuda.ai update-check endpoint.
@@ -239,6 +250,13 @@ mod tests {
         assert_eq!(sip_user_from("SuperSBC"), "supersbc");
         assert_eq!(sip_user_from("Super SBC"), "supersbc");
         assert_eq!(sip_user_from("  Acme  SBC "), "acmesbc");
+    }
+
+    #[test]
+    fn brand_sip_user_from_ua_extracts_brand() {
+        assert_eq!(brand_sip_user_from_ua(Some("AcmeSBC/1.0")), "acmesbc");
+        assert_eq!(brand_sip_user_from_ua(Some("Super SBC/2.0 (built 2026)")), "supersbc");
+        assert_eq!(brand_sip_user_from_ua(Some("NoSlash")), "noslash");
     }
 
     #[test]

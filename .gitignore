@@ -74,3 +74,4 @@ docs/rustpbx-product-brief.zh.html
 tools/go-sidecar/sip_bridge_sidecar
 tools/go-sidecar/sip-bridge-sidecar
 openspec
+*.xlsx
