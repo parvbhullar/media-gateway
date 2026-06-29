@@ -2463,6 +2463,7 @@ impl SipSession {
 
         let dialog_layer = self.server.dialog_layer.clone();
         let mut retry_count = 0;
+        let mut pipe_retry_count = 0;
         let mut invitation = dialog_layer
             .do_invite(invite_option.clone(), state_tx.clone())
             .boxed();
@@ -2597,7 +2598,37 @@ impl SipSession {
                                 Err((StatusCode::ServerInternalError, Some("No response from callee".to_string())))
                             }
                         }
-                        Err(e) => Err((StatusCode::ServerInternalError, Some(format!("Invite failed: {}", e)))),
+                        Err(e) => {
+                            // Stale pooled TCP/TLS connection: the pool returned a socket
+                            // that was already closed by the far end.  Evict it (Option A
+                            // in endpoint.rs handles the pool; the eviction races here are
+                            // covered by retrying once so a fresh dial is attempted).
+                            let is_stale_conn = matches!(&e, rsipstack::Error::IoError(io)
+                                if matches!(io.kind(),
+                                    std::io::ErrorKind::BrokenPipe
+                                    | std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::ConnectionAborted));
+
+                            if is_stale_conn && pipe_retry_count < 1 {
+                                pipe_retry_count += 1;
+                                if let Some(dest) = invite_option.destination.as_ref() {
+                                    self.server.dialog_layer.endpoint.transport_layer
+                                        .del_connection(dest);
+                                }
+                                warn!(
+                                    session_id = %self.context.session_id,
+                                    error = %e,
+                                    attempt = retry_count,
+                                    "Callee INVITE hit stale TCP connection; retrying on fresh connection"
+                                );
+                                invitation = dialog_layer
+                                    .do_invite(invite_option.clone(), state_tx.clone())
+                                    .boxed();
+                                continue;
+                            }
+
+                            Err((StatusCode::ServerInternalError, Some(format!("Invite failed: {}", e))))
+                        }
                     };
                 }
 
