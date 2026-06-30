@@ -52,6 +52,13 @@ impl CallRecordHook for SipFlowUploadHook {
             return Ok(());
         }
 
+        // A SipFlow capture exists for this call → mark it available so the CDR
+        // API can surface a sip-flow pointer without a per-row store probe
+        // (enrich-cdr-api). Set on capture, independent of upload success.
+        // ponytail: keyed on media presence; a media-less failed call with
+        // SIP-only flow reads false — refine via query_flow if ops needs it.
+        record.details.sipflow_available = true;
+
         // Path inside the storage target: YYYYMMDD/<call_id>.wav
         let date_prefix = record.start_time.format("%Y%m%d").to_string();
         let key = format!("{}/{}.wav", date_prefix, &record.call_id);

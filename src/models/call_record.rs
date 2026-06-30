@@ -117,6 +117,17 @@ pub async fn persist_call_record(
         }
     };
 
+    // Denormalize the OK/USR/SYS class + Q.850 detail at call end (enrich-cdr-api).
+    // "rang" mirrors the console: ring_time authoritative, else answered/elapsed>3s.
+    let rang = record.ring_time.is_some()
+        || record.answer_time.is_some()
+        || (record.end_time - record.start_time).num_seconds() > 3;
+    let outcome = crate::callrecord::outcome::from_messages(
+        record.status_code,
+        &record.hangup_messages,
+        rang,
+    );
+
     let active = ActiveModel {
         call_id: Set(record.call_id.clone()),
         display_id: Set(None),
@@ -126,6 +137,10 @@ pub async fn persist_call_record(
         status_code: Set((record.status_code != 0).then_some(record.status_code as i16)),
         hangup_reason: Set(record.hangup_reason.as_ref().map(|r| r.as_db_str())),
         failure_source: Set(details.failure_source.map(|f| f.as_db_str().to_string())),
+        outcome_kind: Set(Some(outcome.kind.as_db_str().to_string())),
+        q850_cause: Set(outcome.q850_cause.map(|c| c as i16)),
+        q850_text: Set(outcome.q850_text.clone()),
+        sipflow_available: Set(details.sipflow_available),
         started_at: Set(record.start_time),
         ended_at: Set(Some(record.end_time)),
         answer_time: Set(record.answer_time),
@@ -169,6 +184,10 @@ pub async fn persist_call_record(
                     Column::Status,
                     Column::StatusCode,
                     Column::HangupReason,
+                    Column::OutcomeKind,
+                    Column::Q850Cause,
+                    Column::Q850Text,
+                    Column::SipflowAvailable,
                     Column::StartedAt,
                     Column::EndedAt,
                     Column::RingTime,
@@ -297,6 +316,19 @@ pub struct Model {
     /// Failure-origin token ("sbc" | "upstream" | "caller"); NULL for a
     /// successful or clean-hangup call. See `FailureSource::as_db_str`.
     pub failure_source: Option<String>,
+    /// Denormalized outcome class: "OK" | "USR" | "SYS" (enrich-cdr-api).
+    /// Written at call end via `crate::callrecord::outcome`; NULL only on
+    /// rows from before this column existed (then base-backfilled). Lets the
+    /// summary `GROUP BY` the class without re-parsing the metadata JSON.
+    pub outcome_kind: Option<String>,
+    /// Parsed Q.850 cause code (e.g. 31, 102) from the selected hangup message;
+    /// NULL when absent or on legacy rows. Set on new writes only.
+    pub q850_cause: Option<i16>,
+    /// Parsed Q.850 cause text (e.g. "NORMAL_UNSPECIFIED"); NULL when absent.
+    pub q850_text: Option<String>,
+    /// Whether a SipFlow capture exists for this call (enrich-cdr-api). Set by
+    /// `SipFlowUploadHook`; `false` for legacy rows and when capture is off.
+    pub sipflow_available: bool,
     pub started_at: DateTimeUtc,
     pub ended_at: Option<DateTimeUtc>,
     /// When the call was answered (200 OK). NULL for unanswered calls.
@@ -578,6 +610,7 @@ impl From<Model> for CallRecord {
                 .failure_source
                 .as_deref()
                 .and_then(FailureSource::from_db_str),
+            sipflow_available: val.sipflow_available,
         };
 
         let leg_timeline = val
@@ -628,6 +661,10 @@ mod cdr_phase1_tests {
             status_code: Some(200),
             hangup_reason: Some("by_callee".to_string()),
             failure_source: None,
+            outcome_kind: Some("OK".to_string()),
+            q850_cause: None,
+            q850_text: None,
+            sipflow_available: false,
             started_at: now,
             ended_at: Some(now),
             answer_time: Some(now),

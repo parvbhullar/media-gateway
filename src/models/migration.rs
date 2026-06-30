@@ -73,6 +73,10 @@ impl MigratorTrait for Migrator {
             Box::new(super::add_tenant_id_to_api_keys::Migration),
             // 503-attribution — failure_source column on rustpbx_call_records.
             Box::new(super::add_cdr_failure_source_column::Migration),
+            // enrich-cdr-api — outcome_kind / q850_cause / q850_text /
+            // sipflow_available columns + grouped-summary index + base backfill.
+            // MUST run after the table + failure_source exist.
+            Box::new(super::add_cdr_outcome_columns::Migration),
         ]
     }
 }

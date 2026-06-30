@@ -150,8 +150,16 @@ async fn download_call_record_sip_flow(
     State(state): State<Arc<ConsoleState>>,
     AuthRequired(_): AuthRequired,
 ) -> Response {
+    build_sip_flow_response(&state, &identifier).await
+}
+
+/// Build the sip-flow JSON for a call: resolve it by db id or call_id, then
+/// query the SipFlow backend across all legs. Shared by the console route and
+/// the carrier API `/api/v1/cdrs/{id}/sip-flow` (enrich-cdr-api). Auth is the
+/// caller's responsibility (the api_v1 route is already behind its middleware).
+pub(crate) async fn build_sip_flow_response(state: &ConsoleState, identifier: &str) -> Response {
     let db = state.db();
-    let record = match resolve_call_record_by_id_or_call_id(db, &identifier).await {
+    let record = match resolve_call_record_by_id_or_call_id(db, identifier).await {
         Ok(model) => model,
         Err(resp) => return resp,
     };
@@ -283,6 +291,18 @@ async fn stream_call_recording(
     State(state): State<Arc<ConsoleState>>,
     AuthRequired(_): AuthRequired,
     headers: HeaderMap,
+) -> Response {
+    stream_recording_response(&state, pk, &headers).await
+}
+
+/// Stream a call's recording (file → S3 → sipflow fallback, with HTTP range
+/// support for the file path). Shared by the console route and the carrier API
+/// `/api/v1/cdrs/{id}/recording` (enrich-cdr-api). Auth is the caller's
+/// responsibility (the api_v1 route is already behind its middleware).
+pub(crate) async fn stream_recording_response(
+    state: &ConsoleState,
+    pk: i64,
+    headers: &HeaderMap,
 ) -> Response {
     let db = state.db();
     let record = match CallRecordEntity::find_by_id(pk).one(db).await {

@@ -330,7 +330,11 @@ async fn delete_cdr_missing_returns_404() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn cdr_recording_returns_501() {
+async fn cdr_recording_route_is_live_not_found_in_test_env() {
+    // enrich-cdr-api: the 501 stub is gone; the route delegates to the shared
+    // console recording streamer. The seeded row has no recording file / S3 /
+    // sipflow capture in the test env, so it resolves to NOT_FOUND (or 503 with
+    // no console state), never NOT_IMPLEMENTED.
     let (state, token) = test_state_with_api_key("cdr-recording").await;
     let seeded = seed_cdr(&state, "call-rec", "inbound", "completed", None, None).await;
 
@@ -345,14 +349,24 @@ async fn cdr_recording_returns_501() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
-    let body = body_json(resp).await;
-    assert_eq!(body["code"], "not_implemented");
-    assert_eq!(body["error"], "recording retrieval not implemented");
+    assert_ne!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    assert!(
+        matches!(
+            resp.status(),
+            StatusCode::NOT_FOUND | StatusCode::SERVICE_UNAVAILABLE
+        ),
+        "expected 404/503 for a recording-less row, got {}",
+        resp.status()
+    );
 }
 
 #[tokio::test]
-async fn cdr_sip_flow_returns_501() {
+async fn cdr_sip_flow_route_is_live_no_capture_in_test_env() {
+    // enrich-cdr-api: the 501 stub is gone; the route delegates to the shared
+    // console sip-flow builder. The test AppState has no SIP/sipflow backend
+    // (`with_skip_sip_bind`), so a real capture can't be returned — it resolves
+    // to NOT_FOUND (no SIP server / flow backend) or SERVICE_UNAVAILABLE (no
+    // console state), never NOT_IMPLEMENTED.
     let (state, token) = test_state_with_api_key("cdr-sipflow").await;
     let seeded = seed_cdr(&state, "call-flow", "inbound", "completed", None, None).await;
 
@@ -367,10 +381,15 @@ async fn cdr_sip_flow_returns_501() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
-    let body = body_json(resp).await;
-    assert_eq!(body["code"], "not_implemented");
-    assert_eq!(body["error"], "sip flow retrieval not implemented");
+    assert_ne!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    assert!(
+        matches!(
+            resp.status(),
+            StatusCode::NOT_FOUND | StatusCode::SERVICE_UNAVAILABLE
+        ),
+        "expected 404/503 in a backend-less test env, got {}",
+        resp.status()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -490,9 +509,24 @@ async fn seed_cdr_full(
     am.insert(state.db()).await.expect("seed cdr full");
 }
 
+/// Count for a SIP code in the report's `by_status_code` array, or 0 if absent.
+fn code_count(body: &Value, code: i64) -> i64 {
+    body["by_status_code"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .find(|e| e["code"] == code)
+                .and_then(|e| e["count"].as_i64())
+                .unwrap_or(0)
+        })
+        .unwrap_or(0)
+}
+
 #[tokio::test]
-async fn cdr_summary_aggregates_status_and_failure_source() {
+async fn cdr_summary_groups_outcome_and_status() {
     let (state, token) = test_state_with_api_key("cdr-summary").await;
+    // outcome_kind is unset on seed → recomputed from status_code:
+    // 200→OK, 503→SYS, 486→USR.
     seed_cdr_full(&state, "c1", "completed", 200, None, None).await;
     seed_cdr_full(&state, "c2", "failed", 503, Some("sbc"), None).await;
     seed_cdr_full(&state, "c3", "failed", 503, Some("upstream"), None).await;
@@ -512,17 +546,18 @@ async fn cdr_summary_aggregates_status_and_failure_source() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
 
-    assert_eq!(body["total"], 4);
-    assert_eq!(body["answered"], 1);
-    assert_eq!(body["failed"], 3);
-    // SIP-code breakdown.
-    assert_eq!(body["by_status_code"]["503"], 2);
-    assert_eq!(body["by_status_code"]["486"], 1);
-    assert_eq!(body["by_status_code"]["200"], 1);
-    // Ours-vs-carrier breakdown.
-    assert_eq!(body["by_failure_source"]["sbc"], 1);
-    assert_eq!(body["by_failure_source"]["upstream"], 2);
-    assert_eq!(body["by_failure_source"]["none"], 1);
+    // OK/USR/SYS partition the total exactly.
+    assert_eq!(body["summary"]["total"], 4);
+    assert_eq!(body["summary"]["ok"], 1); // the 200
+    assert_eq!(body["summary"]["usr"], 1); // the 486
+    assert_eq!(body["summary"]["sys"], 2); // the two 503s
+    // sbc + upstream legs flagged (c2,c3,c4) = 3.
+    assert_eq!(body["summary"]["upstream_flagged"], 3);
+    // SIP-code breakdown is an array of {code, kind, count, remark}.
+    assert_eq!(code_count(&body, 503), 2);
+    assert_eq!(code_count(&body, 486), 1);
+    assert_eq!(code_count(&body, 200), 1);
+    assert_eq!(body["group_by"], "day");
 }
 
 #[tokio::test]
@@ -547,7 +582,49 @@ async fn cdr_summary_filters_by_trunk() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp).await;
-    assert_eq!(body["total"], 2, "only trunk 7's calls");
-    assert_eq!(body["by_status_code"]["503"], 1);
-    assert!(body["by_status_code"].get("486").is_none());
+    assert_eq!(body["summary"]["total"], 2, "only trunk_a's calls");
+    assert_eq!(code_count(&body, 503), 1);
+    assert_eq!(code_count(&body, 486), 0, "trunk_b's 486 excluded");
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/cdrs — trunk filter + enriched item shape (enrich-cdr-api)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn list_cdrs_filters_by_trunk_and_exposes_enriched_fields() {
+    let (state, token) = test_state_with_api_key("cdr-list-trunk").await;
+    let trunk_a = insert_trunk(&state, "list-trunk-a").await;
+    let trunk_b = insert_trunk(&state, "list-trunk-b").await;
+    // outcome_kind is unset on seed → recomputed from status_code: 503 → SYS.
+    seed_cdr_full(&state, "lt1", "failed", 503, Some("sbc"), Some(trunk_a.id)).await;
+    seed_cdr_full(&state, "lt2", "completed", 200, None, Some(trunk_b.id)).await;
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri(&format!("/api/v1/cdrs?sip_trunk_id={}", trunk_a.id))
+                .header(header::AUTHORIZATION, bearer(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+
+    // Filter narrows to trunk_a only.
+    assert_eq!(body["total"], 1);
+    let item = &body["items"][0];
+    assert_eq!(item["sip_trunk_id"], trunk_a.id);
+    assert_eq!(item["call_id"], "lt1");
+    // Enriched fields: outcome class + nested recording/sipflow.
+    assert_eq!(item["outcome_kind"], "SYS");
+    assert_eq!(item["recording"]["available"], false);
+    assert!(item["recording"]["url"].is_null());
+    assert_eq!(item["sipflow"]["available"], false);
+    assert!(item["sipflow"]["url"].is_null());
+    // No Q.850 recorded on this seed → q850 is null.
+    assert!(item["q850"].is_null());
 }

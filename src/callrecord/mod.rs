@@ -16,6 +16,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+pub mod outcome;
 pub mod sipflow;
 pub mod sipflow_upload;
 pub mod recording_upload;
@@ -94,6 +95,11 @@ pub struct CallDetails {
     /// Originating side of a call failure (SBC vs upstream carrier vs caller),
     /// for 503/error attribution. `None` for a successful or clean-hangup call.
     pub failure_source: Option<FailureSource>,
+    /// Whether a SipFlow capture exists for this call (enrich-cdr-api). Set by
+    /// `SipFlowUploadHook` (runs before `DatabaseHook`), read by
+    /// `persist_call_record` into the `sipflow_available` column.
+    #[serde(default)]
+    pub sipflow_available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, String>>,
 }
