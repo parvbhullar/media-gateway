@@ -484,7 +484,7 @@ async fn stream_file_with_range(
 /// `None` lets `stream_call_recording` fall through to its sipflow path
 /// instead of short-circuiting with a 5xx.
 async fn stream_s3_recording(
-    state: &Arc<ConsoleState>,
+    state: &ConsoleState,
     bucket_and_key: &str,
 ) -> Option<Response> {
     use crate::config::CallRecordConfig;
