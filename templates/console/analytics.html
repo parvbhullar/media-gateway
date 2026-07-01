@@ -248,7 +248,7 @@
 
 {% block scripts %}
 <script>
-    window.__analyticsBase = "{{ base_path }}";
+    window.__analyticsBase = "{{ base_path | safe }}";
     document.addEventListener('alpine:init', () => {
         Alpine.data('analyticsPage', () => ({
             filters: {
