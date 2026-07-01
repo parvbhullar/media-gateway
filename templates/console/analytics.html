@@ -248,7 +248,7 @@
 
 {% block scripts %}
 <script>
-    window.__analyticsBase = {{ base_path | json_encode }};
+    window.__analyticsBase = "{{ base_path }}";
     document.addEventListener('alpine:init', () => {
         Alpine.data('analyticsPage', () => ({
             filters: {
