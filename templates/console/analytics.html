@@ -252,7 +252,9 @@
     document.addEventListener('alpine:init', () => {
         Alpine.data('analyticsPage', () => ({
             filters: {
-                date_from: '', date_to: '', number: '', sip_trunk_id: '', direction: '', group_by: 'day',
+                date_from: new Date().toLocaleDateString('en-CA'),
+                date_to: new Date().toLocaleDateString('en-CA'),
+                number: '', sip_trunk_id: '', direction: '', group_by: 'day',
                 // Auto-detected from the browser; sent as the `tz` param so bucket labels and day
                 // boundaries both use the operator's local timezone rather than UTC.
                 tz: Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Kolkata',
