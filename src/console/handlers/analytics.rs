@@ -73,16 +73,17 @@ pub async fn analytics_export_csv(
         "section,number,total,connected,answered,failed,conn_pct,talk_minutes,distinct_dests\n",
     );
     for n in &report.per_number {
-        // number quoted to guard against a stray separator in the value
         out.push_str(&format!(
-            "number,\"{}\",{},{},{},{},{},{},\n",
-            n.number, n.total, n.connected, n.answered, n.failed, n.conn_pct, n.talk_minutes
+            "number,{},{},{},{},{},{},{},\n",
+            csv_quote(&n.number),
+            n.total, n.connected, n.answered, n.failed, n.conn_pct, n.talk_minutes
         ));
     }
     for i in &report.international {
         out.push_str(&format!(
-            "international,\"{}\",{},,{},{},,{},{}\n",
-            i.origin, i.total, i.answered, i.failed, i.talk_minutes, i.distinct_dests
+            "international,{},{},,{},{},,{},{}\n",
+            csv_quote(&i.origin),
+            i.total, i.answered, i.failed, i.talk_minutes, i.distinct_dests
         ));
     }
 
@@ -98,6 +99,14 @@ pub async fn analytics_export_csv(
         out,
     )
         .into_response()
+}
+
+/// RFC 4180 CSV quoting: strips control characters that break row structure
+/// (CRLF folds from SIP headers would split a row in most spreadsheet tools
+/// even inside quotes), then wraps in double-quotes and escapes embedded `"` as `""`.
+fn csv_quote(s: &str) -> String {
+    let sanitized = s.replace(['\r', '\n', '\x00'], " ");
+    format!("\"{}\"", sanitized.replace('"', "\"\""))
 }
 
 /// Page routes (nested under base_path).

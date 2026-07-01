@@ -248,24 +248,46 @@
 
 {% block scripts %}
 <script>
-    window.__analyticsBase = '{{ base_path | safe }}';
+    window.__analyticsBase = {{ base_path | json_encode }};
     document.addEventListener('alpine:init', () => {
         Alpine.data('analyticsPage', () => ({
-            filters: { date_from: '', date_to: '', number: '', sip_trunk_id: '', direction: '', group_by: 'day' },
+            filters: {
+                date_from: '', date_to: '', number: '', sip_trunk_id: '', direction: '', group_by: 'day',
+                // Auto-detected from the browser; sent as the `tz` param so bucket labels and day
+                // boundaries both use the operator's local timezone rather than UTC.
+                tz: Intl.DateTimeFormat().resolvedOptions().timeZone || 'Asia/Kolkata',
+            },
             report: null,
             loading: false,
             error: '',
             init() { this.load(); },
+            // Convert a YYYY-MM-DD date string to the RFC3339 UTC instant that
+            // corresponds to midnight (isEnd=false) or 23:59:59 (isEnd=true) in
+            // the operator's local timezone. Uses the Intl API — no library required.
+            localDayBound(dateStr, tz, isEnd) {
+                const time = isEnd ? '23:59:59' : '00:00:00';
+                // Treat the target local time as if it were UTC to get an approximate Date.
+                const approx = new Date(`${dateStr}T${time}Z`);
+                // Format that approximate instant in the target timezone (sv locale gives ISO-like output).
+                const fmt = new Intl.DateTimeFormat('sv', {
+                    timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+                    hour: '2-digit', minute: '2-digit', second: '2-digit',
+                });
+                // Parse back as UTC to measure how far off we are.
+                const displayed = new Date(fmt.format(approx).replace(' ', 'T') + 'Z');
+                // Subtract the offset: approx was "local time treated as UTC",
+                // displayed is "what UTC shows as in target tz" — their difference is the UTC offset.
+                return new Date(approx.getTime() - (displayed.getTime() - approx.getTime())).toISOString();
+            },
             query() {
                 const p = new URLSearchParams();
-                // CdrSummaryQuery expects RFC3339 start_date/end_date; map the
-                // date inputs to UTC day bounds (tz-precise bounds are a follow-up).
-                if (this.filters.date_from) p.set('start_date', this.filters.date_from + 'T00:00:00Z');
-                if (this.filters.date_to) p.set('end_date', this.filters.date_to + 'T23:59:59Z');
+                if (this.filters.date_from) p.set('start_date', this.localDayBound(this.filters.date_from, this.filters.tz, false));
+                if (this.filters.date_to) p.set('end_date', this.localDayBound(this.filters.date_to, this.filters.tz, true));
                 if (this.filters.number) p.set('number', this.filters.number);
                 if (this.filters.sip_trunk_id) p.set('sip_trunk_id', this.filters.sip_trunk_id);
                 if (this.filters.direction) p.set('direction', this.filters.direction);
                 if (this.filters.group_by) p.set('group_by', this.filters.group_by);
+                if (this.filters.tz) p.set('tz', this.filters.tz);
                 return p.toString();
             },
             exportUrl() { return window.__analyticsBase + '/analytics/export.csv?' + this.query(); },

@@ -12,7 +12,7 @@ use axum::{
 };
 use chrono::{DateTime, Duration, Timelike, Utc};
 use chrono_tz::Tz;
-use sea_orm::{ColumnTrait, Condition, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder};
+use sea_orm::{ColumnTrait, Condition, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect};
 use serde::{Deserialize, Serialize};
 
 use crate::app::AppState;
@@ -463,8 +463,9 @@ pub struct ReportSummary {
     pub ok: i64,
     pub usr: i64,
     pub sys: i64,
-    /// SIP-connected calls (answer_time present). `connected + failed_user +
-    /// failed_sys == total` (analytics-console-page).
+    /// SIP-connected calls (answer_time present). Note: `ok + failed_user +
+    /// failed_sys == total`; `connected` ≤ `ok` because a row can be classified
+    /// Ok without answer_time (race / missing write).
     pub connected: i64,
     /// Calls where voice started (billable_duration_secs > 0); ⊆ connected.
     pub answered: i64,
@@ -974,7 +975,21 @@ pub(crate) async fn compute_cdr_report(
     }
 
     let home = crate::config_merge::read_home_dial_code(db).await;
-    let rows = CdrEntity::find().filter(conds).all(db).await?;
+    const MAX_REPORT_ROWS: u64 = 100_000;
+    let rows: Vec<crate::models::call_record::Model> = CdrEntity::find()
+        .filter(conds)
+        .limit(MAX_REPORT_ROWS)
+        .all(db)
+        .await?;
+    // Note: fires when the dataset has exactly MAX_REPORT_ROWS rows too (false
+    // positive), but a spurious warn is lower cost than missing a real truncation.
+    if rows.len() as u64 == MAX_REPORT_ROWS {
+        tracing::warn!(
+            limit = MAX_REPORT_ROWS,
+            "compute_cdr_report: result set hit row cap — report may be incomplete; \
+             narrow the date range or add more filters"
+        );
+    }
     let report_rows: Vec<ReportRow> = rows.iter().map(project).collect();
     Ok(build_cdr_report(report_rows, group_by, tz, &home))
 }

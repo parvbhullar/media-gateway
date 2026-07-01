@@ -406,7 +406,20 @@ pub async fn read_home_dial_code(db: &DatabaseConnection) -> String {
     };
     decoded
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .filter(|s| {
+            if s.is_empty() {
+                warn!(
+                    key = ROUTING_HOME_DIAL_CODE_KEY,
+                    "value is blank — falling back to default {}; \
+                     set the key to a valid E.164 prefix (e.g. \"+91\") to classify \
+                     international calls correctly",
+                    DEFAULT
+                );
+                false
+            } else {
+                true
+            }
+        })
         .unwrap_or_else(|| DEFAULT.to_string())
 }
 
