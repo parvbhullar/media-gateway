@@ -343,14 +343,14 @@ fn summary_conditions(q: &CdrSummaryQuery) -> Condition {
 // ── Grouped report ────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy)]
-enum GroupBy {
+pub(crate) enum GroupBy {
     Hour,
     Day,
     Month,
 }
 
 impl GroupBy {
-    fn parse(s: Option<&str>) -> Self {
+    pub(crate) fn parse(s: Option<&str>) -> Self {
         match s.map(|x| x.trim().to_ascii_lowercase()).as_deref() {
             Some("hour") => Self::Hour,
             Some("month") => Self::Month,
@@ -383,6 +383,14 @@ pub struct CdrReportResponse {
     pub by_status_code: Vec<StatusCodeStat>,
     pub top_failure_reasons: Vec<FailureReasonStat>,
     pub hangup_reasons: Vec<HangupReasonStat>,
+    /// Per caller-number breakdown, highest volume first (analytics-console-page).
+    pub per_number: Vec<NumberStat>,
+    /// Routing attribution by (direction, trunk, route).
+    pub by_routing: Vec<RoutingStat>,
+    /// Per-origin international breakdown (dest outside the home country).
+    pub international: Vec<IntlOriginStat>,
+    /// Total international calls in the window.
+    pub international_total: i64,
     pub summary: ReportSummary,
 }
 
@@ -455,6 +463,14 @@ pub struct ReportSummary {
     pub ok: i64,
     pub usr: i64,
     pub sys: i64,
+    /// SIP-connected calls (answer_time present). `connected + failed_user +
+    /// failed_sys == total` (analytics-console-page).
+    pub connected: i64,
+    /// Calls where voice started (billable_duration_secs > 0); ⊆ connected.
+    pub answered: i64,
+    /// Aliases for the report vocabulary: USR / SYS failure counts.
+    pub failed_user: i64,
+    pub failed_sys: i64,
     pub inbound: i64,
     pub outbound: i64,
     pub asr: f64,
@@ -464,9 +480,47 @@ pub struct ReportSummary {
     pub avg_talk_secs: f64,
 }
 
+/// Per caller-number (DID) row for the "By Number" table.
+#[derive(Debug, Serialize)]
+pub struct NumberStat {
+    pub number: String,
+    pub total: i64,
+    pub connected: i64,
+    pub answered: i64,
+    pub failed: i64,
+    pub conn_pct: f64,
+    pub talk_minutes: f64,
+}
+
+/// Routing-attribution row: which trunk + route (+ direction) carried the call.
+/// v1 is the single terminating trunk; the Leg A→Leg B dual-trunk path is a
+/// fast-follow (needs ingress/egress capture).
+#[derive(Debug, Serialize)]
+pub struct RoutingStat {
+    pub direction: String,
+    pub trunk: String,
+    pub route_id: Option<i64>,
+    pub total: i64,
+    pub connected: i64,
+    pub failed: i64,
+    pub conn_pct: f64,
+    pub talk_minutes: f64,
+}
+
+/// Per-origin international row (dest not in the home country).
+#[derive(Debug, Serialize)]
+pub struct IntlOriginStat {
+    pub origin: String,
+    pub total: i64,
+    pub answered: i64,
+    pub failed: i64,
+    pub distinct_dests: i64,
+    pub talk_minutes: f64,
+}
+
 /// Per-row projection the report aggregates over — decoupled from the wide
 /// `CdrModel` so the aggregation is pure and unit-testable in isolation.
-struct ReportRow {
+pub(crate) struct ReportRow {
     started_at: DateTime<Utc>,
     direction: String,
     kind: OutcomeKind,
@@ -476,6 +530,11 @@ struct ReportRow {
     hangup_reason: Option<String>,
     upstream_flagged: bool,
     billable_secs: Option<i32>,
+    /// SIP dialog connected (200 OK) — drives the "Connected" tier.
+    answer_time: Option<DateTime<Utc>>,
+    from_number: Option<String>,
+    to_number: Option<String>,
+    route_id: Option<i64>,
 }
 
 /// Resolve a row's OK/USR/SYS class: the denormalized column when present, else
@@ -501,7 +560,7 @@ fn kind_of(m: &CdrModel) -> OutcomeKind {
     }
 }
 
-fn project(m: &CdrModel) -> ReportRow {
+pub(crate) fn project(m: &CdrModel) -> ReportRow {
     ReportRow {
         started_at: m.started_at,
         direction: m.direction.clone(),
@@ -512,6 +571,10 @@ fn project(m: &CdrModel) -> ReportRow {
         hangup_reason: m.hangup_reason.clone(),
         upstream_flagged: matches!(m.failure_source.as_deref(), Some("sbc") | Some("upstream")),
         billable_secs: m.billable_duration_secs,
+        answer_time: m.answer_time,
+        from_number: m.from_number.clone(),
+        to_number: m.to_number.clone(),
+        route_id: m.route_id,
     }
 }
 
@@ -564,9 +627,15 @@ impl Tally {
 }
 
 /// Aggregate projected rows into the grouped report. Pure (no DB/clock) so it is
-/// unit-testable; reproduces the operational report's sections.
-fn build_cdr_report(rows: Vec<ReportRow>, group_by: GroupBy, tz: Tz) -> CdrReportResponse {
-    use std::collections::BTreeMap;
+/// unit-testable; reproduces the operational report's sections. `home_dial_code`
+/// (e.g. `+91`) drives international classification.
+pub(crate) fn build_cdr_report(
+    rows: Vec<ReportRow>,
+    group_by: GroupBy,
+    tz: Tz,
+    home_dial_code: &str,
+) -> CdrReportResponse {
+    use std::collections::{BTreeMap, HashSet};
 
     #[derive(Default)]
     struct BucketAcc {
@@ -574,6 +643,21 @@ fn build_cdr_report(rows: Vec<ReportRow>, group_by: GroupBy, tz: Tz) -> CdrRepor
         inbound: i64,
         outbound: i64,
         talk_secs: i64,
+    }
+    // total / connected / answered / talk — for per-number and per-routing rows.
+    #[derive(Default)]
+    struct FlowAcc {
+        total: i64,
+        connected: i64,
+        answered: i64,
+        talk_secs: i64,
+    }
+    #[derive(Default)]
+    struct IntlAcc {
+        total: i64,
+        answered: i64,
+        talk_secs: i64,
+        dests: HashSet<String>,
     }
 
     let mut bucket_map: BTreeMap<String, BucketAcc> = BTreeMap::new();
@@ -583,6 +667,9 @@ fn build_cdr_report(rows: Vec<ReportRow>, group_by: GroupBy, tz: Tz) -> CdrRepor
     let mut code_map: BTreeMap<i16, Tally> = BTreeMap::new();
     let mut failure_map: BTreeMap<(i16, String), Tally> = BTreeMap::new();
     let mut hangup_map: BTreeMap<String, i64> = BTreeMap::new();
+    let mut number_map: BTreeMap<String, FlowAcc> = BTreeMap::new();
+    let mut routing_map: BTreeMap<(String, String, Option<i64>), FlowAcc> = BTreeMap::new();
+    let mut intl_map: BTreeMap<String, IntlAcc> = BTreeMap::new();
 
     let mut summary = Tally::default();
     let mut inbound = 0i64;
@@ -590,14 +677,22 @@ fn build_cdr_report(rows: Vec<ReportRow>, group_by: GroupBy, tz: Tz) -> CdrRepor
     let mut upstream_flagged = 0i64;
     let mut talk_secs = 0i64;
     let mut answered_with_talk = 0i64;
+    let mut connected_total = 0i64;
+    let mut answered_total = 0i64;
+    let mut international_total = 0i64;
 
     for r in &rows {
         let local = r.started_at.with_timezone(&tz);
         let is_inbound = r.direction == "inbound";
         let is_outbound = r.direction == "outbound";
-        let ok_talk = matches!(r.kind, OutcomeKind::Ok)
-            .then_some(r.billable_secs)
-            .flatten();
+        // Connected = SIP dialog answered (200 OK); Answered = voice started.
+        let connected = r.answer_time.is_some();
+        let answered = r.billable_secs.map(|b| b > 0).unwrap_or(false);
+        let talk = if answered {
+            r.billable_secs.unwrap_or(0).max(0) as i64
+        } else {
+            0
+        };
 
         summary.add(r.kind);
         if is_inbound {
@@ -608,10 +703,14 @@ fn build_cdr_report(rows: Vec<ReportRow>, group_by: GroupBy, tz: Tz) -> CdrRepor
         if r.upstream_flagged {
             upstream_flagged += 1;
         }
-        if let Some(t) = ok_talk {
-            talk_secs += t.max(0) as i64;
+        if connected {
+            connected_total += 1;
+        }
+        if answered {
+            answered_total += 1;
             answered_with_talk += 1;
         }
+        talk_secs += talk;
 
         {
             let b = bucket_map.entry(group_by.bucket_key(&local)).or_default();
@@ -621,9 +720,7 @@ fn build_cdr_report(rows: Vec<ReportRow>, group_by: GroupBy, tz: Tz) -> CdrRepor
             } else if is_outbound {
                 b.outbound += 1;
             }
-            if let Some(t) = ok_talk {
-                b.talk_secs += t.max(0) as i64;
-            }
+            b.talk_secs += talk;
         }
 
         let h = hour_map.entry(local.hour()).or_insert((0, 0));
@@ -640,7 +737,7 @@ fn build_cdr_report(rows: Vec<ReportRow>, group_by: GroupBy, tz: Tz) -> CdrRepor
             .clone()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "(direct)".to_string());
-        gw_map.entry(gw).or_default().add(r.kind);
+        gw_map.entry(gw.clone()).or_default().add(r.kind);
 
         if let Some(code) = r.status_code {
             code_map.entry(code).or_default().add(r.kind);
@@ -652,6 +749,44 @@ fn build_cdr_report(rows: Vec<ReportRow>, group_by: GroupBy, tz: Tz) -> CdrRepor
 
         if let Some(reason) = &r.hangup_reason {
             *hangup_map.entry(reason.clone()).or_insert(0) += 1;
+        }
+
+        // Per caller-number (By Number).
+        let num_key = r
+            .from_number
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "(unknown)".to_string());
+        let na = number_map.entry(num_key).or_default();
+        na.total += 1;
+        na.connected += connected as i64;
+        na.answered += answered as i64;
+        na.talk_secs += talk;
+
+        // Routing attribution (By Dialplan) — direction · trunk · route.
+        let ra = routing_map
+            .entry((r.direction.clone(), gw, r.route_id))
+            .or_default();
+        ra.total += 1;
+        ra.connected += connected as i64;
+        ra.answered += answered as i64;
+        ra.talk_secs += talk;
+
+        // International — destination outside the home country.
+        if let Some(to) = r.to_number.as_deref() {
+            if crate::callrecord::intl::is_international(to, home_dial_code) {
+                international_total += 1;
+                let origin = r
+                    .from_number
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "(unknown)".to_string());
+                let ia = intl_map.entry(origin).or_default();
+                ia.total += 1;
+                ia.answered += answered as i64;
+                ia.talk_secs += talk;
+                ia.dests.insert(to.to_string());
+            }
         }
     }
 
@@ -734,6 +869,48 @@ fn build_cdr_report(rows: Vec<ReportRow>, group_by: GroupBy, tz: Tz) -> CdrRepor
         .collect();
     hangup_reasons.sort_by(|a, b| b.count.cmp(&a.count));
 
+    let mut per_number: Vec<NumberStat> = number_map
+        .into_iter()
+        .map(|(number, a)| NumberStat {
+            number,
+            total: a.total,
+            connected: a.connected,
+            answered: a.answered,
+            failed: a.total - a.connected,
+            conn_pct: pct(a.connected, a.total),
+            talk_minutes: round1(a.talk_secs as f64 / 60.0),
+        })
+        .collect();
+    per_number.sort_by(|a, b| b.total.cmp(&a.total));
+
+    let mut by_routing: Vec<RoutingStat> = routing_map
+        .into_iter()
+        .map(|((direction, trunk, route_id), a)| RoutingStat {
+            direction,
+            trunk,
+            route_id,
+            total: a.total,
+            connected: a.connected,
+            failed: a.total - a.connected,
+            conn_pct: pct(a.connected, a.total),
+            talk_minutes: round1(a.talk_secs as f64 / 60.0),
+        })
+        .collect();
+    by_routing.sort_by(|a, b| b.total.cmp(&a.total));
+
+    let mut international: Vec<IntlOriginStat> = intl_map
+        .into_iter()
+        .map(|(origin, a)| IntlOriginStat {
+            origin,
+            total: a.total,
+            answered: a.answered,
+            failed: a.total - a.answered,
+            distinct_dests: a.dests.len() as i64,
+            talk_minutes: round1(a.talk_secs as f64 / 60.0),
+        })
+        .collect();
+    international.sort_by(|a, b| b.total.cmp(&a.total));
+
     let avg_talk_secs = if answered_with_talk > 0 {
         round1(talk_secs as f64 / answered_with_talk as f64)
     } else {
@@ -745,6 +922,10 @@ fn build_cdr_report(rows: Vec<ReportRow>, group_by: GroupBy, tz: Tz) -> CdrRepor
         ok: summary.ok,
         usr: summary.usr,
         sys: summary.sys,
+        connected: connected_total,
+        answered: answered_total,
+        failed_user: summary.usr,
+        failed_sys: summary.sys,
         inbound,
         outbound,
         asr: summary.conn_pct(),
@@ -762,15 +943,21 @@ fn build_cdr_report(rows: Vec<ReportRow>, group_by: GroupBy, tz: Tz) -> CdrRepor
         by_status_code,
         top_failure_reasons,
         hangup_reasons,
+        per_number,
+        by_routing,
+        international,
+        international_total,
         summary: report_summary,
     }
 }
 
-async fn cdr_summary(
-    State(state): State<AppState>,
-    Query(q): Query<CdrSummaryQuery>,
-) -> ApiResult<Json<CdrReportResponse>> {
-    let db = state.db();
+/// Fetch + filter + aggregate the grouped report for a query. Single shared
+/// path behind `/api/v1/cdrs/summary` and the console `/console/analytics/data`
+/// (analytics-console-page) so the two can't drift.
+pub(crate) async fn compute_cdr_report(
+    db: &sea_orm::DatabaseConnection,
+    q: &CdrSummaryQuery,
+) -> Result<CdrReportResponse, sea_orm::DbErr> {
     let group_by = GroupBy::parse(q.group_by.as_deref());
     let tz: Tz = q
         .tz
@@ -780,20 +967,26 @@ async fn cdr_summary(
         .and_then(|s| s.parse().ok())
         .unwrap_or(chrono_tz::Asia::Kolkata);
 
-    let mut conds = summary_conditions(&q);
+    let mut conds = summary_conditions(q);
     // Bound the scan: default to the last 30 days when no lower bound is given.
     if q.start_date.is_none() {
         conds = conds.add(CdrColumn::StartedAt.gte(Utc::now() - Duration::days(30)));
     }
 
-    let rows = CdrEntity::find()
-        .filter(conds)
-        .all(db)
+    let home = crate::config_merge::read_home_dial_code(db).await;
+    let rows = CdrEntity::find().filter(conds).all(db).await?;
+    let report_rows: Vec<ReportRow> = rows.iter().map(project).collect();
+    Ok(build_cdr_report(report_rows, group_by, tz, &home))
+}
+
+async fn cdr_summary(
+    State(state): State<AppState>,
+    Query(q): Query<CdrSummaryQuery>,
+) -> ApiResult<Json<CdrReportResponse>> {
+    let report = compute_cdr_report(state.db(), &q)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    let report_rows: Vec<ReportRow> = rows.iter().map(project).collect();
-
-    Ok(Json(build_cdr_report(report_rows, group_by, tz)))
+    Ok(Json(report))
 }
 
 async fn get_cdr(
@@ -917,6 +1110,11 @@ mod tests {
             hangup_reason: None,
             upstream_flagged: upstream,
             billable_secs: talk,
+            // a call with talk is connected (has an answer_time)
+            answer_time: talk.map(|_| ts),
+            from_number: None,
+            to_number: None,
+            route_id: None,
         }
     }
 
@@ -953,11 +1151,15 @@ mod tests {
                 true,
             ),
         ];
-        let r = build_cdr_report(rows, GroupBy::Day, ist);
+        let r = build_cdr_report(rows, GroupBy::Day, ist, "+91");
 
         assert_eq!(r.summary.ok + r.summary.usr + r.summary.sys, r.summary.total);
         assert_eq!(r.summary.total, 3);
         assert_eq!(r.summary.ok, 1);
+        // Connected (has answer_time) + Answered (talk > 0) tiers.
+        assert_eq!(r.summary.connected, 1);
+        assert_eq!(r.summary.answered, 1);
+        assert_eq!(r.summary.connected + r.summary.failed_user + r.summary.failed_sys, r.summary.total);
         assert_eq!(r.summary.upstream_flagged, 1);
         assert_eq!(r.summary.talk_minutes, 2.0);
         assert_eq!(r.summary.avg_talk_secs, 120.0);
@@ -991,6 +1193,7 @@ mod tests {
             )],
             GroupBy::Month,
             chrono_tz::Asia::Kolkata,
+            "+91",
         );
         assert_eq!(r.group_by, "month");
         assert_eq!(r.buckets[0].bucket, "2026-06");

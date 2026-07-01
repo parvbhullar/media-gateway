@@ -22,6 +22,11 @@ pub const ROUTING_DEFAULT_COUNTRY_KEY: &str = "routing.default_country";
 /// regex-based route table. Stored as a JSON bool (`true`/`false`).
 pub const ROUTING_DID_STRICT_MODE_KEY: &str = "routing.did_strict_mode";
 
+/// DB key: home dial code (e.g. `+91`) — a call whose destination is a full
+/// E.164 number in a different country is classified international in the
+/// analytics report. Stored as a JSON-encoded string. Default `+91`.
+pub const ROUTING_HOME_DIAL_CODE_KEY: &str = "routing.home_dial_code";
+
 /// Minimal bootstrap config: only `database_url` is required in `config.toml`.
 #[derive(Deserialize)]
 struct Bootstrap {
@@ -341,6 +346,8 @@ async fn seed_routing_defaults(db: &DatabaseConnection) {
         (ROUTING_DEFAULT_COUNTRY_KEY, "\"\""),
         // false = legacy regex-route fallback still used when DID not found.
         (ROUTING_DID_STRICT_MODE_KEY, "false"),
+        // Home country dial code for analytics international classification.
+        (ROUTING_HOME_DIAL_CODE_KEY, "\"+91\""),
     ];
     for (key, value) in defaults {
         match system_config::Model::get(db, key).await {
@@ -379,6 +386,28 @@ pub async fn read_default_country(db: &DatabaseConnection) -> Option<String> {
             Some(trimmed.to_ascii_uppercase())
         }
     })
+}
+
+/// Read `routing.home_dial_code` for analytics international classification.
+/// Defaults to `+91` when unset or blank. Accepts JSON-encoded or raw strings.
+pub async fn read_home_dial_code(db: &DatabaseConnection) -> String {
+    const DEFAULT: &str = "+91";
+    let Some(row) = system_config::Model::get(db, ROUTING_HOME_DIAL_CODE_KEY)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return DEFAULT.to_string();
+    };
+    let decoded: Option<String> = if row.value.trim_start().starts_with('"') {
+        serde_json::from_str(&row.value).ok()
+    } else {
+        Some(row.value)
+    };
+    decoded
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT.to_string())
 }
 
 /// Read `routing.did_strict_mode`. Defaults to `false` when missing or

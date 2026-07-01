@@ -5,6 +5,7 @@ use serde_json::json;
 use std::sync::Arc;
 
 pub mod addons;
+pub mod analytics;
 pub mod call_control;
 pub mod call_record;
 pub mod dashboard;
@@ -57,6 +58,7 @@ pub fn router(state: Arc<ConsoleState>) -> Router {
         .merge(setting::urls())
         .merge(routing::urls())
         .merge(call_record::urls())
+        .merge(analytics::urls())
         .merge(diagnostics::urls())
         .merge(call_control::urls())
         .merge(addons::urls())
