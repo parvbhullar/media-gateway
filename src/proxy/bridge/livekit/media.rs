@@ -24,7 +24,8 @@ use std::sync::Arc;
 
 use anyhow::anyhow;
 use async_trait::async_trait;
-use audio_codec::{CodecType, Decoder, Encoder, Resampler};
+use crate::media::resampler::VoiceResampler;
+use audio_codec::{CodecType, Decoder, Encoder};
 use audio_codec::opus::OpusEncoder;
 
 /// Construct the SIP-side audio decoder. We use the audio_codec crate's
@@ -478,8 +479,8 @@ async fn run_sip_to_livekit(
 ) {
     let mut decoder: Box<dyn Decoder> = build_sip_decoder(codec_type);
     let decoder_rate = decoder.sample_rate();
-    let mut resampler: Option<Resampler> = if decoder_rate != LK_SAMPLE_RATE {
-        Some(Resampler::new(
+    let mut resampler: Option<VoiceResampler> = if decoder_rate != LK_SAMPLE_RATE {
+        Some(VoiceResampler::new(
             decoder_rate as usize,
             LK_SAMPLE_RATE as usize,
         ))
@@ -626,8 +627,8 @@ async fn run_livekit_to_sip(
 ) {
     let mut encoder: Box<dyn Encoder> = build_sip_encoder(codec_type);
     let encoder_rate = encoder.sample_rate();
-    let mut resampler: Option<Resampler> = if encoder_rate != LK_SAMPLE_RATE {
-        Some(Resampler::new(
+    let mut resampler: Option<VoiceResampler> = if encoder_rate != LK_SAMPLE_RATE {
+        Some(VoiceResampler::new(
             LK_SAMPLE_RATE as usize,
             encoder_rate as usize,
         ))

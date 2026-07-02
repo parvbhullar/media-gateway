@@ -1306,11 +1306,19 @@ fn apply_form_to_active_model(
                     .and_then(|c| c.hold_tone_hz)
             };
 
+            // No console form field yet — preserve an existing value on
+            // update, default (48 kHz) on create. Set via API/TOML.
+            let pcm_sample_rate = existing_external_media_cfg
+                .as_ref()
+                .map(|c| c.pcm_sample_rate)
+                .unwrap_or(48_000);
+
             let external_media_cfg = ExternalMediaTrunkConfig {
                 command,
                 audio_codec,
                 bot_join_timeout_ms,
                 hold_tone_hz,
+                pcm_sample_rate,
             };
 
             serde_json::to_value(&external_media_cfg).map_err(|e| {

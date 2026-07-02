@@ -21,7 +21,8 @@ use std::sync::Arc;
 use anyhow::anyhow;
 use async_trait::async_trait;
 use audio_codec::opus::OpusEncoder;
-use audio_codec::{CodecType, Decoder, Encoder, Resampler};
+use crate::media::resampler::VoiceResampler;
+use audio_codec::{CodecType, Decoder, Encoder};
 use parking_lot::RwLock;
 use rustrtc::PeerConnection;
 use rustrtc::config::AudioCapability;
@@ -39,10 +40,12 @@ use crate::proxy::bridge::session::{BridgeKind, MediaBridge};
 type SharedRecorder = Arc<RwLock<Option<Recorder>>>;
 
 const PTIME_MS: u32 = 20;
-const PCM_SAMPLE_RATE: u32 = 48_000;
-/// 960 samples at 48 kHz = 20 ms mono = 1920 bytes (i16 LE).
-const PCM_FRAME_SAMPLES: usize = (PCM_SAMPLE_RATE as usize / 1000) * PTIME_MS as usize;
-const PCM_FRAME_BYTES: usize = PCM_FRAME_SAMPLES * 2;
+
+/// One 20 ms mono PCM frame at `pcm_rate` Hz, in samples (e.g. 960 @ 48 kHz,
+/// 480 @ 24 kHz — the preferred AI-consumer rate).
+fn pcm_frame_samples(pcm_rate: u32) -> usize {
+    (pcm_rate as usize / 1000) * PTIME_MS as usize
+}
 
 /// Stereo-default Opus decoder (downmixes to mono) — Linphone sends
 /// `opus/48000/2`; a mono decoder would produce silence. See livekit::media.
@@ -108,6 +111,9 @@ pub struct ExternalMediaBridge {
     /// UDP socket bound on 127.0.0.1, connected to the sidecar's address
     /// (learned at dispatch time from the sidecar's READY datagram).
     pub sock: Arc<UdpSocket>,
+    /// PCM sample rate on the sidecar datagram pipe (from trunk config;
+    /// 24 kHz preferred for AI consumers, 48 kHz default).
+    pub pcm_rate: u32,
     /// Drop-aware lifecycle signal.
     pub cancel_token: CancellationToken,
     /// For logs.
@@ -170,12 +176,13 @@ impl MediaBridge for ExternalMediaBridge {
             let sock = self.sock.clone();
             let dtmf_pt = self.sip_dtmf_pt;
             let codec_type = sip_codec_type;
+            let pcm_rate = self.pcm_rate;
             let rec_tx = rec_tx.clone();
             tokio::spawn(async move {
                 tracing::info!(trunk = %trunk_name, codec = ?codec_type,
                     "external_media task A (SIP→sidecar) started");
                 run_sip_to_sidecar(trunk_name.clone(), sip_pc, codec_type, dtmf_pt, sock,
-                    rec_tx, cancel)
+                    pcm_rate, rec_tx, cancel)
                     .await;
                 tracing::info!(trunk = %trunk_name, "external_media task A exited");
             });
@@ -187,11 +194,12 @@ impl MediaBridge for ExternalMediaBridge {
             let trunk_name = trunk_name.clone();
             let sock = self.sock.clone();
             let codec_type = sip_codec_type;
+            let pcm_rate = self.pcm_rate;
             tokio::spawn(async move {
                 tracing::info!(trunk = %trunk_name, codec = ?codec_type, sip_clock_rate,
                     "external_media task B (sidecar→SIP) started");
                 run_sidecar_to_sip(trunk_name.clone(), sock, codec_type, sip_clock_rate, sip_pt,
-                    sip_send, rec_tx, cancel)
+                    pcm_rate, sip_send, rec_tx, cancel)
                     .await;
                 tracing::info!(trunk = %trunk_name, "external_media task B exited");
             });
@@ -226,25 +234,30 @@ impl MediaBridge for ExternalMediaBridge {
     }
 }
 
-/// Task A: drain SIP RTP → decode → resample 48k → 20 ms PCM → UDP `send`.
+/// Task A: drain SIP RTP → decode → resample to `pcm_rate` → 20 ms PCM →
+/// UDP `send`.
+#[allow(clippy::too_many_arguments)]
 async fn run_sip_to_sidecar(
     trunk_name: String,
     sip_pc: PeerConnection,
     codec_type: CodecType,
     dtmf_pt: Option<u8>,
     sock: Arc<UdpSocket>,
+    pcm_rate: u32,
     rec_tx: Option<mpsc::Sender<RecItem>>,
     cancel: CancellationToken,
 ) {
     let mut decoder: Box<dyn Decoder> = build_sip_decoder(codec_type);
     let decoder_rate = decoder.sample_rate();
-    let mut resampler: Option<Resampler> = if decoder_rate != PCM_SAMPLE_RATE {
-        Some(Resampler::new(decoder_rate as usize, PCM_SAMPLE_RATE as usize))
+    let mut resampler: Option<VoiceResampler> = if decoder_rate != pcm_rate {
+        Some(VoiceResampler::new(decoder_rate as usize, pcm_rate as usize))
     } else {
         None
     };
 
-    let mut pcm_buf: Vec<i16> = Vec::with_capacity(PCM_FRAME_SAMPLES * 2);
+    let frame_samples = pcm_frame_samples(pcm_rate);
+    let frame_bytes = frame_samples * 2;
+    let mut pcm_buf: Vec<i16> = Vec::with_capacity(frame_samples * 2);
     let mut frames_out: u64 = 0;
 
     // Wait for the inbound audio track.
@@ -301,15 +314,15 @@ async fn run_sip_to_sidecar(
                 if pcm.is_empty() {
                     continue;
                 }
-                let pcm_48k = match resampler.as_mut() {
+                let pcm_out = match resampler.as_mut() {
                     Some(r) => r.resample(&pcm),
                     None => pcm,
                 };
-                pcm_buf.extend_from_slice(&pcm_48k);
+                pcm_buf.extend_from_slice(&pcm_out);
 
-                while pcm_buf.len() >= PCM_FRAME_SAMPLES {
-                    let chunk: Vec<i16> = pcm_buf.drain(..PCM_FRAME_SAMPLES).collect();
-                    let mut bytes = Vec::with_capacity(PCM_FRAME_BYTES);
+                while pcm_buf.len() >= frame_samples {
+                    let chunk: Vec<i16> = pcm_buf.drain(..frame_samples).collect();
+                    let mut bytes = Vec::with_capacity(frame_bytes);
                     for s in &chunk {
                         bytes.extend_from_slice(&s.to_le_bytes());
                     }
@@ -330,23 +343,26 @@ async fn run_sip_to_sidecar(
 
 /// Task B: receive 20 ms PCM datagrams from the sidecar → resample to SIP
 /// rate → encode → send on the SIP track (recv-driven).
+#[allow(clippy::too_many_arguments)]
 async fn run_sidecar_to_sip(
     trunk_name: String,
     sock: Arc<UdpSocket>,
     codec_type: CodecType,
     sip_clock_rate: u32,
     sip_pt: u8,
+    pcm_rate: u32,
     sip_send: rustrtc::media::track::SampleStreamSource,
     rec_tx: Option<mpsc::Sender<RecItem>>,
     cancel: CancellationToken,
 ) {
     let mut encoder: Box<dyn Encoder> = build_sip_encoder(codec_type);
     let encoder_rate = encoder.sample_rate();
-    let mut resampler: Option<Resampler> = if encoder_rate != PCM_SAMPLE_RATE {
-        Some(Resampler::new(PCM_SAMPLE_RATE as usize, encoder_rate as usize))
+    let mut resampler: Option<VoiceResampler> = if encoder_rate != pcm_rate {
+        Some(VoiceResampler::new(pcm_rate as usize, encoder_rate as usize))
     } else {
         None
     };
+    let frame_bytes = pcm_frame_samples(pcm_rate) * 2;
 
     let mut rtp_timestamp: u32 = rand::random();
     let mut sequence_number: u16 = rand::random();
@@ -377,16 +393,16 @@ async fn run_sidecar_to_sip(
                 }
                 // Ignore other control datagrams (e.g. READY) — only process
                 // exact 20 ms PCM frames.
-                if n != PCM_FRAME_BYTES {
+                if n != frame_bytes {
                     continue;
                 }
-                let pcm_48k: Vec<i16> = buf[..n]
+                let pcm_in: Vec<i16> = buf[..n]
                     .chunks_exact(2)
                     .map(|b| i16::from_le_bytes([b[0], b[1]]))
                     .collect();
                 let pcm_sip: Vec<i16> = match resampler.as_mut() {
-                    Some(r) => r.resample(&pcm_48k),
-                    None => pcm_48k,
+                    Some(r) => r.resample(&pcm_in),
+                    None => pcm_in,
                 };
                 if pcm_sip.is_empty() {
                     continue;

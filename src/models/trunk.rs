@@ -713,6 +713,17 @@ pub struct ExternalMediaTrunkConfig {
     /// no sidecar audio is arriving yet. Default none (silence).
     #[serde(default)]
     pub hold_tone_hz: Option<u16>,
+    /// PCM sample rate (Hz) on the sidecar datagram pipe. 24000 is the
+    /// preferred AI-consumer rate; default stays 48000 for compatibility
+    /// with existing sidecars. Allowed: 16000, 24000, 48000. When set to a
+    /// non-default value, rustpbx passes `--sample-rate=<hz>` to the
+    /// sidecar command so it can configure its pipeline to match.
+    #[serde(default = "default_pcm_sample_rate")]
+    pub pcm_sample_rate: u32,
+}
+
+fn default_pcm_sample_rate() -> u32 {
+    48_000
 }
 
 impl ExternalMediaTrunkConfig {
@@ -725,6 +736,14 @@ impl ExternalMediaTrunkConfig {
             other => {
                 return Err(ValidationError::custom(format!(
                     "audio_codec '{other}' not supported (allowed: opus, g722, pcmu, pcma)"
+                )));
+            }
+        }
+        match self.pcm_sample_rate {
+            16_000 | 24_000 | 48_000 => {}
+            other => {
+                return Err(ValidationError::custom(format!(
+                    "pcm_sample_rate {other} not supported (allowed: 16000, 24000, 48000)"
                 )));
             }
         }

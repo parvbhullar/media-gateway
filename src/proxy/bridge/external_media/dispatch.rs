@@ -72,6 +72,12 @@ pub async fn dispatch_external_media(
         .arg(format!("--did={}", ctx.to_user))
         .arg(format!("--caller={}", ctx.from_user))
         .arg(format!("--port={q_port}"));
+    // Only pass the rate when the operator overrides the 48 kHz default —
+    // opting in implies the sidecar understands the flag; existing sidecars
+    // with strict argparse keep working untouched.
+    if cfg.pcm_sample_rate != 48_000 {
+        command.arg(format!("--sample-rate={}", cfg.pcm_sample_rate));
+    }
     // Forward custom INVITE headers (X-*) as a JSON map in the environment;
     // the sidecar exposes each as a `sip.h.<Header>` participant attribute
     // (mirrors livekit/sip's HeadersToAttrs). Env (not argv) so arbitrary
@@ -153,6 +159,7 @@ pub async fn dispatch_external_media(
         sip_codec,
         sip_dtmf_pt,
         sock: sock.clone(),
+        pcm_rate: cfg.pcm_sample_rate,
         cancel_token: cancel.clone(),
         trunk_name: trunk.name.clone(),
         disconnect_cause: Arc::new(parking_lot::Mutex::new(BridgeHangupCause::ByCallee)),
