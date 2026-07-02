@@ -46,7 +46,11 @@ pub async fn create_test_server_with_config(
     let locator = Arc::new(Box::new(MemoryLocator::new()) as Box<dyn Locator>);
     let config = Arc::new(config);
 
-    let endpoint = rsipstack::EndpointBuilder::new().build();
+    let endpoint = rsipstack::EndpointBuilder::new()
+        .with_domain_resolver(Box::new(
+            crate::proxy::dns_resolver::RobustDomainResolver::new(),
+        ))
+        .build();
     // Add a mock transport to the endpoint so it can send out-of-dialog requests in tests
     let (tx_chan, _rx_chan) = tokio::sync::mpsc::unbounded_channel();
     let mock_addr = SipAddr {
@@ -166,7 +170,7 @@ pub async fn create_transaction(
     let connection = ChannelConnection::create_connection(rx, tx, mock_addr, None)
         .await
         .expect("failed to create channel connection");
-    let transport_layer = rsipstack::transport::TransportLayer::new(CancellationToken::new());
+    let transport_layer = crate::proxy::dns_resolver::new_transport_layer(CancellationToken::new());
     let sip_conn: rsipstack::transport::SipConnection = connection.into();
     transport_layer.add_transport(sip_conn.clone());
 

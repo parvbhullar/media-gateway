@@ -27,6 +27,18 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use tracing::warn;
 
+/// The one true way to build a `TransportLayer` in this codebase — always
+/// carries the crash-proof resolver. Direct `TransportLayer::new` panics
+/// on hosts with unparsable resolv.conf entries.
+pub fn new_transport_layer(
+    cancel: tokio_util::sync::CancellationToken,
+) -> rsipstack::transport::TransportLayer {
+    rsipstack::transport::TransportLayer::new_with_domain_resolver(
+        cancel,
+        Box::new(RobustDomainResolver::new()),
+    )
+}
+
 pub struct RobustDomainResolver {
     source: Backend,
 }

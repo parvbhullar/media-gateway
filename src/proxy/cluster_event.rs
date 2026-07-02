@@ -950,7 +950,7 @@ mod tests {
         let (locator_tx, _) = tokio::sync::broadcast::channel(4);
         let presence_manager = Arc::new(PresenceManager::new(None));
         let transport_layer =
-            rsipstack::transport::TransportLayer::new(tokio_util::sync::CancellationToken::new());
+            crate::proxy::dns_resolver::new_transport_layer(tokio_util::sync::CancellationToken::new());
         let endpoint = rsipstack::EndpointBuilder::new()
             .with_transport_layer(transport_layer)
             .build();

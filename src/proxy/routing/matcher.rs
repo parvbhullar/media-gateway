@@ -1128,10 +1128,36 @@ async fn apply_trunk_media_hints(
     routing_state: &RoutingState,
     trunk_name: &str,
 ) {
+    let Some(db) = routing_state.db() else { return };
+    let Some(cfg) = trunk_group_media_config(db, trunk_name).await else {
+        return;
+    };
+
+    if !cfg.codecs.is_empty() {
+        let codecs: Vec<String> = cfg
+            .codecs
+            .iter()
+            .filter_map(|c| super::codec_normalize::normalize_codec(c).map(str::to_string))
+            .collect();
+        if !codecs.is_empty() {
+            info!(trunk = %trunk_name, ?codecs, "trunk media_config codecs applied to egress offer");
+            hints.trunk_media_codecs = Some(codecs);
+        }
+    }
+    if cfg.jitter_buffer.is_some() {
+        hints.trunk_jitter_buffer = cfg.jitter_buffer;
+    }
+}
+
+/// Load a trunk's group `media_config`, keyed by group name or member
+/// gateway name (the config lives on `rustpbx_trunk_groups`). Returns
+/// `None` on any miss or error — media policy is always best-effort.
+pub(crate) async fn trunk_group_media_config(
+    db: &sea_orm::DatabaseConnection,
+    trunk_name: &str,
+) -> Option<crate::handler::api_v1::trunk_media::TrunkMediaConfig> {
     use crate::models::{trunk_group, trunk_group_member};
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-
-    let Some(db) = routing_state.db() else { return };
 
     let group = match trunk_group::Entity::find()
         .filter(trunk_group::Column::Name.eq(trunk_name))
@@ -1160,29 +1186,13 @@ async fn apply_trunk_media_hints(
         }
     };
 
-    let Some(json) = group.and_then(|g| g.media_config) else { return };
-    let cfg: crate::handler::api_v1::trunk_media::TrunkMediaConfig =
-        match serde_json::from_value(json) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(trunk = %trunk_name, error = %e, "stored media_config is malformed; ignoring");
-                return;
-            }
-        };
-
-    if !cfg.codecs.is_empty() {
-        let codecs: Vec<String> = cfg
-            .codecs
-            .iter()
-            .filter_map(|c| super::codec_normalize::normalize_codec(c).map(str::to_string))
-            .collect();
-        if !codecs.is_empty() {
-            info!(trunk = %trunk_name, ?codecs, "trunk media_config codecs applied to egress offer");
-            hints.trunk_media_codecs = Some(codecs);
+    let json = group.and_then(|g| g.media_config)?;
+    match serde_json::from_value(json) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::warn!(trunk = %trunk_name, error = %e, "stored media_config is malformed; ignoring");
+            None
         }
-    }
-    if cfg.jitter_buffer.is_some() {
-        hints.trunk_jitter_buffer = cfg.jitter_buffer;
     }
 }
 

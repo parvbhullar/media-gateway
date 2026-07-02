@@ -94,7 +94,7 @@ impl TestUa {
 
     /// Start the UA with simplified initialization
     pub async fn start(&mut self) -> Result<()> {
-        let transport_layer = TransportLayer::new(self.cancel_token.clone());
+        let transport_layer = crate::proxy::dns_resolver::new_transport_layer(self.cancel_token.clone());
         let local_addr = format!("127.0.0.1:{}", self.config.local_port).parse::<SocketAddr>()?;
 
         // Setup transport

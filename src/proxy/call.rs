@@ -1091,6 +1091,18 @@ impl CallModule {
             }
         }
 
+        // Caller-leg jitter policy from the INBOUND trunk's media_config
+        // (best-effort; needs the DB-wired routing state).
+        if let (Some(trunk_ctx), Some(db)) = (
+            cookie.get_extension::<TrunkContext>(),
+            self.inner.routing_state.db(),
+        ) && let Some(cfg) =
+            crate::proxy::routing::matcher::trunk_group_media_config(db, &trunk_ctx.name)
+                .await
+        {
+            dialplan.media.jitter_buffer_caller = cfg.jitter_buffer;
+        }
+
         if callee_is_same_realm && internal_lookup_empty {
             dialplan
                 .extensions

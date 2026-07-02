@@ -690,6 +690,9 @@ pub struct MediaConfig {
     /// Ingress jitter policy from the egress trunk's media_config;
     /// applied to the bridge leg receiving media from that trunk.
     pub jitter_buffer: Option<crate::media::jitter::JitterBufferPolicy>,
+    /// Ingress jitter policy from the INBOUND trunk's media_config;
+    /// applied to the caller-side bridge leg.
+    pub jitter_buffer_caller: Option<crate::media::jitter::JitterBufferPolicy>,
 }
 
 impl Default for MediaConfig {
@@ -711,6 +714,7 @@ impl MediaConfig {
             enable_latching: true,
             codec_strategy: CodecSelectionStrategy::default(),
             jitter_buffer: None,
+            jitter_buffer_caller: None,
         }
     }
 

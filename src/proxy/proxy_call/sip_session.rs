@@ -3193,12 +3193,17 @@ impl SipSession {
         let Some(bridge) = self.media_bridge.as_ref() else {
             return;
         };
-        // Egress trunk media_config jitter policy applies to the leg
-        // receiving media FROM that trunk (the callee side). Set before
-        // the transcoder decision so it holds for passthrough calls too.
+        // Trunk media_config jitter policies apply to the leg receiving
+        // media FROM each trunk: egress trunk → callee side, inbound
+        // trunk → caller side. Set before the transcoder decision so
+        // they hold for passthrough calls too.
         bridge.set_ingress_jitter(
             self.leg_bridge_endpoint(&LegId::from("callee")),
             self.context.dialplan.media.jitter_buffer,
+        );
+        bridge.set_ingress_jitter(
+            self.leg_bridge_endpoint(&LegId::from("caller")),
+            self.context.dialplan.media.jitter_buffer_caller,
         );
         let Some(caller_answer_sdp) = caller_answer_sdp else {
             return;
