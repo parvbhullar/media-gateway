@@ -1403,6 +1403,8 @@ impl BridgePeer {
         // does NOT want re-pacing — its peers tolerate burst-then-quiet
         // jitter from rustrtc's natural cadence, and the 200 ms re-anchor
         // logic produces audible micro-gaps on WS-SRTP legs.
+        // (Transcoded legs additionally pace regardless — see `pace_now`
+        // at the send site, which re-checks the dynamic transcoder slot.)
         let pace_audio =
             external_bridge_mode && !is_video && path.should_strip_webrtc_audio_metadata();
         let mut playout_anchor: Option<(tokio::time::Instant, u32, u32)> = None;
@@ -1669,7 +1671,17 @@ impl BridgePeer {
                                             }
                                 }
                             }
-                            if pace_audio
+                            // Pace when statically enabled (external bridge)
+                            // OR while this direction transcodes: the
+                            // transcoder can emit 0..N frames per input, so
+                            // without re-pacing a bursty ingress lands
+                            // unsmoothed on the egress peer.
+                            let pace_now = pace_audio
+                                || (!is_video
+                                    && transcoder
+                                        .as_ref()
+                                        .is_some_and(|t| t.read().is_some()));
+                            if pace_now
                                 && let Some(MediaSample::Audio(a)) = samples_to_send.first()
                             {
                                 let clock_rate = a.clock_rate.max(8000);
