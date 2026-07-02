@@ -35,7 +35,6 @@ pub mod resampler;
 pub mod sdp_bridge;
 pub mod telephone_event;
 pub mod transcoder;
-pub mod transcoding_pipeline;
 #[cfg(test)]
 mod unified_pc_tests;
 pub mod wav_writer;
