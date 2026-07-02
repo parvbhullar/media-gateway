@@ -108,6 +108,9 @@ rsipstack = "0.5.9"
 #rsipstack = { path = "../rsipstack" }
 audio-codec = { version = "=0.3.30", default-features = false }
 rubato = { version = "3.0.0", default-features = false }
+# Direct dep only for RobustDomainResolver (crash-proof SIP DNS); version
+# must stay in lockstep with rsipstack's hickory-resolver.
+hickory-resolver = { version = "0.26.1", features = ["system-config", "tokio"] }
 #rustrtc = { path = "../rustrtc" }
 rustrtc = "0.3.52"
 reqwest = { version = "0.13", features = [

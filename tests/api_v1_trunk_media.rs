@@ -458,3 +458,178 @@ async fn put_media_with_all_nulls_stores_some_not_null() {
     assert_eq!(stored["codecs"], json!([]));
     assert_eq!(stored["dtmf_mode"], Value::Null);
 }
+
+// =========================================================================
+// 10. jitter_buffer: adaptive + off round-trip, bounds validation, defaults
+// =========================================================================
+
+#[tokio::test]
+async fn put_media_jitter_buffer_adaptive_round_trips() {
+    let (state, token) = test_state_with_api_key("media-jb-happy").await;
+    insert_trunk(&state, "gw-media-jb").await;
+    insert_trunk_group(state.db(), "tg-media-jb", &["gw-media-jb"]).await;
+
+    let payload = json!({
+        "codecs": [],
+        "dtmf_mode": null,
+        "srtp": null,
+        "media_mode": null,
+        "jitter_buffer": {"mode": "adaptive", "min_ms": 30, "max_ms": 200}
+    });
+
+    let app = rustpbx::app::create_router(state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/trunks/tg-media-jb/media")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = body_json(resp).await;
+    assert_eq!(body["jitter_buffer"]["mode"], "adaptive");
+    assert_eq!(body["jitter_buffer"]["min_ms"], 30);
+    assert_eq!(body["jitter_buffer"]["max_ms"], 200);
+
+    // GET round-trip
+    let app2 = rustpbx::app::create_router(state);
+    let resp2 = app2
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/trunks/tg-media-jb/media")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let get_body = body_json(resp2).await;
+    assert_eq!(get_body["jitter_buffer"]["mode"], "adaptive");
+}
+
+#[tokio::test]
+async fn put_media_jitter_buffer_off_accepted() {
+    let (state, token) = test_state_with_api_key("media-jb-off").await;
+    insert_trunk(&state, "gw-media-jb-off").await;
+    insert_trunk_group(state.db(), "tg-media-jb-off", &["gw-media-jb-off"]).await;
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/trunks/tg-media-jb-off/media")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "codecs": [],
+                        "jitter_buffer": {"mode": "off"}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = body_json(resp).await;
+    assert_eq!(body["jitter_buffer"]["mode"], "off");
+}
+
+#[tokio::test]
+async fn put_media_jitter_buffer_min_ge_max_returns_400() {
+    let (state, token) = test_state_with_api_key("media-jb-minmax").await;
+    insert_trunk(&state, "gw-media-jb-mm").await;
+    insert_trunk_group(state.db(), "tg-media-jb-mm", &["gw-media-jb-mm"]).await;
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/trunks/tg-media-jb-mm/media")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "codecs": [],
+                        "jitter_buffer": {"mode": "adaptive", "min_ms": 120, "max_ms": 120}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    let body = body_json(resp).await;
+    let msg = body["error"].as_str().unwrap();
+    assert!(
+        msg.contains("min_ms"),
+        "expected error to mention 'min_ms', got: {}",
+        msg
+    );
+}
+
+#[tokio::test]
+async fn put_media_jitter_buffer_max_over_500_returns_400() {
+    let (state, token) = test_state_with_api_key("media-jb-max").await;
+    insert_trunk(&state, "gw-media-jb-max").await;
+    insert_trunk_group(state.db(), "tg-media-jb-max", &["gw-media-jb-max"]).await;
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/trunks/tg-media-jb-max/media")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "codecs": [],
+                        "jitter_buffer": {"mode": "adaptive", "min_ms": 20, "max_ms": 600}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    let body = body_json(resp).await;
+    let msg = body["error"].as_str().unwrap();
+    assert!(
+        msg.contains("max_ms"),
+        "expected error to mention 'max_ms', got: {}",
+        msg
+    );
+}
+
+#[tokio::test]
+async fn get_media_defaults_include_null_jitter_buffer() {
+    let (state, token) = test_state_with_api_key("media-jb-null").await;
+    insert_trunk(&state, "gw-media-jb-null").await;
+    insert_trunk_group(state.db(), "tg-media-jb-null", &["gw-media-jb-null"]).await;
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/trunks/tg-media-jb-null/media")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+    let body = body_json(resp).await;
+    assert_eq!(body["jitter_buffer"], Value::Null);
+}

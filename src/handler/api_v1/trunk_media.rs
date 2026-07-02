@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::app::AppState;
 use crate::handler::api_v1::error::{ApiError, ApiResult};
+use crate::media::jitter::JitterBufferPolicy;
 use crate::models::trunk_group::{
     self, Column as TrunkGroupColumn, Entity as TrunkGroupEntity,
 };
@@ -34,7 +35,7 @@ use crate::models::trunk_group::{
 /// echo. `codecs` defaults to `[]`; the three enum fields default to
 /// `None`. `deny_unknown_fields` catches operator typos early (e.g.
 /// `dtmf-mode` vs `dtmf_mode`).
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TrunkMediaConfig {
     #[serde(default)]
@@ -45,11 +46,18 @@ pub struct TrunkMediaConfig {
     pub srtp: Option<String>,
     #[serde(default)]
     pub media_mode: Option<String>,
+    /// Ingress jitter policy for legs arriving from this trunk.
+    /// Null = default behavior (jitter-buffer only while transcoding);
+    /// `{"mode":"off"}` disables even on transcoded legs;
+    /// `{"mode":"adaptive","min_ms":..,"max_ms":..}` re-times ALL inbound
+    /// legs from this trunk, passthrough included.
+    #[serde(default)]
+    pub jitter_buffer: Option<JitterBufferPolicy>,
 }
 
 impl TrunkMediaConfig {
     /// D-11 default shape: what GET returns when the `media_config` column
-    /// is NULL. The empty codec list and three nulls are the canonical
+    /// is NULL. The empty codec list and nulls are the canonical
     /// "no config" state — distinguishable from a PUT-stored all-null by
     /// reading the raw DB column (stored = `Some(json)`), but identical at
     /// the wire layer.
@@ -59,6 +67,7 @@ impl TrunkMediaConfig {
             dtmf_mode: None,
             srtp: None,
             media_mode: None,
+            jitter_buffer: None,
         }
     }
 }
@@ -133,6 +142,26 @@ fn validate_media_mode(value: &Option<String>) -> ApiResult<()> {
     }
 }
 
+/// jitter_buffer bounds: min_ms < max_ms, max_ms ≤ 500 (anything larger
+/// adds conversation-breaking latency).
+fn validate_jitter_buffer(value: &Option<JitterBufferPolicy>) -> ApiResult<()> {
+    if let Some(JitterBufferPolicy::Adaptive { min_ms, max_ms }) = value {
+        if min_ms >= max_ms {
+            return Err(ApiError::bad_request(format!(
+                "jitter_buffer: min_ms ({}) must be < max_ms ({})",
+                min_ms, max_ms
+            )));
+        }
+        if *max_ms > 500 {
+            return Err(ApiError::bad_request(format!(
+                "jitter_buffer: max_ms ({}) must be <= 500",
+                max_ms
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_media_config(cfg: &TrunkMediaConfig) -> ApiResult<()> {
     for c in &cfg.codecs {
         validate_codec(c)?;
@@ -140,6 +169,7 @@ fn validate_media_config(cfg: &TrunkMediaConfig) -> ApiResult<()> {
     validate_dtmf_mode(&cfg.dtmf_mode)?;
     validate_srtp(&cfg.srtp)?;
     validate_media_mode(&cfg.media_mode)?;
+    validate_jitter_buffer(&cfg.jitter_buffer)?;
     Ok(())
 }
 

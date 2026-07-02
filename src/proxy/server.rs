@@ -362,7 +362,13 @@ impl SipServerBuilder {
         let rtp_config = self.rtp_config.unwrap_or_default();
         let cancel_token = self.cancel_token.unwrap_or_default();
         let config = self.config.clone();
-        let transport_layer = TransportLayer::new(cancel_token.clone());
+        // RobustDomainResolver instead of rsipstack's default: the default
+        // panics at startup when the host's resolv.conf has entries hickory
+        // can't parse (e.g. macOS scoped-IPv6 nameservers).
+        let transport_layer = TransportLayer::new_with_domain_resolver(
+            cancel_token.clone(),
+            Box::new(crate::proxy::dns_resolver::RobustDomainResolver::new()),
+        );
         // Clone of TLS listener for hot-reload support (initialized inside if !self.no_bind block)
         let mut tls_listener_clone: Option<rsipstack::transport::TlsListenerConnection> = None;
 

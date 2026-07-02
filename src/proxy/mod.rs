@@ -18,6 +18,7 @@ pub mod cluster_event;
 pub mod data;
 pub mod data_file_ops;
 pub mod dialog_auth_cache;
+pub mod dns_resolver;
 pub mod file_trunk_sync;
 pub mod gateway_health;
 pub mod health_probers;
