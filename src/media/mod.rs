@@ -31,6 +31,7 @@ pub mod mixer_input;
 pub mod mixer_output;
 pub mod mixer_registry;
 pub mod negotiate;
+pub mod resampler;
 pub mod sdp_bridge;
 pub mod telephone_event;
 pub mod transcoder;
