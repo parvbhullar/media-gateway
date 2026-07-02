@@ -215,4 +215,64 @@ mod tests {
         let mut r = VoiceResampler::new(8000, 48000);
         assert!(r.resample(&[]).is_empty());
     }
+
+    /// Goertzel power at `freq` (normalized, relative comparisons only).
+    fn goertzel_power(samples: &[i16], sample_rate: f64, freq: f64) -> f64 {
+        let n = samples.len() as f64;
+        let k = (0.5 + n * freq / sample_rate).floor();
+        let w = 2.0 * std::f64::consts::PI * k / n;
+        let coeff = 2.0 * w.cos();
+        let (mut s1, mut s2) = (0.0f64, 0.0f64);
+        for &x in samples {
+            let s0 = f64::from(x) + coeff * s1 - s2;
+            s2 = s1;
+            s1 = s0;
+        }
+        (s1 * s1 + s2 * s2 - coeff * s1 * s2) / (n * n)
+    }
+
+    /// Sum of image powers relative to the signal, in dBc (negative = good),
+    /// for a 1 kHz tone upsampled from 8 kHz to `out_rate`.
+    fn imaging_dbc(out: &[i16], out_rate: f64) -> f64 {
+        let steady = &out[out.len() / 2..]; // skip warmup
+        let signal = goertzel_power(steady, out_rate, 1000.0);
+        // Images of a 1 kHz tone sit at n*8000 ± 1000 Hz below Nyquist.
+        let images: f64 = [7000.0, 9000.0, 15000.0, 17000.0, 23000.0]
+            .iter()
+            .filter(|&&f| f < out_rate / 2.0)
+            .map(|&f| goertzel_power(steady, out_rate, f))
+            .sum();
+        10.0 * (images / signal).log10()
+    }
+
+    /// The whole point of the rubato upgrade: spectral images after
+    /// upsampling must sit far below the legacy 16-tap polyphase's, and
+    /// below -55 dBc absolutely. Covers both AI-consumer targets (24/48 k).
+    #[test]
+    fn upsample_image_suppression_beats_legacy() {
+        let sine: Vec<i16> = (0..16000)
+            .map(|i| {
+                (10000.0
+                    * (2.0 * std::f64::consts::PI * 1000.0 * f64::from(i) / 8000.0)
+                        .sin()) as i16
+            })
+            .collect();
+
+        for out_rate in [24000usize, 48000] {
+            let new_db = {
+                let mut r = VoiceResampler::new(8000, out_rate);
+                imaging_dbc(&r.resample(&sine), out_rate as f64)
+            };
+            let old_db = {
+                let mut r = audio_codec::Resampler::new(8000, out_rate);
+                imaging_dbc(&r.resample(&sine), out_rate as f64)
+            };
+            println!("8k->{out_rate}: new {new_db:.1} dBc, legacy {old_db:.1} dBc");
+            assert!(new_db < -55.0, "8k->{out_rate}: images too high: {new_db:.1} dBc");
+            assert!(
+                new_db < old_db,
+                "8k->{out_rate}: new ({new_db:.1}) must beat legacy ({old_db:.1})"
+            );
+        }
+    }
 }
