@@ -1,4 +1,5 @@
-use audio_codec::{CodecType, Decoder, Encoder, Resampler, create_decoder, create_encoder};
+use crate::media::resampler::VoiceResampler;
+use audio_codec::{CodecType, Decoder, Encoder, create_decoder, create_encoder};
 use rand::RngExt;
 use rustrtc::media::AudioFrame;
 
@@ -94,7 +95,7 @@ pub struct Transcoder {
     target: CodecType,
     /// The actual negotiated PT for the target codec (from SDP answer, not codec default)
     target_pt: u8,
-    resampler: Option<Resampler>,
+    resampler: Option<VoiceResampler>,
     /// Resampled-PCM accumulator. The resampler does not emit an exact sample
     /// count per call (8k→48k yields 960 or 961 depending on its fractional
     /// position accumulator), but block codecs like Opus require an EXACT
@@ -115,7 +116,7 @@ impl Transcoder {
         let source_sample_rate = decoder.sample_rate();
         let target_sample_rate = encoder.sample_rate();
         let resampler = if source_sample_rate != target_sample_rate {
-            Some(Resampler::new(
+            Some(VoiceResampler::new(
                 source_sample_rate as usize,
                 target_sample_rate as usize,
             ))

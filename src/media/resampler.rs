@@ -24,7 +24,10 @@ pub struct VoiceResampler {
 enum Backend {
     Passthrough,
     Rubato {
-        rs: Async<f32>,
+        /// Mutex only to grant `Sync` (rubato's inner trait object is
+        /// `Send`-only); `resample` takes `&mut self` so access goes via
+        /// `get_mut()` — no runtime locking.
+        rs: std::sync::Mutex<Async<f32>>,
         chunk: usize,          // input frames per rubato call (10 ms)
         in_accum: Vec<f32>,
         out_scratch: Vec<f32>, // output_frames_max, reused every call
@@ -62,7 +65,7 @@ impl VoiceResampler {
                 let out_cap = rs.output_frames_max();
                 Self {
                     backend: Backend::Rubato {
-                        rs,
+                        rs: std::sync::Mutex::new(rs),
                         chunk,
                         in_accum: Vec::with_capacity(chunk * 4),
                         out_scratch: vec![0.0; out_cap],
@@ -87,6 +90,7 @@ impl VoiceResampler {
             Backend::Passthrough => input.to_vec(),
             Backend::Fallback(r) => r.resample(input),
             Backend::Rubato { rs, chunk, in_accum, out_scratch } => {
+                let rs = rs.get_mut().unwrap_or_else(|e| e.into_inner());
                 in_accum.extend(input.iter().map(|&s| f32::from(s) / 32768.0));
                 let per_chunk_out = out_scratch.len();
                 let mut out: Vec<i16> =
