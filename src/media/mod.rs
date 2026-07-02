@@ -30,6 +30,7 @@ mod mixer_e2e_tests;
 pub mod mixer_input;
 pub mod mixer_output;
 pub mod mixer_registry;
+pub mod jitter;
 pub mod negotiate;
 pub mod resampler;
 pub mod sdp_bridge;
