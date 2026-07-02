@@ -41,6 +41,7 @@
 //! 3. The bridge's WebRTC side connects to the WebRTC client
 //! 4. The bridge's RTP side connects to the SIP/RTP endpoint
 
+use crate::media::jitter::{JitterBufferPolicy, JitterConfig, JitterStage};
 use crate::media::recorder::{Leg as RecLeg, Recorder};
 use crate::media::transcoder::{RtpTiming, Transcoder};
 use anyhow::Result;
@@ -396,6 +397,11 @@ pub struct BridgePeer {
     webrtc_to_rtp_transcoder: Arc<parking_lot::RwLock<Option<Transcoder>>>,
     /// Optional RTP timestamp/sequence rewriter for WebRTC→RTP direction.
     webrtc_to_rtp_timing: Arc<parking_lot::RwLock<Option<RtpTiming>>>,
+    /// Ingress jitter policy for media arriving from the RTP side.
+    /// None = auto (jitter-buffer only while that direction transcodes).
+    rtp_ingress_jitter: Arc<parking_lot::RwLock<Option<JitterBufferPolicy>>>,
+    /// Ingress jitter policy for media arriving from the WebRTC side.
+    webrtc_ingress_jitter: Arc<parking_lot::RwLock<Option<JitterBufferPolicy>>>,
 
     /// Opt-in to the audio-fast-path behaviours added for the external
     /// WebRTC trunk dispatcher (PT-clear on codec-match-and-no-transcoder
@@ -453,6 +459,8 @@ impl BridgePeer {
             rtp_to_webrtc_timing: Arc::new(parking_lot::RwLock::new(None)),
             webrtc_to_rtp_transcoder: Arc::new(parking_lot::RwLock::new(None)),
             webrtc_to_rtp_timing: Arc::new(parking_lot::RwLock::new(None)),
+            rtp_ingress_jitter: Arc::new(parking_lot::RwLock::new(None)),
+            webrtc_ingress_jitter: Arc::new(parking_lot::RwLock::new(None)),
             external_bridge_mode: AtomicBool::new(false),
         }
     }
@@ -874,6 +882,88 @@ impl BridgePeer {
         );
     }
 
+    /// Set the ingress jitter policy for media *arriving from* the given
+    /// endpoint. `None` restores the default: jitter-buffer (with default
+    /// bounds) only while that direction is transcoding.
+    pub fn set_ingress_jitter(
+        &self,
+        from_endpoint: BridgeEndpoint,
+        policy: Option<JitterBufferPolicy>,
+    ) {
+        let slot = match from_endpoint {
+            BridgeEndpoint::Rtp => &self.rtp_ingress_jitter,
+            BridgeEndpoint::WebRtc => &self.webrtc_ingress_jitter,
+        };
+        *slot.write() = policy;
+        info!(
+            bridge_id = %self.id,
+            from = ?from_endpoint,
+            ?policy,
+            "Bridge ingress jitter configured"
+        );
+    }
+
+    /// Receive the next sample from `track`, optionally re-timed through the
+    /// ingress jitter stage. Effective policy: an explicit per-trunk setting
+    /// wins; otherwise the stage auto-enables while a transcoder is active
+    /// for this direction (reordered packets corrupt decoder state). Video
+    /// tracks never jitter-buffer. The stage is created and dropped lazily
+    /// so a mid-call policy/transcoder change takes effect on the next
+    /// packet.
+    async fn recv_maybe_jittered(
+        track: &Arc<dyn MediaStreamTrack>,
+        stage: &mut Option<JitterStage>,
+        policy: Option<&parking_lot::RwLock<Option<JitterBufferPolicy>>>,
+        transcoder: Option<&parking_lot::RwLock<Option<Transcoder>>>,
+        is_video: bool,
+    ) -> rustrtc::media::MediaResult<MediaSample> {
+        let effective: Option<JitterConfig> = if is_video {
+            None
+        } else {
+            match policy.and_then(|p| *p.read()) {
+                Some(JitterBufferPolicy::Off) => None,
+                Some(JitterBufferPolicy::Adaptive { min_ms, max_ms }) => {
+                    Some(JitterConfig { min_ms, max_ms })
+                }
+                None => transcoder
+                    .is_some_and(|t| t.read().is_some())
+                    .then(JitterConfig::default),
+            }
+        };
+        let Some(cfg) = effective else {
+            *stage = None;
+            return track.recv().await;
+        };
+        let js = stage.get_or_insert_with(|| JitterStage::new(cfg));
+        loop {
+            if let Some(sample) = js.pop() {
+                return Ok(sample);
+            }
+            let wait = js.next_wait();
+            tokio::select! {
+                recv = track.recv() => {
+                    match recv {
+                        Ok(sample) => {
+                            // Buffered samples surface via pop() above;
+                            // bypass (video / seq-less) returns directly.
+                            if let Some(direct) = js.push_or_bypass(sample) {
+                                return Ok(direct);
+                            }
+                        }
+                        // Track EOS/error: surface immediately — teardown
+                        // path; anything still buffered is end-of-call tail.
+                        Err(e) => return Err(e),
+                    }
+                }
+                _ = tokio::time::sleep(
+                    wait.unwrap_or(std::time::Duration::from_secs(3600))
+                ), if wait.is_some() => {
+                    // Delay elapsed — loop retries pop().
+                }
+            }
+        }
+    }
+
     /// Remove the transcoder for a given direction.
     pub fn clear_transcoder(&self, from_endpoint: BridgeEndpoint) {
         let (transcoder_slot, timing_slot) = match from_endpoint {
@@ -1115,6 +1205,8 @@ impl BridgePeer {
         let webrtc_to_rtp_timing = Arc::clone(&self.webrtc_to_rtp_timing);
         let rtp_to_webrtc_transcoder = Arc::clone(&self.rtp_to_webrtc_transcoder);
         let rtp_to_webrtc_timing = Arc::clone(&self.rtp_to_webrtc_timing);
+        let webrtc_ingress_jitter = Arc::clone(&self.webrtc_ingress_jitter);
+        let rtp_ingress_jitter = Arc::clone(&self.rtp_ingress_jitter);
         let external_bridge_mode = self
             .external_bridge_mode
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -1169,6 +1261,7 @@ impl BridgePeer {
                                         Arc::clone(&dtmf_sink),
                                         Some(Arc::clone(&webrtc_to_rtp_transcoder)),
                                         Some(Arc::clone(&webrtc_to_rtp_timing)),
+                                        Some(Arc::clone(&webrtc_ingress_jitter)),
                                         external_bridge_mode,
                                     ).await;
                                 }
@@ -1221,6 +1314,7 @@ impl BridgePeer {
                                         Arc::clone(&dtmf_sink),
                                         Some(Arc::clone(&rtp_to_webrtc_transcoder)),
                                         Some(Arc::clone(&rtp_to_webrtc_timing)),
+                                        Some(Arc::clone(&rtp_ingress_jitter)),
                                         external_bridge_mode,
                                     ).await;
                                 }
@@ -1255,6 +1349,7 @@ impl BridgePeer {
         dtmf_sink: Arc<parking_lot::RwLock<DtmfSinkSlots>>,
         transcoder: Option<Arc<parking_lot::RwLock<Option<Transcoder>>>>,
         transcoder_timing: Option<Arc<parking_lot::RwLock<Option<RtpTiming>>>>,
+        jitter_policy: Option<Arc<parking_lot::RwLock<Option<JitterBufferPolicy>>>>,
         external_bridge_mode: bool,
     ) {
         // Get the sender channel from weak pointer
@@ -1313,6 +1408,10 @@ impl BridgePeer {
         let mut playout_anchor: Option<(tokio::time::Instant, u32, u32)> = None;
         // Last seen RTP sequence number for loss estimation
         let mut last_seq: Option<u16> = None;
+        // Ingress jitter stage; constructed lazily by recv_maybe_jittered
+        // when the effective policy enables it (explicit per-trunk config,
+        // or auto while this direction transcodes).
+        let mut jitter_stage: Option<JitterStage> = None;
         // Per-second stats for video diagnostics
         let mut stats_packets: u64 = 0;
         let mut stats_bytes: u64 = 0;
@@ -1339,7 +1438,13 @@ impl BridgePeer {
                     stats_packets = 0;
                     stats_bytes = 0;
                 }
-                sample_result = track.recv() => {
+                sample_result = Self::recv_maybe_jittered(
+                    &track,
+                    &mut jitter_stage,
+                    jitter_policy.as_deref(),
+                    transcoder.as_deref(),
+                    is_video,
+                ) => {
                     match sample_result {
                         Ok(sample) => {
                             packet_count += 1;
@@ -1676,6 +1781,7 @@ impl BridgePeer {
         dtmf_sink: Arc<parking_lot::RwLock<DtmfSinkSlots>>,
         transcoder: Option<Arc<parking_lot::RwLock<Option<Transcoder>>>>,
         transcoder_timing: Option<Arc<parking_lot::RwLock<Option<RtpTiming>>>>,
+        jitter_policy: Option<Arc<parking_lot::RwLock<Option<JitterBufferPolicy>>>>,
         external_bridge_mode: bool,
     ) {
         tokio::spawn(async move {
@@ -1693,6 +1799,7 @@ impl BridgePeer {
                 dtmf_sink,
                 transcoder,
                 transcoder_timing,
+                jitter_policy,
                 external_bridge_mode,
             )
             .await;
@@ -3089,6 +3196,37 @@ mod tests {
         }
     }
 
+    /// Verify that set_ingress_jitter stores and clears the per-direction
+    /// jitter policy slots.
+    #[tokio::test]
+    async fn test_bridge_set_ingress_jitter() {
+        let bridge = BridgePeerBuilder::new("jitter-test".to_string())
+            .with_rtp_port_range(38000, 38100)
+            .build();
+
+        assert!(bridge.rtp_ingress_jitter.read().is_none());
+        assert!(bridge.webrtc_ingress_jitter.read().is_none());
+
+        bridge.set_ingress_jitter(
+            BridgeEndpoint::Rtp,
+            Some(JitterBufferPolicy::Adaptive { min_ms: 30, max_ms: 150 }),
+        );
+        assert_eq!(
+            *bridge.rtp_ingress_jitter.read(),
+            Some(JitterBufferPolicy::Adaptive { min_ms: 30, max_ms: 150 })
+        );
+        assert!(bridge.webrtc_ingress_jitter.read().is_none());
+
+        bridge.set_ingress_jitter(BridgeEndpoint::WebRtc, Some(JitterBufferPolicy::Off));
+        assert_eq!(
+            *bridge.webrtc_ingress_jitter.read(),
+            Some(JitterBufferPolicy::Off)
+        );
+
+        bridge.set_ingress_jitter(BridgeEndpoint::Rtp, None);
+        assert!(bridge.rtp_ingress_jitter.read().is_none());
+    }
+
     /// Verify that set_transcoder / clear_transcoder store and clear correctly.
     #[tokio::test]
     async fn test_bridge_set_transcoder() {
@@ -3202,6 +3340,11 @@ mod tests {
                     ds,
                     tr,
                     ti,
+                    // No explicit jitter policy → auto: the active transcoder
+                    // enables the ingress jitter stage, so this test also
+                    // exercises the JB path (min_delay 20 ms ≪ the 200 ms
+                    // window below).
+                    None,
                     false, // external_bridge_mode — keep legacy default for transcoder tests
                 )
                 .await;
@@ -3302,6 +3445,7 @@ mod tests {
                     ds,
                     None, // no transcoder
                     None, // no timing
+                    None, // no jitter policy → passthrough stays a straight relay
                     false, // external_bridge_mode — passthrough test asserts legacy bytes
                 )
                 .await;
