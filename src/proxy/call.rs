@@ -1040,7 +1040,23 @@ impl CallModule {
             if hints.disable_ice_servers == Some(true) {
                 dialplan.media.ice_servers = None;
             }
-            if let Some(codecs) = hints.allow_codecs {
+            // Trunk media_config codecs are the most specific policy: they
+            // pin the egress offer AND flip to Quality strategy so codecs
+            // the caller didn't offer are appended (HD upgrade); the bridge
+            // transcoder covers the mismatch.
+            if let Some(codecs) = hints.trunk_media_codecs {
+                let mut allow_codecs = Vec::new();
+                for codec_name in &codecs {
+                    if let Ok(codec) = CodecType::try_from(codec_name.as_str()) {
+                        allow_codecs.push(codec);
+                    }
+                }
+                if !allow_codecs.is_empty() {
+                    dialplan.allow_codecs = allow_codecs;
+                    dialplan.media.codec_strategy =
+                        crate::media::negotiate::CodecSelectionStrategy::Quality;
+                }
+            } else if let Some(codecs) = hints.allow_codecs {
                 let mut allow_codecs = Vec::new();
                 for codec_name in codecs {
                     if let Ok(codec) = CodecType::try_from(codec_name.as_str()) {
@@ -1061,6 +1077,7 @@ impl CallModule {
                     dialplan.allow_codecs = allow_codecs;
                 }
             }
+            dialplan.media.jitter_buffer = hints.trunk_jitter_buffer;
             dialplan.extensions = std::mem::take(&mut hints.extensions);
         } else if let Some(codecs) = &self.inner.config.codecs {
             let mut allow_codecs = Vec::new();

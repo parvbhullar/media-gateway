@@ -687,6 +687,9 @@ pub struct MediaConfig {
     /// Performance (default): avoid transcoding, keep caller's codecs only.
     /// Quality: prefer Opus > G729 > G722 > G711 (may transcode).
     pub codec_strategy: CodecSelectionStrategy,
+    /// Ingress jitter policy from the egress trunk's media_config;
+    /// applied to the bridge leg receiving media from that trunk.
+    pub jitter_buffer: Option<crate::media::jitter::JitterBufferPolicy>,
 }
 
 impl Default for MediaConfig {
@@ -707,6 +710,7 @@ impl MediaConfig {
             ice_servers: None,
             enable_latching: true,
             codec_strategy: CodecSelectionStrategy::default(),
+            jitter_buffer: None,
         }
     }
 

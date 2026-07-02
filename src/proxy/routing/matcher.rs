@@ -282,7 +282,7 @@ async fn match_invite_impl(
                 }
             }
 
-        let hints = {
+        let mut hints = {
             let mut hints = DialplanHints::default();
             if !rule.codecs.is_empty() {
                 hints.allow_codecs = Some(rule.codecs.clone());
@@ -352,6 +352,11 @@ async fn match_invite_impl(
 
                         if let Some(trace) = &mut trace {
                             trace.selected_trunk = Some(selected_trunk.clone());
+                        }
+
+                        if let Some(h) = hints.as_mut() {
+                            apply_trunk_media_hints(h, &routing_state, &selected_trunk)
+                                .await;
                         }
 
                         if let Some(trunk_config) = trunks
@@ -544,6 +549,11 @@ async fn match_invite_impl(
 
                         if let Some(trace) = &mut trace {
                             trace.selected_trunk = Some(selected_trunk.clone());
+                        }
+
+                        if let Some(h) = hints.as_mut() {
+                            apply_trunk_media_hints(h, &routing_state, &selected_trunk)
+                                .await;
                         }
 
                         if let Some(trunk_config) = trunks
@@ -1105,6 +1115,77 @@ fn update_uri_host(uri: &rsipstack::sip::Uri, new_host: &str) -> Result<rsipstac
 }
 
 /// Select trunk
+/// Enrich hints with the selected trunk's group `media_config` (Phase-5
+/// hot-path enforcement): the group's codecs shape the egress offer (HD
+/// upgrade — offered even when the caller didn't offer them; the bridge
+/// transcoder covers the mismatch) and its jitter policy rides along to
+/// the bridge. Best-effort: routing never fails over media policy.
+///
+/// `media_config` lives on `rustpbx_trunk_groups`; the selected name may
+/// be the group itself or a member gateway, so try both keys.
+async fn apply_trunk_media_hints(
+    hints: &mut DialplanHints,
+    routing_state: &RoutingState,
+    trunk_name: &str,
+) {
+    use crate::models::{trunk_group, trunk_group_member};
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+    let Some(db) = routing_state.db() else { return };
+
+    let group = match trunk_group::Entity::find()
+        .filter(trunk_group::Column::Name.eq(trunk_name))
+        .one(db)
+        .await
+    {
+        Ok(Some(g)) => Some(g),
+        Ok(None) => {
+            // Maybe a member gateway name — resolve to its group.
+            match trunk_group_member::Entity::find()
+                .filter(trunk_group_member::Column::GatewayName.eq(trunk_name))
+                .one(db)
+                .await
+            {
+                Ok(Some(member)) => trunk_group::Entity::find_by_id(member.trunk_group_id)
+                    .one(db)
+                    .await
+                    .ok()
+                    .flatten(),
+                _ => None,
+            }
+        }
+        Err(e) => {
+            tracing::debug!(trunk = %trunk_name, error = %e, "trunk_group media lookup failed");
+            None
+        }
+    };
+
+    let Some(json) = group.and_then(|g| g.media_config) else { return };
+    let cfg: crate::handler::api_v1::trunk_media::TrunkMediaConfig =
+        match serde_json::from_value(json) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(trunk = %trunk_name, error = %e, "stored media_config is malformed; ignoring");
+                return;
+            }
+        };
+
+    if !cfg.codecs.is_empty() {
+        let codecs: Vec<String> = cfg
+            .codecs
+            .iter()
+            .filter_map(|c| super::codec_normalize::normalize_codec(c).map(str::to_string))
+            .collect();
+        if !codecs.is_empty() {
+            info!(trunk = %trunk_name, ?codecs, "trunk media_config codecs applied to egress offer");
+            hints.trunk_media_codecs = Some(codecs);
+        }
+    }
+    if cfg.jitter_buffer.is_some() {
+        hints.trunk_jitter_buffer = cfg.jitter_buffer;
+    }
+}
+
 pub(crate) fn select_trunk(
     dest_config: &crate::proxy::routing::DestConfig,
     select_method: &str,

@@ -786,6 +786,13 @@ pub struct DialplanHints {
     pub max_duration: Option<std::time::Duration>,
     pub enable_sipflow: Option<bool>,
     pub allow_codecs: Option<Vec<String>>,
+    /// Egress trunk_group `media_config.codecs` (lowercase canonical).
+    /// Unlike `allow_codecs` (a filter), these are offered toward the
+    /// trunk even when the caller didn't offer them — the bridge
+    /// transcoder covers the mismatch (HD upgrade).
+    pub trunk_media_codecs: Option<Vec<String>>,
+    /// Egress trunk_group `media_config.jitter_buffer` policy.
+    pub trunk_jitter_buffer: Option<crate::media::jitter::JitterBufferPolicy>,
     pub extensions: http::Extensions,
     pub disable_ice_servers: Option<bool>,
 }

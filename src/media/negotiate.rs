@@ -1840,4 +1840,41 @@ a=rtpmap:101 telephone-event/8000\r\n";
         assert_eq!(callee_audio[1].codec, CodecType::PCMU, "PCMU second");
         assert_eq!(callee_audio[2].codec, CodecType::PCMA, "PCMA third");
     }
+
+    /// HD upgrade via trunk media_config: an egress trunk pinned to
+    /// ["opus"] gets an offer containing Opus FIRST even though the
+    /// caller offered only PCMU. The bridge transcoder covers the
+    /// PCMU↔Opus mismatch once the trunk answers with Opus.
+    #[cfg(feature = "opus")]
+    #[test]
+    fn trunk_pinned_codecs_upgrade_offer_beyond_callers() {
+        let caller_sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=audio 10000 RTP/AVP 0 101\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=rtpmap:101 telephone-event/8000\r\n";
+
+        let offer = MediaNegotiator::build_callee_codec_offer_with_allow(
+            caller_sdp,
+            false, // callee is a SIP trunk, not WebRTC
+            &[CodecType::Opus, CodecType::TelephoneEvent],
+            CodecSelectionStrategy::Quality,
+        );
+
+        let audio: Vec<_> = offer.iter().filter(|c| !c.is_dtmf()).collect();
+        assert!(
+            audio.iter().any(|c| c.codec == CodecType::Opus),
+            "offer must include Opus although the caller never offered it: {audio:?}"
+        );
+        assert_eq!(
+            audio[0].codec,
+            CodecType::Opus,
+            "trunk-pinned Opus must be offered first"
+        );
+        // The allow list restricts to Opus only — the caller's PCMU is
+        // filtered from the egress offer (transcoding bridges the legs).
+        assert_eq!(audio.len(), 1, "allow list pins the egress offer: {audio:?}");
+    }
 }
