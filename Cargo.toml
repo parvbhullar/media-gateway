@@ -104,9 +104,10 @@ toml_edit = { version = "0.25.11", features = ["serde"] }
 rand = "0.10.1"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10.4"
-#rsipstack = "0.5.9"
-rsipstack = { path = "../rsipstack" }
+rsipstack = "0.5.9"
+#rsipstack = { path = "../rsipstack" }
 audio-codec = { version = "=0.3.30", default-features = false }
+rubato = { version = "3.0.0", default-features = false }
 #rustrtc = { path = "../rustrtc" }
 rustrtc = "0.3.52"
 reqwest = { version = "0.13", features = [
