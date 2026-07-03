@@ -249,6 +249,26 @@ mod tests {
         10.0 * (images / signal).log10()
     }
 
+    /// Not a benchmark — a tripwire. Run manually:
+    /// `cargo test --release --lib media::resampler -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn throughput_smoke() {
+        for (out_rate, label) in [(24000usize, "8k->24k"), (48000, "8k->48k")] {
+            let mut r = VoiceResampler::new(8000, out_rate);
+            let input = vec![1000i16; 160]; // 20 ms
+            let start = std::time::Instant::now();
+            let iters = 50_000; // 1000 s of audio
+            for _ in 0..iters {
+                let _ = r.resample(&input);
+            }
+            let elapsed = start.elapsed();
+            let realtime_x = (f64::from(iters) * 0.02) / elapsed.as_secs_f64();
+            println!("{label}: {realtime_x:.0}x realtime ({elapsed:?} for {iters} chunks)");
+            assert!(realtime_x > 100.0, "{label} too slow: {realtime_x:.0}x realtime");
+        }
+    }
+
     /// The whole point of the rubato upgrade: spectral images after
     /// upsampling must sit far below the legacy 16-tap polyphase's, and
     /// below -55 dBc absolutely. Covers both AI-consumer targets (24/48 k).
