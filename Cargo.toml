@@ -105,7 +105,7 @@ rand = "0.10.1"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10.4"
 #rsipstack = "0.5.9"
-rsipstack = { path = "../rsipstack" }
+rsipstack = { path = "vendor/rsipstack" }
 audio-codec = { version = "=0.3.30", default-features = false }
 rubato = { version = "3.0.0", default-features = false }
 # Direct dep only for RobustDomainResolver (crash-proof SIP DNS); version
