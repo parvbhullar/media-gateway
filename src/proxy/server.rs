@@ -35,7 +35,7 @@ use rsipstack::{
         transaction::Transaction,
     },
     transport::{
-        TcpListenerConnection, TlsConfig, TlsListenerConnection, TransportLayer,
+        TcpListenerConnection, TlsConfig, TlsListenerConnection,
         WebSocketListenerConnection, udp::UdpConnection,
     },
 };

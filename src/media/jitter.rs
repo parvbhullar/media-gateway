@@ -50,6 +50,7 @@ impl Default for JitterConfig {
 
 pub struct JitterStage {
     jb: JitterBuffer,
+    cfg: JitterConfig,
 }
 
 impl JitterStage {
@@ -63,7 +64,12 @@ impl JitterStage {
                 Duration::from_millis(cfg.max_ms),
                 capacity,
             ),
+            cfg,
         }
+    }
+
+    pub fn config(&self) -> JitterConfig {
+        self.cfg
     }
 
     /// Buffer the sample, or hand it straight back when the jitter buffer

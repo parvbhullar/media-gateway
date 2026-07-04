@@ -1077,7 +1077,7 @@ impl CallModule {
                     dialplan.allow_codecs = allow_codecs;
                 }
             }
-            dialplan.media.jitter_buffer = hints.trunk_jitter_buffer;
+            dialplan.media.jitter_buffer_callee = hints.trunk_jitter_buffer;
             dialplan.extensions = std::mem::take(&mut hints.extensions);
         } else if let Some(codecs) = &self.inner.config.codecs {
             let mut allow_codecs = Vec::new();

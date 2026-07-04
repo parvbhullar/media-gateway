@@ -3199,7 +3199,7 @@ impl SipSession {
         // they hold for passthrough calls too.
         bridge.set_ingress_jitter(
             self.leg_bridge_endpoint(&LegId::from("callee")),
-            self.context.dialplan.media.jitter_buffer,
+            self.context.dialplan.media.jitter_buffer_callee,
         );
         bridge.set_ingress_jitter(
             self.leg_bridge_endpoint(&LegId::from("caller")),

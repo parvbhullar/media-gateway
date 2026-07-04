@@ -141,13 +141,19 @@ impl DomainResolver for RobustDomainResolver {
     /// Mirrors `DefaultDomainResolver::resolve_with_lookup`: RFC 3263
     /// resolution of a domain target to a concrete transport address.
     async fn resolve(&self, target: &SipAddr) -> rsipstack::Result<SipAddr> {
+        // IP-literal targets need no DNS — pass straight through.
+        if let Host::IpAddr(ip) = &target.addr.host {
+            return Ok(SipAddr {
+                r#type: target.r#type,
+                addr: HostWithPort {
+                    host: Host::IpAddr(*ip),
+                    port: target.addr.port,
+                },
+            });
+        }
         let domain = match &target.addr.host {
             Host::Domain(domain) => domain,
-            _ => {
-                return Err(rsipstack::Error::DnsResolutionError(
-                    target.addr.to_string(),
-                ));
-            }
+            _ => unreachable!("IpAddr handled above"),
         };
         let secure = matches!(
             target.r#type,
@@ -189,9 +195,10 @@ mod tests {
         let _ = RobustDomainResolver::new();
     }
 
-    /// IP-literal hosts resolve without any DNS at all.
+    /// An IP string inside `Host::Domain` (rsipstack's typical form for numeric
+    /// targets) resolves via `resolve_logic` without external DNS.
     #[tokio::test]
-    async fn ip_literal_resolves_without_dns() {
+    async fn ip_string_in_domain_host_resolves() {
         let r = RobustDomainResolver::new();
         let target = SipAddr {
             r#type: Some(Transport::Udp),
@@ -200,10 +207,27 @@ mod tests {
                 port: Some(5060.into()),
             },
         };
-        let resolved = r.resolve(&target).await.expect("ip literal resolves");
+        let resolved = r.resolve(&target).await.expect("ip string resolves");
         assert_eq!(
             resolved.addr.host,
             Host::IpAddr("192.0.2.10".parse().unwrap())
         );
+    }
+
+    /// A true `Host::IpAddr` target passes through unchanged without DNS.
+    #[tokio::test]
+    async fn ip_addr_variant_passes_through() {
+        let r = RobustDomainResolver::new();
+        let ip: std::net::IpAddr = "192.0.2.10".parse().unwrap();
+        let target = SipAddr {
+            r#type: Some(Transport::Udp),
+            addr: HostWithPort {
+                host: Host::IpAddr(ip),
+                port: Some(5060.into()),
+            },
+        };
+        let resolved = r.resolve(&target).await.expect("IpAddr passes through");
+        assert_eq!(resolved.addr.host, Host::IpAddr(ip));
+        assert_eq!(resolved.r#type, Some(Transport::Udp));
     }
 }

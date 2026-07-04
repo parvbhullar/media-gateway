@@ -931,9 +931,22 @@ impl BridgePeer {
             }
         };
         let Some(cfg) = effective else {
+            if let Some(ref js) = *stage {
+                if !js.is_empty() {
+                    tracing::warn!(
+                        "jitter buffer cleared while non-empty (policy off / transcoder removed); \
+                        buffered audio tail dropped"
+                    );
+                }
+            }
             *stage = None;
             return track.recv().await;
         };
+        // Recreate the stage when config parameters change (e.g. operator
+        // updates min_ms/max_ms via API mid-call) — avoids frozen bounds.
+        if stage.as_ref().is_some_and(|js| js.config() != cfg) {
+            *stage = None;
+        }
         let js = stage.get_or_insert_with(|| JitterStage::new(cfg));
         loop {
             if let Some(sample) = js.pop() {
