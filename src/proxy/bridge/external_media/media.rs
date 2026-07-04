@@ -392,8 +392,17 @@ async fn run_sidecar_to_sip(
                     break;
                 }
                 // Ignore other control datagrams (e.g. READY) — only process
-                // exact 20 ms PCM frames.
+                // exact 20 ms PCM frames. A size mismatch almost always means
+                // the sidecar was built for a different pcm_sample_rate than
+                // this trunk is configured for — operator action required.
                 if n != frame_bytes {
+                    tracing::warn!(
+                        received_bytes = n,
+                        expected_bytes = frame_bytes,
+                        pcm_rate = pcm_rate,
+                        "sidecar datagram size mismatch — \
+                        sidecar pcm_sample_rate likely differs from trunk config; frame dropped"
+                    );
                     continue;
                 }
                 let pcm_in: Vec<i16> = buf[..n]

@@ -688,8 +688,8 @@ pub struct MediaConfig {
     /// Quality: prefer Opus > G729 > G722 > G711 (may transcode).
     pub codec_strategy: CodecSelectionStrategy,
     /// Ingress jitter policy from the egress trunk's media_config;
-    /// applied to the bridge leg receiving media from that trunk.
-    pub jitter_buffer: Option<crate::media::jitter::JitterBufferPolicy>,
+    /// applied to the callee-side bridge leg (media arriving from the egress trunk).
+    pub jitter_buffer_callee: Option<crate::media::jitter::JitterBufferPolicy>,
     /// Ingress jitter policy from the INBOUND trunk's media_config;
     /// applied to the caller-side bridge leg.
     pub jitter_buffer_caller: Option<crate::media::jitter::JitterBufferPolicy>,
@@ -713,7 +713,7 @@ impl MediaConfig {
             ice_servers: None,
             enable_latching: true,
             codec_strategy: CodecSelectionStrategy::default(),
-            jitter_buffer: None,
+            jitter_buffer_callee: None,
             jitter_buffer_caller: None,
         }
     }
