@@ -88,6 +88,11 @@ pub struct SipTrunkForm {
     pub incoming_from_user_prefix: Option<String>,
     pub incoming_to_user_prefix: Option<String>,
     pub metadata: Option<String>,
+    /// Per-trunk HD codec upgrade (SIP kind). When true, the egress offer to
+    /// this trunk is pinned to `opus,g722,pcmu,pcma,g729` and flips to the
+    /// Quality strategy, so a low-quality caller is transcoded up to the best
+    /// codec this trunk accepts. Stored in `metadata.media.codecs`.
+    pub prefer_hd: Option<bool>,
     pub is_active: Option<bool>,
     pub rewrite_hostport: Option<bool>,
     pub register_enabled: Option<bool>,

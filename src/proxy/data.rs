@@ -1500,13 +1500,14 @@ fn convert_sip_trunk(model: sip_trunk::Model) -> Result<Option<(String, TrunkCon
         .metadata
         .as_ref()
         .and_then(recording_policy_from_metadata);
+    let codec = sip_trunk_codecs(model.metadata.as_ref());
 
     let trunk = TrunkConfig {
         dest,
         backup_dest,
         username: sip_cfg.auth_username,
         password: sip_cfg.auth_password,
-        codec: Vec::new(),
+        codec,
         disabled: Some(!model.is_active),
         max_calls: model.max_concurrent.map(|v| v as u32),
         max_cps: model.max_cps.map(|v| v as u32),
@@ -1664,6 +1665,33 @@ fn recording_policy_from_metadata(value: &serde_json::Value) -> Option<Recording
     value
         .get("recording")
         .and_then(|entry| serde_json::from_value::<RecordingPolicy>(entry.clone()).ok())
+}
+
+/// Default HD codec-upgrade offer for SIP trunks, best-quality first with
+/// G729 as last resort. The matcher pins this as the egress offer and flips
+/// to the Quality strategy (see `call.rs`), so a low-quality caller is
+/// transcoded/resampled UP to the best codec the callee accepts.
+const DEFAULT_HD_CODECS: [&str; 5] = ["opus", "g722", "pcmu", "pcma", "g729"];
+
+/// Resolve a SIP trunk's egress codec list. HD upgrade is **ON by default**:
+/// absent config yields [`DEFAULT_HD_CODECS`]. An operator opts a trunk OUT
+/// with `metadata.media.hd_disabled = true`, yielding an empty list so codec
+/// selection falls back to the compiled defaults in `negotiate.rs` (no forced
+/// upgrade). An explicit `metadata.media.codecs` list overrides the default.
+fn sip_trunk_codecs(metadata: Option<&serde_json::Value>) -> Vec<String> {
+    let media = metadata.and_then(|m| m.get("media"));
+    if media
+        .and_then(|m| m.get("hd_disabled"))
+        .and_then(|v| v.as_bool())
+        == Some(true)
+    {
+        return Vec::new();
+    }
+    media
+        .and_then(|m| m.get("codecs"))
+        .and_then(|c| serde_json::from_value::<Vec<String>>(c.clone()).ok())
+        .filter(|list| !list.is_empty())
+        .unwrap_or_else(|| DEFAULT_HD_CODECS.iter().map(|s| s.to_string()).collect())
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2028,6 +2056,31 @@ fn push_unique(list: &mut Vec<String>, value: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sip_trunk_codecs_default_on_and_opt_out() {
+        use serde_json::json;
+        let hd = vec!["opus", "g722", "pcmu", "pcma", "g729"];
+        // Default ON: no metadata / no media key / unrelated keys → HD list.
+        assert_eq!(sip_trunk_codecs(None), hd);
+        assert_eq!(sip_trunk_codecs(Some(&json!({}))), hd);
+        assert_eq!(sip_trunk_codecs(Some(&json!({"media": {}}))), hd);
+        assert_eq!(sip_trunk_codecs(Some(&json!({"recording": {"mode": "all"}}))), hd);
+        // Opt OUT → empty, so routing falls back to compiled defaults.
+        assert!(sip_trunk_codecs(Some(&json!({"media": {"hd_disabled": true}}))).is_empty());
+        // Explicit custom list overrides the default set.
+        assert_eq!(
+            sip_trunk_codecs(Some(&json!({"media": {"codecs": ["g722", "pcmu"]}}))),
+            vec!["g722", "pcmu"]
+        );
+        // hd_disabled wins over any codecs list.
+        assert!(
+            sip_trunk_codecs(Some(
+                &json!({"media": {"hd_disabled": true, "codecs": ["opus"]}})
+            ))
+            .is_empty()
+        );
+    }
 
     #[test]
     fn slugify_queue_name_strips_whitespace() {

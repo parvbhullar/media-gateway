@@ -363,6 +363,19 @@ async fn match_invite_impl(
                             .as_ref()
                             .and_then(|trunks| trunks.get(&selected_trunk))
                         {
+                            // Per-trunk HD upgrade: a non-empty codec list on
+                            // the selected trunk (from metadata.media.codecs,
+                            // loaded in-memory) pins the egress offer and flips
+                            // to Quality strategy in call.rs, transcoding a
+                            // low-quality caller up to the best the callee
+                            // accepts. Overrides the (dormant) group config.
+                            if !trunk_config.codec.is_empty()
+                                && let Some(h) = hints.as_mut()
+                            {
+                                h.trunk_media_codecs =
+                                    Some(trunk_config.codec.clone());
+                            }
+
                             // Check Trunk Policy
                             if let Some(policy) = &trunk_config.policy
                                 && let Some(guard) = &routing_state.policy_guard {
@@ -560,6 +573,19 @@ async fn match_invite_impl(
                             .as_ref()
                             .and_then(|trunks| trunks.get(&selected_trunk))
                         {
+                            // Per-trunk HD upgrade: a non-empty codec list on
+                            // the selected trunk (from metadata.media.codecs,
+                            // loaded in-memory) pins the egress offer and flips
+                            // to Quality strategy in call.rs, transcoding a
+                            // low-quality caller up to the best the callee
+                            // accepts. Overrides the (dormant) group config.
+                            if !trunk_config.codec.is_empty()
+                                && let Some(h) = hints.as_mut()
+                            {
+                                h.trunk_media_codecs =
+                                    Some(trunk_config.codec.clone());
+                            }
+
                             // Check Trunk Policy
                             if let Some(policy) = &trunk_config.policy
                                 && let Some(guard) = &routing_state.policy_guard {

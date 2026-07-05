@@ -236,6 +236,20 @@ async fn page_sip_trunk_detail(
                 }
             }
 
+            // Surface the per-trunk HD codec-upgrade state as a boolean the
+            // form checkbox binds to. HD is ON by default; only an explicit
+            // `metadata.media.hd_disabled = true` turns it off.
+            if let Some(obj) = model_json.as_object_mut() {
+                let prefer_hd = model
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("media"))
+                    .and_then(|m| m.get("hd_disabled"))
+                    .and_then(|v| v.as_bool())
+                    != Some(true);
+                obj.insert("prefer_hd".to_string(), Value::Bool(prefer_hd));
+            }
+
             #[cfg(feature = "addon-wholesale")]
             if let Some(obj) = model_json.as_object_mut() {
                 if let Some(link) = tenant_link {
@@ -314,7 +328,9 @@ async fn create_sip_trunk(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "sip".to_string());
     if let Err(response) =
-        apply_form_to_active_model(&mut active, &form, now, false, &kind, None, None, None, None)
+        apply_form_to_active_model(
+            &mut active, &form, now, false, &kind, None, None, None, None, None,
+        )
     {
         return response;
     }
@@ -388,6 +404,7 @@ async fn update_sip_trunk(
     let existing_webrtc_cfg = model.webrtc().ok();
     let existing_livekit_cfg = model.livekit().ok();
     let existing_external_media_cfg = model.external_media().ok();
+    let existing_metadata = model.metadata.clone();
     let mut active: SipTrunkActiveModel = model.into();
     let now = Utc::now();
     if let Err(response) = apply_form_to_active_model(
@@ -396,6 +413,7 @@ async fn update_sip_trunk(
         now,
         true,
         &existing_kind,
+        existing_metadata,
         existing_sip_cfg,
         existing_webrtc_cfg,
         existing_livekit_cfg,
@@ -859,12 +877,50 @@ async fn handle_tenant_update(
 }
 
 #[allow(clippy::result_large_err, clippy::too_many_arguments)]
+/// Record the per-trunk HD codec-upgrade opt-OUT. HD upgrade is ON by default
+/// (routing offers the HD codec set and transcodes a low-quality caller up),
+/// so `prefer_hd = true` clears `metadata.media.hd_disabled` (and drops an
+/// empty `media` object), while `false` sets it. Other metadata/media keys are
+/// preserved. Returns `None` when the blob is left empty so the column stays
+/// NULL.
+fn apply_prefer_hd_metadata(
+    metadata: Option<serde_json::Value>,
+    prefer_hd: bool,
+) -> Option<serde_json::Value> {
+    use serde_json::{Value, json};
+    let mut obj = match metadata {
+        Some(Value::Object(m)) => m,
+        _ => serde_json::Map::new(),
+    };
+    let mut media = obj
+        .get("media")
+        .and_then(|m| m.as_object())
+        .cloned()
+        .unwrap_or_default();
+    if prefer_hd {
+        media.remove("hd_disabled");
+    } else {
+        media.insert("hd_disabled".to_string(), json!(true));
+    }
+    if media.is_empty() {
+        obj.remove("media");
+    } else {
+        obj.insert("media".to_string(), Value::Object(media));
+    }
+    if obj.is_empty() {
+        None
+    } else {
+        Some(Value::Object(obj))
+    }
+}
+
 fn apply_form_to_active_model(
     active: &mut SipTrunkActiveModel,
     form: &SipTrunkForm,
     now: DateTime<Utc>,
     is_update: bool,
     kind: &str,
+    existing_metadata: Option<serde_json::Value>,
     existing_sip_cfg: Option<SipTrunkConfig>,
     existing_webrtc_cfg: Option<WebRtcTrunkConfig>,
     existing_livekit_cfg: Option<LiveKitTrunkConfig>,
@@ -945,8 +1001,16 @@ fn apply_form_to_active_model(
     if !is_update || form.tags.is_some() {
         active.tags = Set(tags);
     }
-    if !is_update || form.metadata.is_some() {
-        active.metadata = Set(metadata);
+    // Fold the per-trunk HD toggle into `metadata.media.codecs`. Merge onto
+    // the form's metadata if it was submitted, else the existing row's, so
+    // neither the toggle nor other metadata keys clobber each other on a
+    // partial update.
+    if !is_update || form.metadata.is_some() || form.prefer_hd.is_some() {
+        let mut merged = metadata.or(existing_metadata);
+        if let Some(prefer_hd) = form.prefer_hd {
+            merged = apply_prefer_hd_metadata(merged, prefer_hd);
+        }
+        active.metadata = Set(merged);
     }
 
     // Build the kind-typed `kind_config` blob. On update we start from the
@@ -1588,6 +1652,27 @@ mod tests {
     use sea_orm::Database;
     use sea_orm_migration::MigratorTrait;
     use std::sync::Arc;
+
+    #[test]
+    fn prefer_hd_metadata_opt_out_and_back() {
+        use serde_json::json;
+        // Default ON = nothing stored: enabling on an empty blob stays None.
+        assert!(apply_prefer_hd_metadata(None, true).is_none());
+        // Opt OUT records media.hd_disabled, preserving sibling keys.
+        let off =
+            apply_prefer_hd_metadata(Some(json!({"recording": {"mode": "all"}})), false)
+                .expect("some");
+        assert_eq!(off["media"]["hd_disabled"], json!(true));
+        assert_eq!(off["recording"]["mode"], "all");
+        // Re-enabling clears the flag and drops the now-empty media object.
+        let back = apply_prefer_hd_metadata(Some(off), true).expect("some");
+        assert!(back.get("media").is_none());
+        assert_eq!(back["recording"]["mode"], "all");
+        // Opt-out on an otherwise-empty blob stores just the flag; re-enable → None.
+        let only = apply_prefer_hd_metadata(None, false).expect("some");
+        assert_eq!(only["media"]["hd_disabled"], json!(true));
+        assert!(apply_prefer_hd_metadata(Some(only), true).is_none());
+    }
 
     fn superuser() -> crate::models::user::Model {
         let now = Utc::now();

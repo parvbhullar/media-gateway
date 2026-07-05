@@ -107,19 +107,22 @@ pub enum CodecSelectionStrategy {
     #[default]
     Performance,
     /// Prefer quality: prioritize codecs by audio quality regardless of
-    /// whether transcoding is required. Order: Opus > G729 > G722 > G711.
+    /// whether transcoding is required. Order: Opus > G722 > G711 > G729
+    /// (wideband first; G729 is lossy 8 kbps narrowband, so it sits below
+    /// even uncompressed G.711 and is only ever chosen as a last resort).
     Quality,
 }
 
-/// Quality-priority codec order (best first).
+/// Quality-priority codec order (best first). Opus (48 kHz) > G722 (16 kHz)
+/// > G711 PCMU/PCMA (8 kHz uncompressed) > G729 (8 kHz compressed).
 fn quality_codec_order() -> Vec<CodecType> {
     vec![
         #[cfg(feature = "opus")]
         CodecType::Opus,
-        CodecType::G729,
         CodecType::G722,
         CodecType::PCMU,
         CodecType::PCMA,
+        CodecType::G729,
     ]
 }
 
@@ -365,15 +368,17 @@ impl MediaNegotiator {
         Err(anyhow!("No compatible codec found"))
     }
 
-    /// Build default codec list for RTP endpoints
+    /// Build default codec list for RTP endpoints. Ordered best-quality
+    /// first (Opus > G722 wideband > G711 uncompressed > G729 compressed),
+    /// so an RTP peer that supports G722 is never downgraded to G729.
     pub fn default_rtp_codecs() -> Vec<CodecType> {
         vec![
             #[cfg(feature = "opus")]
             CodecType::Opus,
-            CodecType::G729,
             CodecType::G722,
             CodecType::PCMU,
             CodecType::PCMA,
+            CodecType::G729,
             CodecType::TelephoneEvent,
         ]
     }
@@ -749,6 +754,40 @@ impl MediaNegotiator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// HD priority regression: wideband/uncompressed must rank above the
+    /// lossy 8 kbps G729 in both the default RTP offer and the quality
+    /// order, so a peer supporting G722 is never downgraded to G729.
+    #[test]
+    fn test_hd_codec_priority_g729_is_last_resort() {
+        for list in [
+            MediaNegotiator::default_rtp_codecs(),
+            quality_codec_order(),
+        ] {
+            let pos = |c: CodecType| list.iter().position(|x| *x == c);
+            let g729 = pos(CodecType::G729).expect("g729 present");
+            assert!(pos(CodecType::G722).unwrap() < g729, "G722 must beat G729");
+            assert!(pos(CodecType::PCMU).unwrap() < g729, "G711u must beat G729");
+            assert!(pos(CodecType::PCMA).unwrap() < g729, "G711a must beat G729");
+        }
+
+        // Functional: a remote offering G729 first + G722 still yields G722,
+        // because negotiate_codec honours our (local) preference order.
+        let remote_sdp = "v=0\r\n\
+            o=- 1 1 IN IP4 127.0.0.1\r\n\
+            s=-\r\n\
+            t=0 0\r\n\
+            m=audio 10000 RTP/AVP 18 9\r\n\
+            a=rtpmap:18 G729/8000\r\n\
+            a=rtpmap:9 G722/8000\r\n";
+        let selected = MediaNegotiator::negotiate_codec(
+            &MediaNegotiator::default_rtp_codecs(),
+            remote_sdp,
+        )
+        .expect("negotiation succeeds")
+        .codec;
+        assert_eq!(selected, CodecType::G722, "G722 must win over G729");
+    }
 
     #[test]
     fn test_parse_rtp_map() {
