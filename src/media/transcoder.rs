@@ -116,11 +116,24 @@ impl Transcoder {
         let source_sample_rate = decoder.sample_rate();
         let target_sample_rate = encoder.sample_rate();
         let resampler = if source_sample_rate != target_sample_rate {
+            tracing::info!(
+                ?source,
+                ?target,
+                source_sample_rate,
+                target_sample_rate,
+                "transcoder: VoiceResampler active"
+            );
             Some(VoiceResampler::new(
                 source_sample_rate as usize,
                 target_sample_rate as usize,
             ))
         } else {
+            tracing::info!(
+                ?source,
+                ?target,
+                sample_rate = source_sample_rate,
+                "transcoder: same-rate transcode, no resampler"
+            );
             None
         };
         // 20 ms of mono PCM at the encoder's sample rate — the canonical
