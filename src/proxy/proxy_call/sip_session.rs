@@ -953,8 +953,24 @@ impl SipSession {
 
             tokio::select! {
                 res = hangup_futures.next(), if !hangup_futures.is_empty() => {
-                    if let Some(res) = res {
-                        tracing::info!("Hangup completed for dialog_id: {:?}", &res);
+                    match res {
+                        Some(Ok(dialog_id)) => {
+                            tracing::info!("Hangup completed for dialog_id: {:?}", dialog_id);
+                        }
+                        Some(Err(e)) => {
+                            // The BYE send itself failed (e.g. transport error), so the
+                            // dialog was left Confirmed (see server_dialog.rs bye ordering).
+                            // Cancel the session so teardown still completes within the
+                            // drain timeout; cleanup() will make one bounded retry on the
+                            // still-Confirmed caller dialog.
+                            warn!(
+                                session_id = %self.context.session_id,
+                                error = %e,
+                                "Hangup send failed; cancelling session to complete teardown"
+                            );
+                            self.cancel_token.cancel();
+                        }
+                        None => {}
                     }
                 }
                 _ = self.cancel_token.cancelled(), if !cancelled => {
@@ -4910,7 +4926,15 @@ impl SipSession {
 
         self.callee_event_tx = None;
 
-        let dialogs_to_hangup = self.pending_hangup.clone();
+        let mut dialogs_to_hangup = self.pending_hangup.clone();
+
+        // If the caller-leg BYE never completed (a failed send leaves the dialog
+        // Confirmed and retryable after the bye ordering fix), make one more
+        // bounded attempt here so the caller is still told to hang up. No-ops
+        // in the normal case where the dialog is already Terminated.
+        if !self.server_dialog.state().is_terminated() {
+            dialogs_to_hangup.insert(self.server_dialog.id());
+        }
 
         if !dialogs_to_hangup.is_empty() {
             let hangup_dialogs = dialogs_to_hangup

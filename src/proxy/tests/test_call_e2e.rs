@@ -810,6 +810,95 @@ async fn test_callee_hangup_cdr() -> Result<()> {
     Ok(())
 }
 
+/// End-to-end happy-path smoke test: when the carrier (callee) hangs up, the
+/// caller leg is torn down (observed as `CallTerminated` on the caller UA).
+///
+/// NOTE: this exercises the full B2BUA carrier-BYE → caller-BYE path but does
+/// NOT reproduce the production loss, which is triggered by transport-lookup
+/// latency outlasting the teardown window — on loopback the BYE always egresses
+/// on the first poll, so this test passes with or without the ordering fix. The
+/// actual regression guard for the fix is `test_server_bye_does_not_terminate_before_send`
+/// in the vendored rsipstack `test_server_dialog.rs`, which asserts the ordering
+/// invariant directly (a failed/incomplete BYE must not leave the dialog Terminated).
+#[tokio::test]
+async fn test_carrier_bye_propagates_to_caller() -> Result<()> {
+    let _ = tracing_subscriber::fmt::try_init();
+
+    let server = Arc::new(E2eTestServer::start().await?);
+
+    let alice = Arc::new(server.create_ua("alice").await?);
+    let bob = server.create_ua("bob").await?;
+
+    sleep(Duration::from_millis(100)).await;
+
+    let dummy_sdp = super::test_ua::create_test_sdp("127.0.0.1", 12345, false);
+
+    // make_call blocks until the 200 OK, so answer bob before joining the handle.
+    let caller_handle = tokio::spawn({
+        let a = alice.clone();
+        let sdp = dummy_sdp.clone();
+        async move { a.make_call("bob", Some(sdp)).await }
+    });
+
+    // Bob (callee/carrier) answers.
+    let mut bob_dialog_id = None;
+    for _ in 0..50 {
+        let events = bob.process_dialog_events().await?;
+        for event in events {
+            if let TestUaEvent::IncomingCall(id, _) = event {
+                bob_dialog_id = Some(id.clone());
+                bob.answer_call(&id, Some(dummy_sdp.clone())).await?;
+                break;
+            }
+        }
+        if bob_dialog_id.is_some() {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    let bob_dialog_id = bob_dialog_id.expect("bob should have received the INVITE");
+
+    // Capture alice's (caller) dialog id from the now-established call.
+    let alice_dialog_id = tokio::time::timeout(Duration::from_secs(5), caller_handle)
+        .await
+        .expect("make_call task should finish")
+        .expect("make_call task should not panic")
+        .expect("alice call should establish");
+
+    // Drain establishment events on the caller leg.
+    let _ = alice.process_dialog_events().await?;
+
+    // Let the call run briefly, then the carrier (bob) hangs up.
+    sleep(Duration::from_millis(300)).await;
+    bob.hangup(&bob_dialog_id).await?;
+
+    // The SBC sends a BYE to the caller leg; poll for alice's CallTerminated
+    // within a bounded window. On loopback this holds with or without the ordering
+    // fix (see the note above) — the ordering invariant itself is guarded by the
+    // whitebox test_server_bye_does_not_terminate_before_send, not by this test.
+    let mut caller_terminated = false;
+    for _ in 0..30 {
+        let events = alice.process_dialog_events().await?;
+        if events
+            .iter()
+            .any(|e| matches!(e, TestUaEvent::CallTerminated(id) if *id == alice_dialog_id))
+        {
+            caller_terminated = true;
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    server.stop();
+    assert!(
+        caller_terminated,
+        "caller leg never received a BYE after the carrier hung up \
+         (carrier BYE was not propagated to the caller)"
+    );
+    info!("Carrier BYE propagation test completed");
+    Ok(())
+}
+
 /// Test 8: Multiple calls with CDR verification
 /// Verifies:
 /// - Multiple concurrent calls generate correct CDRs

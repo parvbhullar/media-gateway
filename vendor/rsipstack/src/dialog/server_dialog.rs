@@ -361,9 +361,21 @@ impl ServerInviteDialog {
             self.inner
                 .make_request(crate::sip::Method::Bye, None, None, None, headers, None)?;
 
+        // Send the BYE on the wire BEFORE marking the dialog Terminated. The
+        // reverse ordering (transition-then-send) makes the caller-facing UAS
+        // leg self-defeating: the Terminated state event fires the session's
+        // teardown/cancel before the BYE is confirmed sent, and — because the
+        // dialog is already Terminated — every retry silently no-ops via the
+        // is_confirmed() guard above. Transition only after do_request succeeds,
+        // so a failed send leaves the dialog Confirmed and retryable. This adopts
+        // client_dialog.rs's send-before-transition ORDERING, but deliberately
+        // diverges on error handling: the UAC swallows the send error and always
+        // transitions, whereas here we propagate the Err and transition only on
+        // success — that is what keeps a failed caller-leg BYE retryable.
+        self.inner.do_request(request).await?;
         self.inner
             .transition(DialogState::Terminated(self.id(), TerminatedReason::UasBye))?;
-        self.inner.do_request(request).await.map(|_| ())
+        Ok(())
     }
 
     /// Send a BYE request with a SIP `Reason` header.

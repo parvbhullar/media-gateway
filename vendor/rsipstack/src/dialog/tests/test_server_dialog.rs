@@ -203,6 +203,86 @@ async fn test_server_dialog_bye_via() -> crate::Result<()> {
     Ok(())
 }
 
+/// Regression: the caller-facing (UAS) BYE must be sent BEFORE the dialog is
+/// marked Terminated.
+///
+/// The reverse ordering (transition-then-send) made the caller leg self-defeating:
+/// the dialog flipped to Terminated before the BYE reached the wire, and — because
+/// the dialog was already Terminated — every retry silently no-oped. This asserts
+/// the invariant directly: after a BYE whose send does not complete successfully,
+/// the dialog must NOT be left Terminated (it must stay Confirmed/retryable).
+///
+/// Here the send fails deterministically (the remote target has no transport type),
+/// so `bye()` returns Err. Post-fix the dialog stays Confirmed (`terminated == false`);
+/// pre-fix the transition-before-send marks it Terminated (`terminated == true`) — so
+/// this fails on the buggy ordering and passes on the fix, verified both ways.
+#[tokio::test]
+async fn test_server_bye_does_not_terminate_before_send() -> crate::Result<()> {
+    use crate::dialog::dialog::DialogState;
+
+    let dialog_id = DialogId {
+        call_id: "server-bye-order".to_string(),
+        local_tag: "bob-tag".to_string(),
+        remote_tag: "alice-tag".to_string(),
+    };
+
+    let endpoint = create_test_endpoint().await?;
+    let (tu_sender, _tu_receiver) = unbounded_channel();
+    let (state_sender, _state_receiver) = unbounded_channel();
+
+    let invite_req = create_invite_request(&dialog_id.remote_tag, "", &dialog_id.call_id);
+    let dialog_inner = DialogInner::new(
+        TransactionRole::Server,
+        dialog_id.clone(),
+        invite_req,
+        endpoint.inner.clone(),
+        state_sender,
+        None,
+        None,
+        tu_sender,
+    )
+    .expect("Failed to create dialog inner");
+
+    // Point the remote target at an IP literal so the BYE resolves synchronously
+    // (no DNS) and then blocks awaiting a response that never comes.
+    *dialog_inner.remote_uri.lock() = crate::sip::Uri::try_from("sip:alice@127.0.0.1:65001")?;
+
+    // Drive the dialog to Confirmed so bye() passes its is_confirmed() guard.
+    dialog_inner.transition(DialogState::Confirmed(
+        dialog_id.clone(),
+        crate::sip::Response::default(),
+    ))?;
+
+    let server_dialog = ServerInviteDialog {
+        inner: Arc::new(dialog_inner),
+    };
+
+    // Fire the BYE. The send does not complete (nothing is listening on
+    // 127.0.0.1:65001), bounded so the test cannot hang.
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        server_dialog.bye(),
+    )
+    .await;
+
+    let terminated = server_dialog.state().is_terminated();
+
+    // Invariant: unless the BYE actually completed successfully, the dialog must
+    // NOT be marked Terminated — a failed/incomplete send must leave it Confirmed
+    // and retryable. The buggy transition-before-send ordering marks it Terminated
+    // regardless of whether the BYE ever reached the wire.
+    let bye_succeeded = matches!(result, Ok(Ok(())));
+    if !bye_succeeded {
+        assert!(
+            !terminated,
+            "dialog was marked Terminated even though the BYE did not complete \
+             (transition ran before the BYE was sent)"
+        );
+    }
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_server_dialog_reinvite_via() -> crate::Result<()> {
     let dialog_id = DialogId {
