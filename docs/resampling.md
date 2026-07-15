@@ -27,6 +27,7 @@ Where it applies (all automatic, no configuration needed):
 | LiveKit → SIP | 48 kHz → codec rate | LiveKit bridge |
 | SIP → sidecar (pipecat/AI) | codec rate → `pcm_sample_rate` | external_media bridge |
 | Sidecar → SIP | `pcm_sample_rate` → codec rate | external_media bridge |
+| Announcements / MOH / prompts | file rate → negotiated codec rate | `ResamplingAudioSource` (playback) |
 
 Codec-native rates are always preferred over resampling:
 
@@ -51,7 +52,8 @@ spectral images above the source Nyquist):
 Throughput on Apple Silicon (release build): **979× realtime** for
 8 k→24 k, **470× realtime** for 8 k→48 k, per core — CPU cost per call is
 negligible. Group delay is ~8 ms at 8 kHz input (`sinc_len = 128`), plus a
-one-time sub-millisecond startup trim on the first frame.
+one-time sub-millisecond startup trim on the first frame. Output
+f32 → i16 conversion rounds to nearest (no truncation bias).
 
 Profile (fixed; there is deliberately no quality knob):
 `sinc_len 128, f_cutoff 0.95, oversampling 64, cubic interpolation,
@@ -63,7 +65,28 @@ creep is ever observed.
 
 ---
 
-## 2. HD codec upgrade per trunk
+## 2. Wideband negotiation & HD codec upgrade
+
+### Global default: quality-first offers
+
+Since 2026-07 the compiled default `codec_strategy` is **`quality`**: every
+egress offer is ordered Opus > G722 > G711 > G729 and wideband codecs are
+appended even when the caller didn't offer them, so order-respecting
+carriers answer G722 (16 kHz) or Opus (48 kHz) instead of locking the call
+to G729/8 kHz. From-scratch outbound INVITEs use the same order (G729 is
+strictly last-resort). Set `codec_strategy = "performance"` in the proxy
+config to restore the old mirror-the-caller, no-transcode behavior.
+
+Two caveats:
+
+- **Answer selection honors the carrier's first codec.** A carrier that
+  ignores offer order and answers G729-first still gets G729 — remove
+  `g729` from that trunk's codec list (below) to cap its worst case.
+- **Quality may transcode.** A PCMU-only caller bridged to an
+  Opus-answering carrier costs an Opus transcode per direction for the
+  call's lifetime; budget CPU when upgrading boxes sized for passthrough.
+
+### Per-trunk codec pin
 
 Pin the codecs a trunk speaks via the trunk media API. When a call egresses
 through that trunk, the offer contains **exactly those codecs, quality-first,
@@ -87,7 +110,10 @@ Rules:
   global `codec_strategy` as before).
 - Trunk `media_config.codecs` is the most specific policy — it takes
   precedence over route-rule `codecs` and the global config codec list,
-  and implies quality-first ordering (Opus > G729 > G722 > G711).
+  and implies quality-first ordering (Opus > G722 > G711 > G729).
+- Codecs appended to an offer never reuse a payload type the caller
+  already bound (e.g. caller `telephone-event` at PT 111 vs Opus's
+  default 111) — collisions are remapped into the 96–127 dynamic range.
 - The API keys on **trunk group name** (`rustpbx_trunk_groups`); on the
   hot path the lookup also resolves member gateway names to their group.
 - Best-effort: a missing/malformed `media_config` never fails routing.
@@ -155,7 +181,10 @@ curl -X PUT http://localhost:8080/api/v1/trunks/lab-trunk/media \
 The PCM pipe between the gateway and a per-call sidecar (pipecat / AI
 agent) defaults to 48 kHz for backward compatibility. **24 kHz is the
 preferred rate for AI consumers** — half the bandwidth/CPU and the native
-rate of most ASR/TTS stacks.
+rate of most ASR/TTS stacks. **16 kHz** is the native rate of speech
+enhancement and ASR models (RNNoise, DeepFilterNet, Whisper) — use it to
+run a denoiser/enhancer sidecar on this path with no extra resampling on
+the sidecar side.
 
 Set it in the trunk's `kind_config`:
 
@@ -174,9 +203,13 @@ pcm_sample_rate = 24000   # 16000 | 24000 | 48000 (default 48000)
 - When the rate is non-default, the gateway appends `--sample-rate=<hz>`
   to the sidecar command so the sidecar can configure its pipeline to
   match. Sidecars that don't understand the flag keep working as long as
-  you leave the default; opting into 24 k implies sidecar support.
+  you leave the default; opting into 24 k or 16 k implies sidecar support.
 - No resampler is inserted when the SIP codec's native rate already
   matches (e.g. G.722 → 16 k pipe).
+- The sidecar → SIP direction encodes exact 20 ms frames (block codecs
+  like Opus reject off-size buffers); the resampler's one-time startup
+  trim is absorbed with leading silence, so steady-state buffering — and
+  therefore added latency — is ~0.
 
 ---
 
@@ -192,8 +225,11 @@ RUSTC_WRAPPER="" cargo test --lib media::jitter
 # Trunk media API (codecs + jitter_buffer validation):
 RUSTC_WRAPPER="" cargo test --test api_v1_trunk_media
 
-# HD-upgrade offer shape (Opus offered beyond the caller's list):
+# Offer shape: quality default, PT-collision guard, HD upgrade:
 RUSTC_WRAPPER="" cargo test --lib media::negotiate
+
+# Playback resampling (FIFO carry-over, no false EOF, reset):
+RUSTC_WRAPPER="" cargo test --lib media::unified_pc_tests
 
 # Throughput tripwire (release; prints ×-realtime figures):
 RUSTC_WRAPPER="" cargo test --release --lib media::resampler -- --ignored --nocapture
@@ -217,5 +253,6 @@ At runtime, look for these log lines:
 | Muffled/aliased audio on transcoded calls | Should be fixed by the HQ resampler; confirm the transcoder log line appears and the build includes `rubato` (`cargo tree -p rubato`). |
 | Choppy audio from one carrier | Set `jitter_buffer: {"mode":"adaptive"}` on that trunk (§3). If the far end is bursty on egress, transcoded legs are already paced; passthrough legs are not — consider forcing a transcode via trunk codecs, or accept relay semantics. |
 | Trunk still negotiates G.711 despite pinned `codecs` | The pin lives on the **trunk group** row; verify with `GET /api/v1/trunks/{name}/media`. The hot path resolves member gateways to their group, but the group row must exist and the routing state must be DB-wired. |
+| Outbound call still lands on G729 | The offer is wideband-first by default — check the INVITE SDP m-line order. If it's correct, the carrier ignored offer order and answered G729-first (the answer's first codec wins per RFC 3264); remove `g729` from that trunk's codec list (§2) so it can't be answered. |
 | Sidecar hears garbage / wrong pitch | Rate mismatch: sidecar must consume the configured `pcm_sample_rate` (watch for the `--sample-rate` flag in its argv). Frame size must match §4. |
 | Added latency after enabling jitter buffer | In-order delay = `min_ms`; lower it (e.g. 10–20 ms) or scope the policy to the problematic trunk only. |

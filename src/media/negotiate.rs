@@ -1494,7 +1494,7 @@ a=rtpmap:101 telephone-event/8000\r\n";
         assert!(!lists.caller_side.iter().any(|c| c.codec == CodecType::Opus));
 
         let callee_audio: Vec<_> = lists.callee_side.iter().filter(|c| !c.is_dtmf()).collect();
-        // Quality order: Opus > G729 > G722 > G711 → Opus first
+        // Quality order: Opus > G722 > G711 > G729 → Opus first
         assert_eq!(callee_audio[0].codec, CodecType::Opus);
         assert_eq!(callee_audio[1].codec, CodecType::PCMU);
         assert_eq!(callee_audio[2].codec, CodecType::PCMA);

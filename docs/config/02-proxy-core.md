@@ -91,12 +91,15 @@ addons = ["wholesale", "monitor"]
 media_proxy = "auto"
 
 # Preferred codec order for SDP negotiation
-codecs = ["opus", "pcmu", "pcma", "g729"]
+codecs = ["opus", "g722", "pcmu", "pcma", "g729"]
 
-# Codec selection strategy for WebRTC endpoints.
-# "performance" (default): avoid transcoding, keep only caller-offered codecs.
-# "quality": prefer Opus > G729 > G722 > G711 (may require transcoding).
-codec_strategy = "performance"
+# Codec selection strategy for SDP negotiation.
+# "quality" (default): prefer Opus > G722 > G711 > G729 — egress offers are
+#   quality-ordered and wideband codecs are appended even when the caller
+#   didn't offer them (may require transcoding; budget CPU accordingly).
+# "performance": avoid transcoding, keep only caller-offered codecs in the
+#   caller's order (pre-2026-07 behavior; narrowband callers stay narrowband).
+codec_strategy = "quality"
 
 # Enable NAT media latching (helps with RTP behind NAT, default: true)
 enable_latching = true
