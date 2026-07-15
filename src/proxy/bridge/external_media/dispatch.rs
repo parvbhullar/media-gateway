@@ -13,7 +13,8 @@
 //!
 //! rustpbx owns all SIP-side codec/resample + external_ip/latching; the
 //! sidecar owns the far-end media entirely. Wire format on the socket: raw
-//! 16-bit LE PCM, 48 kHz mono, 20 ms frames (1920 bytes), no header.
+//! 16-bit LE PCM mono, 20 ms frames at the trunk's `pcm_sample_rate`
+//! (default 48 kHz → 1920 bytes; 16/24 kHz also allowed), no header.
 
 use std::sync::Arc;
 use std::time::Duration;

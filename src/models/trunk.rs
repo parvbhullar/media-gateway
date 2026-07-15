@@ -714,10 +714,12 @@ pub struct ExternalMediaTrunkConfig {
     #[serde(default)]
     pub hold_tone_hz: Option<u16>,
     /// PCM sample rate (Hz) on the sidecar datagram pipe. 24000 is the
-    /// preferred AI-consumer rate; default stays 48000 for compatibility
-    /// with existing sidecars. Allowed: 24000, 48000. When set to a
-    /// non-default value, rustpbx passes `--sample-rate=<hz>` to the
-    /// sidecar command so it can configure its pipeline to match.
+    /// preferred AI-consumer rate; 16000 is the native rate of speech
+    /// enhancement/ASR pipelines (RNNoise, DeepFilterNet, Whisper); default
+    /// stays 48000 for compatibility with existing sidecars. Allowed:
+    /// 16000, 24000, 48000. When set to a non-default value, rustpbx passes
+    /// `--sample-rate=<hz>` to the sidecar command so it can configure its
+    /// pipeline to match.
     #[serde(default = "default_pcm_sample_rate")]
     pub pcm_sample_rate: u32,
 }
@@ -740,14 +742,43 @@ impl ExternalMediaTrunkConfig {
             }
         }
         match self.pcm_sample_rate {
-            24_000 | 48_000 => {}
+            16_000 | 24_000 | 48_000 => {}
             other => {
                 return Err(ValidationError::custom(format!(
-                    "pcm_sample_rate {other} not supported (allowed: 24000, 48000)"
+                    "pcm_sample_rate {other} not supported (allowed: 16000, 24000, 48000)"
                 )));
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod external_media_config_tests {
+    use super::*;
+
+    fn base(pcm_sample_rate: u32) -> ExternalMediaTrunkConfig {
+        ExternalMediaTrunkConfig {
+            command: "sidecar --port {port}".to_string(),
+            audio_codec: "pcmu".to_string(),
+            bot_join_timeout_ms: None,
+            hold_tone_hz: None,
+            pcm_sample_rate,
+        }
+    }
+
+    #[test]
+    fn pcm_sample_rate_allows_16k_24k_48k() {
+        for rate in [16_000, 24_000, 48_000] {
+            assert!(base(rate).validate().is_ok(), "rate {rate} should validate");
+        }
+    }
+
+    #[test]
+    fn pcm_sample_rate_rejects_other_rates() {
+        for rate in [0, 8_000, 44_100] {
+            assert!(base(rate).validate().is_err(), "rate {rate} should be rejected");
+        }
     }
 }
 

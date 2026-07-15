@@ -363,6 +363,14 @@ async fn run_sidecar_to_sip(
         None
     };
     let frame_bytes = pcm_frame_samples(pcm_rate) * 2;
+    // Encode only exact 20 ms frames (same contract as Transcoder::transcode):
+    // block codecs like Opus reject off-size buffers, and the resampler's
+    // output is not guaranteed frame-exact (short first call after startup
+    // trim; the polyphase fallback jitters ±1 sample). Remainder carries to
+    // the next datagram.
+    let samples_per_frame = pcm_frame_samples(encoder_rate);
+    let mut pcm_accum: Vec<i16> = Vec::new();
+    let mut primed = false;
 
     let mut rtp_timestamp: u32 = rand::random();
     let mut sequence_number: u16 = rand::random();
@@ -413,42 +421,55 @@ async fn run_sidecar_to_sip(
                     Some(r) => r.resample(&pcm_in),
                     None => pcm_in,
                 };
-                if pcm_sip.is_empty() {
-                    continue;
+                if !primed && !pcm_sip.is_empty() {
+                    // Absorb the resampler's one-time startup trim: left-pad
+                    // the first output to a frame boundary so the accumulator
+                    // holds ~0 samples in steady state (no standing latency).
+                    let pad = (samples_per_frame - pcm_sip.len() % samples_per_frame)
+                        % samples_per_frame;
+                    pcm_accum.resize(pad, 0);
+                    primed = true;
                 }
-                let encoded = encoder.encode(&pcm_sip);
-                if encoded.is_empty() {
-                    continue;
-                }
-                let frame = RtcAudioFrame {
-                    rtp_timestamp,
-                    clock_rate: sip_clock_rate,
-                    data: encoded.into(),
-                    sequence_number: Some(sequence_number),
-                    payload_type: Some(sip_pt),
-                    marker: false,
-                    header_extension: None,
-                    source_addr: None,
-                    raw_packet: None,
-                };
-                // Record the agent leg (leg B) off the hot path, from the same
-                // encoded frame. Non-blocking; drops on backpressure.
-                if let Some(tx) = &rec_tx {
-                    let _ = tx.try_send(RecItem {
-                        leg: Leg::B,
-                        sample: MediaSample::Audio(frame.clone()),
-                    });
-                }
-                if let Err(e) = sip_send.send_audio(frame).await {
-                    tracing::debug!(trunk = %trunk_name, error = %e,
-                        "SIP send_audio failed — task B exiting");
-                    return;
-                }
-                rtp_timestamp = rtp_timestamp.wrapping_add(ts_increment);
-                sequence_number = sequence_number.wrapping_add(1);
-                frames_sent += 1;
-                if frames_sent == 1 {
-                    tracing::info!(trunk = %trunk_name, "First sidecar→SIP frame sent");
+                pcm_accum.extend_from_slice(&pcm_sip);
+                while pcm_accum.len() >= samples_per_frame {
+                    let encoded = encoder.encode(&pcm_accum[..samples_per_frame]);
+                    pcm_accum.drain(..samples_per_frame);
+                    if encoded.is_empty() {
+                        // 20 ms of timeline was consumed either way — keep RTP
+                        // timestamps aligned with content on encoder hiccups.
+                        rtp_timestamp = rtp_timestamp.wrapping_add(ts_increment);
+                        continue;
+                    }
+                    let frame = RtcAudioFrame {
+                        rtp_timestamp,
+                        clock_rate: sip_clock_rate,
+                        data: encoded.into(),
+                        sequence_number: Some(sequence_number),
+                        payload_type: Some(sip_pt),
+                        marker: false,
+                        header_extension: None,
+                        source_addr: None,
+                        raw_packet: None,
+                    };
+                    // Record the agent leg (leg B) off the hot path, from the
+                    // same encoded frame. Non-blocking; drops on backpressure.
+                    if let Some(tx) = &rec_tx {
+                        let _ = tx.try_send(RecItem {
+                            leg: Leg::B,
+                            sample: MediaSample::Audio(frame.clone()),
+                        });
+                    }
+                    if let Err(e) = sip_send.send_audio(frame).await {
+                        tracing::debug!(trunk = %trunk_name, error = %e,
+                            "SIP send_audio failed — task B exiting");
+                        return;
+                    }
+                    rtp_timestamp = rtp_timestamp.wrapping_add(ts_increment);
+                    sequence_number = sequence_number.wrapping_add(1);
+                    frames_sent += 1;
+                    if frames_sent == 1 {
+                        tracing::info!(trunk = %trunk_name, "First sidecar→SIP frame sent");
+                    }
                 }
             }
         }

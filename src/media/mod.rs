@@ -508,18 +508,14 @@ impl RtpTrackBuilder {
             mode: TransportMode::Rtp,
             enable_latching: false,
             ice_servers: Vec::new(),
-            rtp_map: vec![
-                #[cfg(feature = "opus")]
-                CodecType::Opus,
-                CodecType::G729,
-                CodecType::G722,
-                CodecType::PCMU,
-                CodecType::PCMA,
-                CodecType::TelephoneEvent,
-            ]
-            .into_iter()
-            .map(negotiate::MediaNegotiator::codec_info_for_type)
-            .collect(),
+            // This list becomes the audio m-line of from-scratch offers, and
+            // carriers usually answer with the first codec they support —
+            // default_rtp_codecs() is the single source of the quality order
+            // (Opus > G722 > G711 > G729-last-resort).
+            rtp_map: negotiate::MediaNegotiator::default_rtp_codecs()
+                .into_iter()
+                .map(negotiate::MediaNegotiator::codec_info_for_type)
+                .collect(),
             video_capabilities: Vec::new(),
         }
     }

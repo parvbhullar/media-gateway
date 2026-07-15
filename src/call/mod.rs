@@ -684,8 +684,8 @@ pub struct MediaConfig {
     pub ice_servers: Option<Vec<IceServer>>,
     pub enable_latching: bool,
     /// Codec selection strategy when target is WebRTC.
-    /// Performance (default): avoid transcoding, keep caller's codecs only.
-    /// Quality: prefer Opus > G729 > G722 > G711 (may transcode).
+    /// Quality (default): prefer Opus > G722 > G711 > G729 (may transcode).
+    /// Performance: avoid transcoding, keep caller's codecs only.
     pub codec_strategy: CodecSelectionStrategy,
     /// Ingress jitter policy from the egress trunk's media_config;
     /// applied to the callee-side bridge leg (media arriving from the egress trunk).

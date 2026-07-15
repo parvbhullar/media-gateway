@@ -19,7 +19,7 @@
 /// implementations for WAV, MP3, and raw audio files.
 ///
 /// `ResamplingAudioSource` wraps any `AudioSource` and provides automatic
-/// sample rate conversion using the `audio_codec::Resampler`.
+/// sample rate conversion using the HQ sinc `VoiceResampler`.
 ///
 /// `AudioSourceManager` manages the current active source and allows thread-safe
 /// switching between different audio sources at runtime.
@@ -38,7 +38,8 @@
 /// manager.switch_to_file("announcement.mp3".to_string(), false)?;
 /// ```
 use anyhow::{Result, anyhow};
-use audio_codec::{CodecType, Decoder, Resampler, create_decoder};
+use crate::media::resampler::VoiceResampler;
+use audio_codec::{CodecType, Decoder, create_decoder};
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -409,19 +410,23 @@ impl AudioSource for SilenceSource {
 /// Audio source with resampling support
 pub struct ResamplingAudioSource {
     source: Box<dyn AudioSource>,
-    resampler: Option<Resampler>,
-    /// Sample rate of the wrapped source — cached so `read_samples` can compute
-    /// the correct intermediate buffer size without holding a borrow on `source`.
+    resampler: Option<VoiceResampler>,
+    /// Sample rate of the wrapped source, cached at construction.
     source_sample_rate: u32,
     target_sample_rate: u32,
     intermediate_buffer: Vec<i16>,
+    /// Resampled samples not yet consumed. The sinc resampler is
+    /// chunk-quantized (short first output, remainder carried internally),
+    /// so one read's output rarely matches `buffer.len()` exactly — overflow
+    /// belongs to the next read, never dropped.
+    resampled_fifo: Vec<i16>,
 }
 
 impl ResamplingAudioSource {
     pub fn new(source: Box<dyn AudioSource>, target_sample_rate: u32) -> Self {
         let source_rate = source.sample_rate();
         let resampler = if source_rate != target_sample_rate {
-            Some(Resampler::new(
+            Some(VoiceResampler::new(
                 source_rate as usize,
                 target_sample_rate as usize,
             ))
@@ -435,6 +440,7 @@ impl ResamplingAudioSource {
             resampler,
             target_sample_rate,
             intermediate_buffer: Vec::new(),
+            resampled_fifo: Vec::new(),
         }
     }
 }
@@ -442,24 +448,31 @@ impl ResamplingAudioSource {
 impl AudioSource for ResamplingAudioSource {
     fn read_samples(&mut self, buffer: &mut [i16]) -> usize {
         if let Some(ref mut resampler) = self.resampler {
-            // Calculate how many source samples we need to fill `buffer`.
-            // The old code used `buffer.len()` which is the *target* size — when
-            // upsampling (e.g. 8 kHz → 44.1 kHz) that drastically under-reads the
-            // source.  Use ceiling division to avoid off-by-one shortfalls.
-            let needed_source = (buffer.len() as u64 * self.source_sample_rate as u64).div_ceil(self.target_sample_rate as u64) as usize;
-
-            self.intermediate_buffer.resize(needed_source, 0);
-            let read = self.source.read_samples(&mut self.intermediate_buffer);
-
-            if read == 0 {
-                return 0;
+            // Top up until we can fill `buffer` or the source is exhausted.
+            // The sinc resampler is chunk-quantized (10 ms input chunks,
+            // sub-chunk input buffered internally, short first output), so a
+            // single source read can yield zero output — looping prevents a
+            // false EOF mid-stream and absorbs the startup trim. Up to 10 ms
+            // of source tail may stay in the resampler at true EOF (no flush
+            // API); prompts end in silence, acceptable.
+            while self.resampled_fifo.len() < buffer.len() {
+                // Ceiling division avoids under-reading when upsampling.
+                let deficit = buffer.len() - self.resampled_fifo.len();
+                let needed_source = (deficit as u64 * self.source_sample_rate as u64)
+                    .div_ceil(self.target_sample_rate as u64)
+                    as usize;
+                self.intermediate_buffer.resize(needed_source, 0);
+                let read = self.source.read_samples(&mut self.intermediate_buffer);
+                if read == 0 {
+                    break;
+                }
+                self.resampled_fifo
+                    .extend(resampler.resample(&self.intermediate_buffer[..read]));
             }
-
-            // Resample
-            let resampled = resampler.resample(&self.intermediate_buffer[..read]);
-            let copy_len = resampled.len().min(buffer.len());
-            buffer[..copy_len].copy_from_slice(&resampled[..copy_len]);
-            copy_len
+            let n = self.resampled_fifo.len().min(buffer.len());
+            buffer[..n].copy_from_slice(&self.resampled_fifo[..n]);
+            self.resampled_fifo.drain(..n);
+            n
         } else {
             // No resampling needed
             self.source.read_samples(buffer)
@@ -479,6 +492,14 @@ impl AudioSource for ResamplingAudioSource {
     }
 
     fn reset(&mut self) -> Result<()> {
+        // Restarted playback must not hear the previous stream's filter tail.
+        self.resampled_fifo.clear();
+        if self.resampler.is_some() {
+            self.resampler = Some(VoiceResampler::new(
+                self.source_sample_rate as usize,
+                self.target_sample_rate as usize,
+            ));
+        }
         self.source.reset()
     }
 }

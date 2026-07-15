@@ -87,3 +87,74 @@ fn test_audio_source_has_data() {
     let samples_read = silence.read_samples(&mut buffer);
     assert_eq!(samples_read, 160);
 }
+
+/// Finite tone source for exercising ResamplingAudioSource end-of-stream
+/// behaviour (partial final reads must not read as EOF while data remains).
+struct FiniteToneSource {
+    rate: u32,
+    remaining: usize,
+}
+
+impl AudioSource for FiniteToneSource {
+    fn read_samples(&mut self, buffer: &mut [i16]) -> usize {
+        let n = self.remaining.min(buffer.len());
+        buffer[..n].fill(1000);
+        self.remaining -= n;
+        n
+    }
+    fn sample_rate(&self) -> u32 {
+        self.rate
+    }
+    fn channels(&self) -> u16 {
+        1
+    }
+    fn has_data(&self) -> bool {
+        self.remaining > 0
+    }
+    fn reset(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn test_resampling_audio_source_no_false_eof_and_full_delivery() {
+    // 44.1k -> 8k is chunk-quantized awkwardly (441-sample chunks): partial
+    // reads and the startup trim must never surface as a mid-stream 0-read
+    // (callers treat 0 as end-of-playback), and nearly all audio must arrive.
+    let total_source = 44_313usize; // deliberately not a chunk multiple
+    let source = FiniteToneSource { rate: 44_100, remaining: total_source };
+    let mut rs = ResamplingAudioSource::new(Box::new(source), 8000);
+
+    let expected = total_source * 8000 / 44_100;
+    let mut delivered = 0usize;
+    let mut buffer = vec![0i16; 160]; // 20 ms @ 8k
+    for _ in 0..2000 {
+        let n = rs.read_samples(&mut buffer);
+        if n == 0 {
+            break;
+        }
+        delivered += n;
+    }
+    // Tail tolerance: up to 10 ms of source (~80 output samples) may remain
+    // in the resampler at true EOF (no flush API), plus the startup trim.
+    assert!(
+        delivered + 100 >= expected,
+        "delivered {delivered} of ~{expected} — mid-stream false EOF or dropped audio"
+    );
+    assert!(delivered <= expected + 1, "delivered more samples than the source held");
+}
+
+#[test]
+fn test_resampling_audio_source_reset_restarts_clean() {
+    let source = FiniteToneSource { rate: 16_000, remaining: 16_000 };
+    let mut rs = ResamplingAudioSource::new(Box::new(source), 8000);
+
+    let mut buffer = vec![0i16; 160];
+    assert!(rs.read_samples(&mut buffer) > 0);
+    rs.reset().expect("reset");
+    // After reset the FIFO is cleared and the resampler is fresh: the next
+    // read must still deliver a full buffer (FiniteToneSource::reset is a
+    // no-op, so `remaining` keeps supplying samples).
+    let n = rs.read_samples(&mut buffer);
+    assert_eq!(n, 160, "read after reset should fill the buffer");
+}

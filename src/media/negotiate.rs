@@ -104,12 +104,16 @@ pub struct MediaNegotiator;
 pub enum CodecSelectionStrategy {
     /// Avoid transcoding: keep only codecs the caller already offers
     /// that the target transport supports. No additional codecs are added.
-    #[default]
+    /// Mirrors the caller's codec order, so a G729-first ingress leg
+    /// produces a G729-first egress offer — narrowband lock-in.
     Performance,
     /// Prefer quality: prioritize codecs by audio quality regardless of
     /// whether transcoding is required. Order: Opus > G722 > G711 > G729
     /// (wideband first; G729 is lossy 8 kbps narrowband, so it sits below
     /// even uncompressed G.711 and is only ever chosen as a last resort).
+    /// Default: egress offers lead with wideband so order-respecting
+    /// carriers answer 16/48 kHz instead of G729/8k.
+    #[default]
     Quality,
 }
 
@@ -578,17 +582,33 @@ impl MediaNegotiator {
         // 2. Append PBX-supported audio codecs not already present
         //    Skip this for Performance strategy to avoid transcoding.
         if strategy == CodecSelectionStrategy::Quality {
+            // Appended codecs must not reuse a PT the caller already bound —
+            // e.g. caller telephone-event@111 vs Opus's default PT 111 would
+            // map one PT to two codecs (step 3 pushes caller DTMF verbatim,
+            // so reserve those PTs too). Remap collisions into 96-127.
+            let mut used_pts: HashSet<u8> = result
+                .iter()
+                .chain(extracted.dtmf.iter())
+                .map(|c| c.payload_type)
+                .collect();
             for codec_type in &supported {
                 if *codec_type == CodecType::TelephoneEvent {
                     continue; // handle DTMF separately
                 }
                 if !seen_codecs.contains(codec_type) {
-                    result.push(Self::codec_info_for_type(*codec_type));
+                    let mut info = Self::codec_info_for_type(*codec_type);
+                    if used_pts.contains(&info.payload_type) {
+                        info.payload_type = (96..=127)
+                            .find(|p| !used_pts.contains(p))
+                            .unwrap_or(info.payload_type);
+                    }
+                    used_pts.insert(info.payload_type);
+                    result.push(info);
                     seen_codecs.insert(*codec_type);
                 }
             }
 
-            // Reorder by quality priority: Opus > G729 > G722 > G711
+            // Reorder by quality priority: Opus > G722 > G711 > G729
             let quality_order = quality_codec_order();
             let mut audio: Vec<CodecInfo> = Vec::new();
             let mut dtmf: Vec<CodecInfo> = Vec::new();
@@ -1823,6 +1843,59 @@ a=rtpmap:100 telephone-event/8000\r\n";
     }
 
     #[test]
+    fn test_quality_append_avoids_caller_pt_collision() {
+        // Caller binds PT 111 to telephone-event; the Quality append must not
+        // also emit Opus at its default PT 111 (one PT, two codecs → carriers
+        // reject the SDP or decode DTMF as audio).
+        let caller_sdp = "v=0\r\n\
+o=- 1 1 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+m=audio 10000 RTP/AVP 0 111\r\n\
+a=rtpmap:0 PCMU/8000\r\n\
+a=rtpmap:111 telephone-event/8000\r\n";
+
+        let offer = MediaNegotiator::build_callee_codec_offer_with_allow(
+            caller_sdp,
+            false,
+            &[],
+            CodecSelectionStrategy::Quality,
+        );
+
+        let mut seen_pts = HashSet::new();
+        for c in &offer {
+            assert!(
+                seen_pts.insert(c.payload_type),
+                "duplicate payload type {} in egress offer: {offer:?}",
+                c.payload_type
+            );
+        }
+        // Caller's telephone-event keeps its PT; appended codecs moved aside.
+        assert!(
+            offer.iter().any(|c| c.is_dtmf() && c.payload_type == 111),
+            "caller telephone-event@111 must survive"
+        );
+        #[cfg(feature = "opus")]
+        assert!(
+            offer
+                .iter()
+                .any(|c| c.codec == CodecType::Opus && c.payload_type != 111),
+            "Opus must be appended on a non-colliding PT"
+        );
+    }
+
+    #[test]
+    fn test_default_strategy_is_quality() {
+        // Egress offers must lead with wideband by default; Performance
+        // (mirror the caller's order) is opt-in. Guards the G729/8k
+        // narrowband lock-in regression on outbound calls.
+        assert_eq!(
+            CodecSelectionStrategy::default(),
+            CodecSelectionStrategy::Quality
+        );
+    }
+
+    #[test]
     fn test_performance_strategy_keeps_only_caller_codecs() {
         let caller_sdp = "v=0\r\n\
 o=- 1 1 IN IP4 127.0.0.1\r\n\
@@ -1833,7 +1906,7 @@ a=rtpmap:0 PCMU/8000\r\n\
 a=rtpmap:8 PCMA/8000\r\n\
 a=rtpmap:101 telephone-event/8000\r\n";
 
-        // Performance (default): keep only caller's codecs
+        // Performance (opt-in): keep only caller's codecs
         let lists = MediaNegotiator::build_bridge_codec_lists(
             caller_sdp,
             false, // caller RTP

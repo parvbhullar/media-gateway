@@ -730,8 +730,9 @@ pub struct ProxyConfig {
     #[serde(default)]
     pub blind_transfer_use_refer: bool,
     /// Codec selection strategy for WebRTC endpoints.
-    /// `performance` (default): avoid transcoding, keep caller's codecs only.
-    /// `quality`: prefer Opus > G729 > G722 > G711 (may require transcoding).
+    /// `quality` (default): prefer Opus > G722 > G711 > G729 (may require
+    /// transcoding — wideband is negotiated whenever the far end supports it).
+    /// `performance`: avoid transcoding, keep caller's codecs only.
     #[serde(default)]
     pub codec_strategy: CodecSelectionStrategy,
 }

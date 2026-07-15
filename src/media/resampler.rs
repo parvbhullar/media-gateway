@@ -110,7 +110,9 @@ impl VoiceResampler {
                     match rs.process_into_buffer(&in_adapter, &mut out_adapter, None) {
                         Ok((_read, written)) => {
                             out.extend(out_scratch[..written].iter().map(|&f| {
-                                (f * 32768.0).clamp(i16::MIN as f32, i16::MAX as f32)
+                                (f * 32768.0)
+                                    .round()
+                                    .clamp(i16::MIN as f32, i16::MAX as f32)
                                     as i16
                             }));
                         }
@@ -132,6 +134,21 @@ impl VoiceResampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn f32_to_i16_output_rounds_to_nearest() {
+        // A +3 DC level maps to ~3.0 in the float domain; truncation toward
+        // zero would emit mostly 2s, rounding keeps the steady-state mean ~3.
+        let mut rs = VoiceResampler::new(8000, 48000);
+        let out = rs.resample(&vec![3i16; 8000]);
+        let steady = &out[4800..out.len() - 4800];
+        let mean =
+            steady.iter().map(|&s| f64::from(s)).sum::<f64>() / steady.len() as f64;
+        assert!(
+            (2.6..3.4).contains(&mean),
+            "steady-state mean {mean}: f32→i16 conversion biased (truncation regression?)"
+        );
+    }
 
     #[test]
     fn same_rate_is_passthrough() {
