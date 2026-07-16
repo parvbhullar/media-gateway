@@ -2093,16 +2093,14 @@ async fn test_apply_trunk_config_rewrite_hostport_true() {
         "callee port should be rewritten when rewrite_hostport is true"
     );
 
-    // Verify caller host is also rewritten to trunk's dest
+    // Caller/From host must NOT be rewritten: the outbound leg sets From to
+    // rustpbx's own external SIP address (B2BUA identity), and the original
+    // caller is carried in P-Asserted-Identity instead. Rewriting it here
+    // previously leaked the upstream caller's host into the From header.
     assert_eq!(
         option.caller.host().to_string(),
-        "carrier.gateway.com",
-        "caller host should be rewritten when rewrite_hostport is true"
-    );
-    assert_eq!(
-        option.caller.host_with_port.port,
-        Some(5080.into()),
-        "caller port should be rewritten when rewrite_hostport is true"
+        "original.com",
+        "caller host must be left untouched when rewrite_hostport is true"
     );
 
     // Verify destination is still set
