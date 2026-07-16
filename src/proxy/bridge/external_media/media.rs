@@ -341,6 +341,45 @@ async fn run_sip_to_sidecar(
     }
 }
 
+/// Buffers resampled PCM to exact `samples_per_frame`-sized chunks before
+/// encoding — block codecs like Opus reject off-size buffers, and the
+/// resampler's output is not guaranteed frame-exact (short first call after
+/// startup trim; the polyphase fallback jitters ±1 sample). Extracted from
+/// `run_sidecar_to_sip` so the accumulation/priming logic is unit-testable
+/// without socket I/O or a real encoder.
+struct FrameAccumulator {
+    samples_per_frame: usize,
+    buf: Vec<i16>,
+    primed: bool,
+}
+
+impl FrameAccumulator {
+    fn new(samples_per_frame: usize) -> Self {
+        Self { samples_per_frame: samples_per_frame.max(1), buf: Vec::new(), primed: false }
+    }
+
+    /// Feed newly resampled PCM; returns zero or more complete, exactly
+    /// `samples_per_frame`-sized frames. Any remainder is carried internally
+    /// to the next call.
+    fn push(&mut self, samples: &[i16]) -> Vec<Vec<i16>> {
+        if !self.primed && !samples.is_empty() {
+            // Absorb the resampler's one-time startup trim: left-pad the
+            // first output to a frame boundary so the accumulator holds ~0
+            // samples in steady state (no standing latency).
+            let pad = (self.samples_per_frame - samples.len() % self.samples_per_frame)
+                % self.samples_per_frame;
+            self.buf.resize(pad, 0);
+            self.primed = true;
+        }
+        self.buf.extend_from_slice(samples);
+        let mut frames = Vec::new();
+        while self.buf.len() >= self.samples_per_frame {
+            frames.push(self.buf.drain(..self.samples_per_frame).collect());
+        }
+        frames
+    }
+}
+
 /// Task B: receive 20 ms PCM datagrams from the sidecar → resample to SIP
 /// rate → encode → send on the SIP track (recv-driven).
 #[allow(clippy::too_many_arguments)]
@@ -363,14 +402,9 @@ async fn run_sidecar_to_sip(
         None
     };
     let frame_bytes = pcm_frame_samples(pcm_rate) * 2;
-    // Encode only exact 20 ms frames (same contract as Transcoder::transcode):
-    // block codecs like Opus reject off-size buffers, and the resampler's
-    // output is not guaranteed frame-exact (short first call after startup
-    // trim; the polyphase fallback jitters ±1 sample). Remainder carries to
-    // the next datagram.
+    // Encode only exact 20 ms frames (same contract as Transcoder::transcode).
     let samples_per_frame = pcm_frame_samples(encoder_rate);
-    let mut pcm_accum: Vec<i16> = Vec::new();
-    let mut primed = false;
+    let mut accumulator = FrameAccumulator::new(samples_per_frame);
 
     let mut rtp_timestamp: u32 = rand::random();
     let mut sequence_number: u16 = rand::random();
@@ -421,19 +455,8 @@ async fn run_sidecar_to_sip(
                     Some(r) => r.resample(&pcm_in),
                     None => pcm_in,
                 };
-                if !primed && !pcm_sip.is_empty() {
-                    // Absorb the resampler's one-time startup trim: left-pad
-                    // the first output to a frame boundary so the accumulator
-                    // holds ~0 samples in steady state (no standing latency).
-                    let pad = (samples_per_frame - pcm_sip.len() % samples_per_frame)
-                        % samples_per_frame;
-                    pcm_accum.resize(pad, 0);
-                    primed = true;
-                }
-                pcm_accum.extend_from_slice(&pcm_sip);
-                while pcm_accum.len() >= samples_per_frame {
-                    let encoded = encoder.encode(&pcm_accum[..samples_per_frame]);
-                    pcm_accum.drain(..samples_per_frame);
+                for chunk in accumulator.push(&pcm_sip) {
+                    let encoded = encoder.encode(&chunk);
                     if encoded.is_empty() {
                         // 20 ms of timeline was consumed either way — keep RTP
                         // timestamps aligned with content on encoder hiccups.
@@ -473,5 +496,87 @@ async fn run_sidecar_to_sip(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod frame_accumulator_tests {
+    use super::*;
+
+    #[test]
+    fn post_priming_partial_push_waits_for_a_full_frame() {
+        // Once primed on an exact multiple, later partial pushes must
+        // buffer without emitting until a full frame accumulates.
+        let mut acc = FrameAccumulator::new(160);
+        assert_eq!(acc.push(&[1i16; 160]).len(), 1, "exact multiple primes cleanly");
+        assert!(acc.push(&[2i16; 100]).is_empty(), "100 < 160, no frame yet");
+    }
+
+    #[test]
+    fn every_emitted_frame_is_exactly_samples_per_frame() {
+        // Feed odd-sized chunks (simulating the resampler's ±1 jitter) and
+        // assert every frame that comes out is exactly the target size —
+        // this is the guarantee that keeps Opus from rejecting the buffer.
+        let mut acc = FrameAccumulator::new(160);
+        let mut total_frames = 0;
+        for chunk_len in [161, 159, 160, 158, 162] {
+            for frame in acc.push(&vec![7i16; chunk_len]) {
+                assert_eq!(frame.len(), 160, "frame must be exactly samples_per_frame");
+                total_frames += 1;
+            }
+        }
+        assert!(total_frames > 0, "5 chunks of ~160 samples must yield at least one frame");
+    }
+
+    #[test]
+    fn short_first_push_is_left_padded_to_a_frame_boundary() {
+        // Absorbs the resampler's one-time startup trim: a short first
+        // output must not vanish or stall forever waiting for more data —
+        // it gets padded with leading silence up to the frame boundary.
+        let mut acc = FrameAccumulator::new(160);
+        let frames = acc.push(&[9i16; 100]);
+        assert_eq!(frames.len(), 1, "padding must complete exactly one frame");
+        let frame = &frames[0];
+        assert_eq!(frame.len(), 160);
+        // First 60 samples are the left-pad (silence), last 100 are real audio.
+        assert!(frame[..60].iter().all(|&s| s == 0), "pad must be silence");
+        assert!(frame[60..].iter().all(|&s| s == 9), "real audio must follow the pad");
+    }
+
+    #[test]
+    fn priming_only_happens_once() {
+        // After the first (possibly short) push, later short pushes must
+        // just accumulate normally — re-padding every push would inject
+        // silence gaps throughout the stream, not just at startup.
+        let mut acc = FrameAccumulator::new(160);
+        let first = acc.push(&[1i16; 100]); // primes: 60-sample pad + 100 = one frame
+        assert_eq!(first.len(), 1);
+        let second = acc.push(&[2i16; 60]); // 60 alone isn't a full frame yet
+        assert!(second.is_empty(), "no re-padding — must wait for more data");
+        let third = acc.push(&[2i16; 100]); // 60 + 100 = 160, completes with no padding
+        assert_eq!(third.len(), 1);
+        assert!(third[0].iter().all(|&s| s == 2), "no silence injected on later pushes");
+    }
+
+    #[test]
+    fn remainder_carries_across_pushes_and_no_samples_are_dropped() {
+        let mut acc = FrameAccumulator::new(160);
+        let mut delivered = 0usize;
+        for _ in 0..10 {
+            for frame in acc.push(&[3i16; 100]) {
+                delivered += frame.len();
+            }
+        }
+        // 10 * 100 = 1000 input samples; with a one-time 60-sample left-pad
+        // the accumulator holds 1060 samples total, emitting 6 full frames
+        // (960) and carrying 100 samples forward — nothing is lost.
+        assert_eq!(delivered, 960, "6 full frames delivered, remainder carried internally");
+    }
+
+    #[test]
+    fn empty_push_is_a_no_op_before_priming() {
+        let mut acc = FrameAccumulator::new(160);
+        assert!(acc.push(&[]).is_empty());
+        assert!(!acc.primed, "an empty push must not consume the priming step");
     }
 }
