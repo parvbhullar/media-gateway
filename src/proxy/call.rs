@@ -207,6 +207,37 @@ pub struct DefaultRouteInvite {
     pub source_trunk_hint: Option<String>,
 }
 
+/// CDR-seed fields threaded into `finalize_bridge_answer` after a bridge call
+/// is answered. Grouped so the finalizer's signature stays readable.
+struct BridgeAnswerSeed {
+    call_id: String,
+    caller_uri: String,
+    callee_uri: String,
+    from_number: Option<String>,
+    to_number: Option<String>,
+    trunk_name: String,
+    trunk_id: i64,
+    start_time: chrono::DateTime<chrono::Utc>,
+}
+
+/// Map a bridge dispatch error to a (SIP status code, reason) pair for the
+/// pre-answer engine's reject. Honours an explicit LiveKit Decision-API
+/// rejection (`DispatchRejection`); everything else is a generic 503.
+fn classify_bridge_dispatch_error(e: &anyhow::Error) -> (u16, String) {
+    if let Some(rej) =
+        e.downcast_ref::<crate::proxy::bridge::livekit::dispatch::DispatchRejection>()
+    {
+        (
+            rej.code,
+            rej.reason
+                .clone()
+                .unwrap_or_else(|| "dispatch rejected".to_string()),
+        )
+    } else {
+        (503, format!("dispatch failed: {e}"))
+    }
+}
+
 #[async_trait]
 impl RouteInvite for DefaultRouteInvite {
     async fn route_invite(
@@ -1494,7 +1525,7 @@ impl CallModule {
         use crate::callrecord::CallRecordHangupReason;
         use crate::proxy::bridge::session::BridgeKind;
         use crate::proxy::bridge_sessions::{
-            BridgeCallDirection, BridgeCallRecordInfo, BridgeSession, emit_bridge_call_record,
+            BridgeCallDirection, BridgeCallRecordInfo, emit_bridge_call_record,
         };
 
         // Capture CDR-relevant headers up front so they're available on any
@@ -1573,6 +1604,56 @@ impl CallModule {
                 Some(rsipstack::sip::StatusCode::BadRequest),
             ))
         })?;
+        // Own the offer now so the borrow of `tx` (via `offer_body`) ends here,
+        // freeing `tx` for the mutable borrows below (send_trying, dialog driver).
+        let offer_owned = offer_sdp.to_string();
+        let offer_bytes = offer_body.to_vec();
+
+        // Rejected-INVITE replay: a carrier failover-retrying an INVITE we
+        // already rejected (same Call-ID + From-tag, within the cache TTL)
+        // gets the cached final status back without re-running routing,
+        // capacity accounting, or dispatch — protects the CPS bucket and the
+        // bot's session capacity from retry storms.
+        let from_tag = tx
+            .original
+            .from_header()
+            .ok()
+            .and_then(|f| f.tag().ok().flatten())
+            .map(|t| t.to_string())
+            .unwrap_or_default();
+        if !self.inner.config.disable_rejected_invite_cache
+            && let Some((status, reason)) =
+                self.inner.server.rejected_invites.get(&cdr_call_id, &from_tag)
+        {
+            info!(call_id = %cdr_call_id, status, "replaying cached bridge INVITE rejection");
+            crate::metrics::bridge::dispatch_outcome(kind, "rejection_replayed");
+            let code = rsipstack::sip::StatusCode::from(status);
+            let reason_value =
+                q850_reason_value(&code, reason.as_deref().or(Some("retry rejected")));
+            tx.reply_with(
+                code,
+                vec![rsipstack::sip::Header::Other("Reason".into(), reason_value)],
+                None,
+            )
+            .await
+            .map_err(|e| RouteError::from((anyhow!("replay reply failed: {e}"), None)))?;
+            return Ok(());
+        }
+        // Populate the cache from every final-rejection path below.
+        let rejected_cache = (!self.inner.config.disable_rejected_invite_cache)
+            .then(|| self.inner.server.rejected_invites.clone());
+        let record_rejection = |status: u16, reason: Option<String>| {
+            if let Some(cache) = rejected_cache.as_ref() {
+                cache.put(&cdr_call_id, &from_tag, status, reason);
+            }
+        };
+
+        // Pre-answer engine, step 1: send 100 Trying immediately, before any
+        // network-dependent setup (DB fetch, capacity, signaling). Without
+        // this the carrier hears silence for the whole setup window and may
+        // retransmit the INVITE / fail over. `send_trying` is idempotent with
+        // the dialog layer's own 100 (a retransmit at the transaction level).
+        tx.send_trying().await.ok();
 
         let db = self.inner.server.database.as_ref().ok_or_else(|| {
             emit_failure_cdr(
@@ -1619,7 +1700,7 @@ impl CallModule {
         // it (refund the CPS token + active counter) on any subsequent
         // failure path so a stream of failing INVITEs doesn't drain the
         // bucket and starve legitimate traffic.
-        let permit_opt = if max_calls.is_some() || max_cps.is_some() {
+        let mut permit_opt = if max_calls.is_some() || max_cps.is_some() {
             use crate::proxy::trunk_capacity_state::AcquireOutcome;
             match self
                 .inner
@@ -1674,24 +1755,33 @@ impl CallModule {
 
         let ice_servers = self.inner.server.rtp_config.ice_servers.as_deref();
 
-        // Lift custom `X-*` headers off the INVITE so the bridge far-end can
-        // surface them as `sip.h.<Header>` participant attributes (parallels
-        // livekit/sip's HeadersToAttrs). Standard sip.* attributes are derived
-        // far-end from call_id/from/to; this carries only the operator's
-        // custom headers.
-        let sip_headers: Vec<(String, String)> = tx
-            .original
-            .headers
-            .iter()
-            .filter_map(|h| match h {
-                rsipstack::sip::Header::Other(name, value)
-                    if name.len() >= 2 && name[..2].eq_ignore_ascii_case("x-") =>
-                {
-                    Some((name.clone(), value.clone()))
-                }
-                _ => None,
-            })
-            .collect();
+        // Headers surfaced to the bridge far-end as `sip.h.<Header>` attributes
+        // (parallels livekit/sip's HeadersToAttrs). Default: only the operator's
+        // custom `X-*` headers. When the trunk sets `expose_headers_to_bot`, use
+        // the shared allow-list filter so identity headers (P-Asserted-Identity,
+        // Diversion, History-Info, …) reach the bot too — never sensitive ones.
+        let expose_headers_to_bot = match kind {
+            BridgeKind::WebRtc => {
+                trunk_row.webrtc().map(|c| c.expose_headers_to_bot).unwrap_or(false)
+            }
+            _ => false,
+        };
+        let sip_headers: Vec<(String, String)> = if expose_headers_to_bot {
+            crate::proxy::bridge::common::filtered_remote_headers(&tx.original)
+        } else {
+            tx.original
+                .headers
+                .iter()
+                .filter_map(|h| match h {
+                    rsipstack::sip::Header::Other(name, value)
+                        if name.len() >= 2 && name[..2].eq_ignore_ascii_case("x-") =>
+                    {
+                        Some((name.clone(), value.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
 
         let dispatch_ctx = crate::proxy::bridge::common::DispatchContext {
             call_id: cdr_call_id.clone(),
@@ -1706,92 +1796,458 @@ impl CallModule {
             rtp_end_port: self.inner.server.rtp_config.end_port,
             sip_headers,
         };
-        let dispatch_res = match kind {
-            BridgeKind::WebRtc => {
-                crate::proxy::bridge::webrtc::dispatch_webrtc(
-                    &trunk_row,
-                    offer_sdp,
-                    ice_servers,
-                    &dispatch_ctx,
-                )
-                .await
-            }
-            BridgeKind::LiveKit => {
-                crate::proxy::bridge::livekit::dispatch::dispatch_livekit(
-                    &trunk_row,
-                    offer_sdp,
-                    ice_servers,
-                    &dispatch_ctx,
-                )
-                .await
-            }
-            BridgeKind::ExternalMedia => {
-                crate::proxy::bridge::external_media::dispatch::dispatch_external_media(
-                    &trunk_row,
-                    offer_sdp,
-                    ice_servers,
-                    &dispatch_ctx,
-                )
-                .await
+        // ── Pre-answer engine ──────────────────────────────────────────────
+        // Register the INVITE as a server dialog so provisional responses
+        // (100/180), the To-tag, ACK absorption, and CANCEL detection are
+        // owned by the dialog layer (mirrors the B2BUA path). Dispatch runs
+        // concurrently while we send 180 Ringing on a ticker; the 200 OK is
+        // gated on the trunk's media-commitment policy. CANCEL → 487, ring
+        // timeout → 480, dispatch failure → mapped status — all with the
+        // capacity permit refunded and a CDR emitted. See the
+        // `bridge-pre-answer` capability spec + design.md.
+        use crate::models::trunk::{
+            AnswerOn, DEFAULT_RINGING_INTERVAL_MS, DEFAULT_RING_TIMEOUT_MS,
+        };
+        use rsipstack::dialog::dialog::{DialogState, TerminatedReason};
+
+        // Resolve per-trunk pre-answer knobs (with kind-appropriate defaults).
+        let (ring_timeout_ms, ringing_interval_ms, answer_on) = match kind {
+            BridgeKind::WebRtc => match trunk_row.webrtc() {
+                Ok(c) => (
+                    c.ring_timeout_ms_resolved(),
+                    c.ringing_interval_ms_resolved(),
+                    c.answer_on_resolved(),
+                ),
+                Err(_) => (
+                    DEFAULT_RING_TIMEOUT_MS,
+                    DEFAULT_RINGING_INTERVAL_MS,
+                    AnswerOn::IceConnected,
+                ),
+            },
+            BridgeKind::LiveKit => match trunk_row.livekit() {
+                Ok(c) => (
+                    c.ring_timeout_ms_resolved(),
+                    c.ringing_interval_ms_resolved(),
+                    c.answer_on_resolved(),
+                ),
+                Err(_) => (
+                    DEFAULT_RING_TIMEOUT_MS,
+                    DEFAULT_RINGING_INTERVAL_MS,
+                    AnswerOn::AgentJoined,
+                ),
+            },
+            BridgeKind::ExternalMedia => match trunk_row.external_media() {
+                Ok(c) => (
+                    c.ring_timeout_ms_resolved(),
+                    c.ringing_interval_ms_resolved(),
+                    AnswerOn::Ready,
+                ),
+                Err(_) => (
+                    DEFAULT_RING_TIMEOUT_MS,
+                    DEFAULT_RINGING_INTERVAL_MS,
+                    AnswerOn::Ready,
+                ),
+            },
+        };
+        let ring_timeout = std::time::Duration::from_millis(ring_timeout_ms);
+        let ringing_interval =
+            std::time::Duration::from_millis(ringing_interval_ms.max(200));
+
+        // Post-answer media-inactivity timeout windows. Only the WebRTC kind
+        // has a `BridgePeer` data plane to poll; LiveKit / external_media run
+        // their own media planes (their bot-join watchdogs cover the "no media"
+        // case), so we disable the BridgePeer timer for them (ZERO).
+        let (media_timeout_initial, media_timeout_rolling) = match kind {
+            BridgeKind::WebRtc => match trunk_row.webrtc() {
+                Ok(c) => (
+                    std::time::Duration::from_millis(c.media_timeout_initial_ms_resolved()),
+                    std::time::Duration::from_millis(c.media_timeout_ms_resolved()),
+                ),
+                Err(_) => (
+                    std::time::Duration::from_millis(
+                        crate::models::trunk::DEFAULT_MEDIA_TIMEOUT_INITIAL_MS,
+                    ),
+                    std::time::Duration::from_millis(
+                        crate::models::trunk::DEFAULT_MEDIA_TIMEOUT_MS,
+                    ),
+                ),
+            },
+            _ => (std::time::Duration::ZERO, std::time::Duration::ZERO),
+        };
+
+        // Contact for provisional/final responses: advertise the interface
+        // reachable from the caller's network (same source as the B2BUA path).
+        let peer_ip = extract_peer_ip_from_request(&tx.original);
+        let local_contact = self.inner.server.contact_uri_for_peer(peer_ip);
+
+        // Create the server dialog (auto-sends 100 on first `handle`, owns the
+        // To-tag so 180/200 are consistent).
+        let (state_tx, mut state_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server_dialog = match self
+            .inner
+            .server
+            .dialog_layer
+            .get_or_create_server_invite(tx, state_tx, None, local_contact)
+        {
+            Ok(d) => d,
+            Err(e) => {
+                drop(permit_opt.take());
+                emit_failure_cdr(
+                    500,
+                    CallRecordHangupReason::Failed,
+                    Some(format!("server dialog create failed: {e}")),
+                    Some(trunk_id),
+                );
+                return Err(RouteError::from((
+                    anyhow!("failed to create server dialog for bridge: {e}"),
+                    Some(rsipstack::sip::StatusCode::ServerInternalError),
+                )));
             }
         };
-        let outcome =
-            match dispatch_res {
-                Ok(o) => o,
-                Err(e) => {
-                    warn!(trunk = %trunk_name, kind = %kind.as_str(), error = %e,
-                          "external bridge dispatch failed");
-                    // Refund capacity before emitting the CDR so a stream
-                    // of failures doesn't drain the CPS bucket.
-                    drop(permit_opt);
+        let dialog_id = server_dialog.id();
 
-                    // If the dispatcher signalled an explicit webhook
-                    // rejection (LiveKit Decision API), honour its
-                    // status code + reason on the SIP response instead
-                    // of the generic 503.
-                    if let Some(rej) = e.downcast_ref::<
-                        crate::proxy::bridge::livekit::dispatch::DispatchRejection,
-                    >() {
-                        let code = rej.code;
-                        let reason = rej.reason.clone();
-                        emit_failure_cdr(
-                            code,
-                            CallRecordHangupReason::Rejected,
-                            reason,
-                            Some(trunk_id),
-                        );
-                        let sip_code = rsipstack::sip::StatusCode::from(code);
-                        return Err(RouteError::from((
-                            anyhow!(e),
-                            Some(sip_code),
-                        )));
-                    }
-
-                    emit_failure_cdr(
-                        503,
-                        CallRecordHangupReason::ServerUnavailable,
-                        Some(format!("dispatch failed: {e}")),
-                        Some(trunk_id),
-                    );
-                    return Err(RouteError::from((
-                        e,
-                        Some(rsipstack::sip::StatusCode::ServiceUnavailable),
-                    )));
+        // Dispatch runs as a concurrently-polled future (never dropped
+        // mid-poll unless we then await it to completion for cleanup).
+        let dispatch = async {
+            match kind {
+                BridgeKind::WebRtc => {
+                    crate::proxy::bridge::webrtc::dispatch_webrtc(
+                        &trunk_row,
+                        &offer_owned,
+                        ice_servers,
+                        &dispatch_ctx,
+                    )
+                    .await
                 }
-            };
+                BridgeKind::LiveKit => {
+                    crate::proxy::bridge::livekit::dispatch::dispatch_livekit(
+                        &trunk_row,
+                        &offer_owned,
+                        ice_servers,
+                        &dispatch_ctx,
+                    )
+                    .await
+                }
+                BridgeKind::ExternalMedia => {
+                    crate::proxy::bridge::external_media::dispatch::dispatch_external_media(
+                        &trunk_row,
+                        &offer_owned,
+                        ice_servers,
+                        &dispatch_ctx,
+                    )
+                    .await
+                }
+            }
+        };
+        tokio::pin!(dispatch);
 
-        // Set up call recording for the bridge. Recording is gated on the
-        // global `[recording]` policy (same surface non-bridge calls use);
-        // when disabled, `recording_path` stays `None` and the bridge runs
-        // without a recorder. We attach the recorder *before* `start()` is
-        // called so the forwarder picks it up when it spawns.
-        //
-        // Codec note: WebRTC sends Opus, SIP side varies (PCMU/PCMA/G722/
-        // Opus). `Recorder::new` internally targets PCMU for Opus/G722, and
-        // its per-sample decoder uses the inbound frame's payload type — so
-        // passing `CodecType::PCMU` here yields a playable mono-encoded,
-        // stereo-channel WAV with leg A on one channel and leg B on the
-        // other regardless of which codec each leg negotiated.
+        let mut driver = server_dialog.clone();
+        let mut outcome: Option<crate::proxy::bridge::session::DispatchOutcome> = None;
+        let mut commit_fut: Option<
+            std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>,
+        > = None;
+        let mut answered = false;
+        let mut cancelled = false;
+        let mut timed_out = false;
+        let mut dispatch_failed: Option<(u16, String, anyhow::Error)> = None;
+        // On the answered path, `finalize` returns the bridge Arc and we hold the
+        // SDP so the post-loop code can spawn the liveness watchers once the loop
+        // has released `state_rx`.
+        let mut answered_bridge: Option<
+            std::sync::Arc<dyn crate::proxy::bridge::session::MediaBridge>,
+        > = None;
+        let mut answered_sdp = String::new();
+
+        let ring_deadline = tokio::time::sleep(ring_timeout);
+        tokio::pin!(ring_deadline);
+        let mut ticker = tokio::time::interval(ringing_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await; // consume the immediate first tick
+
+        // Initial 180 Ringing (gates have passed by now).
+        server_dialog.ringing(None, None).ok();
+
+        loop {
+            tokio::select! {
+                biased;
+                // Drive the dialog/transaction: pumps queued 100/180/200/4xx
+                // responses, absorbs INVITE retransmits, and returns on ACK
+                // (Confirmed), CANCEL (Terminated) or transaction error.
+                r = driver.handle(tx) => {
+                    if let Err(ref e) = r {
+                        debug!(%dialog_id, error = %e, "bridge dialog handle returned error");
+                    }
+                    if !answered && !timed_out && dispatch_failed.is_none() {
+                        // handle returned before answer and not due to our own
+                        // timeout/failure → caller sent CANCEL (487 already
+                        // emitted by the dialog layer).
+                        cancelled = true;
+                    }
+                    break;
+                }
+                // Early CANCEL signal (redundant with `handle` returning, but
+                // lets us stop the ticker promptly).
+                Some(st) = state_rx.recv() => {
+                    if matches!(st, DialogState::Terminated(_, TerminatedReason::UacCancel)) {
+                        cancelled = true;
+                    }
+                }
+                // Dispatch completed.
+                res = &mut dispatch,
+                    if outcome.is_none() && dispatch_failed.is_none() && !answered =>
+                {
+                    match res {
+                        Ok(o) => {
+                            let bridge = o.bridge.clone();
+                            let ao = answer_on;
+                            commit_fut = Some(Box::pin(async move {
+                                bridge.await_media_commitment(ao).await
+                            }));
+                            outcome = Some(o);
+                        }
+                        Err(e) => {
+                            let (code, reason) = classify_bridge_dispatch_error(&e);
+                            server_dialog
+                                .reject(
+                                    Some(rsipstack::sip::StatusCode::from(code)),
+                                    Some(reason.clone()),
+                                )
+                                .ok();
+                            dispatch_failed = Some((code, reason, e));
+                        }
+                    }
+                }
+                // Media commitment resolved (immediate for signaling /
+                // livekit / external_media; waits for ICE-connected on webrtc).
+                cr = async { commit_fut.as_mut().unwrap().await },
+                    if commit_fut.is_some() =>
+                {
+                    commit_fut = None;
+                    match cr {
+                        Ok(()) if !cancelled && !timed_out => {
+                            if let Some(o) = outcome.take() {
+                                let sdp = o.sip_sdp_answer.clone();
+                                let headers = vec![rsipstack::sip::Header::ContentType(
+                                    rsipstack::sip::headers::ContentType::from(
+                                        "application/sdp",
+                                    ),
+                                )];
+                                match server_dialog
+                                    .accept(Some(headers), Some(sdp.clone().into_bytes()))
+                                {
+                                    Ok(()) => {
+                                        crate::metrics::bridge::dispatch_outcome(
+                                            kind, "success",
+                                        );
+                                        let answer_time = chrono::Utc::now();
+                                        answered_sdp = sdp.clone();
+                                        answered_bridge = self
+                                            .finalize_bridge_answer(
+                                                dialog_id.clone(),
+                                                o,
+                                                kind,
+                                                permit_opt.take(),
+                                                &offer_bytes,
+                                                BridgeAnswerSeed {
+                                                    call_id: cdr_call_id.clone(),
+                                                    caller_uri: cdr_caller_uri.clone(),
+                                                    callee_uri: cdr_callee_uri.clone(),
+                                                    from_number: cdr_from_number.clone(),
+                                                    to_number: cdr_to_number.clone(),
+                                                    trunk_name: trunk_name.to_string(),
+                                                    trunk_id,
+                                                    start_time: cdr_start,
+                                                },
+                                                answer_time,
+                                                server_dialog.clone(),
+                                                sdp,
+                                                media_timeout_initial,
+                                                media_timeout_rolling,
+                                            )
+                                            .await;
+                                        answered = true;
+                                    }
+                                    Err(e) => {
+                                        warn!(%dialog_id, error = %e,
+                                            "bridge dialog accept failed after commitment");
+                                        o.teardown.close().await.ok();
+                                        dispatch_failed = Some((
+                                            500,
+                                            "accept failed".to_string(),
+                                            anyhow!("dialog accept failed: {e}"),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        // Cancelled/timed-out raced the commitment — the
+                        // outcome (if any) is torn down in post-loop cleanup.
+                        Ok(()) => {}
+                        Err(e) => {
+                            // Bot media never established (PC Failed/Closed).
+                            server_dialog
+                                .reject(
+                                    Some(rsipstack::sip::StatusCode::ServiceUnavailable),
+                                    Some("bot media not established".to_string()),
+                                )
+                                .ok();
+                            dispatch_failed =
+                                Some((503, "bot media not established".to_string(), e));
+                        }
+                    }
+                }
+                // Ring timeout — bound the whole INVITE→final window. The
+                // `!timed_out` guard is essential: an elapsed `Sleep` is
+                // always Poll::Ready, so without it `biased` re-selects this
+                // arm every iteration and hot-spins re-sending 480 until
+                // handle(tx) returns.
+                _ = &mut ring_deadline, if !answered && dispatch_failed.is_none() && !timed_out => {
+                    timed_out = true;
+                    server_dialog
+                        .reject(
+                            Some(rsipstack::sip::StatusCode::TemporarilyUnavailable),
+                            Some("SIP;cause=480;text=\"ring timeout\"".to_string()),
+                        )
+                        .ok();
+                }
+                // Re-send 180 Ringing.
+                _ = ticker.tick(),
+                    if !answered && dispatch_failed.is_none() && !timed_out =>
+                {
+                    server_dialog.ringing(None, None).ok();
+                }
+            }
+        }
+
+        // ── Post-loop: answered path already stashed + started in finalize ──
+        if answered {
+            // Now that the engine loop has released `state_rx`, hand it to the
+            // post-answer liveness watchers (dialog keep-alive/teardown +
+            // bot-disconnect → carrier BYE). `answered_bridge` is `None` only if
+            // `start()` failed inside finalize (which already tore down).
+            if let Some(bridge) = answered_bridge {
+                self.spawn_bridge_liveness_watchers(
+                    dialog_id.clone(),
+                    bridge,
+                    state_rx,
+                    answered_sdp,
+                );
+            }
+            info!(%dialog_id, trunk = %trunk_name, kind = %kind.as_str(),
+                "external bridge established");
+            return Ok(());
+        }
+
+        // Not answered — make sure no bot session leaks, then refund + CDR.
+        if let Some(o) = outcome.take() {
+            o.teardown.close().await.ok();
+        } else if dispatch_failed.is_none() {
+            // Dispatch may still be in flight (cancel/timeout raced it). Await
+            // it bounded, then tear down its result so the bot session doesn't
+            // leak. (Cooperative early-abort via a cancel token is a follow-on;
+            // here we let dispatch settle.)
+            match tokio::time::timeout(std::time::Duration::from_secs(6), &mut dispatch).await
+            {
+                Ok(Ok(o)) => {
+                    o.teardown.close().await.ok();
+                }
+                // Dispatch cleaned up itself (close_on_setup_failure).
+                Ok(Err(_)) => {}
+                Err(_) => warn!(%dialog_id,
+                    "dispatch did not settle within grace after pre-answer abort; \
+                     bot session may leak until its idle timeout"),
+            }
+        }
+        drop(commit_fut);
+        drop(permit_opt.take());
+
+        if cancelled {
+            crate::metrics::bridge::dispatch_outcome(kind, "cancelled");
+            emit_failure_cdr(
+                487,
+                CallRecordHangupReason::ByCaller,
+                Some("caller cancelled before answer".to_string()),
+                Some(trunk_id),
+            );
+            return Ok(());
+        }
+        if timed_out {
+            crate::metrics::bridge::dispatch_outcome(kind, "ring_timeout");
+            record_rejection(480, Some("ring timeout".to_string()));
+            emit_failure_cdr(
+                480,
+                CallRecordHangupReason::Failed,
+                Some("ring timeout before media commitment".to_string()),
+                Some(trunk_id),
+            );
+            return Ok(());
+        }
+        if let Some((code, reason, err)) = dispatch_failed {
+            crate::metrics::bridge::dispatch_outcome(kind, "error");
+            record_rejection(code, Some(reason.clone()));
+            let hangup = if code >= 500 {
+                CallRecordHangupReason::ServerUnavailable
+            } else {
+                CallRecordHangupReason::Rejected
+            };
+            emit_failure_cdr(code, hangup, Some(reason), Some(trunk_id));
+            // Reject already sent on the dialog; returning Err is for metrics/
+            // logging. handle_invite's arm guards on `tx.last_response.is_none()`
+            // so it will not double-reply.
+            return Err(RouteError::from((
+                err,
+                Some(rsipstack::sip::StatusCode::from(code)),
+            )));
+        }
+
+        // Fallback: handle returned without answer/cancel/timeout/failure
+        // (e.g. transaction error). Treat as a server-side failure.
+        crate::metrics::bridge::dispatch_outcome(kind, "error");
+        emit_failure_cdr(
+            500,
+            CallRecordHangupReason::Failed,
+            Some("bridge setup ended without answer".to_string()),
+            Some(trunk_id),
+        );
+        Ok(())
+    }
+
+
+    /// Post-answer finalization for an external-bridge call: attach the
+    /// optional recorder, stash the [`BridgeSession`] in the registry (so a
+    /// BYE can find it), start the media forwarders, and — for kinds with a
+    /// media-plane end-of-call signal — spawn the disconnect watcher.
+    ///
+    /// The 200 OK has already been sent (via the dialog) by the pre-answer
+    /// engine; this only wires up the post-answer data plane. Errors starting
+    /// the bridge are handled here (teardown + CDR) — the SIP side is already
+    /// committed, so there is no failure response to send.
+    #[allow(clippy::too_many_arguments)]
+    async fn finalize_bridge_answer(
+        &self,
+        dialog_id: DialogId,
+        outcome: crate::proxy::bridge::session::DispatchOutcome,
+        kind: crate::proxy::bridge::session::BridgeKind,
+        permit: Option<crate::proxy::trunk_capacity_state::Permit>,
+        offer_bytes: &[u8],
+        seed: BridgeAnswerSeed,
+        answer_time: chrono::DateTime<chrono::Utc>,
+        server_dialog: rsipstack::dialog::server_dialog::ServerInviteDialog,
+        local_sdp: String,
+        media_timeout_initial: std::time::Duration,
+        media_timeout_rolling: std::time::Duration,
+    ) -> Option<std::sync::Arc<dyn crate::proxy::bridge::session::MediaBridge>> {
+        use crate::proxy::bridge::session::BridgeKind;
+        use crate::proxy::bridge_sessions::BridgeSession;
+
+        // Recording is gated on the global `[recording]` policy (same surface
+        // non-bridge calls use). WebRTC + ExternalMedia feed the shared
+        // Recorder (leg A = SIP caller, leg B = bot side); LiveKit has no
+        // recorder data plane yet.
+        let recording_supported = matches!(
+            kind,
+            BridgeKind::WebRtc | BridgeKind::ExternalMedia
+        );
         let recording_path: Option<String> = self
             .inner
             .config
@@ -1802,7 +2258,7 @@ impl CallModule {
                 let root = policy.recorder_path();
                 let date = chrono::Utc::now().format("%Y%m%d").to_string();
                 let safe_call_id = Self::sanitize_filename_component(
-                    &cdr_call_id,
+                    &seed.call_id,
                     &uuid::Uuid::new_v4().to_string(),
                 );
                 let mut path = std::path::PathBuf::from(root);
@@ -1811,35 +2267,17 @@ impl CallModule {
                 path.set_extension("wav");
                 Some(path.to_string_lossy().to_string())
             });
-        // WebRTC (BridgePeer) and ExternalMedia (sidecar PCM Task A/B) both
-        // feed the shared `Recorder` (leg A = SIP caller, leg B = bot side).
-        // LiveKit has no recorder data plane yet (separate follow-up).
-        let recording_supported =
-            matches!(kind, BridgeKind::WebRtc | BridgeKind::ExternalMedia);
+
         if let Some(path) = recording_path.as_ref().filter(|_| recording_supported) {
             match crate::media::recorder::Recorder::new(path, CodecType::PCMU) {
                 Ok(mut rec) => {
-                    // Tell the recorder what codec/PT each leg uses so its
-                    // per-leg timeline projection uses the right clock rate.
-                    // Without this the recorder defaults to its output clock
-                    // (PCMU 8 kHz) for every leg, but the actual SIP-side
-                    // frames carry 48 kHz Opus timestamps — the resulting
-                    // mismatch makes the recorder log a
-                    // `timeline discontinuity` reset on every packet and
-                    // garble the caller's audio in the WAV.
-                    //
-                    // Leg A = inbound SIP side: parse the caller's offer SDP.
-                    // Leg B = bot side: Opus @ 48 kHz. WebRTC publishes stereo
-                    // (PT=111); the external_media sidecar re-encodes mono Opus.
-                    // Both legs are fed an explicit codec hint by their bridge,
-                    // so the leg-B PT here is only a fallback — channel count is
-                    // what matters for the decode/downmix.
                     let leg_a_profile =
                         crate::media::negotiate::MediaNegotiator::extract_leg_profile(
-                            std::str::from_utf8(&offer_body).unwrap_or(""),
+                            std::str::from_utf8(offer_bytes).unwrap_or(""),
                         );
                     rec.set_leg_profile(crate::media::recorder::Leg::A, leg_a_profile);
-                    let leg_b_channels = if kind == BridgeKind::ExternalMedia { 1 } else { 2 };
+                    let leg_b_channels =
+                        if kind == BridgeKind::ExternalMedia { 1 } else { 2 };
                     let leg_b_profile = crate::media::negotiate::NegotiatedLegProfile {
                         audio: Some(crate::media::negotiate::NegotiatedCodec {
                             codec: CodecType::Opus,
@@ -1851,129 +2289,48 @@ impl CallModule {
                         dtmf: None,
                     };
                     rec.set_leg_profile(crate::media::recorder::Leg::B, leg_b_profile);
-                    // external_media level balance (recording-only): the SIP
-                    // caller arrives ~20 dB below the LiveKit TTS bot, and the
-                    // bot tends to clip the μ-law ceiling. Lift the caller and
-                    // tame the bot so both sit at a comparable level in the WAV.
-                    // Does NOT touch live call audio.
                     if kind == BridgeKind::ExternalMedia {
                         rec.set_leg_gain(crate::media::recorder::Leg::A, 3.0);
                         rec.set_leg_gain(crate::media::recorder::Leg::B, 0.6);
                     }
-                    let shared = std::sync::Arc::new(parking_lot::RwLock::new(Some(rec)));
+                    let shared =
+                        std::sync::Arc::new(parking_lot::RwLock::new(Some(rec)));
                     outcome.bridge.attach_recorder(shared);
-                    info!(call_id = %cdr_call_id, path = %path, kind = %kind.as_str(),
+                    info!(call_id = %seed.call_id, path = %path, kind = %kind.as_str(),
                         "bridge recording enabled");
                 }
                 Err(e) => {
-                    // Don't fail the call — just log and continue without
-                    // recording. The CDR will omit the recorder entry.
-                    warn!(call_id = %cdr_call_id, path = %path, error = %e,
+                    warn!(call_id = %seed.call_id, path = %path, error = %e,
                         "failed to create bridge recorder; continuing without recording");
                 }
             }
         }
-        // Clear the CDR recording path for kinds that don't actually record
-        // (LiveKit), so the CDR doesn't advertise a file that was never
-        // written.
         let recording_path = if recording_supported {
             recording_path
         } else {
             None
         };
 
-        // Build the session up-front and stash it *before* sending the 200
-        // OK. A racing BYE could otherwise arrive between `reply_with`
-        // returning and the registry insert, a racing BYE dispatched on a
-        // different tokio task could find the registry empty and fall
-        // through to `process_message` (a no-op for bridge dialogs),
-        // orphaning the bridge.
-        //
-        // We mitigate by keeping the gap as short as possible: derive the
-        // dialog id and insert immediately after `reply_with`, with no
-        // real async work in between (the DashMap-backed `insert` doesn't
-        // yield). In practice the SIP stack itself takes longer to
-        // dispatch the BYE transaction than this window, so the race is
-        // effectively closed but not formally eliminated. To eliminate
-        // entirely we'd need to either pre-compute the local-tag before
-        // `reply_with` or key the registry on Call-ID rather than full
-        // DialogId — follow-up if we ever observe a real orphan.
-        let body_bytes = outcome.sip_sdp_answer.clone().into_bytes();
-        let mut reply_headers = vec![rsipstack::sip::Header::ContentType(
-            rsipstack::sip::headers::ContentType::from("application/sdp"),
-        )];
-        // RFC 3261 §13.3.1.4: a 2xx response to INVITE MUST contain a
-        // Contact header so the UAC knows where to send ACK and BYE.
-        // Without it the dialog never reaches Established on the caller
-        // side — softphones won't ACK, won't enable audio, and can't hang
-        // up cleanly.
-        let peer_ip = extract_peer_ip_from_request(&tx.original);
-        if let Some(uri) = self.inner.server.contact_uri_for_peer(peer_ip) {
-            let typed = rsipstack::sip::typed::Contact {
-                display_name: None,
-                uri,
-                params: vec![],
-            };
-            reply_headers.push(rsipstack::sip::Header::from(typed));
-        }
-        let reply_result = tx
-            .reply_with(
-                rsipstack::sip::StatusCode::OK,
-                reply_headers,
-                Some(body_bytes),
-            )
-            .await;
-        if let Err(e) = reply_result {
-            crate::metrics::bridge::dispatch_outcome(kind, "reply_error");
-            if let Err(close_err) = outcome.teardown.close().await {
-                warn!(
-                    trunk = %trunk_name,
-                    error = %close_err,
-                    "reply_with failed and bridge teardown.close also failed; \
-                     remote session may leak until idle timeout"
-                );
-            }
-            // Refund capacity before CDR emission.
-            drop(permit_opt);
-            emit_failure_cdr(
-                500,
-                CallRecordHangupReason::Failed,
-                Some(format!("reply_with failed: {e}")),
-                Some(trunk_id),
-            );
-            return Err(RouteError::from((
-                anyhow!("failed to send 200 OK for webrtc bridge: {e}"),
-                Some(rsipstack::sip::StatusCode::ServerInternalError),
-            )));
-        }
-        crate::metrics::bridge::dispatch_outcome(kind, "success");
-        let answer_time = chrono::Utc::now();
-
-        // Compute the dialog id after the 200 OK so the local-tag injected
-        // by `reply_with` is reflected. Subsequent in-dialog requests (ACK,
-        // BYE) will derive the same id via TransactionRole::Server.
-        let dialog_id = DialogId::try_from((&tx.original, TransactionRole::Server))
-            .map_err(|e| RouteError::from((anyhow!(e), None)))?;
-
-        // Stash session state for BYE-time teardown. Insert *before*
-        // `start_bridge` so the registry entry is visible before any
-        // chance of a racing BYE.
+        // Stash the session *before* starting forwarders so a racing BYE can
+        // find the registry entry.
         let bridge_arc = outcome.bridge.clone();
         let session = BridgeSession {
             bridge: outcome.bridge,
             teardown: outcome.teardown,
+            server_dialog: Some(server_dialog),
+            local_sdp,
             kind,
-            _permit: permit_opt,
-            call_id: cdr_call_id.clone(),
-            caller_uri: cdr_caller_uri.clone(),
-            callee_uri: cdr_callee_uri.clone(),
-            from_number: cdr_from_number.clone(),
-            to_number: cdr_to_number.clone(),
-            trunk_name: trunk_name.to_string(),
-            trunk_id: Some(trunk_id),
-            start_time: cdr_start,
+            _permit: permit,
+            call_id: seed.call_id.clone(),
+            caller_uri: seed.caller_uri,
+            callee_uri: seed.callee_uri,
+            from_number: seed.from_number,
+            to_number: seed.to_number,
+            trunk_name: seed.trunk_name.clone(),
+            trunk_id: Some(seed.trunk_id),
+            start_time: seed.start_time,
             answer_time,
-            recording_path: recording_path.clone(),
+            recording_path,
         };
         self.inner
             .server
@@ -1981,77 +2338,133 @@ impl CallModule {
             .insert(dialog_id.clone(), session)
             .await;
 
-        // Kick off forwarding tasks via the kind-agnostic start hook.
-        // L13: if start() fails AFTER we've replied 200 OK + stashed the
-        // session, the call would otherwise sit in the registry without
-        // any media flowing — caller hears silence until carrier
-        // RTP-timeout fires. Tear down cleanly so the CDR captures it.
-        // (We can't send a SIP failure response — 200 OK already on the
-        // wire; server-initiated BYE plumbing is a separate follow-up.
-        // See L8 in the LiveKit review.)
+        // Start forwarding. If start fails after the 200 OK, tear down so the
+        // CDR captures it.
         if let Err(e) = bridge_arc.start().await {
             warn!(%dialog_id, error = %e,
-                "bridge start failed AFTER 200 OK — tearing down session");
+                "bridge start failed after answer — tearing down session");
+            // 200 OK is already on the wire; the media plane failed to start, so
+            // the caller would otherwise sit in dead air until its own RTP
+            // timeout. Use a bot-side cause so teardown sends a BYE to the
+            // carrier instead of leaving a zombie call (BotLost → carrier BYE).
             self.teardown_external_bridge_if_present(
                 &dialog_id,
-                crate::proxy::bridge_sessions::BridgeHangupCause::TeardownFailed,
+                crate::proxy::bridge_sessions::BridgeHangupCause::BotLost,
             )
             .await;
-            // Caller learns via RTP timeout; we return Ok because the
-            // 200 OK already went out.
-            return Ok(());
+            return None;
         }
 
-        // Spawn a watcher for kinds whose media plane carries its own
-        // end-of-call signal (LiveKit `RoomEvent::Disconnected`). The
-        // default `MediaBridge::watch_disconnect` future is `pending()`,
-        // so for WebRTC this task simply parks forever until the bridge
-        // Arc is dropped (i.e. the registry entry is removed by a SIP
-        // BYE) — `bridge_for_watcher` is the only place outside the
-        // registry that holds a strong clone, so it doesn't leak the
-        // bridge: as soon as the registry removes the session, the only
-        // remaining strong Arc is `bridge_for_watcher`; the watcher's
-        // future never resolves, but dropping the registry entry doesn't
-        // cancel anything either. To avoid leaking the watcher task in
-        // the WebRTC case, we skip spawning for WebRTC entirely.
-        //
-        // For LiveKit, when task C of `LiveKitBridge` observes
-        // `RoomEvent::Disconnected` it cancels `cancel_token`; the
-        // watcher's `watch_disconnect()` future then resolves and we
-        // drive teardown. v1 limitation: we don't currently emit a SIP
-        // BYE to the carrier here — `teardown_external_bridge_if_present`
-        // tears down the bridge and emits the CDR, but the SIP carrier
-        // only learns of the hangup via its own RTP-timeout machinery.
-        // Plumbing a proper server-initiated BYE through the
-        // dialog/transaction layer is left for a follow-up.
-        if matches!(kind, BridgeKind::LiveKit | BridgeKind::ExternalMedia) {
-            let module = self.clone();
-            let bridge_for_watcher: std::sync::Arc<dyn crate::proxy::bridge::session::MediaBridge> =
-                bridge_arc.clone();
-            let dialog_id_for_watcher = dialog_id.clone();
-            tokio::spawn(async move {
-                // The future's output carries the cause whichever Task
-                // (C: room Disconnected, D: watchdog) tripped the
-                // cancel — so the CDR records the real reason. For
-                // external_media, Task B's `BYE` datagram from the sidecar
-                // resolves it with cause ByCallee.
-                let cause = bridge_for_watcher.watch_disconnect().await;
-                info!(
-                    dialog_id = %dialog_id_for_watcher,
-                    ?cause,
-                    "bridge signalled disconnect; tearing down session"
-                );
-                // Drop our strong Arc on the bridge before driving
-                // teardown so the registry removal can collect it.
-                drop(bridge_for_watcher);
-                module
-                    .teardown_external_bridge_if_present(&dialog_id_for_watcher, cause)
-                    .await;
-            });
-        }
+        // Arm the media-inactivity timeout (no-op for kinds passed ZERO windows).
+        bridge_arc.start_media_timeout(media_timeout_initial, media_timeout_rolling);
 
-        info!(%dialog_id, trunk = %trunk_name, kind = %kind.as_str(), "external bridge established");
-        Ok(())
+        // The pre-answer engine spawns the post-answer liveness watchers (dialog
+        // state + bot disconnect) once it has moved `state_rx` out of its loop.
+        Some(bridge_arc)
+    }
+
+    /// Post-answer liveness watchers for a bridge call. Spawns two tasks:
+    ///
+    /// 1. **Dialog-state watcher** — consumes the server dialog's state channel
+    ///    for the call's lifetime: re-INVITE / UPDATE keep-alives are answered
+    ///    200 with the cached local SDP (so carrier session-refreshes don't kill
+    ///    long calls); INFO / NOTIFY / OPTIONS are absorbed 200; a `Terminated`
+    ///    drives teardown as a backstop.
+    /// 2. **Disconnect watcher** — resolves when the bot side ends the call
+    ///    (PC Failed/Closed, room disconnect, sidecar exit) and drives
+    ///    `teardown` with the bot cause, which sends a BYE to the carrier.
+    ///
+    /// Both funnel through `teardown_external_bridge_if_present`, which is
+    /// idempotent (registry `remove` returns `None` on the second call), so the
+    /// two watchers + the carrier-BYE fast path race safely.
+    fn spawn_bridge_liveness_watchers(
+        &self,
+        dialog_id: DialogId,
+        bridge: std::sync::Arc<dyn crate::proxy::bridge::session::MediaBridge>,
+        mut state_rx: tokio::sync::mpsc::UnboundedReceiver<
+            rsipstack::dialog::dialog::DialogState,
+        >,
+        local_sdp: String,
+    ) {
+        use crate::proxy::bridge_sessions::BridgeHangupCause;
+        use rsipstack::dialog::dialog::{DialogState, TerminatedReason};
+
+        // 1. Dialog-state watcher.
+        let module = self.clone();
+        let dlg_id = dialog_id.clone();
+        tokio::spawn(async move {
+            while let Some(state) = state_rx.recv().await {
+                match state {
+                    DialogState::Terminated(_, reason) => {
+                        let cause = match reason {
+                            TerminatedReason::UacBye | TerminatedReason::UasBye => {
+                                BridgeHangupCause::ByCaller
+                            }
+                            _ => BridgeHangupCause::TeardownFailed,
+                        };
+                        module
+                            .teardown_external_bridge_if_present(&dlg_id, cause)
+                            .await;
+                        break;
+                    }
+                    // re-INVITE / UPDATE keep-alive: replay our established SDP
+                    // (no renegotiation). Without a response the carrier's
+                    // session-refresh timer tears down a healthy call.
+                    DialogState::Updated(_, request, handle) => {
+                        let (headers, body) = if request.body().is_empty() {
+                            (None, None)
+                        } else {
+                            (
+                                Some(vec![rsipstack::sip::Header::ContentType(
+                                    rsipstack::sip::headers::ContentType::from(
+                                        "application/sdp",
+                                    ),
+                                )]),
+                                Some(local_sdp.clone().into_bytes()),
+                            )
+                        };
+                        if let Err(e) = handle
+                            .respond(rsipstack::sip::StatusCode::OK, headers, body)
+                            .await
+                        {
+                            warn!(dialog_id = %dlg_id, error = %e,
+                                "failed to answer bridge keep-alive re-INVITE/UPDATE");
+                        } else {
+                            debug!(dialog_id = %dlg_id, "answered bridge keep-alive");
+                        }
+                    }
+                    DialogState::Info(_, _, handle)
+                    | DialogState::Notify(_, _, handle)
+                    | DialogState::Options(_, _, handle)
+                    | DialogState::Message(_, _, handle) => {
+                        handle
+                            .respond(rsipstack::sip::StatusCode::OK, None, None)
+                            .await
+                            .ok();
+                    }
+                    // REFER on a bridge dialog isn't supported.
+                    DialogState::Refer(_, _, handle) => {
+                        handle
+                            .respond(rsipstack::sip::StatusCode::NotImplemented, None, None)
+                            .await
+                            .ok();
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        // 2. Disconnect watcher (all kinds — WebRTC now has a real
+        // `watch_disconnect`, LiveKit/external_media already did).
+        let module = self.clone();
+        tokio::spawn(async move {
+            let cause = bridge.watch_disconnect().await;
+            info!(%dialog_id, ?cause, "bridge signalled disconnect; tearing down");
+            drop(bridge);
+            module
+                .teardown_external_bridge_if_present(&dialog_id, cause)
+                .await;
+        });
     }
 
     /// BYE/transport-failure teardown hook for external bridge dialogs.
@@ -2083,6 +2496,40 @@ impl CallModule {
             Some(s) => s,
             None => return,
         };
+
+        // Signal the far end before killing media (design D1 / liv-sip
+        // ordering). When the BOT side ended the call first (disconnect,
+        // media timeout), the carrier hasn't been told — send it a BYE on
+        // the server dialog. Caller-initiated (they sent us the BYE) and
+        // transport-failure causes skip this.
+        if cause.should_send_carrier_bye() {
+            match session.server_dialog.as_ref() {
+                Some(dlg) => match dlg.bye_with_reason(cause.bye_reason().to_string()).await {
+                    Ok(()) => {
+                        crate::metrics::bridge::bye_outcome(session.kind, "carrier_bye_sent");
+                        info!(%dialog_id, ?cause, "sent carrier BYE for bot-initiated teardown");
+                    }
+                    Err(e) => {
+                        crate::metrics::bridge::bye_outcome(session.kind, "carrier_bye_error");
+                        warn!(%dialog_id, ?cause, error = %e,
+                            "failed to send carrier BYE for bot-initiated teardown");
+                    }
+                },
+                None => warn!(%dialog_id, ?cause,
+                    "bot-initiated teardown but no server dialog to BYE the carrier"),
+            }
+        }
+
+        // Remove the dialog from the dialog layer now that the call is over
+        // (bridge dialogs have no ServerDialogGuard doing this for us).
+        self.inner.server.dialog_layer.remove_dialog(dialog_id);
+
+        // Stop the media plane now, so the disconnect-watcher (which holds an
+        // Arc clone of the bridge) can resolve its `watch_disconnect` and
+        // release the Arc — otherwise the WebRTC PCs stay open and the bridge
+        // never drops. Idempotent with the bridge's own Drop.
+        session.bridge.shutdown();
+
         let teardown_ok = match session.teardown.close().await {
             Ok(()) => {
                 crate::metrics::bridge::bye_outcome(session.kind, "ok");
@@ -2103,6 +2550,11 @@ impl CallModule {
         let hangup_reason = match (cause, teardown_ok) {
             (BridgeHangupCause::ByCaller, true) => CallRecordHangupReason::ByCaller,
             (BridgeHangupCause::ByCallee, true) => CallRecordHangupReason::ByCallee,
+            // Bot-side abnormal loss / media timeout: the call ended because
+            // the bot went away, which operators want visible as a failure.
+            (BridgeHangupCause::BotLost, _) | (BridgeHangupCause::MediaTimeout, _) => {
+                CallRecordHangupReason::Failed
+            }
             // Watchdog firing is a service-side failure mode (the bot
             // never showed up). Surface as Failed so operators see it
             // in dashboards alongside other call failures.
@@ -2114,6 +2566,12 @@ impl CallModule {
         let last_error_reason = match (cause, teardown_ok) {
             (BridgeHangupCause::BotJoinTimeout, _) => {
                 Some("bot did not join within bot_join_timeout_ms watchdog".to_string())
+            }
+            (BridgeHangupCause::BotLost, _) => {
+                Some("bot connection lost".to_string())
+            }
+            (BridgeHangupCause::MediaTimeout, _) => {
+                Some("media-inactivity timeout".to_string())
             }
             (_, false) => Some("teardown.close errored at teardown".to_string()),
             _ => None,
@@ -2500,6 +2958,24 @@ impl CallModule {
                             reason = %reason_value,
                             "external bridge dispatch failed"
                         );
+                        // Feed the rejected-INVITE replay cache so a carrier
+                        // failover retry of this exact INVITE gets the same
+                        // final status without re-running gates/dispatch.
+                        if !self.inner.config.disable_rejected_invite_cache
+                            && let (Ok(call_id_h), Ok(Some(from_tag))) = (
+                                tx.original.call_id_header(),
+                                tx.original
+                                    .from_header()
+                                    .and_then(|f| f.tag()),
+                            )
+                        {
+                            self.inner.server.rejected_invites.put(
+                                &call_id_h.value().to_string(),
+                                &from_tag.to_string(),
+                                code.code(),
+                                Some(reason_text.clone()),
+                            );
+                        }
                         // Only send a SIP failure response if we haven't
                         // already sent something (`reply_with` inside the
                         // dispatcher might have run before failure).

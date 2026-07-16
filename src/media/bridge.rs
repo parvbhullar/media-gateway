@@ -45,6 +45,7 @@ use crate::media::jitter::{JitterBufferPolicy, JitterConfig, JitterStage};
 use crate::media::recorder::{Leg as RecLeg, Recorder};
 use crate::media::transcoder::{RtpTiming, Transcoder};
 use anyhow::Result;
+use std::time::{Duration, Instant};
 use audio_codec::CodecType as AudioCodecType;
 use bytes::Bytes;
 use rustrtc::{
@@ -413,6 +414,11 @@ pub struct BridgePeer {
     /// break less-strict softphones (Linphone/JsSIP) when applied
     /// unconditionally.
     external_bridge_mode: AtomicBool,
+
+    /// Set by the media-inactivity timeout task when it fires (no RTP within
+    /// the configured window). Read by the WebRTC `watch_disconnect` so the
+    /// teardown records `MediaTimeout` rather than a plain bot disconnect.
+    media_timed_out: Arc<AtomicBool>,
 }
 
 impl BridgePeer {
@@ -462,6 +468,7 @@ impl BridgePeer {
             rtp_ingress_jitter: Arc::new(parking_lot::RwLock::new(None)),
             webrtc_ingress_jitter: Arc::new(parking_lot::RwLock::new(None)),
             external_bridge_mode: AtomicBool::new(false),
+            media_timed_out: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -472,6 +479,118 @@ impl BridgePeer {
     pub fn set_external_bridge_mode(&self, on: bool) {
         self.external_bridge_mode
             .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Subscribe to the WebRTC-side PeerConnection connection-state changes.
+    ///
+    /// Used by the pre-answer engine to gate the 200 OK on the bot PC
+    /// reaching `Connected` (`answer_on = ice_connected`). Also the basis
+    /// for bot-disconnect detection in the follow-up liveness change.
+    pub fn webrtc_peer_state(
+        &self,
+    ) -> tokio::sync::watch::Receiver<rustrtc::PeerConnectionState> {
+        self.webrtc_pc.subscribe_peer_state()
+    }
+
+    /// A clone of the bridge's cancellation token. Cancelling it stops all
+    /// forwarder tasks (same effect as `Drop`, but callable while other `Arc`
+    /// clones are still held). Used by the liveness teardown so the
+    /// disconnect-watcher's `watch_disconnect` future can resolve and release
+    /// its `Arc`, letting the bridge drop.
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel_token.clone()
+    }
+
+    /// Cancel the bridge's forwarder tasks without waiting for `Drop`.
+    pub fn cancel(&self) {
+        self.cancel_token.cancel();
+    }
+
+    /// Whether the media-inactivity timeout fired for this bridge.
+    pub fn media_timed_out(&self) -> bool {
+        self.media_timed_out.load(Ordering::Relaxed)
+    }
+
+    /// Spawn the media-inactivity timeout task. It polls the per-direction
+    /// forwarded-packet counters (zero hot-path cost) with two windows,
+    /// mirroring liv-sip's `timeoutLoop`:
+    ///
+    /// * **initial** — from now until the first packet arrives *from the
+    ///   carrier* (RTP→WebRTC direction). Catches an ACK-lost / one-way-
+    ///   firewall setup where the carrier never sends media.
+    /// * **rolling** — thereafter, from the last packet seen in *either*
+    ///   direction. Catches a mid-call media stall.
+    ///
+    /// A `0` window disables that check; if both are `0`, no task is spawned.
+    /// On expiry it sets `media_timed_out` and cancels the bridge, which makes
+    /// `watch_disconnect` resolve `MediaTimeout` → carrier BYE + CDR.
+    pub fn start_media_timeout(&self, initial: Duration, rolling: Duration) {
+        if initial.is_zero() && rolling.is_zero() {
+            return;
+        }
+        let carrier = Arc::clone(&self.rtp_to_webrtc_stats); // packets FROM carrier
+        let bot = Arc::clone(&self.webrtc_to_rtp_stats); // packets FROM bot
+        let cancel = self.cancel_token.clone();
+        let flag = Arc::clone(&self.media_timed_out);
+        let bridge_id = self.id.clone();
+        // Poll often enough to notice within a fraction of the shorter window,
+        // capped to a sane floor/ceiling.
+        let poll = rolling
+            .min(initial)
+            .max(Duration::from_millis(1))
+            / 4;
+        let poll = poll.clamp(Duration::from_millis(250), Duration::from_secs(2));
+
+        tokio::spawn(async move {
+            let fire = |reason: &str| {
+                warn!(bridge_id = %bridge_id, reason, "media-inactivity timeout — cancelling bridge");
+                flag.store(true, Ordering::Relaxed);
+                cancel.cancel();
+            };
+
+            // Phase 1: wait for first carrier packet (if the initial window is on).
+            if !initial.is_zero() {
+                let start = Instant::now();
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => return,
+                        _ = tokio::time::sleep(poll) => {}
+                    }
+                    if carrier.packets.load(Ordering::Relaxed) > 0 {
+                        break; // media is flowing from the carrier
+                    }
+                    if start.elapsed() >= initial {
+                        fire("no carrier RTP within initial window");
+                        return;
+                    }
+                }
+            }
+
+            if rolling.is_zero() {
+                return; // rolling check disabled
+            }
+
+            // Phase 2: rolling inactivity across both directions.
+            let mut last_c = carrier.packets.load(Ordering::Relaxed);
+            let mut last_b = bot.packets.load(Ordering::Relaxed);
+            let mut last_activity = Instant::now();
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(poll) => {}
+                }
+                let c = carrier.packets.load(Ordering::Relaxed);
+                let b = bot.packets.load(Ordering::Relaxed);
+                if c != last_c || b != last_b {
+                    last_c = c;
+                    last_b = b;
+                    last_activity = Instant::now();
+                } else if last_activity.elapsed() >= rolling {
+                    fire("no RTP in either direction within rolling window");
+                    return;
+                }
+            }
+        });
     }
 
     /// Setup the bridge by adding sample tracks to both sides for forwarding

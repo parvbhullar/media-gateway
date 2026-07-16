@@ -244,3 +244,106 @@ pub async fn fetch_external_trunk(
     }
     Ok(row)
 }
+
+// ── Remote-header exposure filter (control-plane) ────────────────────────────
+//
+// A single allow-list filter over the carrier INVITE's headers, shared by three
+// consumers: `GET /calls/{id}` (bridge entries), the `bridge.call.incoming`
+// webhook payload, and — behind the per-trunk `expose_headers_to_bot` flag — the
+// signaling adapter request context. Only untyped (`Header::Other`) headers are
+// considered: From/To/Contact are typed and the bot already receives them via
+// call_id/from/to. Deny wins over allow so credentials/topology never leak even
+// if a name also matches the allow-list.
+
+fn header_denied(lower_name: &str) -> bool {
+    lower_name.starts_with("content-")
+        || matches!(
+            lower_name,
+            "via" | "route"
+                | "record-route"
+                | "cseq"
+                | "max-forwards"
+                | "authorization"
+                | "proxy-authorization"
+                | "www-authenticate"
+                | "proxy-authenticate"
+                | "session-expires"
+                | "min-se"
+        )
+}
+
+fn header_allowed(lower_name: &str) -> bool {
+    lower_name.starts_with("x-")
+        || matches!(
+            lower_name,
+            "diversion"
+                | "p-asserted-identity"
+                | "p-preferred-identity"
+                | "remote-party-id"
+                | "history-info"
+                | "referred-by"
+                | "user-to-user"
+        )
+}
+
+/// Filter carrier INVITE headers down to the safe, bot-useful set (identity +
+/// `X-*`), dropping sensitive/topology headers. Deny-list wins over allow-list.
+pub fn filter_remote_headers<'a>(
+    headers: impl Iterator<Item = &'a rsipstack::sip::Header>,
+) -> Vec<(String, String)> {
+    headers
+        .filter_map(|h| match h {
+            rsipstack::sip::Header::Other(name, value) => {
+                let lower = name.to_ascii_lowercase();
+                if header_denied(&lower) {
+                    None
+                } else if header_allowed(&lower) {
+                    Some((name.clone(), value.clone()))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Convenience over [`filter_remote_headers`] taking a whole request.
+pub fn filtered_remote_headers(req: &rsipstack::sip::Request) -> Vec<(String, String)> {
+    filter_remote_headers(req.headers.iter())
+}
+
+#[cfg(test)]
+mod header_filter_tests {
+    use super::*;
+    use rsipstack::sip::Header;
+
+    #[test]
+    fn passes_identity_and_x_headers_denies_sensitive() {
+        let headers = vec![
+            Header::Other(
+                "P-Asserted-Identity".into(),
+                "<sip:+15551234567@carrier>".into(),
+            ),
+            Header::Other("Diversion".into(), "<sip:+15559999999@carrier>".into()),
+            Header::Other("X-Custom-Tag".into(), "abc".into()),
+            Header::Other("Proxy-Authorization".into(), "Digest realm=...".into()),
+            Header::Other("Content-Type".into(), "application/sdp".into()),
+            Header::Other("Session-Expires".into(), "1800".into()),
+            Header::Other("Route".into(), "<sip:proxy>".into()),
+        ];
+        let out = filter_remote_headers(headers.iter());
+        let names: Vec<String> = out.iter().map(|(n, _)| n.to_ascii_lowercase()).collect();
+
+        // Identity + X-* survive.
+        assert!(names.contains(&"p-asserted-identity".to_string()));
+        assert!(names.contains(&"diversion".to_string()));
+        assert!(names.contains(&"x-custom-tag".to_string()));
+        // Sensitive/topology denied (deny wins).
+        assert!(!names.iter().any(|n| n == "proxy-authorization"));
+        assert!(!names.iter().any(|n| n == "content-type"));
+        assert!(!names.iter().any(|n| n == "session-expires"));
+        assert!(!names.iter().any(|n| n == "route"));
+        assert_eq!(out.len(), 3, "exactly the 3 allowed headers pass");
+    }
+}

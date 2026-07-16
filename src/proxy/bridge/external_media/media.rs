@@ -216,6 +216,16 @@ impl MediaBridge for ExternalMediaBridge {
         *self.recorder.write() = Some(recorder);
     }
 
+    /// Cancel the forwarder tasks so a SIP-side teardown (carrier BYE) releases
+    /// the disconnect-watcher's Arc. `teardown.close()` kills the sidecar but
+    /// the sidecar dying does NOT echo a BYE datagram, so without this the
+    /// `watch_disconnect` future (parked on `token.cancelled()`) never resolves,
+    /// the watcher never drops its Arc, `Drop` never runs, and the bridge +
+    /// UDP socket + tasks leak on every carrier-terminated call.
+    fn shutdown(&self) {
+        self.cancel_token.cancel();
+    }
+
     fn watch_disconnect(
         &self,
     ) -> std::pin::Pin<

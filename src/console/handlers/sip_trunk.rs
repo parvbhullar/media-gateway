@@ -1139,6 +1139,23 @@ fn apply_form_to_active_model(
                 signaling_timeout_ms: existing_webrtc_cfg
                     .as_ref()
                     .and_then(|c| c.signaling_timeout_ms),
+                ring_timeout_ms: existing_webrtc_cfg
+                    .as_ref()
+                    .and_then(|c| c.ring_timeout_ms),
+                ringing_interval_ms: existing_webrtc_cfg
+                    .as_ref()
+                    .and_then(|c| c.ringing_interval_ms),
+                answer_on: existing_webrtc_cfg.as_ref().and_then(|c| c.answer_on),
+                media_timeout_initial_ms: existing_webrtc_cfg
+                    .as_ref()
+                    .and_then(|c| c.media_timeout_initial_ms),
+                media_timeout_ms: existing_webrtc_cfg
+                    .as_ref()
+                    .and_then(|c| c.media_timeout_ms),
+                expose_headers_to_bot: existing_webrtc_cfg
+                    .as_ref()
+                    .map(|c| c.expose_headers_to_bot)
+                    .unwrap_or(false),
             };
 
             serde_json::to_value(&webrtc_cfg)
@@ -1331,6 +1348,13 @@ fn apply_form_to_active_model(
                 bot_join_timeout_ms,
                 hold_tone_hz,
                 jwt_ttl_secs,
+                ring_timeout_ms: existing_livekit_cfg
+                    .as_ref()
+                    .and_then(|c| c.ring_timeout_ms),
+                ringing_interval_ms: existing_livekit_cfg
+                    .as_ref()
+                    .and_then(|c| c.ringing_interval_ms),
+                answer_on: existing_livekit_cfg.as_ref().and_then(|c| c.answer_on),
             };
 
             serde_json::to_value(&livekit_cfg)
@@ -1383,6 +1407,12 @@ fn apply_form_to_active_model(
                 bot_join_timeout_ms,
                 hold_tone_hz,
                 pcm_sample_rate,
+                ring_timeout_ms: existing_external_media_cfg
+                    .as_ref()
+                    .and_then(|c| c.ring_timeout_ms),
+                ringing_interval_ms: existing_external_media_cfg
+                    .as_ref()
+                    .and_then(|c| c.ringing_interval_ms),
             };
 
             serde_json::to_value(&external_media_cfg).map_err(|e| {

@@ -522,6 +522,9 @@ async fn test_guest_call_allowed_extension() {
         bridge_sessions: std::sync::Arc::new(
             crate::proxy::bridge_sessions::BridgeSessions::new(),
         ),
+        rejected_invites: std::sync::Arc::new(
+            crate::proxy::bridge_sessions::RejectedInviteCache::new(),
+        ),
     });
 
     let module = AuthModule::new(server_inner.clone(), server_inner.proxy_config.clone());

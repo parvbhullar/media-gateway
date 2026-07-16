@@ -442,6 +442,14 @@ impl MediaBridge for LiveKitBridge {
         BridgeKind::LiveKit
     }
 
+    /// Cancel the forwarder tasks on SIP-side teardown so the disconnect
+    /// watcher releases its Arc, rather than relying on the async
+    /// `RoomEvent::Disconnected` from `room.close()` firing in time. Idempotent
+    /// with the room-close path.
+    fn shutdown(&self) {
+        self.cancel_token.cancel();
+    }
+
     /// Surface the LiveKit-side disconnect signal so call.rs can drive SIP
     /// teardown when the room ends (task C cancels the token on
     /// `RoomEvent::Disconnected`, task D on the no-bot watchdog).

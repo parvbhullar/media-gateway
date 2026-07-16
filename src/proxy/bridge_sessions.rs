@@ -42,6 +42,15 @@ pub struct BridgeSession {
     pub bridge: Arc<dyn MediaBridge>,
     /// Signaling-plane teardown action; invoked at BYE time.
     pub teardown: Box<dyn BridgeTeardown>,
+    /// Carrier-facing server dialog. Kept so the teardown funnel can send a
+    /// BYE toward the carrier when the bot side ends the call first
+    /// (bot disconnect / media timeout). `None` only for legacy sessions
+    /// created before the dialog-liveness change (defensive).
+    pub server_dialog:
+        Option<rsipstack::dialog::server_dialog::ServerInviteDialog>,
+    /// The established local SDP answer, replayed on a mid-dialog re-INVITE /
+    /// UPDATE keep-alive so long calls survive carrier session refreshes.
+    pub local_sdp: String,
     /// Which kind of bridge this is. Recorded into CDR metadata.
     pub kind: BridgeKind,
     /// Capacity-gate permit acquired before dispatch. Dropping it at BYE
@@ -267,6 +276,87 @@ impl BridgeSessions {
     }
 }
 
+// ── Rejected-INVITE replay cache ─────────────────────────────────────────────
+
+/// TTL cache of final (≥300) responses issued for external-bridge INVITEs,
+/// keyed by (Call-ID, From-tag). A carrier that retries a rejected INVITE
+/// (failover retry storm) gets the cached status replayed without re-running
+/// routing, capacity accounting, or bridge dispatch — which would otherwise
+/// burn CPS tokens and, worst case, create a second bot session. Mirrors
+/// liv-sip's `rejectedInvites` LRU (1-minute TTL).
+///
+/// Size-bounded: on insert past `MAX_ENTRIES`, expired entries are purged
+/// first; if still full the insert is dropped (a cache miss just re-runs the
+/// normal path — never an error).
+pub struct RejectedInviteCache {
+    inner: DashMap<(String, String), RejectedEntry>,
+    ttl: std::time::Duration,
+}
+
+struct RejectedEntry {
+    status: u16,
+    reason: Option<String>,
+    at: std::time::Instant,
+}
+
+impl RejectedInviteCache {
+    const MAX_ENTRIES: usize = 5_000;
+
+    pub fn new() -> Self {
+        Self {
+            inner: DashMap::new(),
+            ttl: std::time::Duration::from_secs(60),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_ttl(ttl: std::time::Duration) -> Self {
+        Self {
+            inner: DashMap::new(),
+            ttl,
+        }
+    }
+
+    /// Record a final rejection for (call_id, from_tag).
+    pub fn put(&self, call_id: &str, from_tag: &str, status: u16, reason: Option<String>) {
+        if self.inner.len() >= Self::MAX_ENTRIES {
+            let ttl = self.ttl;
+            self.inner.retain(|_, e| e.at.elapsed() < ttl);
+            if self.inner.len() >= Self::MAX_ENTRIES {
+                return; // still full of live entries — drop, miss is harmless
+            }
+        }
+        self.inner.insert(
+            (call_id.to_string(), from_tag.to_string()),
+            RejectedEntry {
+                status,
+                reason,
+                at: std::time::Instant::now(),
+            },
+        );
+    }
+
+    /// Look up a cached rejection; expired entries are removed on read.
+    pub fn get(&self, call_id: &str, from_tag: &str) -> Option<(u16, Option<String>)> {
+        let key = (call_id.to_string(), from_tag.to_string());
+        let hit = match self.inner.get(&key) {
+            Some(e) if e.at.elapsed() < self.ttl => Some((e.status, e.reason.clone())),
+            Some(_) => None, // expired
+            None => return None,
+        };
+        if hit.is_none() {
+            self.inner.remove(&key);
+        }
+        hit
+    }
+}
+
+impl Default for RejectedInviteCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,6 +393,8 @@ mod tests {
         BridgeSession {
             bridge: Arc::new(NoopMediaBridge),
             teardown: Box::new(NoopTeardown),
+            server_dialog: None,
+            local_sdp: String::new(),
             kind: BridgeKind::WebRtc,
             _permit: None,
             call_id: "test-call".into(),
@@ -404,5 +496,31 @@ mod tests {
             reg.remove(&id).await.is_none(),
             "second remove must be None"
         );
+    }
+
+    // ── RejectedInviteCache ──────────────────────────────────────────────
+
+    #[test]
+    fn rejected_cache_hit_within_ttl() {
+        let c = RejectedInviteCache::new();
+        c.put("call-1", "tag-a", 480, Some("ring timeout".into()));
+        assert_eq!(
+            c.get("call-1", "tag-a"),
+            Some((480, Some("ring timeout".into())))
+        );
+        // Different Call-ID or From-tag → miss.
+        assert_eq!(c.get("call-2", "tag-a"), None);
+        assert_eq!(c.get("call-1", "tag-b"), None);
+    }
+
+    #[tokio::test]
+    async fn rejected_cache_expires_after_ttl() {
+        let c = RejectedInviteCache::with_ttl(std::time::Duration::from_millis(50));
+        c.put("call-1", "tag-a", 503, None);
+        assert!(c.get("call-1", "tag-a").is_some());
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        assert_eq!(c.get("call-1", "tag-a"), None, "expired entry must miss");
+        // And the expired entry was evicted on read.
+        assert_eq!(c.inner.len(), 0);
     }
 }

@@ -418,3 +418,103 @@ async fn uses_negotiated_codec_not_misleading_answer_sdp() {
         "must install Opus→PCMA transcoder toward the SIP PCMA PT"
     );
 }
+
+// ── Media-commitment gating (pre-answer engine) ─────────────────────────────
+
+/// `answer_on = signaling` must resolve the commitment immediately — the
+/// engine answers as soon as the SDP answer is applied (legacy behaviour).
+#[tokio::test]
+async fn commitment_signaling_resolves_immediately() {
+    use crate::models::trunk::AnswerOn;
+    use crate::proxy::bridge::session::MediaBridge;
+    use crate::proxy::bridge::webrtc::media_bridge::WebRtcMediaBridge;
+
+    let mb = WebRtcMediaBridge(std::sync::Arc::new(test_bridge().await));
+    tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        mb.await_media_commitment(AnswerOn::Signaling),
+    )
+    .await
+    .expect("signaling commitment must resolve without waiting")
+    .expect("signaling commitment is Ok");
+}
+
+/// `answer_on = ice_connected` must NOT resolve while the bot PeerConnection is
+/// still New/Connecting — this is the gate that stops the 200 OK going out
+/// before media can flow. A fresh PC never reaches Connected here, so the
+/// commitment future stays pending (times out).
+#[tokio::test]
+async fn commitment_ice_connected_blocks_until_connected() {
+    use crate::models::trunk::AnswerOn;
+    use crate::proxy::bridge::session::MediaBridge;
+    use crate::proxy::bridge::webrtc::media_bridge::WebRtcMediaBridge;
+
+    let mb = WebRtcMediaBridge(std::sync::Arc::new(test_bridge().await));
+    let r = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        mb.await_media_commitment(AnswerOn::IceConnected),
+    )
+    .await;
+    assert!(
+        r.is_err(),
+        "ice_connected commitment must block until the bot PC connects"
+    );
+}
+
+// ── Liveness: watch_disconnect resolves on shutdown (deadlock fix) ───────────
+
+/// The disconnect watcher holds an `Arc` clone of the bridge; when the SIP side
+/// tears down (carrier BYE), it calls `shutdown()`, which must make
+/// `watch_disconnect` resolve so the watcher releases its `Arc` and the bridge
+/// can drop. Without this the WebRTC PCs stay open forever. A fresh PC never
+/// reaches Connected, so only the shutdown path can resolve this.
+#[tokio::test]
+async fn watch_disconnect_resolves_on_shutdown() {
+    use crate::proxy::bridge::session::{BridgeHangupCause, MediaBridge};
+    use crate::proxy::bridge::webrtc::media_bridge::WebRtcMediaBridge;
+
+    let mb = WebRtcMediaBridge(std::sync::Arc::new(test_bridge().await));
+    // shutdown() cancels the bridge's forwarder token.
+    mb.shutdown();
+    let cause = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        mb.watch_disconnect(),
+    )
+    .await
+    .expect("watch_disconnect must resolve after shutdown, not hang");
+    assert_eq!(cause, BridgeHangupCause::ByCallee);
+}
+
+// ── Liveness: media-inactivity timeout ──────────────────────────────────────
+
+/// With no media flowing (test bridge has no real RTP), the initial window
+/// must fire: `media_timed_out` is set and the bridge is cancelled.
+#[tokio::test]
+async fn media_timeout_fires_when_no_carrier_rtp() {
+    let bridge = test_bridge().await;
+    bridge.start_media_timeout(
+        std::time::Duration::from_millis(150),
+        std::time::Duration::ZERO,
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        bridge.media_timed_out(),
+        "initial media timeout must fire when no carrier RTP arrives"
+    );
+    assert!(
+        bridge.cancel_token().is_cancelled(),
+        "media timeout must cancel the bridge"
+    );
+}
+
+/// Zero windows disable the timeout entirely (no task spawned).
+#[tokio::test]
+async fn media_timeout_disabled_with_zero_windows() {
+    let bridge = test_bridge().await;
+    bridge.start_media_timeout(std::time::Duration::ZERO, std::time::Duration::ZERO);
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert!(
+        !bridge.media_timed_out(),
+        "zero windows must disable the media timeout"
+    );
+}
