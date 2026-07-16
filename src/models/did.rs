@@ -300,7 +300,10 @@ mod org_id_tests {
     use sea_orm::{ActiveModelTrait, Database};
     use sea_orm_migration::MigratorTrait;
 
-    /// Runs the base table + the org_id ADD migration (task 3.1).
+    /// Runs the base table + the org_id ADD migration (task 3.1) + the
+    /// trunk_group_name ADD migration — the `ActiveModel` default touches
+    /// that column, so omitting it here breaks every insert with "no such
+    /// column" against the in-memory sqlite schema.
     struct TestMigrator;
     #[async_trait::async_trait]
     impl MigratorTrait for TestMigrator {
@@ -308,6 +311,7 @@ mod org_id_tests {
             vec![
                 Box::new(Migration),
                 Box::new(crate::models::add_org_id_did::Migration),
+                Box::new(crate::models::add_did_trunk_group_name_column::Migration),
             ]
         }
     }
