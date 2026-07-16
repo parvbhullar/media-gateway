@@ -120,6 +120,9 @@ pub async fn create_test_server_with_config(
         bridge_sessions: std::sync::Arc::new(
             crate::proxy::bridge_sessions::BridgeSessions::new(),
         ),
+        rejected_invites: std::sync::Arc::new(
+            crate::proxy::bridge_sessions::RejectedInviteCache::new(),
+        ),
     });
 
     // Add test users

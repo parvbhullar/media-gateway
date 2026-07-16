@@ -327,6 +327,51 @@ fn default_true() -> bool {
     true
 }
 
+/// Default ring timeout for the external-bridge pre-answer engine (ms).
+/// Bounds the whole INVITE→final-response window. Overridable per trunk via
+/// `ring_timeout_ms` (falls back to the legacy `bot_join_timeout_ms` where
+/// that field exists).
+pub const DEFAULT_RING_TIMEOUT_MS: u64 = 15_000;
+
+/// Default interval between 180 Ringing re-sends during setup (ms).
+pub const DEFAULT_RINGING_INTERVAL_MS: u64 = 1_000;
+
+/// Default initial media-inactivity window (ms): from answer until the first
+/// RTP packet arrives from the carrier. Matches liv-sip's `MediaTimeoutInitial`.
+pub const DEFAULT_MEDIA_TIMEOUT_INITIAL_MS: u64 = 30_000;
+
+/// Default rolling media-inactivity window (ms): after the first packet, the
+/// max gap with no RTP in either direction before the call is reaped.
+pub const DEFAULT_MEDIA_TIMEOUT_MS: u64 = 15_000;
+
+/// When the pre-answer engine sends the final 200 OK to the carrier — i.e.
+/// what "the call is answerable" means for a given bridge kind. See the
+/// `bridge-pre-answer` capability spec. A single enum spans all kinds;
+/// each kind's `validate()` rejects values that don't apply to it.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AnswerOn {
+    /// Answer as soon as the bot's SDP answer is applied (legacy webrtc
+    /// behaviour; media path unproven). Escape hatch / rollback lever.
+    Signaling,
+    /// Answer only after the bot PeerConnection reaches ICE/DTLS connected
+    /// (webrtc default).
+    IceConnected,
+    /// Answer only after the first inbound RTP packet from the bot (webrtc,
+    /// opt-in; correct for TTS-greeting bots, deadlocks against a
+    /// caller-speaks-first bot).
+    FirstMedia,
+    /// Answer once a LiveKit agent participant joins the room (livekit
+    /// default).
+    AgentJoined,
+    /// Answer once a LiveKit agent has published a subscribed audio track
+    /// (livekit, opt-in — the strict "no dead air" semantic).
+    TrackSubscribed,
+    /// Answer once the external-media sidecar sends its READY datagram
+    /// (external_media; the only valid value there).
+    Ready,
+}
+
 /// Configuration shape for `kind = "webrtc"` trunks. Serialized as JSON in
 /// the `trunks.kind_config` column.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -361,9 +406,64 @@ pub struct WebRtcTrunkConfig {
     /// can raise this without touching global config.
     #[serde(default)]
     pub signaling_timeout_ms: Option<u64>,
+    /// Ring timeout (ms) for the pre-answer engine — bounds the whole
+    /// INVITE→200/final window. `None` → [`DEFAULT_RING_TIMEOUT_MS`].
+    #[serde(default)]
+    pub ring_timeout_ms: Option<u64>,
+    /// 180 Ringing re-send interval (ms). `None` →
+    /// [`DEFAULT_RINGING_INTERVAL_MS`].
+    #[serde(default)]
+    pub ringing_interval_ms: Option<u64>,
+    /// When to send the 200 OK. `None` → `IceConnected`. Allowed:
+    /// `signaling`, `ice_connected`, `first_media`.
+    #[serde(default)]
+    pub answer_on: Option<AnswerOn>,
+    /// Initial media-inactivity window (ms) — no carrier RTP within this after
+    /// answer reaps the call. `None` → [`DEFAULT_MEDIA_TIMEOUT_INITIAL_MS`];
+    /// `0` disables.
+    #[serde(default)]
+    pub media_timeout_initial_ms: Option<u64>,
+    /// Rolling media-inactivity window (ms) — no RTP in either direction for
+    /// this long reaps the call. `None` → [`DEFAULT_MEDIA_TIMEOUT_MS`];
+    /// `0` disables.
+    #[serde(default)]
+    pub media_timeout_ms: Option<u64>,
+    /// When `true`, the bridge far-end receives the allow-list-filtered carrier
+    /// headers (identity: P-Asserted-Identity, Diversion, History-Info, … plus
+    /// `X-*`) instead of only `X-*`. Sensitive/topology headers are never
+    /// forwarded regardless. Default `false`.
+    #[serde(default)]
+    pub expose_headers_to_bot: bool,
 }
 
 impl WebRtcTrunkConfig {
+    /// Resolved ring timeout (ms), applying the default.
+    pub fn ring_timeout_ms_resolved(&self) -> u64 {
+        self.ring_timeout_ms.unwrap_or(DEFAULT_RING_TIMEOUT_MS)
+    }
+
+    /// Resolved initial media-inactivity window (ms). `0` disables.
+    pub fn media_timeout_initial_ms_resolved(&self) -> u64 {
+        self.media_timeout_initial_ms
+            .unwrap_or(DEFAULT_MEDIA_TIMEOUT_INITIAL_MS)
+    }
+
+    /// Resolved rolling media-inactivity window (ms). `0` disables.
+    pub fn media_timeout_ms_resolved(&self) -> u64 {
+        self.media_timeout_ms.unwrap_or(DEFAULT_MEDIA_TIMEOUT_MS)
+    }
+
+    /// Resolved 180 re-send interval (ms), applying the default.
+    pub fn ringing_interval_ms_resolved(&self) -> u64 {
+        self.ringing_interval_ms
+            .unwrap_or(DEFAULT_RINGING_INTERVAL_MS)
+    }
+
+    /// Resolved answer condition, applying the webrtc default.
+    pub fn answer_on_resolved(&self) -> AnswerOn {
+        self.answer_on.unwrap_or(AnswerOn::IceConnected)
+    }
+
     pub fn validate(&self) -> Result<(), ValidationError> {
         if self.signaling.trim().is_empty() {
             return Err(ValidationError::custom("signaling must not be empty"));
@@ -388,6 +488,17 @@ impl WebRtcTrunkConfig {
         {
             return Err(ValidationError::custom(
                 "ice_servers, if present, must be a JSON array",
+            ));
+        }
+        if let Some(a) = self.answer_on
+            && !matches!(
+                a,
+                AnswerOn::Signaling | AnswerOn::IceConnected | AnswerOn::FirstMedia
+            )
+        {
+            return Err(ValidationError::custom(
+                "answer_on for kind=webrtc must be one of: \
+                 signaling, ice_connected, first_media",
             ));
         }
         Ok(())
@@ -495,9 +606,40 @@ pub struct LiveKitTrunkConfig {
     /// for long-running calls; lower for tighter token hygiene.
     #[serde(default)]
     pub jwt_ttl_secs: Option<u64>,
+    /// Ring timeout (ms) for the pre-answer engine. `None` falls back to
+    /// the legacy `bot_join_timeout_ms`, then [`DEFAULT_RING_TIMEOUT_MS`].
+    #[serde(default)]
+    pub ring_timeout_ms: Option<u64>,
+    /// 180 Ringing re-send interval (ms). `None` →
+    /// [`DEFAULT_RINGING_INTERVAL_MS`].
+    #[serde(default)]
+    pub ringing_interval_ms: Option<u64>,
+    /// When to send the 200 OK. `None` → `AgentJoined`. Allowed:
+    /// `agent_joined`, `track_subscribed`.
+    #[serde(default)]
+    pub answer_on: Option<AnswerOn>,
 }
 
 impl LiveKitTrunkConfig {
+    /// Resolved ring timeout (ms). Prefers `ring_timeout_ms`, falls back to
+    /// the legacy `bot_join_timeout_ms`, then the default.
+    pub fn ring_timeout_ms_resolved(&self) -> u64 {
+        self.ring_timeout_ms
+            .or(self.bot_join_timeout_ms)
+            .unwrap_or(DEFAULT_RING_TIMEOUT_MS)
+    }
+
+    /// Resolved 180 re-send interval (ms).
+    pub fn ringing_interval_ms_resolved(&self) -> u64 {
+        self.ringing_interval_ms
+            .unwrap_or(DEFAULT_RINGING_INTERVAL_MS)
+    }
+
+    /// Resolved answer condition, applying the livekit default.
+    pub fn answer_on_resolved(&self) -> AnswerOn {
+        self.answer_on.unwrap_or(AnswerOn::AgentJoined)
+    }
+
     pub fn validate(&self) -> Result<(), ValidationError> {
         if self.server_url.trim().is_empty() {
             return Err(ValidationError::custom("server_url must not be empty"));
@@ -574,7 +716,79 @@ impl LiveKitTrunkConfig {
                 ValidationError::custom(format!("dispatch_endpoint not a URL: {e}"))
             })?;
         }
+        if let Some(a) = self.answer_on
+            && !matches!(a, AnswerOn::AgentJoined | AnswerOn::TrackSubscribed)
+        {
+            return Err(ValidationError::custom(
+                "answer_on for kind=livekit must be one of: \
+                 agent_joined, track_subscribed",
+            ));
+        }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod webrtc_pre_answer_tests {
+    use super::*;
+
+    fn base() -> WebRtcTrunkConfig {
+        WebRtcTrunkConfig {
+            signaling: "http_json".to_string(),
+            endpoint_url: "https://bot.example.com/sip".to_string(),
+            ice_servers: None,
+            audio_codec: "opus".to_string(),
+            auth_header: None,
+            health_check_url: None,
+            protocol: None,
+            signaling_timeout_ms: None,
+            ring_timeout_ms: None,
+            ringing_interval_ms: None,
+            answer_on: None,
+            media_timeout_initial_ms: None,
+            media_timeout_ms: None,
+            expose_headers_to_bot: false,
+        }
+    }
+
+    #[test]
+    fn defaults_are_ice_connected_and_standard_timers() {
+        let c = base();
+        assert_eq!(c.answer_on_resolved(), AnswerOn::IceConnected);
+        assert_eq!(c.ring_timeout_ms_resolved(), DEFAULT_RING_TIMEOUT_MS);
+        assert_eq!(
+            c.ringing_interval_ms_resolved(),
+            DEFAULT_RINGING_INTERVAL_MS
+        );
+    }
+
+    #[test]
+    fn explicit_knobs_win() {
+        let mut c = base();
+        c.ring_timeout_ms = Some(30_000);
+        c.ringing_interval_ms = Some(2_000);
+        c.answer_on = Some(AnswerOn::FirstMedia);
+        assert_eq!(c.ring_timeout_ms_resolved(), 30_000);
+        assert_eq!(c.ringing_interval_ms_resolved(), 2_000);
+        assert_eq!(c.answer_on_resolved(), AnswerOn::FirstMedia);
+    }
+
+    #[test]
+    fn accepts_webrtc_answer_on_values() {
+        for a in [AnswerOn::Signaling, AnswerOn::IceConnected, AnswerOn::FirstMedia] {
+            let mut c = base();
+            c.answer_on = Some(a);
+            assert!(c.validate().is_ok(), "{a:?} should validate for webrtc");
+        }
+    }
+
+    #[test]
+    fn rejects_non_webrtc_answer_on_values() {
+        for a in [AnswerOn::AgentJoined, AnswerOn::TrackSubscribed, AnswerOn::Ready] {
+            let mut c = base();
+            c.answer_on = Some(a);
+            assert!(c.validate().is_err(), "{a:?} must be rejected for webrtc");
+        }
     }
 }
 
@@ -606,6 +820,9 @@ mod livekit_config_tests {
             bot_join_timeout_ms: None,
             hold_tone_hz: None,
             jwt_ttl_secs: None,
+            ring_timeout_ms: None,
+            ringing_interval_ms: None,
+            answer_on: None,
         }
     }
 
@@ -687,6 +904,39 @@ mod livekit_config_tests {
         cfg.dispatch_endpoint = None;
         assert!(cfg.validate().is_err(), "whitespace-only agent_name must not satisfy the gate");
     }
+
+    #[test]
+    fn answer_on_defaults_to_agent_joined() {
+        assert_eq!(base().answer_on_resolved(), AnswerOn::AgentJoined);
+    }
+
+    #[test]
+    fn accepts_livekit_answer_on_values() {
+        for a in [AnswerOn::AgentJoined, AnswerOn::TrackSubscribed] {
+            let mut cfg = base();
+            cfg.answer_on = Some(a);
+            assert!(cfg.validate().is_ok(), "{a:?} should validate for livekit");
+        }
+    }
+
+    #[test]
+    fn rejects_non_livekit_answer_on_values() {
+        for a in [AnswerOn::Signaling, AnswerOn::IceConnected, AnswerOn::Ready] {
+            let mut cfg = base();
+            cfg.answer_on = Some(a);
+            assert!(cfg.validate().is_err(), "{a:?} must be rejected for livekit");
+        }
+    }
+
+    #[test]
+    fn ring_timeout_prefers_explicit_then_bot_join_then_default() {
+        let mut cfg = base();
+        assert_eq!(cfg.ring_timeout_ms_resolved(), DEFAULT_RING_TIMEOUT_MS);
+        cfg.bot_join_timeout_ms = Some(20_000);
+        assert_eq!(cfg.ring_timeout_ms_resolved(), 20_000);
+        cfg.ring_timeout_ms = Some(9_000);
+        assert_eq!(cfg.ring_timeout_ms_resolved(), 9_000);
+    }
 }
 
 /// Configuration shape for `kind = "external_media"` trunks. rustpbx
@@ -722,6 +972,14 @@ pub struct ExternalMediaTrunkConfig {
     /// pipeline to match.
     #[serde(default = "default_pcm_sample_rate")]
     pub pcm_sample_rate: u32,
+    /// Ring timeout (ms) for the pre-answer engine. `None` falls back to
+    /// the legacy `bot_join_timeout_ms`, then [`DEFAULT_RING_TIMEOUT_MS`].
+    #[serde(default)]
+    pub ring_timeout_ms: Option<u64>,
+    /// 180 Ringing re-send interval (ms). `None` →
+    /// [`DEFAULT_RINGING_INTERVAL_MS`].
+    #[serde(default)]
+    pub ringing_interval_ms: Option<u64>,
 }
 
 fn default_pcm_sample_rate() -> u32 {
@@ -729,6 +987,20 @@ fn default_pcm_sample_rate() -> u32 {
 }
 
 impl ExternalMediaTrunkConfig {
+    /// Resolved ring timeout (ms). Prefers `ring_timeout_ms`, falls back to
+    /// the legacy `bot_join_timeout_ms`, then the default.
+    pub fn ring_timeout_ms_resolved(&self) -> u64 {
+        self.ring_timeout_ms
+            .or(self.bot_join_timeout_ms)
+            .unwrap_or(DEFAULT_RING_TIMEOUT_MS)
+    }
+
+    /// Resolved 180 re-send interval (ms).
+    pub fn ringing_interval_ms_resolved(&self) -> u64 {
+        self.ringing_interval_ms
+            .unwrap_or(DEFAULT_RINGING_INTERVAL_MS)
+    }
+
     pub fn validate(&self) -> Result<(), ValidationError> {
         if self.command.trim().is_empty() {
             return Err(ValidationError::custom("command must not be empty"));
@@ -764,6 +1036,8 @@ mod external_media_config_tests {
             bot_join_timeout_ms: None,
             hold_tone_hz: None,
             pcm_sample_rate,
+            ring_timeout_ms: None,
+            ringing_interval_ms: None,
         }
     }
 
@@ -779,6 +1053,20 @@ mod external_media_config_tests {
         for rate in [0, 8_000, 44_100] {
             assert!(base(rate).validate().is_err(), "rate {rate} should be rejected");
         }
+    }
+
+    #[test]
+    fn ring_timeout_prefers_explicit_then_bot_join_then_default() {
+        let mut cfg = base(48_000);
+        assert_eq!(cfg.ring_timeout_ms_resolved(), DEFAULT_RING_TIMEOUT_MS);
+        cfg.bot_join_timeout_ms = Some(12_000);
+        assert_eq!(cfg.ring_timeout_ms_resolved(), 12_000);
+        cfg.ring_timeout_ms = Some(7_000);
+        assert_eq!(cfg.ring_timeout_ms_resolved(), 7_000);
+        assert_eq!(
+            cfg.ringing_interval_ms_resolved(),
+            DEFAULT_RINGING_INTERVAL_MS
+        );
     }
 }
 

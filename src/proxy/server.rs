@@ -104,6 +104,11 @@ pub struct SipServerInner {
     /// by the `ExternalBridge` arm in `proxy::call::CallModule`, drained on
     /// BYE for teardown (`teardown.close()` + bridge drop).
     pub bridge_sessions: Arc<crate::proxy::bridge_sessions::BridgeSessions>,
+    /// TTL cache replaying final rejections to retried external-bridge
+    /// INVITEs (same Call-ID + From-tag) without re-running routing,
+    /// capacity, or dispatch. Kill-switch:
+    /// `proxy.disable_rejected_invite_cache`.
+    pub rejected_invites: Arc<crate::proxy::bridge_sessions::RejectedInviteCache>,
 }
 
 pub type SipServerRef = Arc<SipServerInner>;
@@ -729,6 +734,9 @@ impl SipServerBuilder {
             webhook_cancel_registry,
             trunk_capacity,
             bridge_sessions: Arc::new(crate::proxy::bridge_sessions::BridgeSessions::new()),
+            rejected_invites: Arc::new(
+                crate::proxy::bridge_sessions::RejectedInviteCache::new(),
+            ),
         });
 
         let inner_weak = Arc::downgrade(&inner);

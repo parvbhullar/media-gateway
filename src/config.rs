@@ -735,6 +735,12 @@ pub struct ProxyConfig {
     /// `performance`: avoid transcoding, keep caller's codecs only.
     #[serde(default)]
     pub codec_strategy: CodecSelectionStrategy,
+    /// Kill-switch for the external-bridge rejected-INVITE replay cache
+    /// (carrier failover retries replay the cached final status instead of
+    /// re-running routing/capacity/dispatch). Mirrors liv-sip's
+    /// `disable_rejected_invite_cache` knob. Default `false` (cache on).
+    #[serde(default)]
+    pub disable_rejected_invite_cache: bool,
 }
 
 fn default_auth_cache_size() -> usize {
@@ -1025,6 +1031,7 @@ impl Default for ProxyConfig {
             dialog_auth_cache: default_dialog_auth_cache(),
             blind_transfer_use_refer: false,
             codec_strategy: CodecSelectionStrategy::default(),
+            disable_rejected_invite_cache: false,
         }
     }
 }
