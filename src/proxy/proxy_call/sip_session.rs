@@ -2456,13 +2456,23 @@ impl SipSession {
 
         info!(session_id = %self.context.session_id, %caller, %callee_uri, callee_call_id, "Sending INVITE to callee");
 
+        // When routing via home_proxy, the transport destination must be the
+        // home proxy node, not the callee's own registered contact — otherwise
+        // the packet bypasses the home proxy entirely and goes straight to the
+        // remote UA, which never receives it (wrong node, no route back).
+        let destination = if route_via_home_proxy {
+            target.home_proxy.clone()
+        } else {
+            target.destination.clone()
+        };
+
         let mut invite_option = InviteOption {
             caller_display_name: self.context.dialplan.caller_display_name.clone(),
             callee: callee_uri.clone(),
             caller: from_uri,
             content_type,
             offer,
-            destination: target.destination.clone(),
+            destination,
             contact: contact_uri,
             credential: target.credential.clone(),
             headers: Some(headers),
