@@ -1967,13 +1967,23 @@ impl CallModule {
         // Initial 180 Ringing (gates have passed by now).
         server_dialog.ringing(None, None).ok();
 
+        // Pin the dialog driver so its `handle` future is polled to completion
+        // across select iterations instead of being recreated each time (like
+        // `dispatch`/`ring_deadline` above). `handle` re-runs `handle_invite`
+        // from the top on every fresh call — which re-emits the `Calling`
+        // transition, whose state event feeds `state_rx`; without pinning,
+        // that event wakes the loop and recreates the future, an unbounded hot
+        // spin that never lets the dialog send a final response.
+        let handle_fut = driver.handle(tx);
+        tokio::pin!(handle_fut);
+
         loop {
             tokio::select! {
                 biased;
                 // Drive the dialog/transaction: pumps queued 100/180/200/4xx
                 // responses, absorbs INVITE retransmits, and returns on ACK
                 // (Confirmed), CANCEL (Terminated) or transaction error.
-                r = driver.handle(tx) => {
+                r = &mut handle_fut => {
                     if let Err(ref e) = r {
                         debug!(%dialog_id, error = %e, "bridge dialog handle returned error");
                     }

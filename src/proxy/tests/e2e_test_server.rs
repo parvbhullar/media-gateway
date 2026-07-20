@@ -129,7 +129,18 @@ impl E2eTestServer {
     }
 
     /// Start with a custom ProxyConfig, allowing injection of trunks, routes, etc.
-    pub async fn start_with_config(mut proxy_config: ProxyConfig) -> Result<Self> {
+    pub async fn start_with_config(proxy_config: ProxyConfig) -> Result<Self> {
+        Self::start_with_config_and_db(proxy_config, None).await
+    }
+
+    /// Start with a custom ProxyConfig AND an optional database connection.
+    /// External-bridge (webrtc/livekit/external_media) call paths read the
+    /// trunk row from `rustpbx_trunks` at dispatch time, so their e2e tests
+    /// must inject a migrated in-memory sqlite DB here.
+    pub async fn start_with_config_and_db(
+        mut proxy_config: ProxyConfig,
+        database: Option<sea_orm::DatabaseConnection>,
+    ) -> Result<Self> {
         let port = portpicker::pick_unused_port().unwrap_or(15060);
         let proxy_addr = format!("127.0.0.1:{}", port).parse()?;
 
@@ -168,6 +179,9 @@ impl E2eTestServer {
             .with_locator(Box::new(locator))
             .with_cancel_token(cancel_token.clone())
             .with_callrecord_sender(Some(cdr_sender));
+        if let Some(db) = database {
+            builder = builder.with_database_connection(db);
+        }
 
         builder = builder
             .register_module("registrar", |inner, config| {

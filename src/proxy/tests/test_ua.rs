@@ -424,6 +424,26 @@ impl TestUa {
         self.hangup(dialog_id).await
     }
 
+    /// Cancel an in-flight outgoing INVITE (before a final response) by Call-ID.
+    ///
+    /// During the early phase `do_invite` registers the client dialog under its
+    /// early ID (empty remote tag) and removes it once the INVITE completes, so
+    /// `get_dialog` with the post-180 ID (which carries the remote tag from the
+    /// provisional response) won't find it. Look it up by Call-ID instead.
+    pub async fn cancel_pending_call(&self, call_id: &str) -> Result<()> {
+        let dialog_layer = self
+            .dialog_layer
+            .as_ref()
+            .ok_or_else(|| anyhow!("TestUa not started"))?;
+        let dialog = dialog_layer
+            .get_client_dialog_by_call_id(call_id)
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("no in-flight client dialog for call_id {call_id}"))?;
+        dialog.cancel().await.map_err(|e| e.into_anyhow())?;
+        Ok(())
+    }
+
     /// Send UPDATE request within a dialog and return the answer SDP if any
     pub async fn send_update(
         &self,
