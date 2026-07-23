@@ -11,7 +11,7 @@ use crate::transaction::make_tag;
 use crate::transport::SipAddr;
 use crate::{Error, Result};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 pub type TransactionEventReceiver = UnboundedReceiver<TransactionEvent>;
 pub type TransactionEventSender = UnboundedSender<TransactionEvent>;
@@ -251,6 +251,37 @@ impl Transaction {
         Transaction::new(tx_type, key, original, connection, endpoint_inner)
     }
     // send client request
+    /// Evict `connection` from the transport pool when `err` says the stream
+    /// socket is dead (peer closed it while pooled). The pool key is the
+    /// connection's own address — the post-DNS-resolution key `lookup`
+    /// inserted under — so eviction here cannot miss the way eviction by an
+    /// unresolved destination can. UDP is exempt: its pool entry is the
+    /// shared listener socket, which must survive per-peer resets.
+    /// `pub(crate)` so transaction tests can exercise the guard directly.
+    pub(crate) fn evict_if_stale(&self, connection: &SipConnection, err: &Error) {
+        if !connection.is_reliable() {
+            return;
+        }
+        if let Error::IoError(io) = err {
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+            ) {
+                warn!(
+                    key = %self.key,
+                    addr = %connection.get_addr(),
+                    error = %io,
+                    "evicting stale connection after send failure"
+                );
+                self.endpoint_inner
+                    .transport_layer
+                    .del_connection(connection.get_addr());
+            }
+        }
+    }
+
     pub async fn send(&mut self) -> Result<()> {
         match self.transaction_type {
             TransactionType::ClientInvite | TransactionType::ClientNonInvite => {}
@@ -302,7 +333,10 @@ impl Transaction {
             self.original.to_owned().into()
         };
 
-        connection.send(message, self.destination.as_ref()).await?;
+        if let Err(e) = connection.send(message, self.destination.as_ref()).await {
+            self.evict_if_stale(connection, &e);
+            return Err(e);
+        }
         self.transition(TransactionState::Calling).map(|_| ())
     }
 
@@ -433,7 +467,10 @@ impl Transaction {
                         cancel.to_owned().into()
                     };
 
-                    connection.send(cancel, self.destination.as_ref()).await?;
+                    if let Err(e) = connection.send(cancel, self.destination.as_ref()).await {
+                        self.evict_if_stale(connection, &e);
+                        return Err(e);
+                    }
                 }
                 Ok(())
             }
@@ -512,7 +549,10 @@ impl Transaction {
             _ => None,
         };
         if let Some(conn) = connection {
-            conn.send(ack, self.destination.as_ref()).await?;
+            if let Err(e) = conn.send(ack, self.destination.as_ref()).await {
+                self.evict_if_stale(&conn, &e);
+                return Err(e);
+            }
         }
         // client send ack and transition to Terminated
         self.transition(TransactionState::Terminated).map(|_| ())

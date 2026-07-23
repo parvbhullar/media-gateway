@@ -2626,9 +2626,10 @@ impl SipSession {
                         }
                         Err(e) => {
                             // Stale pooled TCP/TLS connection: the pool returned a socket
-                            // that was already closed by the far end.  Evict it (Option A
-                            // in endpoint.rs handles the pool; the eviction races here are
-                            // covered by retrying once so a fresh dial is attempted).
+                            // that was already closed by the far end. The transport send
+                            // path has already evicted it (Transaction::evict_if_stale,
+                            // keyed by the connection's own resolved address), so the
+                            // retry's fresh lookup dials a new socket.
                             let is_stale_conn = matches!(&e, rsipstack::Error::IoError(io)
                                 if matches!(io.kind(),
                                     std::io::ErrorKind::BrokenPipe
@@ -2637,10 +2638,6 @@ impl SipSession {
 
                             if is_stale_conn && pipe_retry_count < 1 {
                                 pipe_retry_count += 1;
-                                if let Some(dest) = invite_option.destination.as_ref() {
-                                    self.server.dialog_layer.endpoint.transport_layer
-                                        .del_connection(dest);
-                                }
                                 warn!(
                                     session_id = %self.context.session_id,
                                     error = %e,

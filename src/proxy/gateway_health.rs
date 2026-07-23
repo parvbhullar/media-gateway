@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::models::trunk::{
     self as trunk_model, Column as TrunkColumn, Entity as TrunkEntity, Model as TrunkModel,
-    TrunkStatus,
+    SipTransport, TrunkStatus,
 };
 
 /// Configurable thresholds for the consecutive-result state machine.
@@ -112,6 +112,21 @@ pub struct ProbeOutcome {
 /// is reported as-is in `detail`; a non-2xx is reported as
 /// `"reachable (<code>)"`. Timeouts, transport failures, and bad URIs are
 /// the only `ok=false` cases.
+/// Probe destination for a SIP trunk — the same field preference as INVITE
+/// trunk routing (`convert_sip_trunk` in proxy/data.rs: `sip_server` first,
+/// `outbound_proxy` as fallback), so the probe exercises — and keeps warm —
+/// the pooled connection calls actually use.
+pub(crate) fn probe_destination(
+    sip_cfg: &crate::models::trunk::SipTrunkConfig,
+) -> Option<String> {
+    sip_cfg
+        .sip_server
+        .as_deref()
+        .or(sip_cfg.outbound_proxy.as_deref())
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty())
+}
+
 pub async fn probe_trunk(
     endpoint: &rsipstack::transaction::endpoint::EndpointInnerRef,
     trunk: &TrunkModel,
@@ -141,15 +156,11 @@ pub async fn probe_trunk(
         }
     };
 
-    // 1. Resolve destination. Prefer explicit outbound proxy, fall back to
-    //    sip_server.
-    let dest = match sip_cfg
-        .outbound_proxy
-        .as_deref()
-        .or(sip_cfg.sip_server.as_deref())
-    {
-        Some(d) if !d.trim().is_empty() => d.trim().to_string(),
-        _ => {
+    // 1. Resolve destination (see `probe_destination` for the field
+    //    preference rationale).
+    let dest = match probe_destination(&sip_cfg) {
+        Some(d) => d,
+        None => {
             return ProbeOutcome {
                 ok: false,
                 latency_ms: 0,
@@ -289,7 +300,9 @@ pub async fn probe_trunk(
 ///
 /// The probe cadence is dynamic per trunk:
 /// - Trunks with `status = Healthy` are probed every `healthy_interval`
-///   (default 300 s) — slow keepalive once a trunk is known good.
+///   (default 300 s) — slow keepalive once a trunk is known good. TCP/TLS
+///   SIP trunks tighten this to `STREAM_HEALTHY_INTERVAL_SECS` (60 s) so the
+///   pooled stream socket stays warm inside carrier/NAT idle windows.
 /// - Trunks with any other status (`Offline`, `Warning`, `Standby`) are
 ///   probed every `unhealthy_interval` (default 30 s) — fast recovery
 ///   detection so a flapping or down trunk gets re-evaluated quickly.
@@ -468,11 +481,21 @@ impl GatewayHealthMonitor {
     }
 }
 
+/// Healthy-state probe cadence for stream-transport (TCP/TLS) SIP trunks.
+/// Carrier/NAT idle timers commonly kill silent TCP sockets after 60–120s
+/// while the global healthy interval is 300s; probing every 60s keeps the
+/// pooled connection warm inside that window. UDP keeps the global cadence —
+/// there is no stream socket to keep alive.
+pub const STREAM_HEALTHY_INTERVAL_SECS: u64 = 60;
+
 /// Effective interval, in seconds, before the next probe should fire for
 /// `trunk` given the global monitor settings. Per-trunk
 /// `health_check_interval_secs` always wins (operator override). Otherwise:
 ///
-/// - Healthy → `healthy_interval` (steady-state cadence).
+/// - Healthy, TCP/TLS SIP trunk → `min(60s, healthy_interval)` so the pooled
+///   stream socket is re-warmed inside typical carrier idle windows (an
+///   explicitly lower global cadence still wins).
+/// - Healthy, everything else → `healthy_interval` (steady-state cadence).
 /// - Non-healthy → `unhealthy_interval * 2^consecutive_failures`, clamped to
 ///   `max_unhealthy_interval`. This keeps a flapping trunk re-checked
 ///   aggressively for the first few failures and then backs off so we don't
@@ -494,7 +517,16 @@ pub fn effective_interval_secs(
     // (~6 min) instead of 3 × healthy_interval (~15 min).
     let still_healthy = matches!(trunk.status, TrunkStatus::Healthy) && trunk.consecutive_failures == 0;
     let dur = if still_healthy {
-        healthy_interval
+        // Non-SIP kinds and unparseable kind_configs fall back to the
+        // global cadence.
+        let is_stream = trunk
+            .sip()
+            .is_ok_and(|cfg| matches!(cfg.sip_transport, SipTransport::Tcp | SipTransport::Tls));
+        if is_stream {
+            Duration::from_secs(STREAM_HEALTHY_INTERVAL_SECS).min(healthy_interval)
+        } else {
+            healthy_interval
+        }
     } else {
         backoff.interval(trunk.consecutive_failures)
     };
@@ -831,5 +863,109 @@ mod backoff_tests {
             effective_interval_secs(&t, Duration::from_secs(300), &BackoffPolicy::default()),
             15,
         );
+    }
+
+    fn fake_sip_trunk(
+        status: TrunkStatus,
+        cf: i32,
+        override_secs: Option<i32>,
+        transport: &str,
+    ) -> TrunkModel {
+        TrunkModel {
+            status,
+            consecutive_failures: cf,
+            health_check_interval_secs: override_secs,
+            kind: "sip".to_string(),
+            kind_config: serde_json::json!({ "sip_transport": transport }),
+            ..TrunkModel::default()
+        }
+    }
+
+    #[test]
+    fn healthy_stream_trunks_default_to_60s_cadence() {
+        for transport in ["tcp", "tls"] {
+            let t = fake_sip_trunk(TrunkStatus::Healthy, 0, None, transport);
+            assert_eq!(
+                effective_interval_secs(&t, Duration::from_secs(300), &BackoffPolicy::default()),
+                STREAM_HEALTHY_INTERVAL_SECS as i64,
+                "transport={}",
+                transport,
+            );
+        }
+    }
+
+    #[test]
+    fn healthy_udp_trunk_keeps_global_cadence() {
+        let t = fake_sip_trunk(TrunkStatus::Healthy, 0, None, "udp");
+        assert_eq!(
+            effective_interval_secs(&t, Duration::from_secs(300), &BackoffPolicy::default()),
+            300,
+        );
+    }
+
+    #[test]
+    fn stream_default_never_raises_an_explicitly_lower_global_cadence() {
+        let t = fake_sip_trunk(TrunkStatus::Healthy, 0, None, "tcp");
+        assert_eq!(
+            effective_interval_secs(&t, Duration::from_secs(5), &BackoffPolicy::default()),
+            5,
+        );
+    }
+
+    #[test]
+    fn per_trunk_override_beats_stream_default() {
+        let t = fake_sip_trunk(TrunkStatus::Healthy, 0, Some(300), "tcp");
+        assert_eq!(
+            effective_interval_secs(&t, Duration::from_secs(300), &BackoffPolicy::default()),
+            300,
+        );
+    }
+
+    #[test]
+    fn failing_stream_trunk_uses_backoff_not_stream_default() {
+        let t = fake_sip_trunk(TrunkStatus::Healthy, 1, None, "tcp");
+        assert_eq!(
+            effective_interval_secs(&t, Duration::from_secs(300), &BackoffPolicy::default()),
+            30,
+        );
+    }
+
+    #[test]
+    fn probe_destination_prefers_sip_server_like_invite_routing() {
+        let cfg = trunk_model::SipTrunkConfig {
+            sip_server: Some("sip.carrier.example:5060".into()),
+            outbound_proxy: Some("proxy.other.example:5060".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            probe_destination(&cfg).as_deref(),
+            Some("sip.carrier.example:5060"),
+        );
+    }
+
+    #[test]
+    fn probe_destination_falls_back_to_outbound_proxy() {
+        let cfg = trunk_model::SipTrunkConfig {
+            sip_server: None,
+            outbound_proxy: Some("proxy.other.example:5060".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            probe_destination(&cfg).as_deref(),
+            Some("proxy.other.example:5060"),
+        );
+    }
+
+    #[test]
+    fn probe_destination_none_when_unconfigured() {
+        assert_eq!(probe_destination(&Default::default()), None);
+        // Whitespace-only sip_server is "configured but empty" — no silent
+        // fallback to outbound_proxy (mirrors the pre-existing behavior).
+        let cfg = trunk_model::SipTrunkConfig {
+            sip_server: Some("   ".into()),
+            outbound_proxy: Some("proxy.other.example:5060".into()),
+            ..Default::default()
+        };
+        assert_eq!(probe_destination(&cfg), None);
     }
 }
