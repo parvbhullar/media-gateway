@@ -185,10 +185,18 @@ impl<'a> Drop for DialogGuardForUnconfirmed<'a> {
             let _handle = tokio::spawn(async move {
                 if let Dialog::ClientInvite(ref client_dialog) = dlg {
                     if client_dialog.inner.can_cancel() {
-                        if let Err(e) = client_dialog.cancel().await {
-                            warn!(id = %client_dialog.id(), error = %e, "dialog cancel failed");
-                            return;
-                        }
+                        // Fire the CANCEL without blocking on its own transaction
+                        // completing: its non-INVITE transaction can retransmit
+                        // for up to Timer F (~32s) if the far end never answers
+                        // it, but the original INVITE's final response (e.g. a
+                        // 407/487 that arrives independently) should not have
+                        // to wait behind that.
+                        let cancel_dialog = client_dialog.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = cancel_dialog.cancel().await {
+                                warn!(id = %cancel_dialog.id(), error = %e, "dialog cancel failed");
+                            }
+                        });
 
                         if let Some(mut invite_tx) = invite_tx {
                             let duration = tokio::time::Duration::from_secs(2);
