@@ -169,3 +169,81 @@ async fn disable_enable_unknown_org_returns_404() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+/// Regression test: a `drain` disable schedules a delayed hangup task keyed
+/// off the org row's `updated_at` generation. If the org is re-enabled
+/// before the grace period elapses, the stale task must not clobber the
+/// re-enable when it eventually fires.
+#[tokio::test]
+async fn drain_task_does_not_clobber_a_later_re_enable() {
+    let (state, token) = test_state_with_api_key("orgs-drain-race").await;
+    let app = rustpbx::app::create_router(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/organizations/globex")
+                .header(header::AUTHORIZATION, bearer(&token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::json!({"name": "Globex"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Disable with a 1s drain grace period.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/v1/organizations/globex/disable")
+                .header(header::AUTHORIZATION, bearer(&token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"action": "drain", "grace_seconds": 1}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Immediately re-enable, before the drain task's grace period elapses.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/v1/organizations/globex/enable")
+                .header(header::AUTHORIZATION, bearer(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Wait past the drain grace period so the stale task fires.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+
+    // The stale drain task must not have reverted or otherwise disturbed
+    // the re-enable.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/organizations/globex")
+                .header(header::AUTHORIZATION, bearer(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["enabled"], true);
+}

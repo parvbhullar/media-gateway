@@ -259,17 +259,54 @@ async fn disable_organization(
             hangup_all_for_org(registry, &org_id, "org_disabled_immediate");
         }
         DisableAction::Drain => {
+            // Capture this disable's generation via the row's `updated_at`
+            // (bumped by every `set_enabled` call). The spawned task checks
+            // this generation still matches before hanging anyone up, so a
+            // re-enable (or a fresh disable) before the grace period expires
+            // supersedes this task instead of racing it.
+            let disabled_at = crate::models::organization::Model::get(db, &org_id)
+                .await
+                .map_err(|e| ApiError::internal(e.to_string()))?
+                .map(|row| row.updated_at)
+                .ok_or_else(|| ApiError::internal("row vanished after set_enabled"))?;
+
             let grace = req.grace_seconds.unwrap_or(0);
             let registry = registry.clone();
             let org_id = org_id.clone();
+            let db = db.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(grace)).await;
-                hangup_all_for_org(&registry, &org_id, "org_disabled_drain_expired");
+                match crate::models::organization::Model::get(&db, &org_id).await {
+                    Ok(Some(row)) if should_execute_drain(&row, disabled_at) => {
+                        hangup_all_for_org(&registry, &org_id, "org_disabled_drain_expired");
+                    }
+                    Ok(_) => {
+                        // Org was re-enabled or re-disabled since this drain
+                        // was scheduled; a newer generation (or none) now
+                        // owns the hangup decision, so this stale task is a
+                        // no-op.
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            org_id = %org_id,
+                            error = %e,
+                            "org disable: drain generation check failed to load org row"
+                        );
+                    }
+                }
             });
         }
     }
 
     Ok(Json(serde_json::json!({ "org_id": org_id, "enabled": false })))
+}
+
+/// True if a scheduled drain-hangup should still execute: the org row must
+/// still exist, still be disabled, and its `updated_at` must be unchanged
+/// since the disable call that scheduled this drain (i.e. nothing re-enabled
+/// or re-disabled the org in the meantime, which would bump `updated_at`).
+fn should_execute_drain(org: &crate::models::organization::Model, disabled_at: DateTime<Utc>) -> bool {
+    !org.enabled && org.updated_at == disabled_at
 }
 
 /// Hang up every currently active call whose `org_id` matches, via the
@@ -345,4 +382,50 @@ async fn usage(
         calls,
         minutes: total_secs as f64 / 60.0,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn org_with(enabled: bool, updated_at: DateTime<Utc>) -> crate::models::organization::Model {
+        crate::models::organization::Model {
+            org_id: "acme".to_string(),
+            name: "Acme".to_string(),
+            enabled,
+            max_cps: None,
+            max_calls: None,
+            contact_name: None,
+            contact_email: None,
+            notes: None,
+            created_at: updated_at,
+            updated_at,
+        }
+    }
+
+    #[test]
+    fn should_execute_drain_when_still_disabled_and_generation_matches() {
+        let t = Utc::now();
+        let org = org_with(false, t);
+        assert!(should_execute_drain(&org, t));
+    }
+
+    #[test]
+    fn should_not_execute_drain_when_re_enabled() {
+        let disabled_at = Utc::now();
+        let re_enabled_at = disabled_at + chrono::Duration::seconds(1);
+        // Re-enabling flips `enabled` to true and bumps `updated_at`.
+        let org = org_with(true, re_enabled_at);
+        assert!(!should_execute_drain(&org, disabled_at));
+    }
+
+    #[test]
+    fn should_not_execute_drain_when_re_disabled_with_newer_generation() {
+        let disabled_at = Utc::now();
+        let re_disabled_at = disabled_at + chrono::Duration::seconds(1);
+        // A fresh disable call still sets enabled=false but bumps updated_at,
+        // so the stale task's generation no longer matches.
+        let org = org_with(false, re_disabled_at);
+        assert!(!should_execute_drain(&org, disabled_at));
+    }
 }
