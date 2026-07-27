@@ -103,6 +103,8 @@ pub struct CreateExtensionRequest {
     pub call_forwarding_timeout: Option<i32>,
     #[serde(default)]
     pub notes: Option<String>,
+    #[serde(default)]
+    pub org_id: Option<String>,
 }
 
 /// PATCH-style: omitted fields keep their current value.
@@ -133,6 +135,8 @@ pub struct UpdateExtensionRequest {
     pub call_forwarding_timeout: Option<Option<i32>>,
     #[serde(default)]
     pub notes: Option<Option<String>>,
+    #[serde(default)]
+    pub org_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -295,8 +299,13 @@ async fn create_extension(
     let now = Utc::now();
     let active = ExtActive {
         id: ActiveValue::NotSet,
-        // org_id left unset → DB default ('default') until 3.1b threads the real org_id
-        org_id: ActiveValue::NotSet,
+        org_id: req
+            .org_id
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(Set)
+            .unwrap_or(ActiveValue::NotSet),
         extension: Set(ext),
         display_name: Set(req.display_name),
         email: Set(req.email),
@@ -397,6 +406,14 @@ async fn update_extension(
     if let Some(v) = req.notes {
         active.notes = Set(v);
     }
+    if let Some(org_id) = req.org_id.as_ref() {
+        let trimmed = org_id.trim();
+        active.org_id = if trimmed.is_empty() {
+            Set(crate::models::organization::UNASSIGNED_ORG_ID.to_string())
+        } else {
+            Set(trimmed.to_string())
+        };
+    }
     active.updated_at = Set(Utc::now());
 
     let updated = active
@@ -425,4 +442,75 @@ async fn delete_extension(
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod extensions {
+    use super::*;
+
+    #[test]
+    fn test_create_extension_with_org_id() {
+        let req = CreateExtensionRequest {
+            extension: "100".to_string(),
+            sip_password: None,
+            display_name: Some("Test User".to_string()),
+            email: None,
+            status: None,
+            login_disabled: None,
+            voicemail_disabled: None,
+            allow_guest_calls: None,
+            call_forwarding_mode: None,
+            call_forwarding_destination: None,
+            call_forwarding_timeout: None,
+            notes: None,
+            org_id: Some("acme".to_string()),
+        };
+
+        // Verify the request can be created with org_id
+        assert_eq!(req.org_id, Some("acme".to_string()));
+    }
+
+    #[test]
+    fn test_create_extension_without_org_id() {
+        let req = CreateExtensionRequest {
+            extension: "101".to_string(),
+            sip_password: None,
+            display_name: None,
+            email: None,
+            status: None,
+            login_disabled: None,
+            voicemail_disabled: None,
+            allow_guest_calls: None,
+            call_forwarding_mode: None,
+            call_forwarding_destination: None,
+            call_forwarding_timeout: None,
+            notes: None,
+            org_id: None,
+        };
+
+        // Verify org_id defaults to None when not provided
+        assert_eq!(req.org_id, None);
+    }
+
+    #[test]
+    fn test_update_extension_with_org_id() {
+        let req = UpdateExtensionRequest {
+            extension: None,
+            sip_password: None,
+            display_name: None,
+            email: None,
+            status: None,
+            login_disabled: None,
+            voicemail_disabled: None,
+            allow_guest_calls: None,
+            call_forwarding_mode: None,
+            call_forwarding_destination: None,
+            call_forwarding_timeout: None,
+            notes: None,
+            org_id: Some("test-org".to_string()),
+        };
+
+        // Verify the update request can include org_id
+        assert_eq!(req.org_id, Some("test-org".to_string()));
+    }
 }

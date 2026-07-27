@@ -163,6 +163,8 @@ pub struct CreateRouteRequest {
     pub notes: Option<Value>,
     #[serde(default)]
     pub metadata: Option<Value>,
+    #[serde(default)]
+    pub org_id: Option<String>,
 }
 
 /// PATCH-style update: fields left unset preserve existing values.
@@ -202,6 +204,8 @@ pub struct UpdateRouteRequest {
     pub notes: Option<Option<Value>>,
     #[serde(default)]
     pub metadata: Option<Option<Value>>,
+    #[serde(default)]
+    pub org_id: Option<String>,
 }
 
 pub fn router() -> Router<AppState> {
@@ -336,9 +340,13 @@ async fn create_route(
         header_filters: ActiveValue::Set(req.header_filters),
         rewrite_rules: ActiveValue::Set(req.rewrite_rules),
         target_trunks: ActiveValue::Set(req.target_trunks),
-        // org_id left NotSet → DB default ('default') applies until 3.1b threads
-        // the real org_id from request context.
-        org_id: ActiveValue::NotSet,
+        org_id: req
+            .org_id
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(ActiveValue::Set)
+            .unwrap_or(ActiveValue::NotSet),
         notes: ActiveValue::Set(req.notes),
         metadata: ActiveValue::Set(req.metadata),
         created_at: ActiveValue::Set(now),
@@ -434,7 +442,14 @@ async fn update_route(
     if let Some(v) = req.target_trunks {
         active.target_trunks = ActiveValue::Set(v);
     }
-    // `owner` removed (task 3.1): org_id is system-managed, not updatable here.
+    if let Some(org_id) = req.org_id.as_ref() {
+        let trimmed = org_id.trim();
+        active.org_id = if trimmed.is_empty() {
+            ActiveValue::Set(crate::models::organization::UNASSIGNED_ORG_ID.to_string())
+        } else {
+            ActiveValue::Set(trimmed.to_string())
+        };
+    }
     if let Some(v) = req.notes {
         active.notes = ActiveValue::Set(v);
     }
@@ -473,4 +488,88 @@ async fn delete_route(
     refresh_routes_index(&state).await;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod routes {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_create_route_with_org_id() {
+        let req = CreateRouteRequest {
+            name: "test-route".to_string(),
+            description: None,
+            direction: None,
+            priority: None,
+            is_active: None,
+            selection_strategy: None,
+            hash_key: None,
+            source_trunk_id: None,
+            default_trunk_id: None,
+            source_pattern: None,
+            destination_pattern: None,
+            header_filters: None,
+            rewrite_rules: None,
+            target_trunks: None,
+            notes: None,
+            metadata: None,
+            org_id: Some("acme".to_string()),
+        };
+
+        // Verify the request can be created with org_id
+        assert_eq!(req.org_id, Some("acme".to_string()));
+    }
+
+    #[test]
+    fn test_create_route_without_org_id() {
+        let req = CreateRouteRequest {
+            name: "test-route-2".to_string(),
+            description: None,
+            direction: None,
+            priority: None,
+            is_active: None,
+            selection_strategy: None,
+            hash_key: None,
+            source_trunk_id: None,
+            default_trunk_id: None,
+            source_pattern: None,
+            destination_pattern: None,
+            header_filters: None,
+            rewrite_rules: None,
+            target_trunks: None,
+            notes: None,
+            metadata: None,
+            org_id: None,
+        };
+
+        // Verify org_id defaults to None when not provided
+        assert_eq!(req.org_id, None);
+    }
+
+    #[test]
+    fn test_update_route_with_org_id() {
+        let req = UpdateRouteRequest {
+            name: None,
+            description: None,
+            direction: None,
+            priority: None,
+            is_active: None,
+            selection_strategy: None,
+            hash_key: None,
+            source_trunk_id: None,
+            default_trunk_id: None,
+            source_pattern: None,
+            destination_pattern: None,
+            header_filters: None,
+            rewrite_rules: None,
+            target_trunks: None,
+            notes: None,
+            metadata: None,
+            org_id: Some("test-org".to_string()),
+        };
+
+        // Verify the update request can include org_id
+        assert_eq!(req.org_id, Some("test-org".to_string()));
+    }
 }

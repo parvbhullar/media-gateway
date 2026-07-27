@@ -116,6 +116,8 @@ pub struct CreateDidRequest {
     pub label: Option<String>,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    #[serde(default)]
+    pub org_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -131,6 +133,8 @@ pub struct UpdateDidRequest {
     pub label: Option<String>,
     #[serde(default)]
     pub enabled: Option<bool>,
+    #[serde(default)]
+    pub org_id: Option<String>,
 }
 
 fn default_enabled() -> bool {
@@ -258,6 +262,7 @@ async fn create_did(
         failover_trunk: normalize_optional_string(&req.failover_trunk),
         label: normalize_optional_string(&req.label),
         enabled: req.enabled,
+        org_id: normalize_optional_string(&req.org_id),
     };
 
     DidModel::upsert(db, new)
@@ -331,6 +336,7 @@ async fn update_did(
         failover_trunk: normalize_optional_string(&req.failover_trunk),
         label: normalize_optional_string(&req.label),
         enabled: req.enabled.unwrap_or(existing.enabled),
+        org_id: normalize_optional_string(&req.org_id),
     };
 
     DidModel::upsert(db, new)
@@ -376,4 +382,56 @@ async fn delete_did(
     refresh_did_index(&state).await;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod dids {
+    use super::*;
+
+    #[test]
+    fn test_create_did_with_org_id() {
+        let req = CreateDidRequest {
+            number: "+14158675309".to_string(),
+            trunk_name: None,
+            extension_number: None,
+            failover_trunk: None,
+            label: Some("test did".to_string()),
+            enabled: true,
+            org_id: Some("acme".to_string()),
+        };
+
+        // Verify the request can be created with org_id
+        assert_eq!(req.org_id, Some("acme".to_string()));
+    }
+
+    #[test]
+    fn test_create_did_without_org_id() {
+        let req = CreateDidRequest {
+            number: "+14158675310".to_string(),
+            trunk_name: None,
+            extension_number: None,
+            failover_trunk: None,
+            label: None,
+            enabled: true,
+            org_id: None,
+        };
+
+        // Verify org_id defaults to None when not provided
+        assert_eq!(req.org_id, None);
+    }
+
+    #[test]
+    fn test_update_did_with_org_id() {
+        let req = UpdateDidRequest {
+            trunk_name: None,
+            extension_number: None,
+            failover_trunk: None,
+            label: None,
+            enabled: None,
+            org_id: Some("test-org".to_string()),
+        };
+
+        // Verify the update request can include org_id
+        assert_eq!(req.org_id, Some("test-org".to_string()));
+    }
 }

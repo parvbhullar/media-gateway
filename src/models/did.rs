@@ -86,6 +86,7 @@ pub struct NewDid {
     pub failover_trunk: Option<String>,
     pub label: Option<String>,
     pub enabled: bool,
+    pub org_id: Option<String>,
 }
 
 impl Model {
@@ -99,6 +100,10 @@ impl Model {
             failover_trunk: Set(new.failover_trunk),
             label: Set(new.label),
             enabled: Set(new.enabled),
+            org_id: Set(new
+                .org_id
+                .clone()
+                .unwrap_or_else(|| crate::models::organization::UNASSIGNED_ORG_ID.to_string())),
             created_at: Set(now),
             updated_at: Set(now),
             ..Default::default()   // trunk_group_name stays NotSet → NULL
@@ -112,6 +117,7 @@ impl Model {
                         Column::FailoverTrunk,
                         Column::Label,
                         Column::Enabled,
+                        Column::OrgId,
                         Column::UpdatedAt,
                     ])
                     .to_owned(),
