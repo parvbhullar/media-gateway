@@ -16,6 +16,7 @@ pub mod forms;
 pub mod licenses;
 pub mod metrics;
 pub mod notifications;
+pub mod organization;
 pub mod presence;
 pub mod routing;
 pub mod setting;
@@ -65,7 +66,8 @@ pub fn router(state: Arc<ConsoleState>) -> Router {
         .merge(licenses::urls())
         .merge(sipflow::urls())
         .merge(notifications::urls())
-        .merge(metrics::urls());
+        .merge(metrics::urls())
+        .merge(organization::urls());
     #[cfg(feature = "addon-cc")]
     let page_routes = page_routes.merge(crate::addons::cc::console_handlers::page_urls());
 

@@ -57,7 +57,7 @@ impl From<OrgModel> for OrganizationView {
 /// Today's resource counts for one org — used by the list/detail views and
 /// the console Organizations tab.
 #[derive(Debug, Serialize)]
-pub struct OrgTodayCounts {
+pub(crate) struct OrgTodayCounts {
     pub did_count: i64,
     pub trunk_count: i64,
     pub extension_count: i64,
@@ -71,7 +71,7 @@ pub struct OrganizationWithCounts {
     pub today: OrgTodayCounts,
 }
 
-async fn today_counts(
+pub(crate) async fn today_counts(
     db: &sea_orm::DatabaseConnection,
     org_id: &str,
 ) -> ApiResult<OrgTodayCounts> {

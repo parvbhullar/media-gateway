@@ -1,0 +1,59 @@
+{% extends "console/layout.html" %}
+{% block title %}Organizations · {{ site_name | default('RustPBX') }}{% endblock %}
+{% block content %}
+<div class="p-4 sm:p-6">
+    <div class="mx-auto max-w-7xl space-y-6">
+        <header class="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+            <div class="space-y-0.5">
+                <p class="text-[11px] font-semibold uppercase tracking-wide text-sky-600">Multi-tenancy</p>
+                <h1 class="text-2xl font-semibold text-slate-900">Organizations</h1>
+                <p class="text-sm text-slate-500 sm:max-w-xl">Read-only view of organizations managed by the external system. Create, update, disable and enable are performed via the <span class="font-mono">/api/v1/organizations</span> API.</p>
+            </div>
+        </header>
+
+        <section class="rounded-xl bg-white shadow-sm ring-1 ring-black/5">
+            <div class="overflow-x-auto">
+                <table class="min-w-full divide-y divide-slate-100 text-sm">
+                    <thead class="bg-slate-50 text-xs font-semibold uppercase tracking-wide text-slate-500">
+                        <tr>
+                            <th class="px-6 py-3 text-left">Org ID</th>
+                            <th class="px-6 py-3 text-left">Name</th>
+                            <th class="px-6 py-3 text-left">Enabled</th>
+                            <th class="px-6 py-3 text-left">Max CPS</th>
+                            <th class="px-6 py-3 text-left">Max Calls</th>
+                            <th class="px-6 py-3 text-left">DIDs</th>
+                            <th class="px-6 py-3 text-left">Trunks</th>
+                            <th class="px-6 py-3 text-left">Extensions</th>
+                            <th class="px-6 py-3 text-left">Calls Today</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-slate-100">
+                        {% if organizations | length == 0 %}
+                        <tr>
+                            <td colspan="9" class="px-6 py-6 text-center text-sm text-slate-500">No organizations configured yet.</td>
+                        </tr>
+                        {% endif %}
+                        {% for org in organizations %}
+                        <tr>
+                            <td class="px-6 py-3 font-mono text-slate-800">{{ org.org_id }}</td>
+                            <td class="px-6 py-3">{{ org.name }}</td>
+                            <td class="px-6 py-3">
+                                <span class="inline-flex rounded-full px-2 py-0.5 text-xs font-semibold {{ 'bg-emerald-50 text-emerald-700' if org.enabled else 'bg-slate-100 text-slate-500' }}">
+                                    {{ "Enabled" if org.enabled else "Disabled" }}
+                                </span>
+                            </td>
+                            <td class="px-6 py-3">{{ org.max_cps if org.max_cps else "—" }}</td>
+                            <td class="px-6 py-3">{{ org.max_calls if org.max_calls else "—" }}</td>
+                            <td class="px-6 py-3">{{ org.today.did_count }}</td>
+                            <td class="px-6 py-3">{{ org.today.trunk_count }}</td>
+                            <td class="px-6 py-3">{{ org.today.extension_count }}</td>
+                            <td class="px-6 py-3">{{ org.today.call_record_count_today }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </section>
+    </div>
+</div>
+{% endblock %}
