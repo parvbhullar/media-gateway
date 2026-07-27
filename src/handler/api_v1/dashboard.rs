@@ -557,6 +557,7 @@ mod tests {
             sip_trunk_id: None,
             route_id: None,
             sip_gateway: None,
+            org_id: None,
             rewrite_original_from: None,
             rewrite_original_to: None,
             caller_uri: None,

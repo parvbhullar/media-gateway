@@ -347,6 +347,7 @@ mod tests {
                 sip_trunk_id: None,
                 route_id: None,
                 sip_gateway: None,
+                org_id: None,
                 recording_url: None,
                 recording_duration_secs: None,
                 has_transcript: false,

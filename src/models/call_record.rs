@@ -809,7 +809,10 @@ mod cdr_phase1_tests {
         #[async_trait::async_trait]
         impl sea_orm_migration::MigratorTrait for TestMigrator {
             fn migrations() -> Vec<Box<dyn sea_orm_migration::MigrationTrait>> {
-                vec![Box::new(super::super::Migration)]
+                vec![
+                    Box::new(super::Migration),
+                    Box::new(super::super::add_org_id_call_record::Migration),
+                ]
             }
         }
         TestMigrator::up(&db, None)
