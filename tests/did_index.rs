@@ -31,6 +31,7 @@ async fn loads_and_looks_up_by_number() {
             failover_trunk: None,
             label: None,
             enabled: true,
+            org_id: None,
         },
     )
     .await
@@ -59,6 +60,7 @@ async fn disabled_rows_kept_in_index_for_hard_reject() {
             failover_trunk: None,
             label: None,
             enabled: false,
+            org_id: None,
         },
     )
     .await

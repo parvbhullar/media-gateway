@@ -476,7 +476,7 @@ async fn update_did(
         failover_trunk,
         label,
         enabled,
-        org_id: None,
+        org_id: Some(existing.org_id.clone()),
     };
 
     if let Err(err) = Model::upsert(db, new).await {

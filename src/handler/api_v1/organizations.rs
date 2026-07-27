@@ -115,8 +115,12 @@ pub(crate) async fn today_counts(
 #[serde(deny_unknown_fields)]
 pub struct UpsertOrganizationRequest {
     pub name: String,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
+    /// Absent in the request body => preserve whatever the row already has
+    /// (or default to `true` on a true create). Explicit `true`/`false` always
+    /// wins. This mirrors the console DID/edit "merge" convention — a PUT that
+    /// only changes contact info must not silently re-enable a disabled org.
+    #[serde(default)]
+    pub enabled: Option<bool>,
     #[serde(default)]
     pub max_cps: Option<i32>,
     #[serde(default)]
@@ -127,10 +131,6 @@ pub struct UpsertOrganizationRequest {
     pub contact_email: Option<String>,
     #[serde(default)]
     pub notes: Option<String>,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -210,17 +210,23 @@ async fn upsert_organization(
     Json(req): Json<UpsertOrganizationRequest>,
 ) -> ApiResult<(StatusCode, Json<OrganizationView>)> {
     let db = state.db();
-    let existed = OrgModel::get(db, &org_id)
+    let existing_row = OrgModel::get(db, &org_id)
         .await
-        .map_err(|e| ApiError::internal(e.to_string()))?
-        .is_some();
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let existed = existing_row.is_some();
+
+    // `enabled` omitted from the body: preserve the existing row's value on
+    // an update, or default to enabled on a true create.
+    let enabled = req
+        .enabled
+        .unwrap_or_else(|| existing_row.map(|r| r.enabled).unwrap_or(true));
 
     OrgModel::upsert(
         db,
         NewOrganization {
             org_id: org_id.clone(),
             name: req.name,
-            enabled: req.enabled,
+            enabled,
             max_cps: req.max_cps,
             max_calls: req.max_calls,
             contact_name: req.contact_name,

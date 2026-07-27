@@ -1,7 +1,10 @@
 //! org-level multi-tenancy — add `org_id` to `rustpbx_call_records`.
 //!
-//! Populated at call-write time from whichever resource resolved the call
-//! (DID for inbound, trunk for outbound, extension for extension-originated).
+//! Populated at call-write time from the trunk's `org_id`, on the one
+//! enforced admission path (`dispatch_external_bridge` in
+//! `src/proxy/call.rs`). DID and extension `org_id` are not yet read at call
+//! time — see the design doc's "Known follow-up work" section for the
+//! DID/extension resolution rules that still need wiring.
 //! Nullable — NULL for calls with no resolvable org (matches the legacy
 //! `org_id = "default"` sentinel used on `did`/`trunk`/`extension`; this
 //! column stores true NULL instead, since it's new and has no legacy-row

@@ -6,7 +6,13 @@
 
 use std::sync::Arc;
 
-use axum::{Router, extract::State, http::HeaderMap, response::Response, routing::get};
+use axum::{
+    Router,
+    extract::State,
+    http::HeaderMap,
+    response::{IntoResponse, Response},
+    routing::get,
+};
 use serde_json::json;
 
 use crate::console::{ConsoleState, middleware::AuthRequired};
@@ -20,6 +26,14 @@ async fn page_organizations(
     headers: HeaderMap,
     AuthRequired(user): AuthRequired,
 ) -> Response {
+    if !state.has_permission(&user, "organizations", "read").await {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            json!({ "message": "Permission denied" }).to_string(),
+        )
+            .into_response();
+    }
+
     let current_user = state.build_current_user_ctx(&user).await;
     let db = state.db();
     let orgs = match crate::models::organization::Model::list_all(db).await {
@@ -95,6 +109,28 @@ mod tests {
         }
     }
 
+    fn unprivileged_user() -> crate::models::user::Model {
+        let now = Utc::now();
+        crate::models::user::Model {
+            id: 99,
+            email: "limited@rustpbx.com".into(),
+            username: "limited".into(),
+            password_hash: "hashed".into(),
+            reset_token: None,
+            reset_token_expires: None,
+            last_login_at: None,
+            last_login_ip: None,
+            created_at: now,
+            updated_at: now,
+            is_active: true,
+            is_staff: false,
+            is_superuser: false,
+            mfa_enabled: false,
+            mfa_secret: None,
+            auth_source: "local".into(),
+        }
+    }
+
     async fn setup_state() -> Arc<ConsoleState> {
         let db = Database::connect("sqlite::memory:")
             .await
@@ -118,6 +154,14 @@ mod tests {
         let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let html = String::from_utf8_lossy(&body);
         assert!(html.contains("Organizations"));
+    }
+
+    #[tokio::test]
+    async fn page_organizations_denied_without_permission() {
+        let state = setup_state().await;
+        let user = unprivileged_user();
+        let resp = page_organizations(State(state), HeaderMap::new(), AuthRequired(user)).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

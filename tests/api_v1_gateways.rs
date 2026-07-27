@@ -419,6 +419,7 @@ async fn delete_gateway_with_referencing_did_returns_409() {
             failover_trunk: None,
             label: None,
             enabled: true,
+            org_id: None,
         },
     )
     .await

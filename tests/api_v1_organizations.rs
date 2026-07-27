@@ -170,6 +170,95 @@ async fn disable_enable_unknown_org_returns_404() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+/// Regression test: PUT /organizations/{id} omitting `enabled` must not
+/// silently re-enable a disabled org. Only an explicit `enabled` in the body
+/// (or a true create) may change the enabled state.
+#[tokio::test]
+async fn put_without_enabled_field_preserves_disabled_state() {
+    let (state, token) = test_state_with_api_key("orgs-preserve-disabled").await;
+    let app = rustpbx::app::create_router(state);
+
+    // Create the org (defaults to enabled:true).
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/organizations/initech")
+                .header(header::AUTHORIZATION, bearer(&token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"name": "Initech"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Disable it.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/v1/organizations/initech/disable")
+                .header(header::AUTHORIZATION, bearer(&token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"action": "immediate"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["enabled"], false);
+
+    // PUT again, changing only contact info, omitting `enabled` entirely.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/organizations/initech")
+                .header(header::AUTHORIZATION, bearer(&token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "name": "Initech",
+                        "contact_name": "Bill Lumbergh"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    // Must still be disabled — the PUT did not include `enabled`.
+    assert_eq!(body["enabled"], false);
+    assert_eq!(body["contact_name"], "Bill Lumbergh");
+
+    // GET confirms the disabled state stuck.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/organizations/initech")
+                .header(header::AUTHORIZATION, bearer(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["enabled"], false);
+}
+
 /// Regression test: a `drain` disable schedules a delayed hangup task keyed
 /// off the org row's `updated_at` generation. If the org is re-enabled
 /// before the grace period elapses, the stale task must not clobber the

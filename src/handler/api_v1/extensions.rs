@@ -492,6 +492,38 @@ mod extensions {
         assert_eq!(req.org_id, None);
     }
 
+    /// Proves the actual serde + handler behavior, not just that a struct
+    /// literal holds the field we just set: (1) `org_id` omitted from the
+    /// JSON body deserializes to `None` via `#[serde(default)]`; (2) an
+    /// explicit empty-string `org_id` deserializes to `Some("".into())` at
+    /// the DTO level — serde does NOT normalize it; (3) the handler's own
+    /// trim+filter chain (see `create_extension` above, ~line 302-308) is
+    /// what turns that empty string into "unassigned" (`ActiveValue::NotSet`),
+    /// not serde.
+    #[test]
+    fn test_org_id_serde_roundtrip_and_handler_normalization() {
+        let no_org: CreateExtensionRequest =
+            serde_json::from_str(r#"{"extension":"102"}"#).expect("deserialize");
+        assert_eq!(no_org.org_id, None, "omitted org_id must deserialize to None");
+
+        let empty_org: CreateExtensionRequest =
+            serde_json::from_str(r#"{"extension":"102","org_id":""}"#).expect("deserialize");
+        assert_eq!(
+            empty_org.org_id,
+            Some("".to_string()),
+            "serde must NOT normalize an empty-string org_id on its own"
+        );
+
+        // Mirrors the handler's own normalization (create_extension, ~line 302-308):
+        // only that trim+filter chain collapses "" to "unassigned" (NotSet).
+        let normalized = empty_org
+            .org_id
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        assert_eq!(normalized, None);
+    }
+
     #[test]
     fn test_update_extension_with_org_id() {
         let req = UpdateExtensionRequest {

@@ -420,6 +420,34 @@ mod dids {
         assert_eq!(req.org_id, None);
     }
 
+    /// Proves the actual serde + handler behavior, not just that a struct
+    /// literal holds the field we just set: (1) `org_id` omitted from the
+    /// JSON body deserializes to `None` via `#[serde(default)]`; (2) an
+    /// explicit empty-string `org_id` deserializes to `Some("".into())` at
+    /// the DTO level — serde does NOT normalize it; (3) only the handler's
+    /// `normalize_optional_string` (called on the DTO field, see
+    /// `create_did`/`update_did` above) turns that empty string into `None`
+    /// ("unassigned"), which is what the code around line 265/339 relies on.
+    #[test]
+    fn test_org_id_serde_roundtrip_and_handler_normalization() {
+        let no_org: CreateDidRequest =
+            serde_json::from_str(r#"{"number":"+14158675311"}"#).expect("deserialize");
+        assert_eq!(no_org.org_id, None, "omitted org_id must deserialize to None");
+
+        let empty_org: CreateDidRequest = serde_json::from_str(
+            r#"{"number":"+14158675311","org_id":""}"#,
+        )
+        .expect("deserialize");
+        assert_eq!(
+            empty_org.org_id,
+            Some("".to_string()),
+            "serde must NOT normalize an empty-string org_id on its own"
+        );
+
+        // Only the handler's normalization collapses "" to None/unassigned.
+        assert_eq!(normalize_optional_string(&empty_org.org_id), None);
+    }
+
     #[test]
     fn test_update_did_with_org_id() {
         let req = UpdateDidRequest {
