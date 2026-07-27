@@ -58,6 +58,15 @@ pub struct BridgeSession {
     /// `None` when both `max_concurrent` and `max_cps` were unset (no
     /// limits to enforce → no gate created).
     pub _permit: Option<crate::proxy::trunk_capacity_state::Permit>,
+    /// Owning org of the trunk this call bridged through, when assigned.
+    /// `None` for the legacy `"default"` sentinel or an unknown org_id.
+    pub org_id: Option<String>,
+    /// Org-level capacity-gate permit acquired before dispatch, mirroring
+    /// `_permit` but for the org's `OrgCapacityState` gate. Dropping it at
+    /// BYE time releases the slot back to the org's concurrent-call/CPS
+    /// budget. `None` when the trunk has no org, the org has no limits set,
+    /// or enforcement is off.
+    pub _org_permit: Option<crate::proxy::trunk_capacity_state::Permit>,
 
     // --- CDR fields ---------------------------------------------------------
     pub call_id: String,
@@ -85,6 +94,9 @@ pub struct BridgeCallRecordInfo {
     pub to_number: Option<String>,
     pub trunk_name: String,
     pub trunk_id: Option<i64>,
+    /// Owning org of the trunk this call bridged through, when assigned.
+    /// `None` for the legacy `"default"` sentinel or an unknown org_id.
+    pub org_id: Option<String>,
     pub start_time: DateTime<Utc>,
     pub end_time: DateTime<Utc>,
     pub status_code: u16,
@@ -163,6 +175,7 @@ pub fn emit_bridge_call_record(
         from_number: info.from_number.clone(),
         to_number: info.to_number.clone(),
         sip_trunk_id: info.trunk_id,
+        org_id: info.org_id.clone(),
         metadata: Some(metadata),
         last_error,
         ..Default::default()
@@ -397,6 +410,8 @@ mod tests {
             local_sdp: String::new(),
             kind: BridgeKind::WebRtc,
             _permit: None,
+            org_id: None,
+            _org_permit: None,
             call_id: "test-call".into(),
             caller_uri: "sip:alice@example.com".into(),
             callee_uri: "sip:bot@example.com".into(),
@@ -425,6 +440,7 @@ mod tests {
                 to_number: Some("bot42".into()),
                 trunk_name: "webrtc-bot".into(),
                 trunk_id: Some(99),
+                org_id: Some("acme".into()),
                 start_time: start,
                 end_time: Utc::now(),
                 status_code: 200,
@@ -446,6 +462,7 @@ mod tests {
         assert_eq!(md.get("call_type").map(String::as_str), Some("webrtc_bridge"));
         assert_eq!(md.get("trunk_name").map(String::as_str), Some("webrtc-bot"));
         assert_eq!(md.get("kind").map(String::as_str), Some("webrtc"));
+        assert_eq!(record.details.org_id, Some("acme".to_string()));
     }
 
     #[tokio::test]
@@ -462,6 +479,7 @@ mod tests {
                 to_number: Some("b".into()),
                 trunk_name: "webrtc-bot".into(),
                 trunk_id: Some(7),
+                org_id: None,
                 start_time: Utc::now(),
                 end_time: Utc::now(),
                 status_code: 503,

@@ -1553,7 +1553,8 @@ impl CallModule {
         let emit_failure_cdr = |status_code: u16,
                                 hangup_reason: CallRecordHangupReason,
                                 reason: Option<String>,
-                                trunk_id: Option<i64>| {
+                                trunk_id: Option<i64>,
+                                org_id: Option<String>| {
             emit_bridge_call_record(
                 cdr_sender.as_ref(),
                 &BridgeCallRecordInfo {
@@ -1564,6 +1565,7 @@ impl CallModule {
                     to_number: cdr_to_number.clone(),
                     trunk_name: trunk_name.to_string(),
                     trunk_id,
+                    org_id,
                     start_time: cdr_start,
                     end_time: chrono::Utc::now(),
                     status_code,
@@ -1586,6 +1588,7 @@ impl CallModule {
                 CallRecordHangupReason::Rejected,
                 Some("INVITE missing SDP offer".into()),
                 None,
+                None,
             );
             return Err(RouteError::from((
                 anyhow!("INVITE has empty body — webrtc bridge requires SDP offer"),
@@ -1597,6 +1600,7 @@ impl CallModule {
                 400,
                 CallRecordHangupReason::Rejected,
                 Some(format!("INVITE body not valid UTF-8: {e}")),
+                None,
                 None,
             );
             RouteError::from((
@@ -1661,6 +1665,7 @@ impl CallModule {
                 CallRecordHangupReason::Failed,
                 Some("no DB connection".into()),
                 None,
+                None,
             );
             RouteError::from((
                 anyhow!("webrtc bridge requires a database connection"),
@@ -1686,6 +1691,7 @@ impl CallModule {
                     CallRecordHangupReason::ServerUnavailable,
                     Some(format!("trunk lookup failed: {e}")),
                     None,
+                    None,
                 );
                 return Err(RouteError::from((
                     e,
@@ -1695,6 +1701,39 @@ impl CallModule {
         };
         let (trunk_id, max_calls, max_cps) =
             crate::proxy::webrtc_route_dispatch::capacity_limits_for(&trunk_row);
+
+        // Org-level lookup: the trunk's org_id (skip entirely for the
+        // legacy "default" sentinel or an org_id with no matching row —
+        // both mean "unassigned", fail open, no org-level enforcement).
+        let org = if trunk_row.org_id != crate::models::organization::UNASSIGNED_ORG_ID {
+            crate::models::organization::Model::get(db, &trunk_row.org_id)
+                .await
+                .map_err(|e| {
+                    warn!(org_id = %trunk_row.org_id, error = %e, "org lookup failed");
+                    RouteError::from((
+                        anyhow!("org lookup failed: {e}"),
+                        Some(rsipstack::sip::StatusCode::ServerInternalError),
+                    ))
+                })?
+        } else {
+            None
+        };
+        let call_org_id = org.as_ref().map(|o| o.org_id.clone());
+
+        if let Some(o) = org.as_ref().filter(|o| !o.enabled) {
+            warn!(org_id = %o.org_id, "webrtc bridge rejected: org disabled");
+            emit_failure_cdr(
+                503,
+                CallRecordHangupReason::ServerUnavailable,
+                Some(format!("org '{}' is disabled", o.org_id)),
+                Some(trunk_id),
+                Some(o.org_id.clone()),
+            );
+            return Err(RouteError::from((
+                anyhow!("org '{}' is disabled", o.org_id),
+                Some(rsipstack::sip::StatusCode::ServiceUnavailable),
+            )));
+        }
 
         // Capacity gate. Acquire a permit before any expensive setup; drop
         // it (refund the CPS token + active counter) on any subsequent
@@ -1720,6 +1759,7 @@ impl CallModule {
                             max_calls
                         )),
                         Some(trunk_id),
+                        call_org_id.clone(),
                     );
                     return Err(RouteError::from((
                         anyhow!(
@@ -1738,6 +1778,7 @@ impl CallModule {
                         CallRecordHangupReason::ServerUnavailable,
                         Some(format!("trunk CPS cap reached (max_cps={:?})", max_cps)),
                         Some(trunk_id),
+                        call_org_id.clone(),
                     );
                     return Err(RouteError::from((
                         anyhow!(
@@ -1752,6 +1793,75 @@ impl CallModule {
         } else {
             None
         };
+
+        // Org-level capacity gate. Runs after the trunk gate has already
+        // succeeded (permit_opt may be Some by now) — any rejection here
+        // must also release the trunk permit, or the trunk's budget leaks
+        // on every org-capacity rejection.
+        let mut org_permit_opt: Option<crate::proxy::trunk_capacity_state::Permit> = None;
+        if let Some(o) = org.as_ref() {
+            use crate::proxy::trunk_capacity_state::AcquireOutcome as OrgAcquireOutcome;
+            let org_max_calls = o.max_calls.and_then(|v| u32::try_from(v).ok());
+            let org_max_cps = o.max_cps.and_then(|v| u32::try_from(v).ok());
+            if org_max_calls.is_some() || org_max_cps.is_some() {
+                match self
+                    .inner
+                    .server
+                    .org_capacity
+                    .try_acquire(&o.org_id, org_max_calls, org_max_cps)
+                {
+                    OrgAcquireOutcome::Ok(permit) => {
+                        org_permit_opt = Some(permit);
+                    }
+                    OrgAcquireOutcome::CallsExhausted => {
+                        warn!(org_id = %o.org_id, max_calls = ?org_max_calls,
+                              "webrtc bridge rejected: org concurrent-call cap reached");
+                        drop(permit_opt.take());
+                        emit_failure_cdr(
+                            503,
+                            CallRecordHangupReason::ServerUnavailable,
+                            Some(format!(
+                                "org '{}' concurrent-call cap reached (max_calls={:?})",
+                                o.org_id, org_max_calls
+                            )),
+                            Some(trunk_id),
+                            call_org_id.clone(),
+                        );
+                        return Err(RouteError::from((
+                            anyhow!(
+                                "org '{}' concurrent-call cap reached (max_calls={:?})",
+                                o.org_id,
+                                org_max_calls
+                            ),
+                            Some(rsipstack::sip::StatusCode::ServiceUnavailable),
+                        )));
+                    }
+                    OrgAcquireOutcome::CpsExhausted => {
+                        warn!(org_id = %o.org_id, max_cps = ?org_max_cps,
+                              "webrtc bridge rejected: org CPS cap reached");
+                        drop(permit_opt.take());
+                        emit_failure_cdr(
+                            503,
+                            CallRecordHangupReason::ServerUnavailable,
+                            Some(format!(
+                                "org '{}' CPS cap reached (max_cps={:?})",
+                                o.org_id, org_max_cps
+                            )),
+                            Some(trunk_id),
+                            call_org_id.clone(),
+                        );
+                        return Err(RouteError::from((
+                            anyhow!(
+                                "org '{}' CPS cap reached (max_cps={:?})",
+                                o.org_id,
+                                org_max_cps
+                            ),
+                            Some(rsipstack::sip::StatusCode::ServiceUnavailable),
+                        )));
+                    }
+                }
+            }
+        }
 
         let ice_servers = self.inner.server.rtp_config.ice_servers.as_deref();
 
@@ -1892,11 +2002,13 @@ impl CallModule {
             Ok(d) => d,
             Err(e) => {
                 drop(permit_opt.take());
+                drop(org_permit_opt.take());
                 emit_failure_cdr(
                     500,
                     CallRecordHangupReason::Failed,
                     Some(format!("server dialog create failed: {e}")),
                     Some(trunk_id),
+                    call_org_id.clone(),
                 );
                 return Err(RouteError::from((
                     anyhow!("failed to create server dialog for bridge: {e}"),
@@ -2047,6 +2159,8 @@ impl CallModule {
                                                 o,
                                                 kind,
                                                 permit_opt.take(),
+                                                call_org_id.clone(),
+                                                org_permit_opt.take(),
                                                 &offer_bytes,
                                                 BridgeAnswerSeed {
                                                     call_id: cdr_call_id.clone(),
@@ -2160,6 +2274,7 @@ impl CallModule {
         }
         drop(commit_fut);
         drop(permit_opt.take());
+        drop(org_permit_opt.take());
 
         if cancelled {
             crate::metrics::bridge::dispatch_outcome(kind, "cancelled");
@@ -2168,6 +2283,7 @@ impl CallModule {
                 CallRecordHangupReason::ByCaller,
                 Some("caller cancelled before answer".to_string()),
                 Some(trunk_id),
+                call_org_id.clone(),
             );
             return Ok(());
         }
@@ -2179,6 +2295,7 @@ impl CallModule {
                 CallRecordHangupReason::Failed,
                 Some("ring timeout before media commitment".to_string()),
                 Some(trunk_id),
+                call_org_id.clone(),
             );
             return Ok(());
         }
@@ -2190,7 +2307,7 @@ impl CallModule {
             } else {
                 CallRecordHangupReason::Rejected
             };
-            emit_failure_cdr(code, hangup, Some(reason), Some(trunk_id));
+            emit_failure_cdr(code, hangup, Some(reason), Some(trunk_id), call_org_id.clone());
             // Reject already sent on the dialog; returning Err is for metrics/
             // logging. handle_invite's arm guards on `tx.last_response.is_none()`
             // so it will not double-reply.
@@ -2208,6 +2325,7 @@ impl CallModule {
             CallRecordHangupReason::Failed,
             Some("bridge setup ended without answer".to_string()),
             Some(trunk_id),
+            call_org_id.clone(),
         );
         Ok(())
     }
@@ -2229,6 +2347,8 @@ impl CallModule {
         outcome: crate::proxy::bridge::session::DispatchOutcome,
         kind: crate::proxy::bridge::session::BridgeKind,
         permit: Option<crate::proxy::trunk_capacity_state::Permit>,
+        org_id: Option<String>,
+        org_permit: Option<crate::proxy::trunk_capacity_state::Permit>,
         offer_bytes: &[u8],
         seed: BridgeAnswerSeed,
         answer_time: chrono::DateTime<chrono::Utc>,
@@ -2321,6 +2441,8 @@ impl CallModule {
             local_sdp,
             kind,
             _permit: permit,
+            org_id: org_id.clone(),
+            _org_permit: org_permit,
             call_id: seed.call_id.clone(),
             caller_uri: seed.caller_uri,
             callee_uri: seed.callee_uri,
@@ -2587,6 +2709,7 @@ impl CallModule {
                 to_number: session.to_number.clone(),
                 trunk_name: session.trunk_name.clone(),
                 trunk_id: session.trunk_id,
+                org_id: session.org_id.clone(),
                 start_time: session.start_time,
                 end_time: chrono::Utc::now(),
                 status_code: 200,
