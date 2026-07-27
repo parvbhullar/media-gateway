@@ -15,6 +15,7 @@ pub mod diagnostics;
 pub mod dids;
 pub mod error;
 pub mod gateways;
+pub mod organizations;            // Org-level multi-tenancy — CRUD, disable/enable, usage
 pub mod reload_steps;
 pub mod routes;                   // Legacy rustpbx_routes read-only surface
 pub mod routing;                  // Phase 3 Plan 03-01 — RTE-03
@@ -61,6 +62,7 @@ pub fn api_v1_router(state: AppState) -> Router {
         .merge(webhooks::router())                 // Phase 7 — WH-01
         .merge(dashboard::router())                // Dashboard summary (mirrors /console/dashboard/data)
         .merge(extensions::router())               // SIP extensions CRUD
+        .merge(organizations::router())            // Org-level multi-tenancy
         ;
 
     let protected = protected.layer(middleware::from_fn_with_state(
