@@ -387,6 +387,7 @@ mod org_id_tests {
                 failover_trunk: None,
                 label: None,
                 enabled: true,
+                org_id: None,
             },
         )
         .await

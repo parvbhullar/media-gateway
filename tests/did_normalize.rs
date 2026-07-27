@@ -79,6 +79,7 @@ async fn upsert_then_fetch() {
             failover_trunk: None,
             label: Some("Main".into()),
             enabled: true,
+            org_id: None,
         },
     )
     .await
@@ -105,6 +106,7 @@ async fn upsert_is_idempotent_and_updates_fields() {
         failover_trunk: None,
         label: Some("v1".into()),
         enabled: true,
+            org_id: None,
     };
     did::Model::upsert(&db, base.clone()).await.unwrap();
     let updated = NewDid { label: Some("v2".into()), ..base };
@@ -132,6 +134,7 @@ async fn list_by_trunk_and_counts() {
                 failover_trunk: f,
                 label: None,
                 enabled: true,
+            org_id: None,
             },
         )
         .await
@@ -157,6 +160,7 @@ async fn null_extension_clears_matching_rows() {
                 failover_trunk: None,
                 label: None,
                 enabled: true,
+            org_id: None,
             },
         )
         .await
@@ -171,6 +175,7 @@ async fn null_extension_clears_matching_rows() {
             failover_trunk: None,
             label: None,
             enabled: true,
+            org_id: None,
         },
     )
     .await
@@ -201,6 +206,7 @@ async fn upsert_with_null_trunk() {
             failover_trunk: None,
             label: Some("parked".into()),
             enabled: true,
+            org_id: None,
         },
     )
     .await
@@ -222,6 +228,7 @@ async fn count_unassigned_returns_null_trunk_rows() {
             failover_trunk: None,
             label: None,
             enabled: true,
+            org_id: None,
         },
     )
     .await
@@ -235,6 +242,7 @@ async fn count_unassigned_returns_null_trunk_rows() {
             failover_trunk: None,
             label: None,
             enabled: true,
+            org_id: None,
         },
     )
     .await
@@ -256,6 +264,7 @@ async fn delete_removes_row() {
             failover_trunk: None,
             label: None,
             enabled: true,
+            org_id: None,
         },
     )
     .await

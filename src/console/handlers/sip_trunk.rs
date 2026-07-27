@@ -1863,6 +1863,7 @@ mod tests {
                 failover_trunk: None,
                 label: None,
                 enabled: true,
+                org_id: None,
             },
         )
         .await
@@ -1900,6 +1901,7 @@ mod tests {
                 failover_trunk: Some("backup".into()),
                 label: None,
                 enabled: true,
+                org_id: None,
             },
         )
         .await

@@ -82,6 +82,7 @@ pub async fn run(db: &DatabaseConnection) -> Result<BackfillReport> {
                         failover_trunk: None,
                         label: None,
                         enabled: true,
+                        org_id: None,
                     };
                     if let Err(e) = did::Model::upsert(db, new).await {
                         warn!(did = %number, error = %e, "backfill upsert failed");

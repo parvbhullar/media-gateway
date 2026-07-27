@@ -287,6 +287,7 @@ async fn create_did(
         failover_trunk: super::normalize_optional_string(&payload.failover_trunk),
         label: super::normalize_optional_string(&payload.label),
         enabled: payload.enabled,
+        org_id: None,
     };
 
     if let Err(err) = Model::upsert(db, new).await {
@@ -366,6 +367,7 @@ async fn bulk_create_dids(
             failover_trunk: failover.clone(),
             label: label.clone(),
             enabled: payload.enabled,
+            org_id: None,
         };
         match Model::upsert(db, new).await {
             Ok(()) => {
@@ -474,6 +476,7 @@ async fn update_did(
         failover_trunk,
         label,
         enabled,
+        org_id: None,
     };
 
     if let Err(err) = Model::upsert(db, new).await {

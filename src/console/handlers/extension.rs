@@ -1132,6 +1132,7 @@ mod tests {
                 failover_trunk: None,
                 label: None,
                 enabled: true,
+                org_id: None,
             },
         )
         .await

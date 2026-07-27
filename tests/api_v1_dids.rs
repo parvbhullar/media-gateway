@@ -45,6 +45,7 @@ async fn seed_did(
         failover_trunk: None,
         label: label.map(|s| s.to_string()),
         enabled: true,
+            org_id: None,
     };
     rustpbx::models::did::Model::upsert(state.db(), new)
         .await
