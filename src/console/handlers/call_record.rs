@@ -61,6 +61,8 @@ struct QueryCallRecordFilters {
     sip_trunk_ids: Option<Vec<i64>>,
     #[serde(default)]
     tags: Option<Vec<String>>,
+    #[serde(default)]
+    org_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1125,6 +1127,13 @@ fn build_condition(filters: &Option<QueryCallRecordFilters>) -> Condition {
             }
         }
 
+        if let Some(org_id_raw) = filters.org_id.as_ref() {
+            let org_id_trimmed = org_id_raw.trim();
+            if !org_id_trimmed.is_empty() {
+                condition = condition.add(CallRecordColumn::OrgId.eq(org_id_trimmed));
+            }
+        }
+
         let date_from = parse_date(filters.date_from.as_ref(), false);
         let date_to = parse_date(filters.date_to.as_ref(), true);
 
@@ -2047,6 +2056,62 @@ mod tests {
         .await
         .expect("insert call record");
         assert!(record.ring_time.is_some());
+    }
+
+    #[tokio::test]
+    async fn org_id_filter_scopes_query_call_records() {
+        let db = setup_db().await;
+        let state = create_console_state(db.clone()).await;
+
+        for (call_id, org_id) in [("call-acme", Some("acme")), ("call-globex", Some("globex"))] {
+            call_record::ActiveModel {
+                call_id: Set(call_id.into()),
+                direction: Set("inbound".into()),
+                status: Set("completed".into()),
+                started_at: Set(Utc::now()),
+                duration_secs: Set(60),
+                has_transcript: Set(false),
+                transcript_status: Set("pending".into()),
+                created_at: Set(Utc::now()),
+                updated_at: Set(Utc::now()),
+                org_id: Set(org_id.map(|s| s.to_string())),
+                ..Default::default()
+            }
+            .insert(&db)
+            .await
+            .expect("insert call record");
+        }
+
+        let payload = forms::ListQuery::<QueryCallRecordFilters> {
+            page: 1,
+            per_page: 50,
+            filters: Some(QueryCallRecordFilters {
+                org_id: Some("acme".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let resp = query_call_records(State(state), AuthRequired(superuser()), Json(payload)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let items = v["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["call_id"], "call-acme");
+    }
+
+    #[test]
+    fn build_condition_ignores_blank_org_id() {
+        let condition = build_condition(&Some(QueryCallRecordFilters {
+            org_id: Some("   ".into()),
+            ..Default::default()
+        }));
+        // A blank org_id should not add any predicate — same as the other
+        // optional string filters (status/direction) in this function.
+        assert_eq!(format!("{condition:?}"), format!("{:?}", Condition::all()));
     }
 
     #[test]
