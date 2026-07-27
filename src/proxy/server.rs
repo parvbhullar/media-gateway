@@ -99,6 +99,9 @@ pub struct SipServerInner {
     /// Constructed at boot, queried by the INVITE-path enforcement gates
     /// (which only fire when `[trunk.enforcement] enabled = true`).
     pub trunk_capacity: Arc<crate::proxy::trunk_capacity_state::TrunkCapacityState>,
+    /// Org-level capacity bookkeeping (concurrent calls + CPS per org_id).
+    /// Checked *in addition to* trunk-level gates on call admission.
+    pub org_capacity: Arc<crate::proxy::org_capacity_state::OrgCapacityState>,
     /// Per-dialog state for active SIP↔external-bridge sessions
     /// (`kind="webrtc"` today, `kind="livekit"` once that lands). Populated
     /// by the `ExternalBridge` arm in `proxy::call::CallModule`, drained on
@@ -668,6 +671,8 @@ impl SipServerBuilder {
         // `[trunk.enforcement] enabled` (default false).
         let trunk_capacity =
             Arc::new(crate::proxy::trunk_capacity_state::TrunkCapacityState::new());
+        let org_capacity =
+            Arc::new(crate::proxy::org_capacity_state::OrgCapacityState::new());
         // Spawn webhook delivery processor if DB is available.
         if let Some(db_for_processor) = database.clone() {
             let sender_for_processor = webhook_sender.clone();
@@ -733,6 +738,7 @@ impl SipServerBuilder {
             webhook_sender,
             webhook_cancel_registry,
             trunk_capacity,
+            org_capacity,
             bridge_sessions: Arc::new(crate::proxy::bridge_sessions::BridgeSessions::new()),
             rejected_invites: Arc::new(
                 crate::proxy::bridge_sessions::RejectedInviteCache::new(),

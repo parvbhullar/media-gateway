@@ -117,6 +117,7 @@ pub async fn create_test_server_with_config(
         },
         webhook_cancel_registry: std::sync::Arc::new(crate::proxy::webhook::WebhookCancelRegistry::new()),
         trunk_capacity: std::sync::Arc::new(crate::proxy::trunk_capacity_state::TrunkCapacityState::new()),
+        org_capacity: std::sync::Arc::new(crate::proxy::org_capacity_state::OrgCapacityState::new()),
         bridge_sessions: std::sync::Arc::new(
             crate::proxy::bridge_sessions::BridgeSessions::new(),
         ),
