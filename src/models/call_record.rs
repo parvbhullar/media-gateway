@@ -157,6 +157,7 @@ pub async fn persist_call_record(
         sip_trunk_id: Set(sip_trunk_id),
         route_id: Set(route_id),
         sip_gateway: Set(sip_gateway.clone()),
+        org_id: Set(details.org_id.clone()),
         rewrite_original_from: Set(rewrite_original_from),
         rewrite_original_to: Set(rewrite_original_to),
         caller_uri: Set(caller_uri.clone()),
@@ -352,6 +353,7 @@ pub struct Model {
     pub sip_trunk_id: Option<i64>,
     pub route_id: Option<i64>,
     pub sip_gateway: Option<String>,
+    pub org_id: Option<String>,
     pub rewrite_original_from: Option<String>,
     pub rewrite_original_to: Option<String>,
     pub caller_uri: Option<String>,
@@ -590,6 +592,7 @@ impl From<Model> for CallRecord {
             sip_trunk_id: val.sip_trunk_id,
             route_id: val.route_id,
             sip_gateway: val.sip_gateway,
+            org_id: val.org_id,
             recording_url: val.recording_url,
             recording_duration_secs: val.recording_duration_secs,
             has_transcript: val.has_transcript,
@@ -681,6 +684,7 @@ mod cdr_phase1_tests {
             sip_trunk_id: None,
             route_id: None,
             sip_gateway: None,
+            org_id: None,
             rewrite_original_from: None,
             rewrite_original_to: None,
             caller_uri: Some("sip:1001@host".to_string()),
@@ -794,5 +798,47 @@ mod cdr_phase1_tests {
         assert_eq!(md.get("tenant").map(|s| s.as_str()), Some("acme"));
         assert!(!md.contains_key("sip_leg_roles"));
         assert!(!md.contains_key("hangup_messages"));
+    }
+
+    async fn test_db() -> sea_orm::DatabaseConnection {
+        use sea_orm_migration::MigratorTrait;
+        let db = sea_orm::Database::connect("sqlite::memory:")
+            .await
+            .expect("failed to connect to test db");
+        struct TestMigrator;
+        #[async_trait::async_trait]
+        impl sea_orm_migration::MigratorTrait for TestMigrator {
+            fn migrations() -> Vec<Box<dyn sea_orm_migration::MigrationTrait>> {
+                vec![Box::new(super::super::Migration)]
+            }
+        }
+        TestMigrator::up(&db, None)
+            .await
+            .expect("failed to run migrations");
+        db
+    }
+
+    #[tokio::test]
+    async fn persist_call_record_writes_org_id() {
+        let db = test_db().await;
+        let mut record = crate::callrecord::CallRecord {
+            call_id: "org-tag-test".into(),
+            details: crate::callrecord::CallDetails {
+                direction: "inbound".into(),
+                status: "completed".into(),
+                org_id: Some("acme".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        persist_call_record(&db, &mut record).await.unwrap();
+
+        let row = Entity::find()
+            .filter(Column::CallId.eq("org-tag-test"))
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.org_id, Some("acme".to_string()));
     }
 }

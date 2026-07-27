@@ -77,6 +77,10 @@ impl MigratorTrait for Migrator {
             // sipflow_available columns + grouped-summary index + base backfill.
             // MUST run after the table + failure_source exist.
             Box::new(super::add_cdr_outcome_columns::Migration),
+            // org-level multi-tenancy — organizations table. MUST be
+            // registered here or the table is never created in production.
+            Box::new(super::organization::Migration),
+            Box::new(super::add_org_id_call_record::Migration),
         ]
     }
 }
