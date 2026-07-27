@@ -7,10 +7,11 @@ use axum::{
     http::HeaderMap,
     response::Response,
 };
-use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
+use chrono_tz::Tz;
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, FromQueryResult, PaginatorTrait,
-    QueryFilter, QuerySelect, sea_query,
+    ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, EntityTrait, FromQueryResult,
+    PaginatorTrait, QueryFilter, QuerySelect, sea_query,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -23,8 +24,10 @@ pub async fn dashboard(
     headers: HeaderMap,
     AuthRequired(user): AuthRequired,
 ) -> Response {
-    let range = resolve_time_range(None);
-    let payload = match build_dashboard_payload(&state, &range).await {
+    let tz = resolve_display_tz(&state);
+    let range = resolve_time_range(None, tz);
+    let filters = DashboardFilters::default();
+    let payload = match build_dashboard_payload(&state, &range, &filters).await {
         Ok(payload) => payload,
         Err(err) => {
             warn!(error = %err, "failed to build dashboard payload");
@@ -51,6 +54,48 @@ pub async fn dashboard(
 #[derive(Deserialize)]
 pub struct DashboardDataQuery {
     range: Option<String>,
+    /// Substring match against from_number OR to_number.
+    number: Option<String>,
+    /// Exact direction filter (case-insensitive): inbound | outbound | internal.
+    direction: Option<String>,
+}
+
+/// Optional filters applied to every call-record query inside
+/// `build_dashboard_payload` AND the active-calls preview.
+#[derive(Clone, Default)]
+pub struct DashboardFilters {
+    pub number: Option<String>,
+    pub direction: Option<String>,
+}
+
+impl DashboardFilters {
+    fn normalized(mut self) -> Self {
+        self.number = self.number.filter(|s| !s.trim().is_empty()).map(|s| s.trim().to_string());
+        self.direction = self
+            .direction
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.trim().to_lowercase());
+        self
+    }
+
+    /// Build a sea_orm `Condition` that ANDs the active filters together.
+    /// Empty/None filters contribute nothing, so an unfiltered call returns
+    /// `Condition::all()` which is a no-op when added to a query.
+    fn to_condition(&self) -> Condition {
+        let mut cond = Condition::all();
+        if let Some(ref num) = self.number {
+            let pat = format!("%{}%", num);
+            cond = cond.add(
+                Condition::any()
+                    .add(CallRecordColumn::FromNumber.like(pat.clone()))
+                    .add(CallRecordColumn::ToNumber.like(pat)),
+            );
+        }
+        if let Some(ref dir) = self.direction {
+            cond = cond.add(CallRecordColumn::Direction.eq(dir.clone()));
+        }
+        cond
+    }
 }
 
 pub async fn dashboard_data(
@@ -58,12 +103,31 @@ pub async fn dashboard_data(
     AuthRequired(_): AuthRequired,
     Query(query): Query<DashboardDataQuery>,
 ) -> Result<Json<DashboardPayload>, Response> {
-    let range = resolve_time_range(query.range.as_deref());
-    match build_dashboard_payload(&state, &range).await {
-        Ok(payload) => Ok(Json(payload)),
+    let filters = DashboardFilters {
+        number: query.number,
+        direction: query.direction,
+    };
+    Ok(Json(
+        fetch_dashboard_payload(&state, query.range.as_deref(), filters).await,
+    ))
+}
+
+/// Public, auth-free entry point that reuses the same payload logic as
+/// `dashboard_data`. Used by `api_v1::dashboard` so the v1 API and the
+/// console UI return identical shapes for a given `range` key.
+pub async fn fetch_dashboard_payload(
+    state: &ConsoleState,
+    range_key: Option<&str>,
+    filters: DashboardFilters,
+) -> DashboardPayload {
+    let tz = resolve_display_tz(state);
+    let range = resolve_time_range(range_key, tz);
+    let filters = filters.normalized();
+    match build_dashboard_payload(state, &range, &filters).await {
+        Ok(payload) => payload,
         Err(err) => {
             warn!(error = %err, "failed to build dashboard payload");
-            Ok(Json(DashboardPayload::empty(range)))
+            DashboardPayload::empty(range)
         }
     }
 }
@@ -83,7 +147,7 @@ impl DashboardPayload {
         let bucket_seconds = (total_seconds as f64 / bucket_count as f64)
             .ceil()
             .max(60.0) as i64;
-        let (timeline, labels) = build_timeline_from_buckets(Vec::new(), &range, bucket_seconds);
+        let (timeline, labels) = build_timeline_from_buckets(Vec::new(), &range, bucket_seconds, chrono_tz::UTC);
         Self {
             range: range.descriptor(),
             metrics: DashboardMetrics {
@@ -197,11 +261,20 @@ pub struct TimelineBucket {
     count: i64,
 }
 
+fn resolve_display_tz(state: &ConsoleState) -> Tz {
+    state
+        .display_timezone()
+        .parse::<Tz>()
+        .unwrap_or(chrono_tz::Asia::Kolkata)
+}
+
 async fn build_dashboard_payload(
     state: &ConsoleState,
     range: &TimeRange,
+    filters: &DashboardFilters,
 ) -> Result<DashboardPayload> {
     let db = state.db();
+    let filter_cond = filters.to_condition();
 
     #[derive(Debug, FromQueryResult)]
     struct RecentStats {
@@ -213,6 +286,7 @@ async fn build_dashboard_payload(
     let recent_stats = CallRecordEntity::find()
         .filter(CallRecordColumn::StartedAt.gte(range.start))
         .filter(CallRecordColumn::StartedAt.lt(range.end))
+        .filter(filter_cond.clone())
         .select_only()
         .column_as(CallRecordColumn::Id.count(), "total")
         .column_as(
@@ -275,6 +349,7 @@ async fn build_dashboard_payload(
     let timeline_buckets = CallRecordEntity::find()
         .filter(CallRecordColumn::StartedAt.gte(range.start))
         .filter(CallRecordColumn::StartedAt.lt(range.end))
+        .filter(filter_cond.clone())
         .select_only()
         .column_as(time_expr, "bucket")
         .column_as(CallRecordColumn::Id.count(), "count")
@@ -286,10 +361,11 @@ async fn build_dashboard_payload(
     let previous_count = CallRecordEntity::find()
         .filter(CallRecordColumn::StartedAt.gte(range.previous_start))
         .filter(CallRecordColumn::StartedAt.lt(range.previous_end))
+        .filter(filter_cond.clone())
         .count(db)
         .await?;
 
-    let today_start = start_of_day(Utc::now());
+    let today_start = start_of_day_in_tz(Utc::now(), resolve_display_tz(state));
 
     #[derive(Debug, FromQueryResult)]
     struct TodayStats {
@@ -299,6 +375,7 @@ async fn build_dashboard_payload(
 
     let today_stats = CallRecordEntity::find()
         .filter(CallRecordColumn::StartedAt.gte(today_start))
+        .filter(filter_cond.clone())
         .select_only()
         .column_as(
             sea_query::SimpleExpr::from(sea_query::Func::sum(
@@ -341,6 +418,7 @@ async fn build_dashboard_payload(
     let direction_stats = CallRecordEntity::find()
         .filter(CallRecordColumn::StartedAt.gte(range.start))
         .filter(CallRecordColumn::StartedAt.lt(range.end))
+        .filter(filter_cond.clone())
         .select_only()
         .column(CallRecordColumn::Direction)
         .column_as(CallRecordColumn::Id.count(), "count")
@@ -349,7 +427,7 @@ async fn build_dashboard_payload(
         .all(db)
         .await?;
 
-    let (active_total, active_preview) = active_call_stats(state, 10).await;
+    let (active_total, active_preview) = active_call_stats(state, 10, filters).await;
 
     let capacity = state
         .sip_server()
@@ -371,8 +449,9 @@ async fn build_dashboard_payload(
         None
     };
 
+    let display_tz = resolve_display_tz(state);
     let (timeline, timeline_labels) =
-        build_timeline_from_buckets(timeline_buckets, range, bucket_seconds);
+        build_timeline_from_buckets(timeline_buckets, range, bucket_seconds, display_tz);
     let trend = calc_trend_string(total_recent, previous_count as u32);
     let asr_string = if total_recent > 0 {
         format!(
@@ -429,6 +508,7 @@ fn build_timeline_from_buckets(
     buckets: Vec<TimelineBucket>,
     range: &TimeRange,
     bucket_seconds: i64,
+    tz: Tz,
 ) -> (Vec<i64>, Vec<String>) {
     let bucket_count = range.bucket_count.max(1);
     let mut series = vec![0i64; bucket_count];
@@ -449,32 +529,64 @@ fn build_timeline_from_buckets(
         } else {
             bucket_end
         };
-        labels.push(format_timeline_label(range, clamped_end));
+        labels.push(format_timeline_label(range, clamped_end, tz));
     }
 
     (series, labels)
 }
 
-fn format_timeline_label(range: &TimeRange, timestamp: DateTime<Utc>) -> String {
+fn format_timeline_label(range: &TimeRange, timestamp: DateTime<Utc>, tz: Tz) -> String {
+    let local = timestamp.with_timezone(&tz);
     let total_seconds = range.duration().num_seconds();
-    if total_seconds <= 3600 {
-        timestamp.format("%H:%M").to_string()
-    } else if total_seconds <= 172_800 {
-        timestamp.format("%d %H:%M").to_string()
+    if total_seconds <= 86_400 {
+        // single-day ranges (10m / Today / Yesterday): just show HH:MM
+        local.format("%H:%M").to_string()
+    } else if total_seconds <= 7 * 86_400 {
+        // multi-day ranges up to a week: show day + time
+        local.format("%d/%m - %H:%M").to_string()
     } else {
-        timestamp.format("%m-%d").to_string()
+        // longer ranges: show month-day only
+        local.format("%m-%d").to_string()
     }
 }
 
-async fn active_call_stats(state: &ConsoleState, limit: usize) -> (usize, Vec<ActiveCallPreview>) {
+async fn active_call_stats(
+    state: &ConsoleState,
+    limit: usize,
+    filters: &DashboardFilters,
+) -> (usize, Vec<ActiveCallPreview>) {
     let mut previews = Vec::new();
     let mut active_count = 0;
     // 2. Proxy Calls (including Wholesale)
     if let Ok(guard) = state.sip_server.read()
         && let Some(server) = guard.as_ref()
     {
-        active_count += server.active_call_registry.count();
-        let proxy_calls = server.active_call_registry.list_recent(limit);
+        let has_filter = filters.number.is_some() || filters.direction.is_some();
+        // Pull all when filtering so post-filter we don't truncate; pull
+        // all when unfiltered too, since `count()` is the SOT — using
+        // `list_recent(limit)` here previously capped active_count at limit.
+        let proxy_calls_all = server.active_call_registry.list_recent(usize::MAX);
+        let proxy_calls: Vec<_> = proxy_calls_all
+            .into_iter()
+            .filter(|call| {
+                if let Some(ref dir) = filters.direction {
+                    if !call.direction.eq_ignore_ascii_case(dir) {
+                        return false;
+                    }
+                }
+                if let Some(ref num) = filters.number {
+                    let needle = num.to_lowercase();
+                    let caller = call.caller.as_deref().unwrap_or("").to_lowercase();
+                    let callee = call.callee.as_deref().unwrap_or("").to_lowercase();
+                    if !caller.contains(&needle) && !callee.contains(&needle) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .collect();
+        // Filtered: count = filtered subset; unfiltered: count = registry total.
+        active_count += if has_filter { proxy_calls.len() } else { server.active_call_registry.count() };
         for call in proxy_calls {
             let status = call.status.to_string();
             // Capitalize status
@@ -489,7 +601,8 @@ async fn active_call_stats(state: &ConsoleState, limit: usize) -> (usize, Vec<Ac
             };
 
             let start_time = call.started_at;
-            let started_at = start_time.format("%H:%M").to_string();
+            let display_tz = resolve_display_tz(state);
+            let started_at = start_time.with_timezone(&display_tz).format("%H:%M").to_string();
             let duration_secs = if let Some(answered_at) = call.answered_at {
                 (Utc::now() - answered_at).num_seconds().max(0)
             } else {
@@ -515,11 +628,6 @@ async fn active_call_stats(state: &ConsoleState, limit: usize) -> (usize, Vec<Ac
     }
 
     // Sort and limit
-    previews.sort_by_key(|b| std::cmp::Reverse(b.started_at_ts));
-    if previews.len() > limit {
-        previews.truncate(limit);
-    }
-
     previews.sort_by_key(|b| std::cmp::Reverse(b.started_at_ts));
     if previews.len() > limit {
         previews.truncate(limit);
@@ -612,11 +720,11 @@ fn ensure_direction_defaults(map: &mut BTreeMap<String, i64>) {
     }
 }
 
-fn resolve_time_range(input: Option<&str>) -> TimeRange {
+fn resolve_time_range(input: Option<&str>, tz: Tz) -> TimeRange {
     let now = Utc::now();
     match input.unwrap_or("10m") {
         "today" => {
-            let start = start_of_day(now);
+            let start = start_of_day_in_tz(now, tz);
             let previous_start = start - Duration::days(1);
             TimeRange {
                 key: "today".to_string(),
@@ -632,7 +740,7 @@ fn resolve_time_range(input: Option<&str>) -> TimeRange {
             }
         }
         "yesterday" => {
-            let today_start = start_of_day(now);
+            let today_start = start_of_day_in_tz(now, tz);
             let start = today_start - Duration::days(1);
             let end = today_start;
             TimeRange {
@@ -649,7 +757,7 @@ fn resolve_time_range(input: Option<&str>) -> TimeRange {
             }
         }
         "week" => {
-            let start = start_of_week(now);
+            let start = start_of_week_in_tz(now, tz);
             TimeRange {
                 key: "week".to_string(),
                 label: "This week".to_string(),
@@ -711,18 +819,22 @@ fn resolve_time_range(input: Option<&str>) -> TimeRange {
     }
 }
 
-fn start_of_day(now: DateTime<Utc>) -> DateTime<Utc> {
-    let naive = now
+/// Returns midnight of the current day in the given display timezone, as UTC.
+fn start_of_day_in_tz(now: DateTime<Utc>, tz: Tz) -> DateTime<Utc> {
+    let local = now.with_timezone(&tz);
+    let midnight = local
         .date_naive()
         .and_hms_opt(0, 0, 0)
-        .expect("valid start of day");
-    Utc.from_utc_datetime(&naive)
+        .expect("valid midnight");
+    tz.from_local_datetime(&midnight)
+        .earliest()
+        .map(|dt| dt.with_timezone(&Utc))
+        .unwrap_or_else(|| Utc.from_utc_datetime(&midnight))
 }
 
-fn start_of_week(now: DateTime<Utc>) -> DateTime<Utc> {
-    let weekday = now.weekday();
-    let days_from_monday = weekday.num_days_from_monday() as i64;
-    let seconds = now.time().num_seconds_from_midnight() as i64;
-    let midnight = now - Duration::seconds(seconds);
-    start_of_day(midnight - Duration::days(days_from_monday))
+fn start_of_week_in_tz(now: DateTime<Utc>, tz: Tz) -> DateTime<Utc> {
+    let local = now.with_timezone(&tz);
+    let days_from_monday = local.weekday().num_days_from_monday() as i64;
+    let day_start = start_of_day_in_tz(now, tz);
+    day_start - Duration::days(days_from_monday)
 }

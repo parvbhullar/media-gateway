@@ -1138,6 +1138,7 @@ impl RwiCommandProcessor {
                     started_at: chrono::Utc::now(),
                     answered_at: None,
                     status: ActiveProxyCallStatus::Ringing,
+                    trunk_group_name: None,
                 };
                 registry.upsert(entry, handle.clone());
                 (handle, cmd_rx)
@@ -2027,6 +2028,7 @@ impl RwiCommandProcessor {
                 started_at: chrono::Utc::now(),
                 answered_at: None,
                 status: ActiveProxyCallStatus::Ringing,
+                trunk_group_name: None,
             };
             registry.upsert(entry, handle);
         }
@@ -4146,6 +4148,7 @@ mod tests {
             started_at: chrono::Utc::now(),
             answered_at: None,
             status: crate::proxy::active_call_registry::ActiveProxyCallStatus::Ringing,
+            trunk_group_name: None,
         };
 
         registry.upsert(entry, handle.clone());
@@ -4180,6 +4183,7 @@ mod tests {
             started_at: chrono::Utc::now(),
             answered_at: None,
             status: crate::proxy::active_call_registry::ActiveProxyCallStatus::Ringing,
+            trunk_group_name: None,
         };
 
         registry.upsert(entry, handle.clone());

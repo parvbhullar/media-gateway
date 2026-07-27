@@ -85,10 +85,21 @@ pub struct Recorder {
     last_ssrc_b: Option<u32>,
     profile_a: NegotiatedLegProfile,
     profile_b: NegotiatedLegProfile,
+    // Per-leg linear gain applied to decoded PCM before re-encode (1.0 =
+    // no-op). Used to balance legs in the mixdown (e.g. a quiet SIP caller vs
+    // a hot TTS bot). Recording-only — does not affect live call audio.
+    gain_a: f32,
+    gain_b: f32,
     dtmf_state_a: Option<DtmfEventState>,
     dtmf_state_b: Option<DtmfEventState>,
 
     next_flush_ts: u32, // The next timestamp to be flushed
+    // Per-leg end-of-data marker that persists across flushes. Tracks the highest
+    // absolute timestamp written into each leg's buffer so leg_end_ts(leg) can
+    // return the correct per-leg position even after the buffer has been drained.
+    // Distinct from next_flush_ts (global) which advances on either leg's activity.
+    last_written_ts_a: u32,
+    last_written_ts_b: u32,
     ptime: Duration,
 
     written_samples: u64,
@@ -145,9 +156,13 @@ impl Recorder {
             last_ssrc_b: None,
             profile_a: NegotiatedLegProfile::default(),
             profile_b: NegotiatedLegProfile::default(),
+            gain_a: 1.0,
+            gain_b: 1.0,
             dtmf_state_a: None,
             dtmf_state_b: None,
             next_flush_ts: 0,
+            last_written_ts_a: 0,
+            last_written_ts_b: 0,
             written_samples: 0,
             writer,
             ptime: Duration::from_millis(200),
@@ -158,6 +173,15 @@ impl Recorder {
         match leg {
             Leg::A => self.profile_a = profile,
             Leg::B => self.profile_b = profile,
+        }
+    }
+
+    /// Set a per-leg linear gain (1.0 = unchanged) applied to decoded PCM
+    /// before re-encode. Recording-only — does not affect live call audio.
+    pub fn set_leg_gain(&mut self, leg: Leg, gain: f32) {
+        match leg {
+            Leg::A => self.gain_a = gain,
+            Leg::B => self.gain_b = gain,
         }
     }
 
@@ -205,6 +229,13 @@ impl Recorder {
 
         let codec_hint = codec_hint.or(match (frame.payload_type, profile_audio_pt) {
             (Some(pt), Some(audio_pt)) if pt == audio_pt => profile_audio_codec,
+            // PT was cleared on the wire (external_bridge_mode strips it so
+            // strict peers accept our RTP). Without a PT we'd otherwise fall
+            // through to `try_from(0)` = PCMU and (a) decode the stream with
+            // the wrong codec and (b) on raw-packet legs set an 8 kHz
+            // timeline clock against 48 kHz timestamps → 6× WAV duration.
+            // Trust the negotiated leg profile's codec instead.
+            (None, _) => profile_audio_codec,
             _ => None,
         });
 
@@ -239,7 +270,17 @@ impl Recorder {
                         self.sample_rate as usize,
                     )
                 });
-            let pcm = resampler.resample(&pcm);
+            let mut pcm = resampler.resample(&pcm);
+            // Per-leg recording gain (default 1.0). Hard-clamp to i16.
+            let gain = match leg {
+                Leg::A => self.gain_a,
+                Leg::B => self.gain_b,
+            };
+            if gain != 1.0 {
+                for s in pcm.iter_mut() {
+                    *s = ((*s as f32) * gain).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                }
+            }
             encoded = if let Some(enc) = self.encoder.as_mut() {
                 enc.encode(&pcm)
             } else {
@@ -327,14 +368,47 @@ impl Recorder {
 
     fn leg_end_ts(&self, leg: Leg) -> u32 {
         let (samples_per_block, bytes_per_block) = self.block_info();
+        let last_written = match leg {
+            Leg::A => self.last_written_ts_a,
+            Leg::B => self.last_written_ts_b,
+        };
         let buffered_end = match leg {
             Leg::A => self.buffer_a.last_key_value(),
             Leg::B => self.buffer_b.last_key_value(),
         }
         .map(|(k, v)| k + (v.len() / bytes_per_block) as u32 * samples_per_block)
-        .unwrap_or(self.next_flush_ts);
+        .unwrap_or(last_written);
 
-        buffered_end.max(self.next_flush_ts)
+        // Wall-clock floor: number of samples that "should" have elapsed since
+        // recording started, computed from monotonic time. This is a true
+        // per-leg anchor that does NOT get polluted by the other leg's activity
+        // (unlike next_flush_ts) but still lets `maybe_reset_leg_timeline`
+        // detect a DTX-resume packet whose RTP clock paused during silence,
+        // so the resumed audio lands at its real-time position instead of
+        // being glued back-to-back with the pre-silence packet.
+        let wall_clock = (self.start_instant.elapsed().as_millis() as u64
+            * self.sample_rate as u64
+            / 1000) as u32;
+
+        buffered_end.max(last_written).max(wall_clock)
+    }
+
+    // Update the per-leg high-water mark. Called whenever data is inserted into
+    // a leg's buffer so leg_end_ts(leg) reports the right position even after
+    // the buffer has been drained by flush().
+    fn bump_last_written(&mut self, leg: Leg, end_ts: u32) {
+        match leg {
+            Leg::A => {
+                if end_ts > self.last_written_ts_a {
+                    self.last_written_ts_a = end_ts;
+                }
+            }
+            Leg::B => {
+                if end_ts > self.last_written_ts_b {
+                    self.last_written_ts_b = end_ts;
+                }
+            }
+        }
     }
 
     fn block_span_samples(&self, data: &[u8]) -> u32 {
@@ -435,12 +509,14 @@ impl Recorder {
                         self.buffer_b.insert(key, data);
                     }
                 }
+                self.bump_last_written(leg, block_end);
                 continue;
             }
 
             if key < start_ts
                 && let Some(prefix) = self.trim_back(&data, start_ts - key)
             {
+                let prefix_end = key.saturating_add(self.block_span_samples(&prefix));
                 match leg {
                     Leg::A => {
                         self.buffer_a.insert(key, prefix);
@@ -449,6 +525,7 @@ impl Recorder {
                         self.buffer_b.insert(key, prefix);
                     }
                 }
+                self.bump_last_written(leg, prefix_end);
             }
 
             if block_end > end_ts
@@ -456,6 +533,7 @@ impl Recorder {
                     self.trim_front(&data, end_ts.saturating_sub(key))
             {
                 let suffix_ts = key.saturating_add(trimmed_samples);
+                let suffix_end = suffix_ts.saturating_add(self.block_span_samples(&suffix));
                 match leg {
                     Leg::A => {
                         self.buffer_a.insert(suffix_ts, suffix);
@@ -464,9 +542,11 @@ impl Recorder {
                         self.buffer_b.insert(suffix_ts, suffix);
                     }
                 }
+                self.bump_last_written(leg, suffix_end);
             }
         }
 
+        let dtmf_end = start_ts.saturating_add(self.block_span_samples(&encoded));
         match leg {
             Leg::A => {
                 self.buffer_a.insert(start_ts, encoded);
@@ -475,6 +555,7 @@ impl Recorder {
                 self.buffer_b.insert(start_ts, encoded);
             }
         }
+        self.bump_last_written(leg, dtmf_end);
     }
 
     fn insert_audio_block(&mut self, leg: Leg, start_ts: u32, encoded: Bytes) {
@@ -510,6 +591,7 @@ impl Recorder {
         }
 
         for (ts, data) in inserts {
+            let end_ts = ts.saturating_add(self.block_span_samples(&data));
             match leg {
                 Leg::A => {
                     self.buffer_a.insert(ts, data);
@@ -518,6 +600,7 @@ impl Recorder {
                     self.buffer_b.insert(ts, data);
                 }
             }
+            self.bump_last_written(leg, end_ts);
         }
     }
 
@@ -1196,9 +1279,13 @@ mod tests {
             last_ssrc_b: None,
             profile_a: NegotiatedLegProfile::default(),
             profile_b: NegotiatedLegProfile::default(),
+            gain_a: 1.0,
+            gain_b: 1.0,
             dtmf_state_a: None,
             dtmf_state_b: None,
             next_flush_ts: 0,
+            last_written_ts_a: 0,
+            last_written_ts_b: 0,
             written_samples: 0,
             writer: Box::new(TestWriter::new()),
             ptime: Duration::from_millis(20),

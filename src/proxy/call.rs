@@ -5,6 +5,7 @@ use crate::call::{
     MediaConfig, RouteInvite, RoutingState, SipUser, TransactionCookie, TrunkContext,
 };
 use crate::config::{ProxyConfig, RouteResult};
+use crate::models::trunk::TrunkDirection;
 use crate::media::{Track, recorder::RecorderOption};
 use crate::proxy::active_call_registry::{ActiveProxyCallEntry, ActiveProxyCallStatus};
 use crate::proxy::data::ProxyDataContext;
@@ -12,7 +13,10 @@ use crate::proxy::proxy_call::CallSessionBuilder;
 use crate::proxy::proxy_call::sip_session::SipSession;
 use crate::proxy::routing::{
     RouteRule, SourceTrunk, TrunkConfig, build_source_trunk,
-    matcher::{RouteResourceLookup, match_invite},
+    matcher::{
+        DidLookup, RouteResourceLookup, build_did_extension_route_result, did_lookup_result,
+        match_invite,
+    },
 };
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -60,6 +64,78 @@ pub trait CallRouter: Send + Sync {
         caller: &SipUser,
         cookie: &TransactionCookie,
     ) -> Result<Dialplan, RouteError>;
+}
+
+/// Outcome of routing an inbound INVITE.
+///
+/// The standard path produces a [`Dialplan`] that the SIP forward machinery
+/// consumes. The `ExternalBridge` variant is emitted when the routing
+/// matcher resolves the INVITE to a `kind="webrtc"` (or, post-Phase 5,
+/// `kind="livekit"`) trunk. That variant short-circuits the forward
+/// machinery: the call layer drives the bridge dispatcher directly, replies
+/// 200 OK with the bridge's RTP-side SDP, and stashes session state for
+/// BYE-time teardown.
+///
+/// Custom [`CallRouter`] implementations don't produce this variant — only
+/// the built-in matcher invoked through `default_resolve` does. Hence the
+/// trait's signature stays `Result<Dialplan, _>` unchanged.
+pub enum DialplanOutcome {
+    Dialplan(Dialplan),
+    ExternalBridge {
+        kind: crate::proxy::bridge::session::BridgeKind,
+        trunk_name: String,
+        kind_config: serde_json::Value,
+    },
+}
+
+impl std::fmt::Debug for DialplanOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dialplan(_) => f.debug_struct("Dialplan").finish_non_exhaustive(),
+            Self::ExternalBridge { kind, trunk_name, .. } => f
+                .debug_struct("ExternalBridge")
+                .field("kind", &kind.as_str())
+                .field("trunk_name", trunk_name)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+impl DialplanOutcome {
+    /// Test/internal helper: unwrap to a [`Dialplan`], panicking on the
+    /// `ExternalBridge` variant. Used by unit tests that exercise
+    /// `default_resolve` against non-bridge routes.
+    pub fn expect_dialplan(self) -> Dialplan {
+        match self {
+            Self::Dialplan(d) => d,
+            Self::ExternalBridge { kind, trunk_name, .. } => {
+                panic!(
+                    "expected DialplanOutcome::Dialplan, got ExternalBridge {} {trunk_name}",
+                    kind.as_str()
+                )
+            }
+        }
+    }
+}
+
+/// Extract the caller's IP from an incoming request (prefers Via `received`
+/// param, falls back to Via sent-by host). Used to pick the local interface
+/// that routes back to the caller for Contact/SDP.
+fn extract_peer_ip_from_request(req: &rsipstack::sip::Request) -> Option<IpAddr> {
+    use rsipstack::sip::ToTypedHeader;
+    let via = req.via_header().ok()?;
+    let typed = via.typed().ok()?;
+    for param in &typed.params {
+        if let rsipstack::sip::Param::Received(r) = param {
+            if let Ok(ip) = r.parse() {
+                return Some(ip);
+            }
+        }
+    }
+    match typed.uri.host() {
+        rsipstack::sip::Host::IpAddr(ip) => Some(*ip),
+        rsipstack::sip::Host::Domain(_) => None,
+    }
 }
 
 fn q850_cause_from_status(code: &rsipstack::sip::StatusCode) -> u16 {
@@ -131,6 +207,37 @@ pub struct DefaultRouteInvite {
     pub source_trunk_hint: Option<String>,
 }
 
+/// CDR-seed fields threaded into `finalize_bridge_answer` after a bridge call
+/// is answered. Grouped so the finalizer's signature stays readable.
+struct BridgeAnswerSeed {
+    call_id: String,
+    caller_uri: String,
+    callee_uri: String,
+    from_number: Option<String>,
+    to_number: Option<String>,
+    trunk_name: String,
+    trunk_id: i64,
+    start_time: chrono::DateTime<chrono::Utc>,
+}
+
+/// Map a bridge dispatch error to a (SIP status code, reason) pair for the
+/// pre-answer engine's reject. Honours an explicit LiveKit Decision-API
+/// rejection (`DispatchRejection`); everything else is a generic 503.
+fn classify_bridge_dispatch_error(e: &anyhow::Error) -> (u16, String) {
+    if let Some(rej) =
+        e.downcast_ref::<crate::proxy::bridge::livekit::dispatch::DispatchRejection>()
+    {
+        (
+            rej.code,
+            rej.reason
+                .clone()
+                .unwrap_or_else(|| "dispatch rejected".to_string()),
+        )
+    } else {
+        (503, format!("dispatch failed: {e}"))
+    }
+}
+
 #[async_trait]
 impl RouteInvite for DefaultRouteInvite {
     async fn route_invite(
@@ -189,7 +296,103 @@ impl RouteInvite for DefaultRouteInvite {
                     ));
                 }
             }
+
+            // ─── DID-first lookup ────────────────────────────────────────
+            if let Some(source) = source_trunk.as_ref() {
+                let did_index = self.data_context.did_index();
+                let default_country = self.data_context.did_default_country();
+                let strict = self.data_context.did_strict_mode();
+                let to_user = extract_to_user(origin).unwrap_or_default();
+
+                match did_lookup_result(
+                    &did_index,
+                    default_country.as_deref(),
+                    &to_user,
+                    &source.name,
+                    strict,
+                ) {
+                    DidLookup::ShortCircuitExtension(ext) => {
+                        info!(
+                            did = %to_user,
+                            extension = %ext,
+                            trunk = %source.name,
+                            "inbound DID resolved directly to extension"
+                        );
+                        return build_did_extension_route_result(option, &ext);
+                    }
+                    DidLookup::Reject(detail) => {
+                        let reason = q850_reason_value(
+                            &rsipstack::sip::StatusCode::Forbidden,
+                            Some(&detail),
+                        );
+                        warn!(
+                            trunk = %source.name,
+                            reason = %reason,
+                            "rejecting inbound INVITE due to DID ownership mismatch"
+                        );
+                        return Ok(RouteResult::Abort(
+                            rsipstack::sip::StatusCode::Forbidden,
+                            Some(reason),
+                        ));
+                    }
+                    DidLookup::KnownNoExtension { number, .. } => {
+                        debug!(
+                            did = %number,
+                            trunk = %source.name,
+                            "inbound DID recognized, no direct extension; falling through to rules"
+                        );
+                    }
+                    DidLookup::FallThrough => {}
+                }
+            }
         }
+
+        // Disabled-DID guard for BOTH directions: a soft-disabled DID must
+        // not be usable as caller-id (outbound) or destination (any side).
+        // Inbound destination is already covered by did_lookup_result above;
+        // this block adds the caller-id check (covers inbound spoofing too)
+        // and the outbound destination check.
+        {
+            let did_index = self.data_context.did_index();
+            let default_country = self.data_context.did_default_country();
+            let from_user = extract_from_user(origin).unwrap_or_default();
+            let to_user = extract_to_user(origin).unwrap_or_default();
+            for (party, raw) in [("caller", &from_user), ("callee", &to_user)] {
+                if raw.is_empty() {
+                    continue;
+                }
+                let region_upper = default_country.as_deref().map(|c| c.to_ascii_uppercase());
+                let normalized = match crate::models::did::normalize_did(raw, region_upper.as_deref()) {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                };
+                if let Some(entry) = did_index.lookup(&normalized)
+                    && !entry.enabled
+                {
+                    // Skip the inbound-callee case — already handled above
+                    // (would otherwise double-log and never reach here since
+                    // the inbound branch returned). Outbound callee, and
+                    // either-direction caller, both flow through here.
+                    let detail = format!("Number is disabled: {}", normalized);
+                    let reason = q850_reason_value(
+                        &rsipstack::sip::StatusCode::Forbidden,
+                        Some(&detail),
+                    );
+                    warn!(
+                        direction = ?direction,
+                        party = %party,
+                        number = %normalized,
+                        reason = %reason,
+                        "rejecting INVITE — {} number is disabled", party,
+                    );
+                    return Ok(RouteResult::Abort(
+                        rsipstack::sip::StatusCode::Forbidden,
+                        Some(reason),
+                    ));
+                }
+            }
+        }
+
         let resource_lookup = self.data_context.as_ref() as &dyn RouteResourceLookup;
         match_invite(
             if trunks_snapshot.is_empty() {
@@ -384,6 +587,12 @@ impl CallModule {
                 Some(Arc::new(crate::call::policy::PolicyGuard::new(limiter)));
         }
 
+        // Phase R-full/T — attach DB so the runtime matcher / trunk-group
+        // resolver / capacity check can query the supersip_* tables.
+        if let Some(db) = server.database.clone() {
+            routing_state = routing_state.with_db(db);
+        }
+
         let inner = Arc::new(CallModuleInner {
             config,
             server,
@@ -393,13 +602,58 @@ impl CallModule {
         Self { inner }
     }
 
+    /// Decide whether `callee_uri` resolves to a destination this server hosts
+    /// (a known enabled DID, a local extension, or a callee registered on a
+    /// cluster peer). Used to disambiguate the routing direction for calls
+    /// arriving on a `bidirectional` trunk, where the realm check alone cannot
+    /// tell inbound DID termination apart from outbound PSTN routing.
+    async fn is_local_callee_destination(
+        &self,
+        callee_uri: &rsipstack::sip::Uri,
+        callee_realm: &str,
+        original: &rsipstack::sip::Request,
+    ) -> bool {
+        let callee_user = callee_uri.user().unwrap_or_default();
+        if callee_user.is_empty() {
+            return false;
+        }
+
+        // 1. Known, enabled DID hosted on this system → inbound termination.
+        let did_index = self.inner.server.data_context.did_index();
+        let default_country = self.inner.server.data_context.did_default_country();
+        let region_upper = default_country.as_deref().map(|c| c.to_ascii_uppercase());
+        if let Ok(normalized) = crate::models::did::normalize_did(callee_user, region_upper.as_deref())
+            && let Some(entry) = did_index.lookup(&normalized)
+            && entry.enabled
+        {
+            return true;
+        }
+
+        // 2. Local extension/user.
+        if let Ok(Some(_)) = self
+            .inner
+            .server
+            .user_backend
+            .get_user(callee_user, Some(callee_realm), Some(original))
+            .await
+        {
+            return true;
+        }
+
+        // 3. Callee registered on a shared-locator cluster peer.
+        matches!(
+            self.inner.server.locator.lookup(callee_uri).await,
+            Ok(locs) if !locs.is_empty()
+        )
+    }
+
     async fn default_resolve(
         &self,
         original: &rsipstack::sip::Request,
         route_invite: Box<dyn RouteInvite>,
         caller: &SipUser,
         cookie: &TransactionCookie,
-    ) -> Result<Dialplan, RouteError> {
+    ) -> Result<DialplanOutcome, RouteError> {
         let callee_uri = resolve_callee_uri(original).map_err(|e| RouteError::from((e, None)))?;
         let callee_realm = callee_uri.host().to_string();
 
@@ -463,7 +717,26 @@ impl CallModule {
         } else if caller_is_same_realm && !callee_is_same_realm {
             DialDirection::Outbound
         } else if !caller_is_same_realm && callee_is_same_realm {
-            DialDirection::Inbound
+            // External caller, callee on our server. Classify by the source trunk's
+            // configured direction so outbound route rules are evaluated for trunks
+            // that originate calls (e.g. VAPI). Without a trunk this stays Inbound.
+            match cookie.get_extension::<TrunkContext>().map(|ctx| ctx.direction) {
+                Some(TrunkDirection::Outbound) => DialDirection::Outbound,
+                Some(TrunkDirection::Inbound) | None => DialDirection::Inbound,
+                Some(TrunkDirection::Bidirectional) => {
+                    // Ambiguous: a bidirectional trunk carries both inbound DID
+                    // termination and outbound routing. Disambiguate by the callee —
+                    // a destination we host is inbound, anything else routes out.
+                    if self
+                        .is_local_callee_destination(&callee_uri, &callee_realm, original)
+                        .await
+                    {
+                        DialDirection::Inbound
+                    } else {
+                        DialDirection::Outbound
+                    }
+                }
+            }
         } else {
             if is_from_trunk {
                 // If the call comes from a trunk, we can allow it to reach an internal destination even if the callee realm doesn't match, as long as the caller realm also doesn't match (to prevent external-to-external calls).
@@ -641,6 +914,23 @@ impl CallModule {
             match preview_outcome {
                 RouteResult::Queue { queue, hints, .. } => (None, Some(queue), None, hints),
                 RouteResult::Forward(option, hints) => (Some(option), None, None, hints),
+                // PR 6: matcher detected a `kind="webrtc"` trunk. Short-circuit
+                // the SIP-forward Dialplan flow — the call layer drives the
+                // bridge dispatcher directly. See
+                // `proxy::call::CallModule::handle_invite` for the
+                // dispatch + 200-OK + session-stash code path.
+                RouteResult::ExternalBridge {
+                    kind,
+                    trunk_name,
+                    kind_config,
+                    ..
+                } => {
+                    return Ok(DialplanOutcome::ExternalBridge {
+                        kind,
+                        trunk_name,
+                        kind_config,
+                    });
+                }
                 RouteResult::NotHandled(_, hints) => (None, None, None, hints),
                 RouteResult::Abort(code, reason) => {
                     let err = anyhow::anyhow!(
@@ -655,6 +945,18 @@ impl CallModule {
                     auto_answer,
                     ..
                 } => (None, None, Some((app_name, app_params, auto_answer)), None),
+                RouteResult::Reject {
+                    code,
+                    reason,
+                    retry_after_secs: _,
+                } => {
+                    // Trunk-enforcement reject during preview. Map to a SIP
+                    // error response. The Retry-After header is not yet
+                    // plumbed through RouteError; reason carries the cause.
+                    let status = rsipstack::sip::StatusCode::from(code);
+                    let err = anyhow::anyhow!(reason);
+                    return Err(RouteError::from((err, Some(status))));
+                }
             }
         };
 
@@ -666,15 +968,64 @@ impl CallModule {
         } else if let Some(queue_targets) = queue_targets {
             queue_targets
         } else if let Some(option) = preview_forward.as_ref() {
-            let target = Location {
-                aor: option.callee.clone(),
-                destination: option.destination.clone(),
-                credential: option.credential.clone(),
-                headers: option.headers.clone(),
-                contact_raw: Some(option.callee.to_string()),
-                ..Default::default()
-            };
-            DialStrategy::Sequential(vec![target])
+            // On-net forwards from the routing layer (the DID→extension
+            // short-circuit and rule-driven internal forwards) arrive as
+            // Forward(callee=ext@realm, dest=None) with no contact metadata.
+            // Resolve the target's live registration through the locator so we
+            // dial the registered contact (destination/transport/webrtc)
+            // instead of DNS of the realm host — mirroring how queue and agent
+            // targets are resolved. Two cases are deliberately excluded and
+            // dialed as-is: forwards that already carry an explicit destination
+            // (e.g. external trunk forwards), and call-forwarding-always
+            // (`always_forwarding`), which has its own offline-bypass semantics
+            // and must not be subjected to the locator offline check.
+            let forward_realm = option.callee.host().to_string();
+            let forward_same_realm = self.inner.server.is_same_realm(&forward_realm).await;
+            if !always_forwarding && option.destination.is_none() && forward_same_realm {
+                match self.inner.server.locator.lookup(&option.callee).await {
+                    Ok(registrations) if !registrations.is_empty() => {
+                        info!(
+                            target = %option.callee,
+                            resolved_count = registrations.len(),
+                            "Resolved on-net forward target through locator"
+                        );
+                        // The target is registered, so it is not offline; clear
+                        // the marker that the original-DID lookup may have set.
+                        internal_lookup_empty = false;
+                        DialStrategy::Sequential(registrations)
+                    }
+                    Ok(_) => {
+                        warn!(
+                            target = %option.callee,
+                            "On-net forward target not registered; treating as offline"
+                        );
+                        internal_lookup_empty = true;
+                        DialStrategy::Sequential(vec![])
+                    }
+                    Err(error) => {
+                        // A locator/DB failure is infrastructure, not an offline
+                        // callee. Surface it distinctly; behaviour still falls
+                        // back to offline so the caller gets a clean 480.
+                        warn!(
+                            target = %option.callee,
+                            %error,
+                            "Locator lookup failed for on-net forward target; treating as offline"
+                        );
+                        internal_lookup_empty = true;
+                        DialStrategy::Sequential(vec![])
+                    }
+                }
+            } else {
+                let target = Location {
+                    aor: option.callee.clone(),
+                    destination: option.destination.clone(),
+                    credential: option.credential.clone(),
+                    headers: option.headers.clone(),
+                    contact_raw: Some(option.callee.to_string()),
+                    ..Default::default()
+                };
+                DialStrategy::Sequential(vec![target])
+            }
         } else {
             resolve_unhandled_targets(callee_is_same_realm, internal_lookup_empty, locs)?
         };
@@ -725,7 +1076,23 @@ impl CallModule {
             if hints.disable_ice_servers == Some(true) {
                 dialplan.media.ice_servers = None;
             }
-            if let Some(codecs) = hints.allow_codecs {
+            // Trunk media_config codecs are the most specific policy: they
+            // pin the egress offer AND flip to Quality strategy so codecs
+            // the caller didn't offer are appended (HD upgrade); the bridge
+            // transcoder covers the mismatch.
+            if let Some(codecs) = hints.trunk_media_codecs {
+                let mut allow_codecs = Vec::new();
+                for codec_name in &codecs {
+                    if let Ok(codec) = CodecType::try_from(codec_name.as_str()) {
+                        allow_codecs.push(codec);
+                    }
+                }
+                if !allow_codecs.is_empty() {
+                    dialplan.allow_codecs = allow_codecs;
+                    dialplan.media.codec_strategy =
+                        crate::media::negotiate::CodecSelectionStrategy::Quality;
+                }
+            } else if let Some(codecs) = hints.allow_codecs {
                 let mut allow_codecs = Vec::new();
                 for codec_name in codecs {
                     if let Ok(codec) = CodecType::try_from(codec_name.as_str()) {
@@ -746,6 +1113,7 @@ impl CallModule {
                     dialplan.allow_codecs = allow_codecs;
                 }
             }
+            dialplan.media.jitter_buffer_callee = hints.trunk_jitter_buffer;
             dialplan.extensions = std::mem::take(&mut hints.extensions);
         } else if let Some(codecs) = &self.inner.config.codecs {
             let mut allow_codecs = Vec::new();
@@ -759,11 +1127,23 @@ impl CallModule {
             }
         }
 
+        // Caller-leg jitter policy from the INBOUND trunk's media_config
+        // (best-effort; needs the DB-wired routing state).
+        if let (Some(trunk_ctx), Some(db)) = (
+            cookie.get_extension::<TrunkContext>(),
+            self.inner.routing_state.db(),
+        ) && let Some(cfg) =
+            crate::proxy::routing::matcher::trunk_group_media_config(db, &trunk_ctx.name)
+                .await
+        {
+            dialplan.media.jitter_buffer_caller = cfg.jitter_buffer;
+        }
+
         if callee_is_same_realm && internal_lookup_empty {
             dialplan.extensions.insert(CalleeOfflineMarker);
         }
 
-        Ok(dialplan)
+        Ok(DialplanOutcome::Dialplan(dialplan))
     }
 
     fn apply_recording_policy(&self, mut dialplan: Dialplan, caller: &SipUser) -> Dialplan {
@@ -773,7 +1153,15 @@ impl CallModule {
             _ => return dialplan,
         };
 
-        if sipflow_active {
+        // When sipflow is active AND the recording policy only wants local files,
+        // let sipflow be the sole recording mechanism. But when recording is
+        // explicitly configured for S3/Http upload (uploads_recording() = true),
+        // the user wants WAV files pushed to cloud — allow both to coexist.
+        if sipflow_active && !policy.uploads_recording() {
+            warn!(
+                "sipflow active and recording.type is local — recording disabled for this call; \
+                 set recording.type = \"s3\" or \"http\" to enable recording alongside sipflow"
+            );
             dialplan.recording.enabled = false;
             dialplan.recording.option = None;
             return dialplan;
@@ -1008,7 +1396,7 @@ impl CallModule {
         tx: &mut Transaction,
         cookie: TransactionCookie,
         caller: &SipUser,
-    ) -> Result<Dialplan, RouteError> {
+    ) -> Result<DialplanOutcome, RouteError> {
         let trunk_context = cookie.get_extension::<TrunkContext>();
         let source_trunk_hint = trunk_context.as_ref().map(|c| c.name.clone());
 
@@ -1036,25 +1424,47 @@ impl CallModule {
             }
         };
 
-        let dialplan = if let Some(resolver) = self.inner.server.call_router.as_ref() {
-            resolver
-                .resolve(&tx.original, route_invite, caller, &cookie)
-                .await
+        // Custom CallRouter implementations cannot emit an ExternalBridge
+        // outcome — only the built-in matcher does. So a custom router's
+        // `Dialplan` is wrapped as-is.
+        let outcome: DialplanOutcome = if let Some(resolver) =
+            self.inner.server.call_router.as_ref()
+        {
+            DialplanOutcome::Dialplan(
+                resolver
+                    .resolve(&tx.original, route_invite, caller, &cookie)
+                    .await?,
+            )
         } else {
             self.default_resolve(&tx.original, route_invite, caller, &cookie)
-                .await
-        }?;
+                .await?
+        };
 
-        let mut dialplan = dialplan;
-        if dialplan.caller_contact.is_none()
-            && let Some(contact_uri) = self.inner.server.default_contact_uri()
-        {
-            let contact = rsipstack::sip::typed::Contact {
-                display_name: None,
-                uri: contact_uri,
-                params: vec![],
-            };
-            dialplan = dialplan.with_caller_contact(contact);
+        let mut dialplan = match outcome {
+            DialplanOutcome::Dialplan(d) => d,
+            // The bridge branch skips all dialplan-flavor post-processing
+            // (caller_contact, inspectors, callee user lookup, recording
+            // policy) — none of it applies to a media-only bridge.
+            bridge @ DialplanOutcome::ExternalBridge { .. } => return Ok(bridge),
+        };
+        if dialplan.caller_contact.is_none() {
+            // Use the local IP that routes to the caller, so the caller can
+            // actually reach us for ACK/BYE. Falls back to default when the
+            // caller's IP can't be extracted.
+            let caller_peer_ip = extract_peer_ip_from_request(&tx.original);
+            let contact_uri = self
+                .inner
+                .server
+                .contact_uri_for_peer(caller_peer_ip)
+                .or_else(|| self.inner.server.default_contact_uri());
+            if let Some(contact_uri) = contact_uri {
+                let contact = rsipstack::sip::typed::Contact {
+                    display_name: None,
+                    uri: contact_uri,
+                    params: vec![],
+                };
+                dialplan = dialplan.with_caller_contact(contact);
+            }
         }
         for inspector in &self.inner.server.dialplan_inspectors {
             dialplan = inspector
@@ -1100,7 +1510,1105 @@ impl CallModule {
         }
 
         let dialplan = self.apply_recording_policy(dialplan, caller);
-        Ok(dialplan)
+        Ok(DialplanOutcome::Dialplan(dialplan))
+    }
+
+    /// Drive the external (WebRTC / LiveKit) bridge for an INVITE whose
+    /// routing matcher resolved to a `kind="webrtc"` / `kind="livekit"`
+    /// trunk.
+    ///
+    /// Returns `Ok(())` after a successful dispatch + 200-OK + session-stash
+    /// (the bridge media tasks are running by the time this returns). Any
+    /// dispatcher / SDP / DB error is mapped to a SIP failure response and
+    /// returned as `Err`.
+    async fn dispatch_external_bridge(
+        &self,
+        tx: &mut Transaction,
+        kind: crate::proxy::bridge::session::BridgeKind,
+        trunk_name: &str,
+    ) -> Result<(), RouteError> {
+        use crate::callrecord::CallRecordHangupReason;
+        use crate::proxy::bridge::session::BridgeKind;
+        use crate::proxy::bridge_sessions::{
+            BridgeCallDirection, BridgeCallRecordInfo, emit_bridge_call_record,
+        };
+
+        // Capture CDR-relevant headers up front so they're available on any
+        // error path (capacity reject, dispatch fail, reply fail, ...).
+        // We emit a failure CDR on those returns so missed/blocked calls
+        // are still visible to billing/audit.
+        let cdr_sender = self.inner.server.callrecord_sender.clone();
+        let cdr_call_id = tx
+            .original
+            .call_id_header()
+            .map(|h| h.value().to_string())
+            .unwrap_or_default();
+        let cdr_caller_uri = tx
+            .original
+            .from_header()
+            .ok()
+            .and_then(|h| h.uri().ok())
+            .map(|u| u.to_string())
+            .unwrap_or_default();
+        let cdr_callee_uri = tx.original.uri.to_string();
+        let cdr_from_number = extract_from_user(&tx.original);
+        let cdr_to_number = extract_to_user(&tx.original);
+        let cdr_start = chrono::Utc::now();
+        // Helper closure to emit a failure CDR before returning Err.
+        let emit_failure_cdr = |status_code: u16,
+                                hangup_reason: CallRecordHangupReason,
+                                reason: Option<String>,
+                                trunk_id: Option<i64>| {
+            emit_bridge_call_record(
+                cdr_sender.as_ref(),
+                &BridgeCallRecordInfo {
+                    call_id: cdr_call_id.clone(),
+                    caller_uri: cdr_caller_uri.clone(),
+                    callee_uri: cdr_callee_uri.clone(),
+                    from_number: cdr_from_number.clone(),
+                    to_number: cdr_to_number.clone(),
+                    trunk_name: trunk_name.to_string(),
+                    trunk_id,
+                    start_time: cdr_start,
+                    end_time: chrono::Utc::now(),
+                    status_code,
+                    hangup_reason,
+                    last_error_reason: reason,
+                    direction: BridgeCallDirection::Inbound,
+                    answer_time: None,
+                    kind,
+                    // Failure path runs before a Recorder is created — no
+                    // file to attach.
+                    recording_path: None,
+                },
+            );
+        };
+
+        let offer_body = tx.original.body();
+        if offer_body.is_empty() {
+            emit_failure_cdr(
+                400,
+                CallRecordHangupReason::Rejected,
+                Some("INVITE missing SDP offer".into()),
+                None,
+            );
+            return Err(RouteError::from((
+                anyhow!("INVITE has empty body — webrtc bridge requires SDP offer"),
+                Some(rsipstack::sip::StatusCode::BadRequest),
+            )));
+        }
+        let offer_sdp = std::str::from_utf8(offer_body).map_err(|e| {
+            emit_failure_cdr(
+                400,
+                CallRecordHangupReason::Rejected,
+                Some(format!("INVITE body not valid UTF-8: {e}")),
+                None,
+            );
+            RouteError::from((
+                anyhow!("INVITE body is not valid UTF-8 SDP: {e}"),
+                Some(rsipstack::sip::StatusCode::BadRequest),
+            ))
+        })?;
+        // Own the offer now so the borrow of `tx` (via `offer_body`) ends here,
+        // freeing `tx` for the mutable borrows below (send_trying, dialog driver).
+        let offer_owned = offer_sdp.to_string();
+        let offer_bytes = offer_body.to_vec();
+
+        // Rejected-INVITE replay: a carrier failover-retrying an INVITE we
+        // already rejected (same Call-ID + From-tag, within the cache TTL)
+        // gets the cached final status back without re-running routing,
+        // capacity accounting, or dispatch — protects the CPS bucket and the
+        // bot's session capacity from retry storms.
+        let from_tag = tx
+            .original
+            .from_header()
+            .ok()
+            .and_then(|f| f.tag().ok().flatten())
+            .map(|t| t.to_string())
+            .unwrap_or_default();
+        if !self.inner.config.disable_rejected_invite_cache
+            && let Some((status, reason)) =
+                self.inner.server.rejected_invites.get(&cdr_call_id, &from_tag)
+        {
+            info!(call_id = %cdr_call_id, status, "replaying cached bridge INVITE rejection");
+            crate::metrics::bridge::dispatch_outcome(kind, "rejection_replayed");
+            let code = rsipstack::sip::StatusCode::from(status);
+            let reason_value =
+                q850_reason_value(&code, reason.as_deref().or(Some("retry rejected")));
+            tx.reply_with(
+                code,
+                vec![rsipstack::sip::Header::Other("Reason".into(), reason_value)],
+                None,
+            )
+            .await
+            .map_err(|e| RouteError::from((anyhow!("replay reply failed: {e}"), None)))?;
+            return Ok(());
+        }
+        // Populate the cache from every final-rejection path below.
+        let rejected_cache = (!self.inner.config.disable_rejected_invite_cache)
+            .then(|| self.inner.server.rejected_invites.clone());
+        let record_rejection = |status: u16, reason: Option<String>| {
+            if let Some(cache) = rejected_cache.as_ref() {
+                cache.put(&cdr_call_id, &from_tag, status, reason);
+            }
+        };
+
+        // Pre-answer engine, step 1: send 100 Trying immediately, before any
+        // network-dependent setup (DB fetch, capacity, signaling). Without
+        // this the carrier hears silence for the whole setup window and may
+        // retransmit the INVITE / fail over. `send_trying` is idempotent with
+        // the dialog layer's own 100 (a retransmit at the transaction level).
+        tx.send_trying().await.ok();
+
+        let db = self.inner.server.database.as_ref().ok_or_else(|| {
+            emit_failure_cdr(
+                500,
+                CallRecordHangupReason::Failed,
+                Some("no DB connection".into()),
+                None,
+            );
+            RouteError::from((
+                anyhow!("webrtc bridge requires a database connection"),
+                Some(rsipstack::sip::StatusCode::ServerInternalError),
+            ))
+        })?;
+
+        // Single DB fetch — capacity, dispatch, AND close-context all read
+        // from this one row. Previously each of these went through its own
+        // round-trip per INVITE. Kind-aware: the matcher already steered
+        // us to the right arm, so we just validate that the DB row still
+        // matches.
+        let trunk_row = match crate::proxy::bridge::common::fetch_external_trunk(
+            db, trunk_name, kind,
+        )
+        .await
+        {
+            Ok(row) => row,
+            Err(e) => {
+                warn!(trunk = %trunk_name, error = %e, "webrtc trunk lookup failed");
+                emit_failure_cdr(
+                    503,
+                    CallRecordHangupReason::ServerUnavailable,
+                    Some(format!("trunk lookup failed: {e}")),
+                    None,
+                );
+                return Err(RouteError::from((
+                    e,
+                    Some(rsipstack::sip::StatusCode::ServiceUnavailable),
+                )));
+            }
+        };
+        let (trunk_id, max_calls, max_cps) =
+            crate::proxy::webrtc_route_dispatch::capacity_limits_for(&trunk_row);
+
+        // Capacity gate. Acquire a permit before any expensive setup; drop
+        // it (refund the CPS token + active counter) on any subsequent
+        // failure path so a stream of failing INVITEs doesn't drain the
+        // bucket and starve legitimate traffic.
+        let mut permit_opt = if max_calls.is_some() || max_cps.is_some() {
+            use crate::proxy::trunk_capacity_state::AcquireOutcome;
+            match self
+                .inner
+                .server
+                .trunk_capacity
+                .try_acquire(trunk_id, max_calls, max_cps)
+            {
+                AcquireOutcome::Ok(permit) => Some(permit),
+                AcquireOutcome::CallsExhausted => {
+                    warn!(trunk = %trunk_name, max_calls = ?max_calls,
+                          "webrtc bridge rejected: concurrent-call cap reached");
+                    emit_failure_cdr(
+                        503,
+                        CallRecordHangupReason::ServerUnavailable,
+                        Some(format!(
+                            "trunk concurrent-call cap reached (max_calls={:?})",
+                            max_calls
+                        )),
+                        Some(trunk_id),
+                    );
+                    return Err(RouteError::from((
+                        anyhow!(
+                            "trunk '{}' concurrent-call cap reached (max_calls={:?})",
+                            trunk_name,
+                            max_calls
+                        ),
+                        Some(rsipstack::sip::StatusCode::ServiceUnavailable),
+                    )));
+                }
+                AcquireOutcome::CpsExhausted => {
+                    warn!(trunk = %trunk_name, max_cps = ?max_cps,
+                          "webrtc bridge rejected: CPS cap reached");
+                    emit_failure_cdr(
+                        503,
+                        CallRecordHangupReason::ServerUnavailable,
+                        Some(format!("trunk CPS cap reached (max_cps={:?})", max_cps)),
+                        Some(trunk_id),
+                    );
+                    return Err(RouteError::from((
+                        anyhow!(
+                            "trunk '{}' CPS cap reached (max_cps={:?})",
+                            trunk_name,
+                            max_cps
+                        ),
+                        Some(rsipstack::sip::StatusCode::ServiceUnavailable),
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+
+        let ice_servers = self.inner.server.rtp_config.ice_servers.as_deref();
+
+        // Headers surfaced to the bridge far-end as `sip.h.<Header>` attributes
+        // (parallels livekit/sip's HeadersToAttrs). Default: only the operator's
+        // custom `X-*` headers. When the trunk sets `expose_headers_to_bot`, use
+        // the shared allow-list filter so identity headers (P-Asserted-Identity,
+        // Diversion, History-Info, …) reach the bot too — never sensitive ones.
+        let expose_headers_to_bot = match kind {
+            BridgeKind::WebRtc => {
+                trunk_row.webrtc().map(|c| c.expose_headers_to_bot).unwrap_or(false)
+            }
+            _ => false,
+        };
+        let sip_headers: Vec<(String, String)> = if expose_headers_to_bot {
+            crate::proxy::bridge::common::filtered_remote_headers(&tx.original)
+        } else {
+            tx.original
+                .headers
+                .iter()
+                .filter_map(|h| match h {
+                    rsipstack::sip::Header::Other(name, value)
+                        if name.len() >= 2 && name[..2].eq_ignore_ascii_case("x-") =>
+                    {
+                        Some((name.clone(), value.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let dispatch_ctx = crate::proxy::bridge::common::DispatchContext {
+            call_id: cdr_call_id.clone(),
+            from_user: cdr_from_number.clone().unwrap_or_default(),
+            to_user: cdr_to_number.clone().unwrap_or_default(),
+            // Public IP + bind/port config so the SIP-leg answer SDP
+            // advertises a routable address (not the cloud VM's private
+            // interface IP). Same source the legacy forward path uses.
+            external_ip: self.inner.server.rtp_config.external_ip.clone(),
+            bind_ip: self.inner.server.rtp_config.bind_ip.clone(),
+            rtp_start_port: self.inner.server.rtp_config.start_port,
+            rtp_end_port: self.inner.server.rtp_config.end_port,
+            sip_headers,
+        };
+        // ── Pre-answer engine ──────────────────────────────────────────────
+        // Register the INVITE as a server dialog so provisional responses
+        // (100/180), the To-tag, ACK absorption, and CANCEL detection are
+        // owned by the dialog layer (mirrors the B2BUA path). Dispatch runs
+        // concurrently while we send 180 Ringing on a ticker; the 200 OK is
+        // gated on the trunk's media-commitment policy. CANCEL → 487, ring
+        // timeout → 480, dispatch failure → mapped status — all with the
+        // capacity permit refunded and a CDR emitted. See the
+        // `bridge-pre-answer` capability spec + design.md.
+        use crate::models::trunk::{
+            AnswerOn, DEFAULT_RINGING_INTERVAL_MS, DEFAULT_RING_TIMEOUT_MS,
+        };
+        use rsipstack::dialog::dialog::{DialogState, TerminatedReason};
+
+        // Resolve per-trunk pre-answer knobs (with kind-appropriate defaults).
+        let (ring_timeout_ms, ringing_interval_ms, answer_on) = match kind {
+            BridgeKind::WebRtc => match trunk_row.webrtc() {
+                Ok(c) => (
+                    c.ring_timeout_ms_resolved(),
+                    c.ringing_interval_ms_resolved(),
+                    c.answer_on_resolved(),
+                ),
+                Err(_) => (
+                    DEFAULT_RING_TIMEOUT_MS,
+                    DEFAULT_RINGING_INTERVAL_MS,
+                    AnswerOn::IceConnected,
+                ),
+            },
+            BridgeKind::LiveKit => match trunk_row.livekit() {
+                Ok(c) => (
+                    c.ring_timeout_ms_resolved(),
+                    c.ringing_interval_ms_resolved(),
+                    c.answer_on_resolved(),
+                ),
+                Err(_) => (
+                    DEFAULT_RING_TIMEOUT_MS,
+                    DEFAULT_RINGING_INTERVAL_MS,
+                    AnswerOn::AgentJoined,
+                ),
+            },
+            BridgeKind::ExternalMedia => match trunk_row.external_media() {
+                Ok(c) => (
+                    c.ring_timeout_ms_resolved(),
+                    c.ringing_interval_ms_resolved(),
+                    AnswerOn::Ready,
+                ),
+                Err(_) => (
+                    DEFAULT_RING_TIMEOUT_MS,
+                    DEFAULT_RINGING_INTERVAL_MS,
+                    AnswerOn::Ready,
+                ),
+            },
+        };
+        let ring_timeout = std::time::Duration::from_millis(ring_timeout_ms);
+        let ringing_interval =
+            std::time::Duration::from_millis(ringing_interval_ms.max(200));
+
+        // Post-answer media-inactivity timeout windows. Only the WebRTC kind
+        // has a `BridgePeer` data plane to poll; LiveKit / external_media run
+        // their own media planes (their bot-join watchdogs cover the "no media"
+        // case), so we disable the BridgePeer timer for them (ZERO).
+        let (media_timeout_initial, media_timeout_rolling) = match kind {
+            BridgeKind::WebRtc => match trunk_row.webrtc() {
+                Ok(c) => (
+                    std::time::Duration::from_millis(c.media_timeout_initial_ms_resolved()),
+                    std::time::Duration::from_millis(c.media_timeout_ms_resolved()),
+                ),
+                Err(_) => (
+                    std::time::Duration::from_millis(
+                        crate::models::trunk::DEFAULT_MEDIA_TIMEOUT_INITIAL_MS,
+                    ),
+                    std::time::Duration::from_millis(
+                        crate::models::trunk::DEFAULT_MEDIA_TIMEOUT_MS,
+                    ),
+                ),
+            },
+            _ => (std::time::Duration::ZERO, std::time::Duration::ZERO),
+        };
+
+        // Contact for provisional/final responses: advertise the interface
+        // reachable from the caller's network (same source as the B2BUA path).
+        let peer_ip = extract_peer_ip_from_request(&tx.original);
+        let local_contact = self.inner.server.contact_uri_for_peer(peer_ip);
+
+        // Create the server dialog (auto-sends 100 on first `handle`, owns the
+        // To-tag so 180/200 are consistent).
+        let (state_tx, mut state_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server_dialog = match self
+            .inner
+            .server
+            .dialog_layer
+            .get_or_create_server_invite(tx, state_tx, None, local_contact)
+        {
+            Ok(d) => d,
+            Err(e) => {
+                drop(permit_opt.take());
+                emit_failure_cdr(
+                    500,
+                    CallRecordHangupReason::Failed,
+                    Some(format!("server dialog create failed: {e}")),
+                    Some(trunk_id),
+                );
+                return Err(RouteError::from((
+                    anyhow!("failed to create server dialog for bridge: {e}"),
+                    Some(rsipstack::sip::StatusCode::ServerInternalError),
+                )));
+            }
+        };
+        let dialog_id = server_dialog.id();
+
+        // Dispatch runs as a concurrently-polled future (never dropped
+        // mid-poll unless we then await it to completion for cleanup).
+        let dispatch = async {
+            match kind {
+                BridgeKind::WebRtc => {
+                    crate::proxy::bridge::webrtc::dispatch_webrtc(
+                        &trunk_row,
+                        &offer_owned,
+                        ice_servers,
+                        &dispatch_ctx,
+                    )
+                    .await
+                }
+                BridgeKind::LiveKit => {
+                    crate::proxy::bridge::livekit::dispatch::dispatch_livekit(
+                        &trunk_row,
+                        &offer_owned,
+                        ice_servers,
+                        &dispatch_ctx,
+                    )
+                    .await
+                }
+                BridgeKind::ExternalMedia => {
+                    crate::proxy::bridge::external_media::dispatch::dispatch_external_media(
+                        &trunk_row,
+                        &offer_owned,
+                        ice_servers,
+                        &dispatch_ctx,
+                    )
+                    .await
+                }
+            }
+        };
+        tokio::pin!(dispatch);
+
+        let mut driver = server_dialog.clone();
+        let mut outcome: Option<crate::proxy::bridge::session::DispatchOutcome> = None;
+        let mut commit_fut: Option<
+            std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>,
+        > = None;
+        let mut answered = false;
+        let mut cancelled = false;
+        let mut timed_out = false;
+        let mut dispatch_failed: Option<(u16, String, anyhow::Error)> = None;
+        // On the answered path, `finalize` returns the bridge Arc and we hold the
+        // SDP so the post-loop code can spawn the liveness watchers once the loop
+        // has released `state_rx`.
+        let mut answered_bridge: Option<
+            std::sync::Arc<dyn crate::proxy::bridge::session::MediaBridge>,
+        > = None;
+        let mut answered_sdp = String::new();
+
+        let ring_deadline = tokio::time::sleep(ring_timeout);
+        tokio::pin!(ring_deadline);
+        let mut ticker = tokio::time::interval(ringing_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await; // consume the immediate first tick
+
+        // Initial 180 Ringing (gates have passed by now).
+        server_dialog.ringing(None, None).ok();
+
+        loop {
+            tokio::select! {
+                biased;
+                // Drive the dialog/transaction: pumps queued 100/180/200/4xx
+                // responses, absorbs INVITE retransmits, and returns on ACK
+                // (Confirmed), CANCEL (Terminated) or transaction error.
+                r = driver.handle(tx) => {
+                    if let Err(ref e) = r {
+                        debug!(%dialog_id, error = %e, "bridge dialog handle returned error");
+                    }
+                    if !answered && !timed_out && dispatch_failed.is_none() {
+                        // handle returned before answer and not due to our own
+                        // timeout/failure → caller sent CANCEL (487 already
+                        // emitted by the dialog layer).
+                        cancelled = true;
+                    }
+                    break;
+                }
+                // Early CANCEL signal (redundant with `handle` returning, but
+                // lets us stop the ticker promptly).
+                Some(st) = state_rx.recv() => {
+                    if matches!(st, DialogState::Terminated(_, TerminatedReason::UacCancel)) {
+                        cancelled = true;
+                    }
+                }
+                // Dispatch completed.
+                res = &mut dispatch,
+                    if outcome.is_none() && dispatch_failed.is_none() && !answered =>
+                {
+                    match res {
+                        Ok(o) => {
+                            let bridge = o.bridge.clone();
+                            let ao = answer_on;
+                            commit_fut = Some(Box::pin(async move {
+                                bridge.await_media_commitment(ao).await
+                            }));
+                            outcome = Some(o);
+                        }
+                        Err(e) => {
+                            let (code, reason) = classify_bridge_dispatch_error(&e);
+                            server_dialog
+                                .reject(
+                                    Some(rsipstack::sip::StatusCode::from(code)),
+                                    Some(reason.clone()),
+                                )
+                                .ok();
+                            dispatch_failed = Some((code, reason, e));
+                        }
+                    }
+                }
+                // Media commitment resolved (immediate for signaling /
+                // livekit / external_media; waits for ICE-connected on webrtc).
+                cr = async { commit_fut.as_mut().unwrap().await },
+                    if commit_fut.is_some() =>
+                {
+                    commit_fut = None;
+                    match cr {
+                        Ok(()) if !cancelled && !timed_out => {
+                            if let Some(o) = outcome.take() {
+                                let sdp = o.sip_sdp_answer.clone();
+                                let headers = vec![rsipstack::sip::Header::ContentType(
+                                    rsipstack::sip::headers::ContentType::from(
+                                        "application/sdp",
+                                    ),
+                                )];
+                                match server_dialog
+                                    .accept(Some(headers), Some(sdp.clone().into_bytes()))
+                                {
+                                    Ok(()) => {
+                                        crate::metrics::bridge::dispatch_outcome(
+                                            kind, "success",
+                                        );
+                                        let answer_time = chrono::Utc::now();
+                                        answered_sdp = sdp.clone();
+                                        answered_bridge = self
+                                            .finalize_bridge_answer(
+                                                dialog_id.clone(),
+                                                o,
+                                                kind,
+                                                permit_opt.take(),
+                                                &offer_bytes,
+                                                BridgeAnswerSeed {
+                                                    call_id: cdr_call_id.clone(),
+                                                    caller_uri: cdr_caller_uri.clone(),
+                                                    callee_uri: cdr_callee_uri.clone(),
+                                                    from_number: cdr_from_number.clone(),
+                                                    to_number: cdr_to_number.clone(),
+                                                    trunk_name: trunk_name.to_string(),
+                                                    trunk_id,
+                                                    start_time: cdr_start,
+                                                },
+                                                answer_time,
+                                                server_dialog.clone(),
+                                                sdp,
+                                                media_timeout_initial,
+                                                media_timeout_rolling,
+                                            )
+                                            .await;
+                                        answered = true;
+                                    }
+                                    Err(e) => {
+                                        warn!(%dialog_id, error = %e,
+                                            "bridge dialog accept failed after commitment");
+                                        o.teardown.close().await.ok();
+                                        dispatch_failed = Some((
+                                            500,
+                                            "accept failed".to_string(),
+                                            anyhow!("dialog accept failed: {e}"),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                        // Cancelled/timed-out raced the commitment — the
+                        // outcome (if any) is torn down in post-loop cleanup.
+                        Ok(()) => {}
+                        Err(e) => {
+                            // Bot media never established (PC Failed/Closed).
+                            server_dialog
+                                .reject(
+                                    Some(rsipstack::sip::StatusCode::ServiceUnavailable),
+                                    Some("bot media not established".to_string()),
+                                )
+                                .ok();
+                            dispatch_failed =
+                                Some((503, "bot media not established".to_string(), e));
+                        }
+                    }
+                }
+                // Ring timeout — bound the whole INVITE→final window. The
+                // `!timed_out` guard is essential: an elapsed `Sleep` is
+                // always Poll::Ready, so without it `biased` re-selects this
+                // arm every iteration and hot-spins re-sending 480 until
+                // handle(tx) returns.
+                _ = &mut ring_deadline, if !answered && dispatch_failed.is_none() && !timed_out => {
+                    timed_out = true;
+                    server_dialog
+                        .reject(
+                            Some(rsipstack::sip::StatusCode::TemporarilyUnavailable),
+                            Some("SIP;cause=480;text=\"ring timeout\"".to_string()),
+                        )
+                        .ok();
+                }
+                // Re-send 180 Ringing.
+                _ = ticker.tick(),
+                    if !answered && dispatch_failed.is_none() && !timed_out =>
+                {
+                    server_dialog.ringing(None, None).ok();
+                }
+            }
+        }
+
+        // ── Post-loop: answered path already stashed + started in finalize ──
+        if answered {
+            // Now that the engine loop has released `state_rx`, hand it to the
+            // post-answer liveness watchers (dialog keep-alive/teardown +
+            // bot-disconnect → carrier BYE). `answered_bridge` is `None` only if
+            // `start()` failed inside finalize (which already tore down).
+            if let Some(bridge) = answered_bridge {
+                self.spawn_bridge_liveness_watchers(
+                    dialog_id.clone(),
+                    bridge,
+                    state_rx,
+                    answered_sdp,
+                );
+            }
+            info!(%dialog_id, trunk = %trunk_name, kind = %kind.as_str(),
+                "external bridge established");
+            return Ok(());
+        }
+
+        // Not answered — make sure no bot session leaks, then refund + CDR.
+        if let Some(o) = outcome.take() {
+            o.teardown.close().await.ok();
+        } else if dispatch_failed.is_none() {
+            // Dispatch may still be in flight (cancel/timeout raced it). Await
+            // it bounded, then tear down its result so the bot session doesn't
+            // leak. (Cooperative early-abort via a cancel token is a follow-on;
+            // here we let dispatch settle.)
+            match tokio::time::timeout(std::time::Duration::from_secs(6), &mut dispatch).await
+            {
+                Ok(Ok(o)) => {
+                    o.teardown.close().await.ok();
+                }
+                // Dispatch cleaned up itself (close_on_setup_failure).
+                Ok(Err(_)) => {}
+                Err(_) => warn!(%dialog_id,
+                    "dispatch did not settle within grace after pre-answer abort; \
+                     bot session may leak until its idle timeout"),
+            }
+        }
+        drop(commit_fut);
+        drop(permit_opt.take());
+
+        if cancelled {
+            crate::metrics::bridge::dispatch_outcome(kind, "cancelled");
+            emit_failure_cdr(
+                487,
+                CallRecordHangupReason::ByCaller,
+                Some("caller cancelled before answer".to_string()),
+                Some(trunk_id),
+            );
+            return Ok(());
+        }
+        if timed_out {
+            crate::metrics::bridge::dispatch_outcome(kind, "ring_timeout");
+            record_rejection(480, Some("ring timeout".to_string()));
+            emit_failure_cdr(
+                480,
+                CallRecordHangupReason::Failed,
+                Some("ring timeout before media commitment".to_string()),
+                Some(trunk_id),
+            );
+            return Ok(());
+        }
+        if let Some((code, reason, err)) = dispatch_failed {
+            crate::metrics::bridge::dispatch_outcome(kind, "error");
+            record_rejection(code, Some(reason.clone()));
+            let hangup = if code >= 500 {
+                CallRecordHangupReason::ServerUnavailable
+            } else {
+                CallRecordHangupReason::Rejected
+            };
+            emit_failure_cdr(code, hangup, Some(reason), Some(trunk_id));
+            // Reject already sent on the dialog; returning Err is for metrics/
+            // logging. handle_invite's arm guards on `tx.last_response.is_none()`
+            // so it will not double-reply.
+            return Err(RouteError::from((
+                err,
+                Some(rsipstack::sip::StatusCode::from(code)),
+            )));
+        }
+
+        // Fallback: handle returned without answer/cancel/timeout/failure
+        // (e.g. transaction error). Treat as a server-side failure.
+        crate::metrics::bridge::dispatch_outcome(kind, "error");
+        emit_failure_cdr(
+            500,
+            CallRecordHangupReason::Failed,
+            Some("bridge setup ended without answer".to_string()),
+            Some(trunk_id),
+        );
+        Ok(())
+    }
+
+
+    /// Post-answer finalization for an external-bridge call: attach the
+    /// optional recorder, stash the [`BridgeSession`] in the registry (so a
+    /// BYE can find it), start the media forwarders, and — for kinds with a
+    /// media-plane end-of-call signal — spawn the disconnect watcher.
+    ///
+    /// The 200 OK has already been sent (via the dialog) by the pre-answer
+    /// engine; this only wires up the post-answer data plane. Errors starting
+    /// the bridge are handled here (teardown + CDR) — the SIP side is already
+    /// committed, so there is no failure response to send.
+    #[allow(clippy::too_many_arguments)]
+    async fn finalize_bridge_answer(
+        &self,
+        dialog_id: DialogId,
+        outcome: crate::proxy::bridge::session::DispatchOutcome,
+        kind: crate::proxy::bridge::session::BridgeKind,
+        permit: Option<crate::proxy::trunk_capacity_state::Permit>,
+        offer_bytes: &[u8],
+        seed: BridgeAnswerSeed,
+        answer_time: chrono::DateTime<chrono::Utc>,
+        server_dialog: rsipstack::dialog::server_dialog::ServerInviteDialog,
+        local_sdp: String,
+        media_timeout_initial: std::time::Duration,
+        media_timeout_rolling: std::time::Duration,
+    ) -> Option<std::sync::Arc<dyn crate::proxy::bridge::session::MediaBridge>> {
+        use crate::proxy::bridge::session::BridgeKind;
+        use crate::proxy::bridge_sessions::BridgeSession;
+
+        // Recording is gated on the global `[recording]` policy (same surface
+        // non-bridge calls use). WebRTC + ExternalMedia feed the shared
+        // Recorder (leg A = SIP caller, leg B = bot side); LiveKit has no
+        // recorder data plane yet.
+        let recording_supported = matches!(
+            kind,
+            BridgeKind::WebRtc | BridgeKind::ExternalMedia
+        );
+        let recording_path: Option<String> = self
+            .inner
+            .config
+            .recording
+            .as_ref()
+            .filter(|p| p.enabled)
+            .and_then(|policy| {
+                let root = policy.recorder_path();
+                let date = chrono::Utc::now().format("%Y%m%d").to_string();
+                let safe_call_id = Self::sanitize_filename_component(
+                    &seed.call_id,
+                    &uuid::Uuid::new_v4().to_string(),
+                );
+                let mut path = std::path::PathBuf::from(root);
+                path.push(date);
+                path.push(safe_call_id);
+                path.set_extension("wav");
+                Some(path.to_string_lossy().to_string())
+            });
+
+        if let Some(path) = recording_path.as_ref().filter(|_| recording_supported) {
+            match crate::media::recorder::Recorder::new(path, CodecType::PCMU) {
+                Ok(mut rec) => {
+                    let leg_a_profile =
+                        crate::media::negotiate::MediaNegotiator::extract_leg_profile(
+                            std::str::from_utf8(offer_bytes).unwrap_or(""),
+                        );
+                    rec.set_leg_profile(crate::media::recorder::Leg::A, leg_a_profile);
+                    let leg_b_channels =
+                        if kind == BridgeKind::ExternalMedia { 1 } else { 2 };
+                    let leg_b_profile = crate::media::negotiate::NegotiatedLegProfile {
+                        audio: Some(crate::media::negotiate::NegotiatedCodec {
+                            codec: CodecType::Opus,
+                            payload_type: 111,
+                            clock_rate: 48000,
+                            channels: leg_b_channels,
+                        }),
+                        video: None,
+                        dtmf: None,
+                    };
+                    rec.set_leg_profile(crate::media::recorder::Leg::B, leg_b_profile);
+                    if kind == BridgeKind::ExternalMedia {
+                        rec.set_leg_gain(crate::media::recorder::Leg::A, 3.0);
+                        rec.set_leg_gain(crate::media::recorder::Leg::B, 0.6);
+                    }
+                    let shared =
+                        std::sync::Arc::new(parking_lot::RwLock::new(Some(rec)));
+                    outcome.bridge.attach_recorder(shared);
+                    info!(call_id = %seed.call_id, path = %path, kind = %kind.as_str(),
+                        "bridge recording enabled");
+                }
+                Err(e) => {
+                    warn!(call_id = %seed.call_id, path = %path, error = %e,
+                        "failed to create bridge recorder; continuing without recording");
+                }
+            }
+        }
+        let recording_path = if recording_supported {
+            recording_path
+        } else {
+            None
+        };
+
+        // Stash the session *before* starting forwarders so a racing BYE can
+        // find the registry entry.
+        let bridge_arc = outcome.bridge.clone();
+        let session = BridgeSession {
+            bridge: outcome.bridge,
+            teardown: outcome.teardown,
+            server_dialog: Some(server_dialog),
+            local_sdp,
+            kind,
+            _permit: permit,
+            call_id: seed.call_id.clone(),
+            caller_uri: seed.caller_uri,
+            callee_uri: seed.callee_uri,
+            from_number: seed.from_number,
+            to_number: seed.to_number,
+            trunk_name: seed.trunk_name.clone(),
+            trunk_id: Some(seed.trunk_id),
+            start_time: seed.start_time,
+            answer_time,
+            recording_path,
+        };
+        self.inner
+            .server
+            .bridge_sessions
+            .insert(dialog_id.clone(), session)
+            .await;
+
+        // Start forwarding. If start fails after the 200 OK, tear down so the
+        // CDR captures it.
+        if let Err(e) = bridge_arc.start().await {
+            warn!(%dialog_id, error = %e,
+                "bridge start failed after answer — tearing down session");
+            // 200 OK is already on the wire; the media plane failed to start, so
+            // the caller would otherwise sit in dead air until its own RTP
+            // timeout. Use a bot-side cause so teardown sends a BYE to the
+            // carrier instead of leaving a zombie call (BotLost → carrier BYE).
+            self.teardown_external_bridge_if_present(
+                &dialog_id,
+                crate::proxy::bridge_sessions::BridgeHangupCause::BotLost,
+            )
+            .await;
+            return None;
+        }
+
+        // Arm the media-inactivity timeout (no-op for kinds passed ZERO windows).
+        bridge_arc.start_media_timeout(media_timeout_initial, media_timeout_rolling);
+
+        // The pre-answer engine spawns the post-answer liveness watchers (dialog
+        // state + bot disconnect) once it has moved `state_rx` out of its loop.
+        Some(bridge_arc)
+    }
+
+    /// Post-answer liveness watchers for a bridge call. Spawns two tasks:
+    ///
+    /// 1. **Dialog-state watcher** — consumes the server dialog's state channel
+    ///    for the call's lifetime: re-INVITE / UPDATE keep-alives are answered
+    ///    200 with the cached local SDP (so carrier session-refreshes don't kill
+    ///    long calls); INFO / NOTIFY / OPTIONS are absorbed 200; a `Terminated`
+    ///    drives teardown as a backstop.
+    /// 2. **Disconnect watcher** — resolves when the bot side ends the call
+    ///    (PC Failed/Closed, room disconnect, sidecar exit) and drives
+    ///    `teardown` with the bot cause, which sends a BYE to the carrier.
+    ///
+    /// Both funnel through `teardown_external_bridge_if_present`, which is
+    /// idempotent (registry `remove` returns `None` on the second call), so the
+    /// two watchers + the carrier-BYE fast path race safely.
+    fn spawn_bridge_liveness_watchers(
+        &self,
+        dialog_id: DialogId,
+        bridge: std::sync::Arc<dyn crate::proxy::bridge::session::MediaBridge>,
+        mut state_rx: tokio::sync::mpsc::UnboundedReceiver<
+            rsipstack::dialog::dialog::DialogState,
+        >,
+        local_sdp: String,
+    ) {
+        use crate::proxy::bridge_sessions::BridgeHangupCause;
+        use rsipstack::dialog::dialog::{DialogState, TerminatedReason};
+
+        // 1. Dialog-state watcher.
+        let module = self.clone();
+        let dlg_id = dialog_id.clone();
+        tokio::spawn(async move {
+            while let Some(state) = state_rx.recv().await {
+                match state {
+                    DialogState::Terminated(_, reason) => {
+                        let cause = match reason {
+                            TerminatedReason::UacBye | TerminatedReason::UasBye => {
+                                BridgeHangupCause::ByCaller
+                            }
+                            _ => BridgeHangupCause::TeardownFailed,
+                        };
+                        module
+                            .teardown_external_bridge_if_present(&dlg_id, cause)
+                            .await;
+                        break;
+                    }
+                    // re-INVITE / UPDATE keep-alive: replay our established SDP
+                    // (no renegotiation). Without a response the carrier's
+                    // session-refresh timer tears down a healthy call.
+                    DialogState::Updated(_, request, handle) => {
+                        let (headers, body) = if request.body().is_empty() {
+                            (None, None)
+                        } else {
+                            (
+                                Some(vec![rsipstack::sip::Header::ContentType(
+                                    rsipstack::sip::headers::ContentType::from(
+                                        "application/sdp",
+                                    ),
+                                )]),
+                                Some(local_sdp.clone().into_bytes()),
+                            )
+                        };
+                        if let Err(e) = handle
+                            .respond(rsipstack::sip::StatusCode::OK, headers, body)
+                            .await
+                        {
+                            warn!(dialog_id = %dlg_id, error = %e,
+                                "failed to answer bridge keep-alive re-INVITE/UPDATE");
+                        } else {
+                            debug!(dialog_id = %dlg_id, "answered bridge keep-alive");
+                        }
+                    }
+                    DialogState::Info(_, _, handle)
+                    | DialogState::Notify(_, _, handle)
+                    | DialogState::Options(_, _, handle)
+                    | DialogState::Message(_, _, handle) => {
+                        handle
+                            .respond(rsipstack::sip::StatusCode::OK, None, None)
+                            .await
+                            .ok();
+                    }
+                    // REFER on a bridge dialog isn't supported.
+                    DialogState::Refer(_, _, handle) => {
+                        handle
+                            .respond(rsipstack::sip::StatusCode::NotImplemented, None, None)
+                            .await
+                            .ok();
+                    }
+                    _ => {}
+                }
+            }
+        });
+
+        // 2. Disconnect watcher (all kinds — WebRTC now has a real
+        // `watch_disconnect`, LiveKit/external_media already did).
+        let module = self.clone();
+        tokio::spawn(async move {
+            let cause = bridge.watch_disconnect().await;
+            info!(%dialog_id, ?cause, "bridge signalled disconnect; tearing down");
+            drop(bridge);
+            module
+                .teardown_external_bridge_if_present(&dialog_id, cause)
+                .await;
+        });
+    }
+
+    /// BYE/transport-failure teardown hook for external bridge dialogs.
+    ///
+    /// Called from `on_transaction_begin` for in-dialog requests; if the
+    /// dialog matches a stashed external-bridge session we drain it, drive
+    /// `teardown.close()`, and drop the bridge. Teardown errors are logged
+    /// but not propagated — the BYE response goes out either way.
+    ///
+    /// `cause` carries why the teardown is happening (SIP-side BYE vs.
+    /// bot-side disconnect) and shapes the final CDR's `hangup_reason`.
+    async fn teardown_external_bridge_if_present(
+        &self,
+        dialog_id: &DialogId,
+        cause: crate::proxy::bridge_sessions::BridgeHangupCause,
+    ) {
+        use crate::callrecord::CallRecordHangupReason;
+        use crate::proxy::bridge_sessions::{
+            BridgeCallDirection, BridgeCallRecordInfo, BridgeHangupCause,
+            emit_bridge_call_record,
+        };
+        let session = match self
+            .inner
+            .server
+            .bridge_sessions
+            .remove(dialog_id)
+            .await
+        {
+            Some(s) => s,
+            None => return,
+        };
+
+        // Signal the far end before killing media (design D1 / liv-sip
+        // ordering). When the BOT side ended the call first (disconnect,
+        // media timeout), the carrier hasn't been told — send it a BYE on
+        // the server dialog. Caller-initiated (they sent us the BYE) and
+        // transport-failure causes skip this.
+        if cause.should_send_carrier_bye() {
+            match session.server_dialog.as_ref() {
+                Some(dlg) => match dlg.bye_with_reason(cause.bye_reason().to_string()).await {
+                    Ok(()) => {
+                        crate::metrics::bridge::bye_outcome(session.kind, "carrier_bye_sent");
+                        info!(%dialog_id, ?cause, "sent carrier BYE for bot-initiated teardown");
+                    }
+                    Err(e) => {
+                        crate::metrics::bridge::bye_outcome(session.kind, "carrier_bye_error");
+                        warn!(%dialog_id, ?cause, error = %e,
+                            "failed to send carrier BYE for bot-initiated teardown");
+                    }
+                },
+                None => warn!(%dialog_id, ?cause,
+                    "bot-initiated teardown but no server dialog to BYE the carrier"),
+            }
+        }
+
+        // Remove the dialog from the dialog layer now that the call is over
+        // (bridge dialogs have no ServerDialogGuard doing this for us).
+        self.inner.server.dialog_layer.remove_dialog(dialog_id);
+
+        // Stop the media plane now, so the disconnect-watcher (which holds an
+        // Arc clone of the bridge) can resolve its `watch_disconnect` and
+        // release the Arc — otherwise the WebRTC PCs stay open and the bridge
+        // never drops. Idempotent with the bridge's own Drop.
+        session.bridge.shutdown();
+
+        let teardown_ok = match session.teardown.close().await {
+            Ok(()) => {
+                crate::metrics::bridge::bye_outcome(session.kind, "ok");
+                true
+            }
+            Err(e) => {
+                crate::metrics::bridge::bye_outcome(session.kind, "teardown_error");
+                warn!(%dialog_id, error = %e, "external bridge teardown.close failed");
+                false
+            }
+        };
+
+        // Map the explicit cause + teardown outcome into the CDR hangup
+        // reason. `TeardownFailed` overrides whatever the caller passed,
+        // but only when adapter.close *also* errored (which is the only
+        // signal we have that the call ended unhealthily — SIP BYE itself
+        // is normal).
+        let hangup_reason = match (cause, teardown_ok) {
+            (BridgeHangupCause::ByCaller, true) => CallRecordHangupReason::ByCaller,
+            (BridgeHangupCause::ByCallee, true) => CallRecordHangupReason::ByCallee,
+            // Bot-side abnormal loss / media timeout: the call ended because
+            // the bot went away, which operators want visible as a failure.
+            (BridgeHangupCause::BotLost, _) | (BridgeHangupCause::MediaTimeout, _) => {
+                CallRecordHangupReason::Failed
+            }
+            // Watchdog firing is a service-side failure mode (the bot
+            // never showed up). Surface as Failed so operators see it
+            // in dashboards alongside other call failures.
+            (BridgeHangupCause::BotJoinTimeout, _) => CallRecordHangupReason::Failed,
+            (_, false) | (BridgeHangupCause::TeardownFailed, _) => {
+                CallRecordHangupReason::Failed
+            }
+        };
+        let last_error_reason = match (cause, teardown_ok) {
+            (BridgeHangupCause::BotJoinTimeout, _) => {
+                Some("bot did not join within bot_join_timeout_ms watchdog".to_string())
+            }
+            (BridgeHangupCause::BotLost, _) => {
+                Some("bot connection lost".to_string())
+            }
+            (BridgeHangupCause::MediaTimeout, _) => {
+                Some("media-inactivity timeout".to_string())
+            }
+            (_, false) => Some("teardown.close errored at teardown".to_string()),
+            _ => None,
+        };
+
+        emit_bridge_call_record(
+            self.inner.server.callrecord_sender.as_ref(),
+            &BridgeCallRecordInfo {
+                call_id: session.call_id.clone(),
+                caller_uri: session.caller_uri.clone(),
+                callee_uri: session.callee_uri.clone(),
+                from_number: session.from_number.clone(),
+                to_number: session.to_number.clone(),
+                trunk_name: session.trunk_name.clone(),
+                trunk_id: session.trunk_id,
+                start_time: session.start_time,
+                end_time: chrono::Utc::now(),
+                status_code: 200,
+                hangup_reason,
+                last_error_reason,
+                direction: BridgeCallDirection::Inbound,
+                answer_time: Some(session.answer_time),
+                kind: session.kind,
+                recording_path: session.recording_path.clone(),
+            },
+        );
+
+        // Dropping `session` drops the last MediaBridge handle (assuming
+        // nothing else holds one), triggering the bridge's Drop which
+        // cancels its cancel_token; the forwarding tasks exit. It also
+        // drops the capacity Permit, refunding the active slot.
+        info!(%dialog_id, "external bridge torn down");
     }
 
     fn report_failure(
@@ -1111,10 +2619,13 @@ impl CallModule {
         reason: Option<String>,
         extensions: Option<HashMap<String, String>>,
     ) {
-        let direction = if cookie.get_extension::<TrunkContext>().is_some() {
-            DialDirection::Inbound
-        } else {
-            DialDirection::Internal
+        // Mirror the direction classification used in default_resolve so failure
+        // CDRs are labeled consistently. Outbound trunks (and the outbound side of
+        // bidirectional trunks) report Outbound; everything else stays Inbound.
+        let direction = match cookie.get_extension::<TrunkContext>().map(|ctx| ctx.direction) {
+            Some(TrunkDirection::Outbound) => DialDirection::Outbound,
+            Some(_) => DialDirection::Inbound,
+            None => DialDirection::Internal,
         };
         let session_id = tx.original.call_id_header().map_or_else(
             |_| uuid::Uuid::new_v4().to_string(),
@@ -1179,7 +2690,18 @@ impl CallModule {
                     info!(%old_session_id, "Replaces target is in a conference; proceeding with seat replacement");
                     // Proceed with normal call creation, then spawn background task to do seat replacement
                     let dialplan = match self.build_dialplan(tx, cookie.clone(), &caller).await {
-                        Ok(d) => d,
+                        Ok(DialplanOutcome::Dialplan(d)) => d,
+                        Ok(DialplanOutcome::ExternalBridge { trunk_name, .. }) => {
+                            warn!(
+                                %trunk_name,
+                                "Replaces-with-external-bridge target is not supported; \
+                                 rejecting with 503"
+                            );
+                            tx.reply(rsipstack::sip::StatusCode::ServiceUnavailable)
+                                .await
+                                .map_err(|e| anyhow!("Failed to send reply: {}", e))?;
+                            return Ok(());
+                        }
                         Err(route_err) => {
                             if cookie.is_spam() {
                                 return Ok(());
@@ -1283,7 +2805,18 @@ impl CallModule {
                     // Standard attended transfer: C sends INVITE with Replaces to replace B
                     // We create a conference on the fly and merge both sessions
                     let dialplan = match self.build_dialplan(tx, cookie.clone(), &caller).await {
-                        Ok(d) => d,
+                        Ok(DialplanOutcome::Dialplan(d)) => d,
+                        Ok(DialplanOutcome::ExternalBridge { trunk_name, .. }) => {
+                            warn!(
+                                %trunk_name,
+                                "Replaces-with-external-bridge target is not supported; \
+                                 rejecting with 503"
+                            );
+                            tx.reply(rsipstack::sip::StatusCode::ServiceUnavailable)
+                                .await
+                                .map_err(|e| anyhow!("Failed to send reply: {}", e))?;
+                            return Ok(());
+                        }
                         Err(route_err) => {
                             if cookie.is_spam() {
                                 return Ok(());
@@ -1400,7 +2933,73 @@ impl CallModule {
         }
 
         let dialplan = match self.build_dialplan(tx, cookie.clone(), &caller).await {
-            Ok(d) => d,
+            Ok(DialplanOutcome::Dialplan(d)) => d,
+            Ok(DialplanOutcome::ExternalBridge { kind, trunk_name, .. }) => {
+                // Matcher resolved to an external-bridge trunk — short-
+                // circuit the SIP forward machinery and drive the bridge
+                // dispatcher directly. On success the INVITE is already 200
+                // OK'd inside `dispatch_external_bridge` and the bridge
+                // state is stashed for BYE-time teardown; nothing more to
+                // do here.
+                match self.dispatch_external_bridge(tx, kind, &trunk_name).await {
+                    Ok(()) => return Ok(()),
+                    Err(route_err) => {
+                        if cookie.is_spam() {
+                            return Ok(());
+                        }
+                        let code = route_err
+                            .status
+                            .unwrap_or(rsipstack::sip::StatusCode::ServiceUnavailable);
+                        let reason_text = route_err.error.to_string();
+                        let reason_value = if reason_text.contains(";cause=") {
+                            reason_text.clone()
+                        } else {
+                            q850_reason_value(&code, Some(reason_text.as_str()))
+                        };
+                        warn!(
+                            %code,
+                            key = %tx.key,
+                            trunk = %trunk_name,
+                            reason = %reason_value,
+                            "external bridge dispatch failed"
+                        );
+                        // Feed the rejected-INVITE replay cache so a carrier
+                        // failover retry of this exact INVITE gets the same
+                        // final status without re-running gates/dispatch.
+                        if !self.inner.config.disable_rejected_invite_cache
+                            && let (Ok(call_id_h), Ok(Some(from_tag))) = (
+                                tx.original.call_id_header(),
+                                tx.original
+                                    .from_header()
+                                    .and_then(|f| f.tag()),
+                            )
+                        {
+                            self.inner.server.rejected_invites.put(
+                                &call_id_h.value().to_string(),
+                                &from_tag.to_string(),
+                                code.code(),
+                                Some(reason_text.clone()),
+                            );
+                        }
+                        // Only send a SIP failure response if we haven't
+                        // already sent something (`reply_with` inside the
+                        // dispatcher might have run before failure).
+                        if tx.last_response.is_none() {
+                            tx.reply_with(
+                                code.clone(),
+                                vec![rsipstack::sip::Header::Other(
+                                    "Reason".into(),
+                                    reason_value,
+                                )],
+                                None,
+                            )
+                            .await
+                            .map_err(|e| anyhow!("Failed to send reply: {}", e))?;
+                        }
+                        return Err(route_err.error);
+                    }
+                }
+            }
             Err(route_err) => {
                 if cookie.is_spam() {
                     return Ok(());
@@ -1801,6 +3400,7 @@ impl CallModule {
             started_at: chrono::Utc::now(),
             answered_at: None,
             status: ActiveProxyCallStatus::Ringing,
+            trunk_group_name: None,
         };
         registry.upsert(entry, new_handle.clone());
 
@@ -2126,8 +3726,60 @@ impl ProxyModule for CallModule {
             | rsipstack::sip::Method::Update
             | rsipstack::sip::Method::Cancel
             | rsipstack::sip::Method::Bye => {
-                if let Err(e) = self.process_message(tx).await {
-                    warn!(%dialog_id, method=%tx.original.method, "error process {}\n{}", e, tx.original.to_string());
+                let is_terminating = matches!(
+                    tx.original.method,
+                    rsipstack::sip::Method::Bye | rsipstack::sip::Method::Cancel
+                );
+                // External-bridge dialogs aren't tracked in the dialog
+                // layer (we never built a SipSession for them), so
+                // `process_message` will be a no-op for them. Reply directly
+                // and run teardown so the BYE response goes out.
+                //
+                // Only BYE is treated as a bridge terminator here. A CANCEL
+                // arriving in-dialog (after our 200 OK has gone out) is no
+                // longer protocol-valid as a transaction cancel; let the
+                // transaction layer respond per RFC 3261. Tearing the
+                // bridge down on a stray CANCEL would silently hang up a
+                // healthy established call.
+                let is_bridge_bye = matches!(tx.original.method, rsipstack::sip::Method::Bye)
+                    && self
+                        .inner
+                        .server
+                        .bridge_sessions
+                        .contains(&dialog_id)
+                        .await;
+
+                if is_bridge_bye {
+                    use crate::proxy::bridge_sessions::BridgeHangupCause;
+                    // Reply 200 OK to the BYE ourselves.
+                    if let Err(e) = tx
+                        .reply_with(rsipstack::sip::StatusCode::OK, vec![], None)
+                        .await
+                    {
+                        warn!(%dialog_id, error = %e, "failed to reply OK to external bridge BYE");
+                    }
+                    self.teardown_external_bridge_if_present(
+                        &dialog_id,
+                        BridgeHangupCause::ByCaller,
+                    )
+                    .await;
+                } else {
+                    if let Err(e) = self.process_message(tx).await {
+                        warn!(%dialog_id, method=%tx.original.method, "error process {}\n{}", e, tx.original.to_string());
+                    }
+                    // Safety net: if an external-bridge session somehow
+                    // exists for this dialog (shouldn't, given the check
+                    // above) it still gets torn down — treat it as a
+                    // transport-level failure since neither side cleanly
+                    // hung up.
+                    if is_terminating {
+                        use crate::proxy::bridge_sessions::BridgeHangupCause;
+                        self.teardown_external_bridge_if_present(
+                            &dialog_id,
+                            BridgeHangupCause::TeardownFailed,
+                        )
+                        .await;
+                    }
                 }
                 Ok(ProxyAction::Abort)
             }
@@ -2211,6 +3863,29 @@ mod tests {
             _cookie: &TransactionCookie,
         ) -> Result<RouteResult> {
             Ok(RouteResult::NotHandled(option, None))
+        }
+    }
+
+    /// Simulates the DID→extension short-circuit (and rule-driven internal
+    /// forward): rewrites the callee to an on-net extension and returns a bare
+    /// `Forward(option, None)` with no `destination` and no trunk config —
+    /// exactly what `build_did_extension_route_result` produces.
+    struct ForwardExtensionRouteInvite {
+        extension_uri: String,
+    }
+
+    #[async_trait]
+    impl RouteInvite for ForwardExtensionRouteInvite {
+        async fn route_invite(
+            &self,
+            mut option: InviteOption,
+            _origin: &rsipstack::sip::Request,
+            _direction: &DialDirection,
+            _cookie: &TransactionCookie,
+        ) -> Result<RouteResult> {
+            option.callee = rsipstack::sip::Uri::try_from(self.extension_uri.as_str()).unwrap();
+            option.destination = None;
+            Ok(RouteResult::Forward(option, None))
         }
     }
 
@@ -2341,12 +4016,102 @@ mod tests {
                 &TransactionCookie::default(),
             )
             .await
-            .expect("offline user should not error at resolve time");
+            .expect("offline user should not error at resolve time")
+            .expect_dialplan();
 
         assert!(dialplan.is_empty(), "targets should be empty");
         assert!(
             dialplan.extensions.get::<CalleeOfflineMarker>().is_some(),
             "offline marker should be set"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_resolve_resolves_did_extension_forward_through_locator() {
+        // Regression (I1): a DID→extension short-circuit returns
+        // Forward(callee=ext@realm, destination=None). Without re-resolving the
+        // on-net extension through the locator, the bare target is dialed with
+        // destination=None (DNS of the realm host) and the INVITE never reaches
+        // the registered (NAT'd) softphone. The registered contact's
+        // destination/transport must be used instead — mirroring how queue and
+        // agent targets are resolved.
+        let (server, config) = create_test_server().await;
+
+        // Extension 1001 is registered with a concrete contact destination.
+        let _ = server
+            .locator
+            .register(
+                "1001",
+                Some("rustpbx.com"),
+                Location {
+                    aor: rsipstack::sip::Uri::try_from("sip:1001@rustpbx.com").unwrap(),
+                    expires: 3600,
+                    destination: Some(rsipstack::transport::SipAddr {
+                        r#type: Some(rsipstack::sip::Transport::Udp),
+                        addr: rsipstack::sip::HostWithPort {
+                            host: "203.0.113.7".parse().unwrap(),
+                            port: Some(5062.into()),
+                        },
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        let module = CallModule::new(config, server);
+
+        // Inbound INVITE from an external carrier to the DID.
+        let mut request = crate::proxy::tests::common::create_test_request(
+            rsipstack::sip::Method::Invite,
+            "carrier1",
+            None,
+            "carrier.example",
+            None,
+        );
+        request.uri = rsipstack::sip::Uri::try_from("sip:+14155551212@rustpbx.com").unwrap();
+        replace_to_header(
+            &mut request,
+            rsipstack::sip::Uri::try_from("sip:+14155551212@rustpbx.com").unwrap(),
+        );
+
+        let caller = SipUser {
+            username: "carrier1".to_string(),
+            realm: Some("carrier.example".to_string()),
+            ..Default::default()
+        };
+
+        let dialplan = module
+            .default_resolve(
+                &request,
+                Box::new(ForwardExtensionRouteInvite {
+                    extension_uri: "sip:1001@rustpbx.com".to_string(),
+                }),
+                &caller,
+                &TransactionCookie::default(),
+            )
+            .await
+            .expect("DID→extension forward should not error at resolve time")
+            .expect_dialplan();
+
+        use crate::call::DialplanFlow;
+        match &dialplan.flow {
+            DialplanFlow::Targets(DialStrategy::Sequential(targets)) => {
+                assert_eq!(targets.len(), 1, "exactly one resolved extension target expected");
+                assert!(
+                    targets[0].destination.is_some(),
+                    "extension target must carry the registered contact destination \
+                     (locator-resolved); got destination=None which would dial DNS of the realm"
+                );
+            }
+            other => panic!("expected Sequential targets, got {:?}", other),
+        }
+        // Note: this also depends on the fix resetting `internal_lookup_empty`
+        // to false on a successful locator hit, so it is not an independent
+        // guard from the destination assertion above — both prove the same
+        // locator re-resolution.
+        assert!(
+            dialplan.extensions.get::<CalleeOfflineMarker>().is_none(),
+            "a registered extension must not be marked offline"
         );
     }
 
@@ -2404,7 +4169,8 @@ mod tests {
                 &TransactionCookie::default(),
             )
             .await
-            .expect("online user should succeed");
+            .expect("online user should succeed")
+            .expect_dialplan();
 
         assert!(!dialplan.is_empty(), "online user should have targets");
         assert!(
@@ -2447,7 +4213,8 @@ mod tests {
                 &TransactionCookie::default(),
             )
             .await
-            .expect("external destination should succeed");
+            .expect("external destination should succeed")
+            .expect_dialplan();
 
         assert!(!dialplan.is_empty(), "external callee should have targets");
         assert!(
@@ -2491,12 +4258,14 @@ mod tests {
             name: "wholesale-trunk".to_string(),
             tenant_id: Some(100),
             did_numbers: vec![],
+            direction: TrunkDirection::Bidirectional,
         });
 
         let dialplan = module
             .default_resolve(&request, Box::new(NotHandledRouteInvite), &caller, &cookie)
             .await
-            .expect("wholesale trunk should not error at resolve time");
+            .expect("wholesale trunk should not error at resolve time")
+            .expect_dialplan();
 
         assert!(
             dialplan.is_empty(),
@@ -2592,7 +4361,8 @@ mod tests {
                 &TransactionCookie::default(),
             )
             .await
-            .expect("offline internal user should not error — 480 deferred to build_dialplan");
+            .expect("offline internal user should not error — 480 deferred to build_dialplan")
+            .expect_dialplan();
 
         assert!(
             dialplan.is_empty(),
@@ -2637,7 +4407,8 @@ mod tests {
                 &TransactionCookie::default(),
             )
             .await
-            .expect("external destination should fall through to locs");
+            .expect("external destination should fall through to locs")
+            .expect_dialplan();
 
         use crate::call::{DialStrategy, DialplanFlow};
         match &dialplan.flow {
@@ -2695,7 +4466,8 @@ mod tests {
                 &TransactionCookie::default(),
             )
             .await
-            .expect("always forwarding should bypass offline locator check");
+            .expect("always forwarding should bypass offline locator check")
+            .expect_dialplan();
 
         let target = dialplan
             .first_target()
@@ -2808,5 +4580,197 @@ mod tests {
 
         let resolved = resolve_callee_uri(&request).expect("expected callee uri");
         assert_eq!(resolved, to_uri);
+    }
+
+    // ------------------------------------------------------------------
+    // PR 6: DialplanOutcome + bridge-routing coverage. Verifies that the
+    // routing path produces the right `DialplanOutcome` variant for both
+    // the legacy SIP / NotHandled flow and the new WebRTC bridge flow.
+    // ------------------------------------------------------------------
+
+    /// A RouteInvite stub that pretends every INVITE resolved to a
+    /// `kind="webrtc"` trunk. Used to drive `default_resolve`'s
+    /// ExternalBridge arm without setting up a real matcher.
+    struct ExternalBridgeRouteInvite {
+        trunk_name: String,
+    }
+
+    #[async_trait]
+    impl RouteInvite for ExternalBridgeRouteInvite {
+        async fn route_invite(
+            &self,
+            option: InviteOption,
+            _origin: &rsipstack::sip::Request,
+            _direction: &DialDirection,
+            _cookie: &TransactionCookie,
+        ) -> Result<RouteResult> {
+            Ok(RouteResult::ExternalBridge {
+                kind: crate::proxy::bridge::session::BridgeKind::WebRtc,
+                trunk_name: self.trunk_name.clone(),
+                kind_config: serde_json::json!({
+                    "signaling": "http_json",
+                    "endpoint_url": "http://127.0.0.1:7860/api/offer",
+                    "audio_codec": "opus",
+                    "protocol": {
+                        "request_body_template": "{\"sdp\":\"{offer_sdp}\"}",
+                        "response_answer_path": "$.sdp",
+                    }
+                }),
+                option,
+                hints: None,
+            })
+        }
+    }
+
+    #[test]
+    fn expect_dialplan_returns_inner_for_dialplan_variant() {
+        let dp = Dialplan::new(
+            "test-session".to_string(),
+            crate::proxy::tests::common::create_test_request(
+                rsipstack::sip::Method::Invite,
+                "alice",
+                None,
+                "rustpbx.com",
+                None,
+            ),
+            DialDirection::Internal,
+        );
+        let outcome = DialplanOutcome::Dialplan(dp);
+        // Should not panic.
+        let _ = outcome.expect_dialplan();
+    }
+
+    #[test]
+    #[should_panic(expected = "expected DialplanOutcome::Dialplan")]
+    fn expect_dialplan_panics_on_external_bridge_variant() {
+        let outcome = DialplanOutcome::ExternalBridge {
+            kind: crate::proxy::bridge::session::BridgeKind::WebRtc,
+            trunk_name: "pipecat".into(),
+            kind_config: serde_json::json!({}),
+        };
+        let _ = outcome.expect_dialplan();
+    }
+
+    #[tokio::test]
+    async fn default_resolve_returns_external_bridge_outcome_for_webrtc_route() {
+        let (server, config) = create_test_server().await;
+        let module = CallModule::new(config, server);
+
+        let mut request = crate::proxy::tests::common::create_test_request(
+            rsipstack::sip::Method::Invite,
+            "bp",
+            None,
+            "rustpbx.com",
+            None,
+        );
+        // Force callee outside the local realm so the matcher path (not the
+        // internal-user lookup) decides routing.
+        request.uri = rsipstack::sip::Uri::try_from("sip:9000@external.example").unwrap();
+        replace_to_header(
+            &mut request,
+            rsipstack::sip::Uri::try_from("sip:9000@external.example").unwrap(),
+        );
+
+        let caller = SipUser {
+            username: "bp".to_string(),
+            realm: Some("rustpbx.com".to_string()),
+            ..Default::default()
+        };
+
+        let outcome = module
+            .default_resolve(
+                &request,
+                Box::new(ExternalBridgeRouteInvite {
+                    trunk_name: "pipecat_bot".into(),
+                }),
+                &caller,
+                &TransactionCookie::default(),
+            )
+            .await
+            .expect("external bridge route should not error at resolve time");
+
+        match outcome {
+            DialplanOutcome::ExternalBridge { kind, trunk_name, kind_config } => {
+                assert_eq!(
+                    kind,
+                    crate::proxy::bridge::session::BridgeKind::WebRtc
+                );
+                assert_eq!(trunk_name, "pipecat_bot");
+                assert_eq!(
+                    kind_config["signaling"].as_str(),
+                    Some("http_json"),
+                    "kind_config should be passed through from the matcher"
+                );
+            }
+            DialplanOutcome::Dialplan(_) => {
+                panic!("expected ExternalBridge outcome, got Dialplan")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn default_resolve_returns_dialplan_outcome_for_sip_route() {
+        // The classic SIP-kind / NotHandled path must remain a
+        // `DialplanOutcome::Dialplan(_)` after the PR 6 refactor.
+        let (server, config) = create_test_server().await;
+        let module = CallModule::new(config, server);
+
+        let mut request = crate::proxy::tests::common::create_test_request(
+            rsipstack::sip::Method::Invite,
+            "bp",
+            None,
+            "rustpbx.com",
+            None,
+        );
+        request.uri = rsipstack::sip::Uri::try_from("sip:9000@external.example").unwrap();
+        replace_to_header(
+            &mut request,
+            rsipstack::sip::Uri::try_from("sip:9000@external.example").unwrap(),
+        );
+
+        let caller = SipUser {
+            username: "bp".to_string(),
+            realm: Some("rustpbx.com".to_string()),
+            ..Default::default()
+        };
+
+        let outcome = module
+            .default_resolve(
+                &request,
+                Box::new(NotHandledRouteInvite),
+                &caller,
+                &TransactionCookie::default(),
+            )
+            .await
+            .expect("classic sip route should not error at resolve time");
+
+        match outcome {
+            DialplanOutcome::Dialplan(_) => {}
+            DialplanOutcome::ExternalBridge { trunk_name, .. } => {
+                panic!("expected Dialplan outcome, got ExternalBridge {trunk_name}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bridge_sessions_registry_roundtrip_on_server_inner() {
+        // Tip-of-iceberg sanity that the registry hung off SipServerInner is
+        // present and usable from the call layer.
+        use rsipstack::dialog::DialogId;
+
+        let (server, _config) = create_test_server().await;
+        assert_eq!(
+            server.bridge_sessions.len().await,
+            0,
+            "registry should start empty"
+        );
+
+        let id = DialogId {
+            call_id: "smoke-test".into(),
+            local_tag: "lt".into(),
+            remote_tag: "rt".into(),
+        };
+        assert!(!server.bridge_sessions.contains(&id).await);
+        assert!(server.bridge_sessions.remove(&id).await.is_none());
     }
 }

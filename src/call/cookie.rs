@@ -1,4 +1,5 @@
 use crate::call::SipUser;
+use crate::models::trunk::TrunkDirection;
 use rsipstack::transaction::key::TransactionKey;
 use std::{
     sync::{Arc, RwLock},
@@ -135,4 +136,11 @@ pub struct TrunkContext {
     pub name: String,
     pub tenant_id: Option<i64>,
     pub did_numbers: Vec<String>,
+    pub direction: TrunkDirection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchedRouteContext {
+    pub id: i64,
+    pub name: String,
 }

@@ -1147,7 +1147,7 @@
                             request_uri_user: '',
                             request_uri_host: '',
                             request_uri_port: '',
-                        }, raw?.match || {}),
+                        }, this.remapMatchKeys(raw?.match, (k) => this.matchKeyToForm(k))),
                         rewrite: Object.assign({
                             from_user: '',
                             from_host: '',
@@ -1155,7 +1155,7 @@
                             to_host: '',
                             request_uri_user: '',
                             request_uri_host: '',
-                        }, raw?.rewrite || {}),
+                        }, this.remapMatchKeys(raw?.rewrite, (k) => this.matchKeyToForm(k))),
                         action: {
                             select: normalizeSelection(raw?.action?.select),
                             hash_key: raw?.action?.hash_key || null,
@@ -1214,6 +1214,43 @@
                 trimString(value) {
                     if (value == null) return '';
                     return typeof value === 'string' ? value.trim() : String(value).trim();
+                },
+                // The routing engine stores match/rewrite conditions with dot-notation keys
+                // (from.host, to.user, request_uri.port). The form uses underscore keys
+                // (from_host, to_user, request_uri_port). Convert between the two so routes
+                // provisioned via the API (dot keys) populate the form, and edits saved from
+                // the form are written back in the engine-canonical dot form. Unknown keys
+                // (e.g. header.*) pass through unchanged.
+                matchKeyToForm(key) {
+                    const map = {
+                        'from.user': 'from_user',
+                        'from.host': 'from_host',
+                        'to.user': 'to_user',
+                        'to.host': 'to_host',
+                        'request_uri.user': 'request_uri_user',
+                        'request_uri.host': 'request_uri_host',
+                        'request_uri.port': 'request_uri_port',
+                    };
+                    return map[key] || key;
+                },
+                matchKeyToEngine(key) {
+                    const map = {
+                        'from_user': 'from.user',
+                        'from_host': 'from.host',
+                        'to_user': 'to.user',
+                        'to_host': 'to.host',
+                        'request_uri_user': 'request_uri.user',
+                        'request_uri_host': 'request_uri.host',
+                        'request_uri_port': 'request_uri.port',
+                    };
+                    return map[key] || key;
+                },
+                remapMatchKeys(object, fn) {
+                    const result = {};
+                    Object.entries(object || {}).forEach(([key, value]) => {
+                        result[fn(key)] = value;
+                    });
+                    return result;
                 },
                 sanitizeKeyValue(object) {
                     const result = {};
@@ -1362,10 +1399,15 @@
                 formatTimestamp(value) {
                     if (!value) return '{{ "routing_form.timestamp_recently" | t }}';
                     const date = new Date(value);
-                    if (Number.isNaN(date.getTime())) {
-                        return '{{ "routing_form.timestamp_recently" | t }}';
-                    }
-                    return date.toLocaleString();
+                    if (Number.isNaN(date.getTime())) return '{{ "routing_form.timestamp_recently" | t }}';
+                    try {
+                        return new Intl.DateTimeFormat(undefined, {
+                            timeZone: window.DISPLAY_TIMEZONE || 'Asia/Kolkata',
+                            year: 'numeric', month: '2-digit', day: '2-digit',
+                            hour: '2-digit', minute: '2-digit', second: '2-digit',
+                            hour12: false,
+                        }).format(date);
+                    } catch (_) { return date.toLocaleString(); }
                 },
                 setTargetType(value) {
                     const targetType = this.normalizeTargetType(value);
@@ -1458,7 +1500,10 @@
                     }
                 },
                 buildPayload() {
-                    const match = this.sanitizeKeyValue(this.route.match);
+                    const match = this.remapMatchKeys(
+                        this.sanitizeKeyValue(this.route.match),
+                        (k) => this.matchKeyToEngine(k),
+                    );
                     this.matchHeaders.forEach((header) => {
                         const name = this.trimString(header.name);
                         const value = this.trimString(header.value);
@@ -1467,7 +1512,10 @@
                         }
                     });
 
-                    const rewrite = this.sanitizeKeyValue(this.route.rewrite);
+                    const rewrite = this.remapMatchKeys(
+                        this.sanitizeKeyValue(this.route.rewrite),
+                        (k) => this.matchKeyToEngine(k),
+                    );
                     this.rewriteHeaders.forEach((header) => {
                         const name = this.trimString(header.name);
                         const value = this.trimString(header.value);

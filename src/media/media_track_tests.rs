@@ -261,3 +261,25 @@ async fn test_media_track_multiple_operations() {
     // Both should be identical since PC state hasn't changed
     assert_eq!(offer1.unwrap(), offer2.unwrap());
 }
+
+#[test]
+fn test_default_rtp_map_puts_g729_last() {
+    // The builder's default rtp_map becomes the audio m-line of from-scratch
+    // offers, and carriers usually answer with the first codec they support.
+    // Quality order: wideband first, G729 (lossy 8 kbps) strictly last.
+    use audio_codec::CodecType;
+
+    let builder = RtpTrackBuilder::new("codec-order".to_string());
+    let audio: Vec<CodecType> = builder
+        .rtp_map
+        .iter()
+        .map(|c| c.codec)
+        .filter(|c| c.is_audio())
+        .collect();
+
+    assert_eq!(audio.last(), Some(&CodecType::G729), "G729 must be last resort");
+    #[cfg(feature = "opus")]
+    assert_eq!(audio.first(), Some(&CodecType::Opus), "Opus (48k) leads");
+    let pos = |t: CodecType| audio.iter().position(|c| *c == t).unwrap();
+    assert!(pos(CodecType::G722) < pos(CodecType::PCMU), "G722 (16k) above G711");
+}

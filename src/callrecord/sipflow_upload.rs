@@ -69,6 +69,15 @@ async fn do_upload(
         return;
     }
 
+    // A SipFlow capture exists for this call → mark it available so the CDR
+    // API can surface a sip-flow pointer without a per-row store probe
+    // (enrich-cdr-api). Set on capture, independent of upload success below.
+    if let Some(ref db) = db {
+        if let Err(e) = crate::models::call_record::mark_sipflow_available(db, call_id).await {
+            warn!(call_id, "SipFlowUploadHook: failed to mark sipflow_available: {e}");
+        }
+    }
+
     // Path inside the storage target: YYYYMMDD/<call_id>.wav
     let key = format!("{}/{}.wav", date_prefix, call_id);
 

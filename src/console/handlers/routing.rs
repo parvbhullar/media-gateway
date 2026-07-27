@@ -4,6 +4,9 @@ use crate::addons::queue::models::{
 use crate::addons::queue::services::utils as queue_utils;
 use crate::console::handlers::{bad_request, forms};
 use crate::console::{ConsoleState, middleware::AuthRequired};
+// PR 5 / Phase 10: trunk options shown in the routing console include both
+// SIP and WebRTC kinds. The trunk-kind label is surfaced in the option text
+// so operators can tell at a glance which kind a route targets.
 use crate::models::{
     routing::{
         ActiveModel as RoutingActiveModel, Column as RoutingColumn, Entity as RoutingEntity,
@@ -189,7 +192,9 @@ impl RouteDocument {
             doc.id = Some(model.id);
             doc.name = model.name.clone();
             doc.description = model.description.clone();
-            doc.owner = model.owner.clone();
+            // task 3.1: the legacy `owner` column was superseded by org_id
+            // (backfilled). Surface org_id in the doc's `owner` slot.
+            doc.owner = Some(model.org_id.clone());
             doc.direction = model.direction;
             doc.priority = model.priority;
             doc.disabled = !model.is_active;
@@ -212,6 +217,7 @@ impl RouteDocument {
             if let Some(notes) = model.notes.clone() {
                 doc.notes = parse_notes_value(Some(notes));
             }
+            inject_pattern_matchers(&mut doc.matchers, model);
             doc.ensure_consistency();
             return doc;
         }
@@ -220,7 +226,8 @@ impl RouteDocument {
             id: Some(model.id),
             name: model.name.clone(),
             description: model.description.clone(),
-            owner: model.owner.clone(),
+            // task 3.1: surface org_id in the doc's `owner` slot (owner column dropped).
+            owner: Some(model.org_id.clone()),
             direction: model.direction,
             priority: model.priority,
             disabled: !model.is_active,
@@ -247,6 +254,7 @@ impl RouteDocument {
             source_trunk: None,
             notes: parse_notes_value(model.notes.clone()),
         };
+        inject_pattern_matchers(&mut doc.matchers, model);
         doc.ensure_consistency();
         doc
     }
@@ -456,10 +464,12 @@ fn parse_trunk_assignments(value: Option<Value>) -> Vec<RouteTrunkDocument> {
     match value {
         Some(Value::Array(items)) => items
             .into_iter()
-            .filter_map(|item| {
-                if let Value::Object(mut obj) = item {
+            .filter_map(|item| match item {
+                Value::Object(mut obj) => {
+                    // Accept "name" (console format) or "trunk_name" (api_v1 format).
                     let name = obj
                         .remove("name")
+                        .or_else(|| obj.remove("trunk_name"))
                         .and_then(|v| sanitize_optional_string(v.as_str().map(|s| s.to_string())));
                     let weight = obj
                         .remove("weight")
@@ -467,12 +477,31 @@ fn parse_trunk_assignments(value: Option<Value>) -> Vec<RouteTrunkDocument> {
                         .map(|w| w.clamp(0, MAX_PRIORITY as i64) as i32)
                         .unwrap_or(0);
                     name.map(|n| RouteTrunkDocument { name: n, weight })
-                } else {
-                    None
                 }
+                // Accept bare strings: ["gw_name"] (third api_v1-accepted shape).
+                Value::String(s) => sanitize_optional_string(Some(s))
+                    .map(|n| RouteTrunkDocument { name: n, weight: 0 }),
+                _ => None,
             })
             .collect(),
         _ => Vec::new(),
+    }
+}
+
+/// Inject `destination_pattern` → `to.user` and `source_pattern` → `from.user` into
+/// the matchers map so routes created via /api/v1/routes (which use dedicated DB columns)
+/// display their match conditions in the console the same way file-based routes do.
+/// Only inserts if the key is not already present in header_filters.
+fn inject_pattern_matchers(matchers: &mut JsonMap<String, Value>, model: &RoutingModel) {
+    if let Some(ref p) = model.destination_pattern {
+        if !p.is_empty() && !matchers.contains_key("to.user") {
+            matchers.insert("to.user".to_string(), Value::String(p.clone()));
+        }
+    }
+    if let Some(ref p) = model.source_pattern {
+        if !p.is_empty() && !matchers.contains_key("from.user") {
+            matchers.insert("from.user".to_string(), Value::String(p.clone()));
+        }
     }
 }
 
@@ -553,6 +582,9 @@ async fn generate_clone_name(db: &DatabaseConnection, original: &str) -> Result<
 }
 
 async fn load_trunks(db: &DatabaseConnection) -> Result<Vec<SipTrunkModel>, DbErr> {
+    // PR 5 / Phase 10: include trunks of every registered kind. Callers
+    // (`build_trunk_options`) tag each entry with its `kind` so the routing
+    // UI can show the operator what they're picking.
     SipTrunkEntity::find()
         .order_by_asc(SipTrunkColumn::Name)
         .all(db)
@@ -570,14 +602,23 @@ fn build_trunk_options(trunks: &[SipTrunkModel]) -> Vec<Value> {
     trunks
         .iter()
         .map(|trunk| {
+            // `carrier` only exists in the SIP `kind_config`. WebRTC trunks
+            // report an empty carrier — the consuming UI is expected to use
+            // `kind` to render an appropriate label.
+            let carrier = trunk
+                .sip()
+                .ok()
+                .and_then(|cfg| cfg.carrier)
+                .unwrap_or_default();
             json!({
                 "id": trunk.id,
                 "name": trunk.name,
+                "kind": trunk.kind,
                 "display_name": trunk
                     .display_name
                     .clone()
                     .unwrap_or_else(|| trunk.name.clone()),
-                "carrier": trunk.carrier.clone().unwrap_or_default(),
+                "carrier": carrier,
                 "status": trunk.status,
                 "direction": trunk.direction,
             })
@@ -769,7 +810,9 @@ fn apply_document_to_active(
 ) {
     active.name = Set(doc.name.clone());
     active.description = Set(doc.description.clone());
-    active.owner = Set(doc.owner.clone());
+    // task 3.1: `owner` column dropped → org_id is the tenant key. It is left
+    // untouched here (NotSet on create → DB default; unchanged on update) until
+    // 3.1b threads the real org_id from request context.
     active.direction = Set(doc.direction);
     active.priority = Set(doc.priority);
     active.is_active = Set(!doc.disabled);
@@ -777,6 +820,18 @@ fn apply_document_to_active(
     active.hash_key = Set(doc.action.hash_key.clone());
     active.header_filters = Set(value_from_map(&doc.matchers));
     active.rewrite_rules = Set(value_from_map(&doc.rewrite));
+    // Keep dedicated pattern columns in sync with matchers so routes edited via the
+    // console remain consistent with what /api/v1/routes and the call resolver see.
+    active.destination_pattern = Set(
+        doc.matchers.get("to.user")
+            .and_then(|v| v.as_str())
+            .and_then(|s| sanitize_optional_string(Some(s.to_string()))),
+    );
+    active.source_pattern = Set(
+        doc.matchers.get("from.user")
+            .and_then(|v| v.as_str())
+            .and_then(|s| sanitize_optional_string(Some(s.to_string()))),
+    );
     active.target_trunks = Set(value_from_trunks(&doc.action.trunks));
     active.source_trunk_id = Set(resolve_trunk_id(trunk_lookup, doc.source_trunk.as_deref()));
     let default_target = doc.action.trunks.first().map(|t| t.name.as_str());
@@ -861,7 +916,7 @@ pub(crate) async fn query_routing(
                 let mut condition = Condition::any();
                 condition = condition.add(RoutingColumn::Name.contains(trimmed));
                 condition = condition.add(RoutingColumn::Description.contains(trimmed));
-                condition = condition.add(RoutingColumn::Owner.contains(trimmed));
+                condition = condition.add(RoutingColumn::OrgId.contains(trimmed));
                 selector = selector.filter(condition);
             }
         }
@@ -892,10 +947,12 @@ pub(crate) async fn query_routing(
             selector = selector.filter(RoutingColumn::SelectionStrategy.eq(strategy));
         }
 
+        // task 3.1: `owner` column dropped → this filter now matches org_id
+        // (the query param is still named `owner` for console-API stability).
         if let Some(ref owner) = filters.owner {
             let trimmed = owner.trim();
             if !trimmed.is_empty() {
-                selector = selector.filter(RoutingColumn::Owner.contains(trimmed));
+                selector = selector.filter(RoutingColumn::OrgId.contains(trimmed));
             }
         }
     }

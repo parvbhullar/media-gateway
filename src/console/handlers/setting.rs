@@ -1,4 +1,9 @@
 use crate::app::AppStateInner;
+use crate::handler::api_v1::auth::issue_api_key;
+use crate::models::api_key::{
+    ActiveModel as ApiKeyActiveModel, Column as ApiKeyColumn, Entity as ApiKeyEntity,
+};
+use crate::models::system_config;
 use crate::config::{
     CallRecordConfig, Config, HttpRouterConfig, LocatorWebhookConfig, ProxyConfig,
     UserBackendConfig,
@@ -23,7 +28,7 @@ use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, post};
+use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Duration, Utc};
 use futures::stream;
@@ -176,6 +181,10 @@ impl From<UserModel> for UserView {
 pub fn urls() -> Router<Arc<ConsoleState>> {
     let router = Router::new()
         .route("/settings", get(page_settings))
+        .route("/settings/config", get(get_effective_config))
+        .route("/settings/config/entry", patch(upsert_config_entry))
+        .route("/settings/config/entry/{key}", delete(delete_config_entry))
+        .route("/settings/config/group/{prefix}", delete(delete_config_group))
         .route("/settings/logs/recent", get(fetch_recent_logs))
         .route("/settings/logs/follow", get(follow_logs))
         .route("/settings/logs/stream", get(stream_logs))
@@ -199,7 +208,21 @@ pub fn urls() -> Router<Arc<ConsoleState>> {
             post(test_user_backend),
         )
         .route("/settings/config/security", patch(update_security_settings))
-        .route("/settings/config/rwi", patch(update_rwi_settings));
+        .route("/settings/config/display", patch(update_display_settings))
+        .route("/settings/config/rwi", patch(update_rwi_settings))
+        // Failed S3 upload retry queue (read + ops)
+        .route(
+            "/settings/uploads/pending",
+            get(list_pending_uploads),
+        )
+        .route(
+            "/settings/uploads/pending/retry",
+            post(retry_pending_uploads),
+        )
+        .route(
+            "/settings/uploads/pending/clear",
+            post(clear_pending_failures),
+        );
 
     #[cfg(feature = "commerce")]
     let router = router
@@ -237,6 +260,11 @@ pub fn urls() -> Router<Arc<ConsoleState>> {
         .route(
             "/settings/roles/{id}",
             get(get_role).patch(update_role).delete(delete_role_handler),
+        )
+        .route("/settings/api-keys", get(list_api_keys).post(create_api_key))
+        .route(
+            "/settings/api-keys/{id}/revoke",
+            post(revoke_api_key),
         )
 }
 
@@ -527,6 +555,11 @@ async fn build_settings_payload(state: &ConsoleState) -> JsonValue {
                 .unwrap_or(JsonValue::Null),
         );
     }
+
+    data.insert(
+        "display".to_string(),
+        json!({ "timezone": state.display_timezone() }),
+    );
 
     JsonValue::Object(data)
 }
@@ -1486,7 +1519,7 @@ enum CallRecordStoragePayload {
         root: Option<String>,
     },
     S3 {
-        vendor: String,
+        vendor: crate::storage::S3Vendor,
         bucket: String,
         region: String,
         access_key: String,
@@ -1554,6 +1587,265 @@ pub(crate) struct EmergencySettingsPayload {
     emergency_trunk: String,
 }
 
+/// GET /settings/config
+///
+/// Returns all effective configuration: the in-memory merged config (what the
+/// server is actually running with) combined with the raw DB overrides so the
+/// caller can see both the effective values and which keys have been overridden.
+pub(crate) async fn get_effective_config(
+    State(state): State<Arc<ConsoleState>>,
+    AuthRequired(user): AuthRequired,
+) -> Response {
+    if !state.has_permission(&user, "system", "read").await {
+        return json_error(StatusCode::FORBIDDEN, "Permission denied");
+    }
+
+    let db = match get_db(&state) {
+        Ok(db) => db,
+        Err(r) => return r,
+    };
+
+    // Load all DB overrides
+    let db_overrides = match system_config::Model::get_all(&db).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load config overrides: {e}"),
+            );
+        }
+    };
+
+    // Build a map of key → {value, is_override, updated_at}
+    let overrides_map: serde_json::Value = serde_json::Value::Object(
+        db_overrides
+            .iter()
+            .map(|row| {
+                let val: serde_json::Value = serde_json::from_str(&row.value)
+                    .unwrap_or(serde_json::Value::String(row.value.clone()));
+                (
+                    row.key.clone(),
+                    json!({
+                        "value": val,
+                        "is_override": row.is_override,
+                        "updated_at": row.updated_at.to_rfc3339(),
+                    }),
+                )
+            })
+            .collect(),
+    );
+
+    // Include the effective running config (what server booted with).
+    // Expose enough of each section that the UI can render "current running
+    // values" next to each tab without needing to call multiple endpoints.
+    let effective = if let Some(app_state) = state.app_state() {
+        let config = app_state.config();
+        let proxy_json = serde_json::to_value(&config.proxy).unwrap_or(JsonValue::Null);
+        let rwi_json = serde_json::to_value(&config.rwi).unwrap_or(JsonValue::Null);
+        let recording_json =
+            serde_json::to_value(&config.recording).unwrap_or(JsonValue::Null);
+        let callrecord_json =
+            serde_json::to_value(&config.callrecord).unwrap_or(JsonValue::Null);
+        let sipflow_json =
+            serde_json::to_value(&config.sipflow).unwrap_or(JsonValue::Null);
+        json!({
+            "http_addr": config.http_addr,
+            "external_ip": config.external_ip,
+            "log_level": config.log_level,
+            "log_file": config.log_file,
+            "database_url": config.database_url,
+            "rtp_start_port": config.rtp_start_port,
+            "rtp_end_port": config.rtp_end_port,
+            "recording": {
+                "path": config.recorder_path(),
+                "policy": recording_json,
+            },
+            "callrecord": callrecord_json,
+            "proxy": proxy_json,
+            "rwi": rwi_json,
+            "sipflow": sipflow_json,
+        })
+    } else {
+        json!(null)
+    };
+
+    Json(json!({
+        "status": "ok",
+        "effective_config": effective,
+        "db_overrides": overrides_map,
+        "override_count": db_overrides.len(),
+        "note": "effective_config shows running values; db_overrides shows what is stored in DB. Restart applies all overrides."
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct ConfigEntryPayload {
+    key: String,
+    /// Raw JSON string as it will be stored (e.g. "\"debug\"", "5060", "true",
+    /// "[\"a\",\"b\"]"). The backend validates it by parsing as JSON.
+    value: String,
+    #[serde(default)]
+    is_override: bool,
+}
+
+/// PATCH /settings/config/entry — upsert a single system_config row.
+pub(crate) async fn upsert_config_entry(
+    State(state): State<Arc<ConsoleState>>,
+    AuthRequired(user): AuthRequired,
+    Json(payload): Json<ConfigEntryPayload>,
+) -> Response {
+    if !state.has_permission(&user, "system", "write").await {
+        return json_error(StatusCode::FORBIDDEN, "Permission denied");
+    }
+
+    let key = payload.key.trim();
+    if key.is_empty() {
+        return json_error(StatusCode::UNPROCESSABLE_ENTITY, "key must not be empty");
+    }
+
+    // Validate the value is valid JSON so the merge step won't silently skip it
+    if serde_json::from_str::<serde_json::Value>(&payload.value).is_err() {
+        return json_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "value must be valid JSON (e.g. \"debug\" for strings, 5060 for numbers)",
+        );
+    }
+
+    let db = match get_db(&state) {
+        Ok(db) => db,
+        Err(r) => return r,
+    };
+
+    if let Err(e) = system_config::Model::upsert(&db, key, &payload.value, payload.is_override).await {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to save entry: {e}"),
+        );
+    }
+
+    Json(json!({
+        "status": "ok",
+        "requires_restart": true,
+        "message": "Entry saved. Restart RustPBX to apply.",
+        "key": key,
+    }))
+    .into_response()
+}
+
+/// DELETE /settings/config/entry/{key} — remove a system_config row.
+pub(crate) async fn delete_config_entry(
+    State(state): State<Arc<ConsoleState>>,
+    AuthRequired(user): AuthRequired,
+    AxumPath(key): AxumPath<String>,
+) -> Response {
+    if !state.has_permission(&user, "system", "write").await {
+        return json_error(StatusCode::FORBIDDEN, "Permission denied");
+    }
+
+    let db = match get_db(&state) {
+        Ok(db) => db,
+        Err(r) => return r,
+    };
+
+    use sea_orm::EntityTrait;
+    match system_config::Entity::delete_by_id(key.clone()).exec(&db).await {
+        Ok(res) => Json(json!({
+            "status": "ok",
+            "deleted": res.rows_affected,
+            "key": key,
+            "requires_restart": true,
+        }))
+        .into_response(),
+        Err(e) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to delete entry: {e}"),
+        ),
+    }
+}
+
+/// DELETE /settings/config/group/{prefix} — remove every row in a namespace.
+///
+/// Deletes both the exact `prefix` key (if it exists as a single top-level
+/// row) AND every row whose key starts with `prefix.`. This matches the
+/// atomic-wipe semantics used by the typed settings handlers (e.g. SipFlow),
+/// so that namespaced sections like `[sipflow]` can be fully cleared in one
+/// call instead of one row at a time.
+///
+/// Special case: prefix `"general"` (the synthetic group used in the UI for
+/// keys without a dot) deletes only top-level keys that have no dot.
+pub(crate) async fn delete_config_group(
+    State(state): State<Arc<ConsoleState>>,
+    AuthRequired(user): AuthRequired,
+    AxumPath(prefix): AxumPath<String>,
+) -> Response {
+    if !state.has_permission(&user, "system", "write").await {
+        return json_error(StatusCode::FORBIDDEN, "Permission denied");
+    }
+
+    let prefix = prefix.trim();
+    if prefix.is_empty() {
+        return json_error(StatusCode::UNPROCESSABLE_ENTITY, "prefix must not be empty");
+    }
+
+    let db = match get_db(&state) {
+        Ok(db) => db,
+        Err(r) => return r,
+    };
+
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+    if prefix == "general" {
+        // Top-level keys only: those without a dot. SQLite's `NOT LIKE '%.%'`
+        // captures them. We avoid deleting `database_url` here defensively
+        // since it should never have been seeded anyway.
+        let result = system_config::Entity::delete_many()
+            .filter(system_config::Column::Key.not_like("%.%"))
+            .filter(system_config::Column::Key.ne("database_url"))
+            .exec(&db)
+            .await;
+        return match result {
+            Ok(res) => Json(json!({
+                "status": "ok",
+                "deleted": res.rows_affected,
+                "group": "general",
+                "requires_restart": true,
+            }))
+            .into_response(),
+            Err(e) => json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to delete group: {e}"),
+            ),
+        };
+    }
+
+    // Section group: delete both the exact prefix row (legacy single-object
+    // form) and every `prefix.*` row in one go.
+    let dotted = format!("{prefix}.");
+    let result = system_config::Entity::delete_many()
+        .filter(
+            system_config::Column::Key
+                .eq(prefix.to_string())
+                .or(system_config::Column::Key.starts_with(&dotted)),
+        )
+        .exec(&db)
+        .await;
+
+    match result {
+        Ok(res) => Json(json!({
+            "status": "ok",
+            "deleted": res.rows_affected,
+            "group": prefix,
+            "requires_restart": true,
+        }))
+        .into_response(),
+        Err(e) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to delete group: {e}"),
+        ),
+    }
+}
+
 pub(crate) async fn update_platform_settings(
     State(state): State<Arc<ConsoleState>>,
     AuthRequired(user): AuthRequired,
@@ -1562,21 +1854,29 @@ pub(crate) async fn update_platform_settings(
     if !state.has_permission(&user, "system", "write").await {
         return json_error(StatusCode::FORBIDDEN, "Permission denied");
     }
+
+    let db = match get_db(&state) {
+        Ok(db) => db,
+        Err(r) => return r,
+    };
+
+    // Load base config for validation only (not written back to disk)
     let config_path = match get_config_path(&state) {
-        Ok(path) => path,
-        Err(resp) => return resp,
+        Ok(p) => p,
+        Err(r) => return r,
     };
-
     let mut doc = match load_document(&config_path) {
-        Ok(doc) => doc,
-        Err(resp) => return resp,
+        Ok(d) => d,
+        Err(r) => return r,
     };
 
+    let mut overrides: Vec<(&'static str, serde_json::Value)> = Vec::new();
     let mut modified = false;
 
     if let Some(level_opt) = payload.log_level {
         if let Some(level) = normalize_opt_string(level_opt) {
-            doc["log_level"] = value(level);
+            doc["log_level"] = value(level.clone());
+            overrides.push(("log_level", serde_json::json!(level)));
         } else {
             doc.remove("log_level");
         }
@@ -1585,7 +1885,8 @@ pub(crate) async fn update_platform_settings(
 
     if let Some(file_opt) = payload.log_file {
         if let Some(path) = normalize_opt_string(file_opt) {
-            doc["log_file"] = value(path);
+            doc["log_file"] = value(path.clone());
+            overrides.push(("log_file", serde_json::json!(path)));
         } else {
             doc.remove("log_file");
         }
@@ -1594,7 +1895,8 @@ pub(crate) async fn update_platform_settings(
 
     if let Some(ext_opt) = payload.external_ip {
         if let Some(ip) = normalize_opt_string(ext_opt) {
-            doc["external_ip"] = value(ip);
+            doc["external_ip"] = value(ip.clone());
+            overrides.push(("external_ip", serde_json::json!(ip)));
         } else {
             doc.remove("external_ip");
         }
@@ -1610,6 +1912,7 @@ pub(crate) async fn update_platform_settings(
                 );
             }
             doc["rtp_start_port"] = value(i64::from(port));
+            overrides.push(("rtp_start_port", serde_json::json!(port)));
         } else {
             doc.remove("rtp_start_port");
         }
@@ -1625,12 +1928,14 @@ pub(crate) async fn update_platform_settings(
                 );
             }
             doc["rtp_end_port"] = value(i64::from(port));
+            overrides.push(("rtp_end_port", serde_json::json!(port)));
         } else {
             doc.remove("rtp_end_port");
         }
         modified = true;
     }
 
+    // Validate the merged document as a Config
     let doc_text = doc.to_string();
     let config = match parse_config_from_str(&doc_text) {
         Ok(cfg) => cfg,
@@ -1646,8 +1951,19 @@ pub(crate) async fn update_platform_settings(
         );
     }
 
-    if modified && let Err(resp) = persist_document(&config_path, doc_text) {
-        return resp;
+    // Persist to DB (not to disk)
+    if modified {
+        for (key, val) in overrides {
+            let is_override = key == "external_ip"; // manual IP = skip auto-detection
+            if let Err(e) =
+                system_config::Model::upsert(&db, key, &val.to_string(), is_override).await
+            {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to save setting '{key}': {e}"),
+                );
+            }
+        }
     }
 
     Json(json!({
@@ -1675,98 +1991,59 @@ pub(crate) async fn update_proxy_settings(
     if !state.has_permission(&user, "system", "write").await {
         return json_error(StatusCode::FORBIDDEN, "Permission denied");
     }
+
+    let db = match get_db(&state) {
+        Ok(db) => db,
+        Err(r) => return r,
+    };
+
     let config_path = match get_config_path(&state) {
-        Ok(path) => path,
-        Err(resp) => return resp,
+        Ok(p) => p,
+        Err(r) => return r,
     };
-
     let mut doc = match load_document(&config_path) {
-        Ok(doc) => doc,
-        Err(resp) => return resp,
+        Ok(d) => d,
+        Err(r) => return r,
     };
 
+    let mut overrides: Vec<(&'static str, serde_json::Value)> = Vec::new();
     let mut modified = false;
     let table = ensure_table_mut(&mut doc, "proxy");
 
     if let Some(realms) = payload.realms {
-        set_string_array(table, "realms", realms);
+        set_string_array(table, "realms", realms.clone());
+        overrides.push(("proxy.realms", serde_json::json!(realms)));
         modified = true;
     }
 
     if let Some(webhook) = payload.locator_webhook {
-        let toml_s = match toml::to_string(&webhook) {
-            Ok(s) => s,
-            Err(err) => {
-                return json_error(
-                    StatusCode::BAD_REQUEST,
-                    format!("Failed to serialize locator_webhook: {err}"),
-                );
-            }
-        };
-        let new_doc = match toml_s.parse::<DocumentMut>() {
-            Ok(doc) => doc,
-            Err(err) => {
-                return json_error(
-                    StatusCode::BAD_REQUEST,
-                    format!("Invalid locator_webhook payload: {err}"),
-                );
-            }
-        };
-        table["locator_webhook"] = new_doc.as_item().clone();
+        let toml_s = toml::to_string(&webhook).unwrap_or_default();
+        if let Ok(new_doc) = toml_s.parse::<DocumentMut>() {
+            table["locator_webhook"] = new_doc.as_item().clone();
+        }
+        overrides.push(("proxy.locator_webhook", serde_json::to_value(&webhook).unwrap_or_default()));
         modified = true;
     }
 
     if let Some(backends) = payload.user_backends {
-        #[derive(Serialize)]
-        struct UserBackendsToml {
-            b: Vec<UserBackendConfig>,
+        let toml_s = toml::to_string(&json!({ "b": backends })).unwrap_or_default();
+        if let Ok(new_doc) = toml_s.parse::<DocumentMut>() {
+            if let Some(item) = new_doc.get("b") {
+                table["user_backends"] = item.clone();
+            } else {
+                table.remove("user_backends");
+            }
         }
-
-        let toml_s = match toml::to_string(&UserBackendsToml { b: backends }) {
-            Ok(s) => s,
-            Err(err) => {
-                return json_error(
-                    StatusCode::BAD_REQUEST,
-                    format!("Failed to serialize user_backends: {err}"),
-                );
-            }
-        };
-        let new_doc = match toml_s.parse::<DocumentMut>() {
-            Ok(doc) => doc,
-            Err(err) => {
-                return json_error(
-                    StatusCode::BAD_REQUEST,
-                    format!("Invalid user_backends payload: {err}"),
-                );
-            }
-        };
-        let Some(backends_item) = new_doc.get("b").cloned() else {
-            return json_error(StatusCode::BAD_REQUEST, "Invalid user_backends payload");
-        };
-        table["user_backends"] = backends_item;
+        overrides.push(("proxy.user_backends", serde_json::to_value(&backends).unwrap_or_default()));
         modified = true;
     }
 
     if let Some(router) = payload.http_router {
-        let toml_s = match toml::to_string(&router) {
-            Ok(s) => s,
-            Err(err) => {
-                return json_error(
-                    StatusCode::BAD_REQUEST,
-                    format!("Failed to serialize http_router: {err}"),
-                );
-            }
-        };
-        let new_doc = match toml_s.parse::<DocumentMut>() {
-            Ok(doc) => doc,
-            Err(err) => {
-                return json_error(
-                    StatusCode::BAD_REQUEST,
-                    format!("Invalid http_router payload: {err}"),
-                );
-            }
-        };
-        table["http_router"] = new_doc.as_item().clone();
+        let toml_s = toml::to_string(&router).unwrap_or_default();
+        if let Ok(new_doc) = toml_s.parse::<DocumentMut>() {
+            table["http_router"] = new_doc.as_item().clone();
+        }
+        overrides.push(("proxy.http_router", serde_json::to_value(&router).unwrap_or_default()));
         modified = true;
     }
 
@@ -1775,8 +2052,15 @@ pub(crate) async fn update_proxy_settings(
         if let Err(resp) = parse_config_from_str(&doc_text) {
             return resp;
         }
-        if let Err(resp) = persist_document(&config_path, doc_text) {
-            return resp;
+        for (key, val) in overrides {
+            if let Err(e) =
+                system_config::Model::upsert(&db, key, &val.to_string(), false).await
+            {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to save setting '{key}': {e}"),
+                );
+            }
         }
     }
 
@@ -1805,15 +2089,23 @@ pub(crate) async fn update_storage_settings(
         Err(resp) => return resp,
     };
 
+    // DB ops collected while mutating `doc` (which is used for Config validation).
+    // Some(v) = upsert, None = delete the row so base config.toml value takes effect.
+    let mut ops: Vec<(String, Option<serde_json::Value>)> = Vec::new();
     let mut modified = false;
 
     if let Some(path_opt) = payload.recorder_path {
         {
             let table = ensure_table_mut(&mut doc, "recording");
-            if let Some(path) = normalize_opt_string(path_opt) {
-                table["path"] = value(path);
-            } else {
-                table.remove("path");
+            match normalize_opt_string(path_opt) {
+                Some(path) => {
+                    table["path"] = value(path.clone());
+                    ops.push(("recording.path".into(), Some(json!(path))));
+                }
+                None => {
+                    table.remove("path");
+                    ops.push(("recording.path".into(), None));
+                }
             }
         }
         doc.remove("recorder_path");
@@ -1821,18 +2113,32 @@ pub(crate) async fn update_storage_settings(
     }
 
     if let Some(cache_opt) = payload.media_cache_path {
-        if let Some(path) = normalize_opt_string(cache_opt) {
-            doc["media_cache_path"] = value(path);
-        } else {
-            doc.remove("media_cache_path");
+        match normalize_opt_string(cache_opt) {
+            Some(path) => {
+                doc["media_cache_path"] = value(path.clone());
+                ops.push(("media_cache_path".into(), Some(json!(path))));
+            }
+            None => {
+                doc.remove("media_cache_path");
+                ops.push(("media_cache_path".into(), None));
+            }
         }
         modified = true;
     }
 
+    // Signal that the entire `callrecord.*` key space should be wiped before
+    // upserting the new values. Used so stale fields from the previous mode
+    // (e.g. local→s3) or seeded base-config values don't leak back in via
+    // config_merge::seed_missing_from_doc.
+    let mut clear_callrecord = false;
+
     if let Some(callrecord_opt) = payload.callrecord {
+        clear_callrecord = true;
         match callrecord_opt {
             Some(CallRecordStoragePayload::Disabled) | None => {
                 doc.remove("callrecord");
+                // ops entries are a no-op for disabled: the blanket wipe below
+                // is the whole effect.
             }
             Some(CallRecordStoragePayload::Local { root }) => {
                 let Some(root_path) = normalize_opt_string(root) else {
@@ -1843,8 +2149,10 @@ pub(crate) async fn update_storage_settings(
                 };
                 let mut table = Table::new();
                 table["type"] = value("local");
-                table["root"] = value(root_path);
+                table["root"] = value(root_path.clone());
                 doc["callrecord"] = Item::Table(table);
+                ops.push(("callrecord.type".into(), Some(json!("local"))));
+                ops.push(("callrecord.root".into(), Some(json!(root_path))));
             }
             Some(CallRecordStoragePayload::S3 {
                 vendor,
@@ -1857,83 +2165,125 @@ pub(crate) async fn update_storage_settings(
                 with_media,
                 keep_media_copy,
             }) => {
+                let endpoint = endpoint.unwrap_or_default();
+                let root = root.unwrap_or_default();
+                let vendor_str = serde_json::to_value(&vendor)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_else(|| "aws".to_string());
                 let mut table = Table::new();
                 table["type"] = value("s3");
-                table["vendor"] = value(vendor);
-                table["bucket"] = value(bucket);
-                table["region"] = value(region);
-                table["access_key"] = value(access_key);
-                table["secret_key"] = value(secret_key);
-                if let Some(ep) = normalize_opt_string(endpoint) {
-                    table["endpoint"] = value(ep);
-                } else {
-                    table.remove("endpoint");
+                table["vendor"] = value(vendor_str.clone());
+                table["bucket"] = value(bucket.clone());
+                table["region"] = value(region.clone());
+                table["access_key"] = value(access_key.clone());
+                table["secret_key"] = value(secret_key.clone());
+                table["endpoint"] = value(endpoint.clone());
+                table["root"] = value(root.clone());
+                if let Some(b) = with_media {
+                    table["with_media"] = value(b);
                 }
-                if let Some(r) = normalize_opt_string(root) {
-                    table["root"] = value(r);
-                } else {
-                    table.remove("root");
-                }
-                if let Some(wm) = with_media {
-                    table["with_media"] = value(wm);
-                }
-                if let Some(kmc) = keep_media_copy {
-                    table["keep_media_copy"] = value(kmc);
+                if let Some(b) = keep_media_copy {
+                    table["keep_media_copy"] = value(b);
                 }
                 doc["callrecord"] = Item::Table(table);
+
+                ops.push(("callrecord.type".into(), Some(json!("s3"))));
+                ops.push(("callrecord.vendor".into(), Some(json!(vendor_str))));
+                ops.push(("callrecord.bucket".into(), Some(json!(bucket))));
+                ops.push(("callrecord.region".into(), Some(json!(region))));
+                ops.push(("callrecord.access_key".into(), Some(json!(access_key))));
+                ops.push(("callrecord.secret_key".into(), Some(json!(secret_key))));
+                ops.push(("callrecord.endpoint".into(), Some(json!(endpoint))));
+                ops.push(("callrecord.root".into(), Some(json!(root))));
+                if let Some(b) = with_media {
+                    ops.push(("callrecord.with_media".into(), Some(json!(b))));
+                }
+                if let Some(b) = keep_media_copy {
+                    ops.push(("callrecord.keep_media_copy".into(), Some(json!(b))));
+                }
             }
         }
         modified = true;
     }
 
+    // All individual recording.* keys managed by recording_policy.
+    const RECORDING_KEYS: &[&str] = &[
+        "recording.enabled",
+        "recording.auto_start",
+        "recording.directions",
+        "recording.caller_allow",
+        "recording.caller_deny",
+        "recording.callee_allow",
+        "recording.callee_deny",
+        "recording.filename_pattern",
+        "recording.samplerate",
+        "recording.ptime",
+        "recording.path",
+        "recording.format",
+    ];
+
     if let Some(policy_opt) = payload.recording_policy {
         match policy_opt {
             Some(policy_payload) => {
                 let mut table = Table::new();
-                table["enabled"] = value(policy_payload.enabled.unwrap_or(false));
+                let enabled = policy_payload.enabled.unwrap_or(false);
+                table["enabled"] = value(enabled);
+                ops.push(("recording.enabled".into(), Some(json!(enabled))));
 
                 if let Some(directions) = policy_payload.directions {
                     if directions.is_empty() {
                         table.remove("directions");
+                        ops.push(("recording.directions".into(), None));
                     } else {
-                        set_string_array(&mut table, "directions", directions);
+                        set_string_array(&mut table, "directions", directions.clone());
+                        ops.push(("recording.directions".into(), Some(json!(directions))));
                     }
                 }
 
                 if let Some(allow) = policy_payload.caller_allow {
                     if allow.is_empty() {
                         table.remove("caller_allow");
+                        ops.push(("recording.caller_allow".into(), None));
                     } else {
-                        set_string_array(&mut table, "caller_allow", allow);
+                        set_string_array(&mut table, "caller_allow", allow.clone());
+                        ops.push(("recording.caller_allow".into(), Some(json!(allow))));
                     }
                 }
 
                 if let Some(deny) = policy_payload.caller_deny {
                     if deny.is_empty() {
                         table.remove("caller_deny");
+                        ops.push(("recording.caller_deny".into(), None));
                     } else {
-                        set_string_array(&mut table, "caller_deny", deny);
+                        set_string_array(&mut table, "caller_deny", deny.clone());
+                        ops.push(("recording.caller_deny".into(), Some(json!(deny))));
                     }
                 }
 
                 if let Some(allow) = policy_payload.callee_allow {
                     if allow.is_empty() {
                         table.remove("callee_allow");
+                        ops.push(("recording.callee_allow".into(), None));
                     } else {
-                        set_string_array(&mut table, "callee_allow", allow);
+                        set_string_array(&mut table, "callee_allow", allow.clone());
+                        ops.push(("recording.callee_allow".into(), Some(json!(allow))));
                     }
                 }
 
                 if let Some(deny) = policy_payload.callee_deny {
                     if deny.is_empty() {
                         table.remove("callee_deny");
+                        ops.push(("recording.callee_deny".into(), None));
                     } else {
-                        set_string_array(&mut table, "callee_deny", deny);
+                        set_string_array(&mut table, "callee_deny", deny.clone());
+                        ops.push(("recording.callee_deny".into(), Some(json!(deny))));
                     }
                 }
 
                 if let Some(auto_start) = policy_payload.auto_start {
                     table["auto_start"] = value(auto_start);
+                    ops.push(("recording.auto_start".into(), Some(json!(auto_start))));
                 }
 
                 match policy_payload.filename_pattern {
@@ -1941,12 +2291,18 @@ pub(crate) async fn update_storage_settings(
                         let trimmed = pattern.trim();
                         if trimmed.is_empty() {
                             table.remove("filename_pattern");
+                            ops.push(("recording.filename_pattern".into(), None));
                         } else {
                             table["filename_pattern"] = value(trimmed);
+                            ops.push((
+                                "recording.filename_pattern".into(),
+                                Some(json!(trimmed)),
+                            ));
                         }
                     }
                     Some(None) => {
                         table.remove("filename_pattern");
+                        ops.push(("recording.filename_pattern".into(), None));
                     }
                     None => {}
                 }
@@ -1954,9 +2310,11 @@ pub(crate) async fn update_storage_settings(
                 match policy_payload.samplerate {
                     Some(Some(rate)) => {
                         table["samplerate"] = value(i64::from(rate));
+                        ops.push(("recording.samplerate".into(), Some(json!(rate))));
                     }
                     Some(None) => {
                         table.remove("samplerate");
+                        ops.push(("recording.samplerate".into(), None));
                     }
                     None => {}
                 }
@@ -1964,18 +2322,25 @@ pub(crate) async fn update_storage_settings(
                 match policy_payload.ptime {
                     Some(Some(ptime)) => {
                         table["ptime"] = value(i64::from(ptime));
+                        ops.push(("recording.ptime".into(), Some(json!(ptime))));
                     }
                     Some(None) => {
                         table.remove("ptime");
+                        ops.push(("recording.ptime".into(), None));
                     }
                     None => {}
                 }
 
                 if let Some(path_opt) = policy_payload.path {
-                    if let Some(path) = normalize_opt_string(path_opt) {
-                        table["path"] = value(path);
-                    } else {
-                        table.remove("path");
+                    match normalize_opt_string(path_opt) {
+                        Some(path) => {
+                            table["path"] = value(path.clone());
+                            ops.push(("recording.path".into(), Some(json!(path))));
+                        }
+                        None => {
+                            table.remove("path");
+                            ops.push(("recording.path".into(), None));
+                        }
                     }
                 }
 
@@ -1985,8 +2350,13 @@ pub(crate) async fn update_storage_settings(
                             let normalized = format_value.trim().to_ascii_lowercase();
                             if normalized.is_empty() {
                                 table.remove("format");
+                                ops.push(("recording.format".into(), None));
                             } else if normalized == "wav" || normalized == "ogg" {
-                                table["format"] = value(normalized);
+                                table["format"] = value(normalized.clone());
+                                ops.push((
+                                    "recording.format".into(),
+                                    Some(json!(normalized)),
+                                ));
                             } else {
                                 return json_error(
                                     StatusCode::UNPROCESSABLE_ENTITY,
@@ -1996,6 +2366,7 @@ pub(crate) async fn update_storage_settings(
                         }
                         None => {
                             table.remove("format");
+                            ops.push(("recording.format".into(), None));
                         }
                     }
                 }
@@ -2004,6 +2375,9 @@ pub(crate) async fn update_storage_settings(
             }
             None => {
                 doc.remove("recording");
+                for key in RECORDING_KEYS {
+                    ops.push((key.to_string(), None));
+                }
             }
         }
         modified = true;
@@ -2017,8 +2391,10 @@ pub(crate) async fn update_storage_settings(
                     let normalized = format_value.trim().to_ascii_lowercase();
                     if normalized.is_empty() {
                         table.remove("format");
+                        ops.push(("recording.format".into(), None));
                     } else if normalized == "wav" {
-                        table["format"] = value(normalized);
+                        table["format"] = value(normalized.clone());
+                        ops.push(("recording.format".into(), Some(json!(normalized))));
                     } else {
                         return json_error(
                             StatusCode::UNPROCESSABLE_ENTITY,
@@ -2028,6 +2404,7 @@ pub(crate) async fn update_storage_settings(
                 }
                 None => {
                     table.remove("format");
+                    ops.push(("recording.format".into(), None));
                 }
             }
         }
@@ -2035,14 +2412,65 @@ pub(crate) async fn update_storage_settings(
         modified = true;
     }
 
+    // Validate the mutated doc parses as a Config before touching the DB.
     let doc_text = doc.to_string();
     let config = match parse_config_from_str(&doc_text) {
         Ok(cfg) => cfg,
         Err(resp) => return resp,
     };
 
-    if modified && let Err(resp) = persist_document(&config_path, doc_text) {
-        return resp;
+    if modified {
+        let db = match get_db(&state) {
+            Ok(db) => db,
+            Err(r) => return r,
+        };
+        use sea_orm::EntityTrait;
+        // Wipe the entire `callrecord.*` key space before writing the new
+        // set. Without this, fields from the previous mode (e.g. local→s3)
+        // or seeded base-config values would leak back in on the next
+        // startup via seed_missing_from_doc and clobber the current mode.
+        if clear_callrecord {
+            use sea_orm::{ColumnTrait, QueryFilter};
+            if let Err(e) = system_config::Entity::delete_many()
+                .filter(system_config::Column::Key.starts_with("callrecord."))
+                .exec(&db)
+                .await
+            {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to clear stale callrecord.* rows: {e}"),
+                );
+            }
+            // Also remove any legacy top-level `callrecord` row left over
+            // from the previous (object-blob) storage format.
+            let _ = system_config::Entity::delete_by_id("callrecord".to_string())
+                .exec(&db)
+                .await;
+        }
+        for (key, val_opt) in ops {
+            match val_opt {
+                Some(v) => {
+                    if let Err(e) =
+                        system_config::Model::upsert(&db, &key, &v.to_string(), false).await
+                    {
+                        return json_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Failed to save setting '{key}': {e}"),
+                        );
+                    }
+                }
+                None => {
+                    if let Err(e) =
+                        system_config::Entity::delete_by_id(key.clone()).exec(&db).await
+                    {
+                        return json_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Failed to delete setting '{key}': {e}"),
+                        );
+                    }
+                }
+            }
+        }
     }
 
     let (storage_meta, storage_profiles) = build_storage_profiles(&config);
@@ -2157,8 +2585,25 @@ pub(crate) async fn update_security_settings(
         Err(resp) => return resp,
     };
 
-    if modified && let Err(resp) = persist_document(&config_path, doc_text) {
-        return resp;
+    if modified {
+        let db = match get_db(&state) {
+            Ok(db) => db,
+            Err(r) => return r,
+        };
+        let rules = config.proxy.acl_rules.clone().unwrap_or_default();
+        if let Err(e) = system_config::Model::upsert(
+            &db,
+            "proxy.acl_rules",
+            &serde_json::to_string(&rules).unwrap_or_default(),
+            false,
+        )
+        .await
+        {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to save acl_rules: {e}"),
+            );
+        }
     }
 
     let acl_rules = config.proxy.acl_rules.clone().unwrap_or_default();
@@ -2204,6 +2649,54 @@ struct RwiContextPayload {
     no_answer_timeout_secs: Option<u32>,
     no_answer_action: Option<String>,
     no_answer_transfer_target: Option<String>,
+}
+
+const ALLOWED_TIMEZONES: &[&str] = &[
+    "Asia/Kolkata",
+    "UTC",
+    "America/New_York",
+    "America/Chicago",
+    "America/Denver",
+    "America/Los_Angeles",
+    "Europe/London",
+    "Europe/Paris",
+    "Europe/Berlin",
+    "Asia/Dubai",
+    "Asia/Singapore",
+    "Asia/Tokyo",
+    "Australia/Sydney",
+];
+
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct DisplaySettingsPayload {
+    pub display_timezone: String,
+}
+
+pub(crate) async fn update_display_settings(
+    State(state): State<Arc<ConsoleState>>,
+    AuthRequired(user): AuthRequired,
+    Json(payload): Json<DisplaySettingsPayload>,
+) -> Response {
+    if !user.is_superuser && !state.has_permission(&user, "system", "write").await {
+        return (StatusCode::FORBIDDEN, Json(json!({"message": "Permission denied"}))).into_response();
+    }
+    let tz = payload.display_timezone.trim();
+    if !ALLOWED_TIMEZONES.contains(&tz) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"message": format!("Invalid timezone '{}'. Must be one of the supported IANA timezone names.", tz)})),
+        )
+            .into_response();
+    }
+    if let Err(e) = state.set_display_timezone(tz).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"message": format!("Failed to save timezone: {}", e)})),
+        )
+            .into_response();
+    }
+    Json(json!({"message": "Display settings saved", "display_timezone": state.display_timezone()}))
+        .into_response()
 }
 
 pub(crate) async fn update_rwi_settings(
@@ -2326,8 +2819,24 @@ pub(crate) async fn update_rwi_settings(
         Err(resp) => return resp,
     };
 
-    if modified && let Err(resp) = persist_document(&config_path, doc_text) {
-        return resp;
+    if modified {
+        let db = match get_db(&state) {
+            Ok(db) => db,
+            Err(r) => return r,
+        };
+        if let Err(e) = system_config::Model::upsert(
+            &db,
+            "rwi",
+            &serde_json::to_string(&config.rwi).unwrap_or_default(),
+            false,
+        )
+        .await
+        {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to save rwi settings: {e}"),
+            );
+        }
     }
 
     let rwi_config = config.rwi.unwrap_or_default();
@@ -2338,6 +2847,14 @@ pub(crate) async fn update_rwi_settings(
         "rwi": rwi_config
     }))
     .into_response()
+}
+
+/// Get the DB connection from the console state, returning an error Response if unavailable.
+fn get_db(state: &ConsoleState) -> Result<sea_orm::DatabaseConnection, Response> {
+    state
+        .app_state()
+        .map(|s| s.db().clone())
+        .ok_or_else(|| json_error(StatusCode::SERVICE_UNAVAILABLE, "Application state unavailable"))
 }
 
 #[cfg(feature = "commerce")]
@@ -3007,6 +3524,7 @@ fn load_document(path: &str) -> Result<DocumentMut, Response> {
     })
 }
 
+#[allow(dead_code)]
 #[allow(clippy::result_large_err)]
 fn persist_document(path: &str, contents: String) -> Result<(), Response> {
     fs::write(path, contents).map_err(|err| {
@@ -3537,6 +4055,334 @@ async fn assign_user_roles(
         }
     }
     Json(json!({ "status": "ok" })).into_response()
+}
+
+// ─── Pending S3 uploads (failed-upload retry queue) ─────────────────────────
+
+/// GET /settings/uploads/pending
+///
+/// Returns the recent pending_uploads rows plus counts grouped by status.
+/// Used by the "Pending S3 uploads" panel on the Recording tab.
+pub(crate) async fn list_pending_uploads(
+    State(state): State<Arc<ConsoleState>>,
+    AuthRequired(user): AuthRequired,
+) -> Response {
+    if !state.has_permission(&user, "system", "read").await {
+        return json_error(StatusCode::FORBIDDEN, "Permission denied");
+    }
+    let db = match get_db(&state) {
+        Ok(db) => db,
+        Err(r) => return r,
+    };
+
+    let counts =
+        match crate::models::pending_upload::Model::count_by_status(&db).await {
+            Ok(c) => c,
+            Err(e) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to count pending uploads: {e}"),
+                );
+            }
+        };
+
+    let rows = match crate::models::pending_upload::Model::list_recent(&db, 50).await {
+        Ok(r) => r,
+        Err(e) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to list pending uploads: {e}"),
+            );
+        }
+    };
+
+    let entries: Vec<JsonValue> = rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "call_id": r.call_id,
+                "kind": r.kind,
+                "local_path": r.local_path,
+                "target_key": r.target_key,
+                "attempts": r.attempts,
+                "status": r.status,
+                "last_error": r.last_error,
+                "last_attempt_at": r.last_attempt_at.map(|t| t.to_rfc3339()),
+                "created_at": r.created_at.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    Json(json!({
+        "status": "ok",
+        "counts": {
+            "pending": counts.0,
+            "failed_permanent": counts.1,
+            "failed_missing_source": counts.2,
+        },
+        "entries": entries,
+    }))
+    .into_response()
+}
+
+/// POST /settings/uploads/pending/retry
+///
+/// Resets every non-pending row back to `pending` (so failed_permanent
+/// rows get a fresh chance) and triggers an immediate sweep of the
+/// upload-retry scheduler. Returns the post-sweep counts.
+pub(crate) async fn retry_pending_uploads(
+    State(state): State<Arc<ConsoleState>>,
+    AuthRequired(user): AuthRequired,
+) -> Response {
+    if !state.has_permission(&user, "system", "write").await {
+        return json_error(StatusCode::FORBIDDEN, "Permission denied");
+    }
+    let db = match get_db(&state) {
+        Ok(db) => db,
+        Err(r) => return r,
+    };
+    let reset = match crate::models::pending_upload::Model::reset_failed(&db).await {
+        Ok(n) => n,
+        Err(e) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to reset failed rows: {e}"),
+            );
+        }
+    };
+
+    let app_state = match state.app_state() {
+        Some(a) => a,
+        None => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Application state unavailable",
+            );
+        }
+    };
+    if let Err(e) = crate::upload_retry::sweep(&app_state, 10).await {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Sweep failed: {e}"),
+        );
+    }
+
+    let counts = match crate::models::pending_upload::Model::count_by_status(&db).await {
+        Ok(c) => c,
+        Err(e) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to count after sweep: {e}"),
+            );
+        }
+    };
+    Json(json!({
+        "status": "ok",
+        "reset_to_pending": reset,
+        "counts": {
+            "pending": counts.0,
+            "failed_permanent": counts.1,
+            "failed_missing_source": counts.2,
+        },
+    }))
+    .into_response()
+}
+
+/// POST /settings/uploads/pending/clear
+///
+/// Deletes every row in `failed_permanent` or `failed_missing_source`.
+/// Used by the "Clear failures" button in the panel — these are rows
+/// the operator has acknowledged and decided not to retry.
+pub(crate) async fn clear_pending_failures(
+    State(state): State<Arc<ConsoleState>>,
+    AuthRequired(user): AuthRequired,
+) -> Response {
+    if !state.has_permission(&user, "system", "write").await {
+        return json_error(StatusCode::FORBIDDEN, "Permission denied");
+    }
+    let db = match get_db(&state) {
+        Ok(db) => db,
+        Err(r) => return r,
+    };
+    let cleared = match crate::models::pending_upload::Model::clear_failures(&db).await {
+        Ok(n) => n,
+        Err(e) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to clear failures: {e}"),
+            );
+        }
+    };
+    Json(json!({
+        "status": "ok",
+        "cleared": cleared,
+    }))
+    .into_response()
+}
+
+// ── API key management (superuser / system:write only) ───────────────────────
+
+#[derive(Debug, Deserialize)]
+struct CreateApiKeyPayload {
+    pub name: String,
+    pub description: Option<String>,
+}
+
+fn is_authorized_for_api_keys(_state: &ConsoleState, user: &UserModel) -> bool {
+    user.is_superuser
+}
+
+async fn list_api_keys(
+    State(state): State<Arc<ConsoleState>>,
+    AuthRequired(user): AuthRequired,
+) -> Response {
+    if !is_authorized_for_api_keys(&state, &user) {
+        return (StatusCode::FORBIDDEN, Json(json!({ "message": "Forbidden" }))).into_response();
+    }
+
+    let db = state.db();
+
+    match ApiKeyEntity::find()
+        .order_by_desc(ApiKeyColumn::CreatedAt)
+        .all(db)
+        .await
+    {
+        Ok(keys) => {
+            let items: Vec<JsonValue> = keys
+                .into_iter()
+                .map(|k| {
+                    json!({
+                        "id": k.id,
+                        "name": k.name,
+                        "description": k.description,
+                        "created_at": k.created_at.to_rfc3339(),
+                        "last_used_at": k.last_used_at.map(|t| t.to_rfc3339()),
+                        "revoked_at": k.revoked_at.map(|t| t.to_rfc3339()),
+                        "is_active": k.revoked_at.is_none(),
+                    })
+                })
+                .collect();
+            Json(json!({ "items": items })).into_response()
+        }
+        Err(e) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to list API keys: {e}"),
+        ),
+    }
+}
+
+async fn create_api_key(
+    State(state): State<Arc<ConsoleState>>,
+    AuthRequired(user): AuthRequired,
+    Json(payload): Json<CreateApiKeyPayload>,
+) -> Response {
+    if !is_authorized_for_api_keys(&state, &user) {
+        return (StatusCode::FORBIDDEN, Json(json!({ "message": "Forbidden" }))).into_response();
+    }
+
+    let name = payload.name.trim().to_string();
+    if name.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "message": "name is required" })),
+        )
+            .into_response();
+    }
+
+    let db = state.db();
+    let issued = issue_api_key();
+    let plaintext = issued.plaintext.clone();
+    let am = ApiKeyActiveModel {
+        name: Set(name.clone()),
+        hash_sha256: Set(issued.hash),
+        description: Set(payload.description.and_then(|d| {
+            let t = d.trim().to_string();
+            if t.is_empty() { None } else { Some(t) }
+        })),
+        created_at: Set(Utc::now()),
+        ..Default::default()
+    };
+
+    match am.insert(db).await {
+        Ok(key) => Json(json!({
+            "id": key.id,
+            "name": key.name,
+            "description": key.description,
+            "created_at": key.created_at.to_rfc3339(),
+            "plaintext": plaintext,
+            "is_active": true,
+        }))
+        .into_response(),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("UNIQUE") || msg.contains("unique") {
+                (
+                    StatusCode::CONFLICT,
+                    Json(json!({ "message": "An API key with this name already exists" })),
+                )
+                    .into_response()
+            } else {
+                json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to create API key: {e}"),
+                )
+            }
+        }
+    }
+}
+
+async fn revoke_api_key(
+    State(state): State<Arc<ConsoleState>>,
+    AuthRequired(user): AuthRequired,
+    AxumPath(id): AxumPath<i64>,
+) -> Response {
+    if !is_authorized_for_api_keys(&state, &user) {
+        return (StatusCode::FORBIDDEN, Json(json!({ "message": "Forbidden" }))).into_response();
+    }
+
+    let db = state.db();
+
+    let key = match ApiKeyEntity::find_by_id(id).one(db).await {
+        Ok(Some(k)) => k,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "message": "API key not found" })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to fetch API key: {e}"),
+            );
+        }
+    };
+
+    if key.revoked_at.is_some() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "message": "API key is already revoked" })),
+        )
+            .into_response();
+    }
+
+    let mut am: ApiKeyActiveModel = key.into();
+    am.revoked_at = Set(Some(Utc::now()));
+    match am.update(db).await {
+        Ok(updated) => Json(json!({
+            "id": updated.id,
+            "name": updated.name,
+            "revoked_at": updated.revoked_at.map(|t| t.to_rfc3339()),
+            "is_active": false,
+        }))
+        .into_response(),
+        Err(e) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to revoke API key: {e}"),
+        ),
+    }
 }
 
 #[cfg(test)]

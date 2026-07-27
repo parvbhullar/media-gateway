@@ -1,3 +1,7 @@
+# Declare this crate as its own workspace root so cargo does not attach it to
+# the unrelated parent `active-call` workspace it happens to be nested under.
+[workspace]
+
 [package]
 name = "rustpbx"
 version = "0.4.4"
@@ -36,10 +40,12 @@ addon-acme = ["instant-acme"]
 addon-wholesale = ["flate2", "dep:async-compression", "dep:async-stream"]
 addon-archive = ["flate2"]
 addon-endpoint-manager = []
+parallel-trunk-dial = []
 addon-enterprise-auth = ["dep:ldap3", "flate2", "dep:ring"]
 addon-transcript = []
-addon-voicemail = ["dep:url"]
-addon-ivr-editor = ["dep:hex"]
+addon-voicemail = []
+addon-ivr-editor = []
+addon-jsonrpc-router = ["dep:minijinja", "dep:evalexpr"]
 addon-cc = []
 addon-sbc = ["dep:minijinja", "dep:evalexpr"]
 addon-observability = ["metrics-exporter-prometheus"]
@@ -58,7 +64,7 @@ commerce = [
     "addon-telemetry",
     "addon-sbc",
 ]
-wholesale = ["addon-wholesale", "dep:hex"]
+wholesale = ["addon-wholesale"]
 contact-center = [
     "addon-cc",
     "addon-endpoint-manager",
@@ -80,6 +86,7 @@ cross = ["aws-lc-rs/bindgen"]
 perfcli-bin = []
 text2wav-bin = []
 wav2text-bin = []
+integration-test = []
 
 [dependencies]
 instant-acme = { version = "0.8.5", optional = true }
@@ -106,7 +113,7 @@ tokio-util = "0.7.18"
 tracing = "0.1.43"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tracing-appender = "0.2.5"
-url = { version = "2.5.8", optional = true }
+url = { version = "2.5.8" }
 uuid = { version = "1.23.1", features = ["v4"] }
 clap = { version = "4.6.1", features = ["derive"] }
 toml = "1.1.2"
@@ -114,11 +121,16 @@ toml_edit = { version = "0.25.11", features = ["serde"] }
 rand = "0.10.1"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10.4"
-rsipstack = "0.5.11"
-hex = { version = "0.4.3", optional = true }
-#rsipstack = { path = "../rsipstack" }
-audio-codec = "0.3.38"
-#udio-codec = { path = "../audio-codec", default-features = false }
+hex = "0.4.3"
+# Vendored (not crates.io 0.5.11) because it carries fixes not yet upstreamed:
+# CANCEL-transaction-gating and dead-TCP-connection eviction.
+#rsipstack = "0.5.11"
+rsipstack = { path = "vendor/rsipstack" }
+audio-codec = { version = "=0.3.30", default-features = false }
+rubato = { version = "3.0.0", default-features = false }
+# Direct dep only for RobustDomainResolver (crash-proof SIP DNS); version
+# must stay in lockstep with rsipstack's hickory-resolver.
+hickory-resolver = { version = "0.26.1", features = ["system-config", "tokio"] }
 #rustrtc = { path = "../rustrtc" }
 rustrtc = "0.3.60"
 reqwest = { version = "0.13", features = [
@@ -134,6 +146,7 @@ reqwest = { version = "0.13", features = [
 base64 = "0.22.1"
 hmac = "0.13.0"
 sha2 = "0.11.0"
+subtle = "2.5"
 dotenvy = "0.15.7"
 md-5 = "0.11.0"
 once_cell = "1.21.4"
@@ -201,6 +214,9 @@ aws-lc-rs = { version = "1", optional = true }
 totp-rs = { version = "5.7.1", features = ["qr", "gen_secret"] }
 ldap3 = { version = "0.12.1", optional = true }
 ring = { version = "0.17", optional = true }
+livekit = { version = "0.7", default-features = false, features = ["rustls-tls-webpki-roots"] }
+livekit-api = { version = "0.5", default-features = false, features = ["access-token", "services-tokio", "signal-client-tokio", "rustls-tls-webpki-roots"] }
+livekit-protocol = "0.7"
 
 [dev-dependencies]
 tempfile = "3.27.0"
@@ -211,6 +227,7 @@ serde_urlencoded = "0.7"
 tokio-tungstenite = { version = "0.29.0", features = [
     "rustls-tls-native-roots",
 ] }
+http-body-util = "0.1.3"
 
 [build-dependencies]
 chrono = "0.4"
@@ -227,3 +244,34 @@ required-features = ["opus"]
 [[bin]]
 name = "verify-i18n"
 path = "tools/verify_i18n.rs"
+
+# ── Build profiles ────────────────────────────────────────────────────────────
+
+[profile.dev]
+opt-level = 0
+debug = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+# Fast deploy builds: optimized but incremental-friendly (no LTO, 16 units).
+#
+# `strip` intentionally NOT set here even though release inherits-from-it
+# has `strip = "symbols"`. Stripping the deploy binary has been correlated
+# with corrupted IceCandidate port serialization on cross-toolchain
+# deployments (built on Ubuntu 22.04, run on Ubuntu 24.04). The corruption
+# breaks LiveKit publisher PC ICE because LiveKit's server can't parse our
+# port. Run `cargo build --profile deploy` and ship the unstripped binary
+# (~90MB → ~150MB); the deploy script can strip it post-build if size
+# matters more than safety.
+[profile.deploy]
+inherits = "release"
+lto = false
+codegen-units = 16
+strip = false

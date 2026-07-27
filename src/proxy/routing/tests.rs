@@ -46,6 +46,8 @@ async fn test_match_invite_no_routes() {
             panic!("Unexpected queue result")
         }
         RouteResult::Application { .. } => panic!("unexpected Application route in test"),
+        RouteResult::Reject { .. } => panic!("unexpected Reject route in test"),
+        RouteResult::ExternalBridge { .. } => panic!("unexpected ExternalBridge route in test"),
     }
 }
 
@@ -244,6 +246,8 @@ async fn test_match_invite_inbound_respects_source_trunk() {
             panic!("unexpected queue result")
         }
         RouteResult::Application { .. } => panic!("unexpected Application route in test"),
+        RouteResult::Reject { .. } => panic!("unexpected Reject route in test"),
+        RouteResult::ExternalBridge { .. } => panic!("unexpected ExternalBridge route in test"),
     }
 }
 
@@ -302,6 +306,8 @@ async fn test_match_invite_inbound_without_source_trunk() {
             panic!("unexpected queue result")
         }
         RouteResult::Application { .. } => panic!("unexpected Application route in test"),
+        RouteResult::Reject { .. } => panic!("unexpected Reject route in test"),
+        RouteResult::ExternalBridge { .. } => panic!("unexpected ExternalBridge route in test"),
     }
 }
 
@@ -377,6 +383,8 @@ async fn test_match_invite_exact_match() {
             panic!("unexpected queue result")
         }
         RouteResult::Application { .. } => panic!("unexpected Application route in test"),
+        RouteResult::Reject { .. } => panic!("unexpected Reject route in test"),
+        RouteResult::ExternalBridge { .. } => panic!("unexpected ExternalBridge route in test"),
     }
 }
 
@@ -449,6 +457,8 @@ async fn test_match_invite_regex_match() {
             panic!("unexpected queue result")
         }
         RouteResult::Application { .. } => panic!("unexpected Application route in test"),
+        RouteResult::Reject { .. } => panic!("unexpected Reject route in test"),
+        RouteResult::ExternalBridge { .. } => panic!("unexpected ExternalBridge route in test"),
     }
 }
 
@@ -549,6 +559,8 @@ async fn test_match_invite_queue_action_builds_hold_and_fallback() {
         RouteResult::NotHandled(_, _) => panic!("route was not handled"),
         RouteResult::Abort(..) => panic!("queue route aborted"),
         RouteResult::Application { .. } => panic!("unexpected Application route in test"),
+        RouteResult::Reject { .. } => panic!("unexpected Reject route in test"),
+        RouteResult::ExternalBridge { .. } => panic!("unexpected ExternalBridge route in test"),
     }
 }
 
@@ -802,6 +814,8 @@ async fn test_match_invite_reject_rule() {
             panic!("unexpected queue result")
         }
         RouteResult::Application { .. } => panic!("unexpected Application route in test"),
+        RouteResult::Reject { .. } => panic!("unexpected Reject route in test"),
+        RouteResult::ExternalBridge { .. } => panic!("unexpected ExternalBridge route in test"),
     }
 }
 
@@ -871,6 +885,8 @@ async fn test_match_invite_rewrite_rules() {
             panic!("unexpected queue result")
         }
         RouteResult::Application { .. } => panic!("unexpected Application route in test"),
+        RouteResult::Reject { .. } => panic!("unexpected Reject route in test"),
+        RouteResult::ExternalBridge { .. } => panic!("unexpected ExternalBridge route in test"),
     }
 }
 
@@ -961,6 +977,8 @@ async fn test_match_invite_load_balancing() {
                 panic!("unexpected queue result")
             }
             RouteResult::Application { .. } => panic!("unexpected Application route in test"),
+            RouteResult::Reject { .. } => panic!("unexpected Reject route in test"),
+            RouteResult::ExternalBridge { .. } => panic!("unexpected ExternalBridge route in test"),
         }
     }
 
@@ -1043,6 +1061,8 @@ async fn test_match_invite_header_matching() {
             panic!("unexpected queue result")
         }
         RouteResult::Application { .. } => panic!("unexpected Application route in test"),
+        RouteResult::Reject { .. } => panic!("unexpected Reject route in test"),
+        RouteResult::ExternalBridge { .. } => panic!("unexpected ExternalBridge route in test"),
     }
 }
 
@@ -1110,6 +1130,8 @@ async fn test_match_invite_default_route() {
             panic!("unexpected queue result")
         }
         RouteResult::Application { .. } => panic!("unexpected Application route in test"),
+        RouteResult::Reject { .. } => panic!("unexpected Reject route in test"),
+        RouteResult::ExternalBridge { .. } => panic!("unexpected ExternalBridge route in test"),
     }
 }
 
@@ -1184,6 +1206,8 @@ async fn test_match_invite_advanced_rewrite_patterns() {
             panic!("unexpected queue result")
         }
         RouteResult::Application { .. } => panic!("unexpected Application route in test"),
+        RouteResult::Reject { .. } => panic!("unexpected Reject route in test"),
+        RouteResult::ExternalBridge { .. } => panic!("unexpected ExternalBridge route in test"),
     }
 
     // Test case 2: Simple digit extraction 12345 -> prefix{1}suffix
@@ -1244,6 +1268,8 @@ async fn test_match_invite_advanced_rewrite_patterns() {
             panic!("unexpected queue result")
         }
         RouteResult::Application { .. } => panic!("unexpected Application route in test"),
+        RouteResult::Reject { .. } => panic!("unexpected Reject route in test"),
+        RouteResult::ExternalBridge { .. } => panic!("unexpected ExternalBridge route in test"),
     }
 }
 
@@ -1323,6 +1349,8 @@ async fn test_match_invite_rewrite_from_host_uses_match_capture() {
             panic!("unexpected queue result")
         }
         RouteResult::Application { .. } => panic!("unexpected Application route in test"),
+        RouteResult::Reject { .. } => panic!("unexpected Reject route in test"),
+        RouteResult::ExternalBridge { .. } => panic!("unexpected ExternalBridge route in test"),
     }
 }
 
@@ -1542,6 +1570,8 @@ async fn test_match_invite_application_action() {
         RouteResult::NotHandled(_, _) => panic!("Expected Application, got NotHandled"),
         RouteResult::Abort(_, _) => panic!("Expected Application, got Abort"),
         RouteResult::Queue { .. } => panic!("Expected Application, got Queue"),
+        RouteResult::Reject { .. } => panic!("Expected Application, got Reject"),
+        RouteResult::ExternalBridge { .. } => panic!("Expected Application, got ExternalBridge"),
     }
 }
 
@@ -2088,16 +2118,14 @@ async fn test_apply_trunk_config_rewrite_hostport_true() {
         "callee port should be rewritten when rewrite_hostport is true"
     );
 
-    // Verify caller host is also rewritten to trunk's dest
+    // Caller/From host must NOT be rewritten: the outbound leg sets From to
+    // rustpbx's own external SIP address (B2BUA identity), and the original
+    // caller is carried in P-Asserted-Identity instead. Rewriting it here
+    // previously leaked the upstream caller's host into the From header.
     assert_eq!(
         option.caller.host().to_string(),
-        "carrier.gateway.com",
-        "caller host should be rewritten when rewrite_hostport is true"
-    );
-    assert_eq!(
-        option.caller.host_with_port.port,
-        Some(5080.into()),
-        "caller port should be rewritten when rewrite_hostport is true"
+        "original.com",
+        "caller host must be left untouched when rewrite_hostport is true"
     );
 
     // Verify destination is still set

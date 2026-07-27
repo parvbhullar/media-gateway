@@ -4,9 +4,11 @@ use crate::media::{Track, recorder::Leg};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use parking_lot::Mutex;
+use rustrtc::media::AudioFrame;
 use rustrtc::media::error::MediaResult;
 use rustrtc::media::frame::{MediaKind, MediaSample};
 use rustrtc::media::track::{MediaStreamTrack, TrackState};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -46,6 +48,11 @@ pub struct ForwardingTrack {
     sipflow_tx: Option<mpsc::Sender<(Leg, MediaSample)>>,
     recorder_leg: Leg,
     dtmf_mapping: Mutex<Option<DtmfMapping>>,
+    /// Transcoded frames not yet emitted. `Transcoder::transcode` returns
+    /// 0..N frames per input packet, but `recv()` can only hand back one at a
+    /// time; the surplus (rare — only for >20 ms input packets) waits here and
+    /// drains on subsequent `recv()` calls so no audio is dropped.
+    pending: Mutex<VecDeque<AudioFrame>>,
 }
 
 pub struct ForwardingTrackHandle {
@@ -80,6 +87,7 @@ impl ForwardingTrack {
             sipflow_tx,
             recorder_leg,
             dtmf_mapping: Mutex::new(None),
+            pending: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -247,6 +255,13 @@ impl MediaStreamTrack for ForwardingTrack {
         loop {
             self.rebuild_runtime_if_needed();
 
+            // Emit any frame buffered from a previous multi-frame transcode
+            // before pulling new input. (Already recorded + timestamp-rewritten
+            // when it was produced.)
+            if let Some(frame) = self.pending.lock().pop_front() {
+                return Ok(MediaSample::Audio(frame));
+            }
+
             let audio_mapping = self.audio_mapping.lock().clone();
             let dtmf_mapping = self.dtmf_mapping.lock().clone();
             let sample = self.inner.recv().await?;
@@ -306,21 +321,35 @@ impl MediaStreamTrack for ForwardingTrack {
                 }
 
                 if let Some(audio_mapping) = audio_mapping.as_ref().filter(|_| matched_audio) {
-                    let mut guard = self.transcoder.lock();
-                    if let Some(transcoder) = guard.as_mut() {
-                        let mut output = transcoder.transcode(frame);
-
+                    let mut frames = {
+                        let mut guard = self.transcoder.lock();
+                        match guard.as_mut() {
+                            Some(transcoder) => Some(transcoder.transcode(frame)),
+                            None => None,
+                        }
+                    };
+                    if let Some(ref mut frames) = frames {
+                        // 0..N exactly-sized frames; timestamp-rewrite each.
                         let mut timing_guard = self.audio_timing.lock();
                         if let Some(timing) = timing_guard.as_mut() {
-                            timing.rewrite(
-                                &mut output,
-                                audio_mapping.source_clock_rate,
-                                audio_mapping.target_clock_rate,
-                                audio_mapping.target_pt,
-                            );
+                            for f in frames.iter_mut() {
+                                timing.rewrite(
+                                    f,
+                                    audio_mapping.source_clock_rate,
+                                    audio_mapping.target_clock_rate,
+                                    audio_mapping.target_pt,
+                                );
+                            }
                         }
-
-                        return Ok(MediaSample::Audio(output));
+                        drop(timing_guard);
+                        let mut pending = self.pending.lock();
+                        pending.extend(frames.drain(..));
+                        match pending.pop_front() {
+                            Some(f) => return Ok(MediaSample::Audio(f)),
+                            // Transcoder is still buffering a sub-frame
+                            // remainder — pull the next input packet.
+                            None => continue,
+                        }
                     }
 
                     if frame.payload_type != Some(audio_mapping.target_pt)

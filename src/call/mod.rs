@@ -1,5 +1,6 @@
 use crate::{
     config::{MediaProxyMode, RouteResult},
+    media::negotiate::CodecSelectionStrategy,
     media::recorder::RecorderOption,
     proxy::routing::VideoPolicy,
 };
@@ -28,7 +29,8 @@ pub mod runtime;
 pub mod sip;
 pub mod user;
 pub use cookie::{
-    CalleeDisplayName, CalleeOfflineMarker, TenantId, TransactionCookie, TrunkContext,
+    CalleeDisplayName, CalleeOfflineMarker, MatchedRouteContext, TenantId, TransactionCookie,
+    TrunkContext,
 };
 pub use user::SipUser;
 
@@ -693,6 +695,16 @@ pub struct MediaConfig {
     pub enable_latching: bool,
     /// Video policy: pass-through or strip video from SDP
     pub video_policy: Option<VideoPolicy>,
+    /// Codec selection strategy when target is WebRTC.
+    /// Quality (default): prefer Opus > G722 > G711 > G729 (may transcode).
+    /// Performance: avoid transcoding, keep caller's codecs only.
+    pub codec_strategy: CodecSelectionStrategy,
+    /// Ingress jitter policy from the egress trunk's media_config;
+    /// applied to the callee-side bridge leg (media arriving from the egress trunk).
+    pub jitter_buffer_callee: Option<crate::media::jitter::JitterBufferPolicy>,
+    /// Ingress jitter policy from the INBOUND trunk's media_config;
+    /// applied to the caller-side bridge leg.
+    pub jitter_buffer_caller: Option<crate::media::jitter::JitterBufferPolicy>,
 }
 
 impl Default for MediaConfig {
@@ -713,6 +725,9 @@ impl MediaConfig {
             ice_servers: None,
             enable_latching: true,
             video_policy: None,
+            codec_strategy: CodecSelectionStrategy::default(),
+            jitter_buffer_callee: None,
+            jitter_buffer_caller: None,
         }
     }
 
@@ -1127,6 +1142,10 @@ pub struct RoutingState {
     /// Round-robin counters for each destination group
     round_robin_counters: Arc<Mutex<HashMap<String, usize>>>,
     pub policy_guard: Option<Arc<crate::call::policy::PolicyGuard>>,
+    /// Optional DB connection — populated by the proxy boot path so the
+    /// matcher / trunk-group resolver / capacity check can query the
+    /// supersip_* tables. None for embedded / standalone test paths.
+    db: Option<sea_orm::DatabaseConnection>,
 }
 
 impl Default for RoutingState {
@@ -1140,7 +1159,22 @@ impl RoutingState {
         Self {
             round_robin_counters: Arc::new(Mutex::new(HashMap::new())),
             policy_guard: None,
+            db: None,
         }
+    }
+
+    /// Builder — attach a DB connection. Used by the proxy boot path so
+    /// the runtime matcher can query supersip_routing_tables, trunk
+    /// capacity, and ACL tables.
+    pub fn with_db(mut self, db: sea_orm::DatabaseConnection) -> Self {
+        self.db = Some(db);
+        self
+    }
+
+    /// Borrow the optional DB connection. Returns `None` when running
+    /// in a path that hasn't been wired with persistence (tests, etc.).
+    pub fn db(&self) -> Option<&sea_orm::DatabaseConnection> {
+        self.db.as_ref()
     }
 
     /// Get the next trunk index for round-robin selection

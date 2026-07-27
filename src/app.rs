@@ -132,6 +132,18 @@ impl AppStateInner {
         &self.sip_server
     }
 
+    /// Phase 7 — webhook broadcast sender, delegated to SipServer.
+    pub fn webhook_sender(&self) -> crate::proxy::webhook::WebhookEventSender {
+        self.sip_server().webhook_sender()
+    }
+
+    /// Phase 7 — webhook cancel registry, delegated to SipServer.
+    pub fn webhook_cancel_registry(
+        &self,
+    ) -> std::sync::Arc<crate::proxy::webhook::WebhookCancelRegistry> {
+        self.sip_server().webhook_cancel_registry()
+    }
+
     pub fn skip_migrate(&self) -> bool {
         self.skip_migrate
     }
@@ -258,6 +270,16 @@ impl AppStateBuilder {
             crate::models::create_db(&config.database_url).await?
         };
 
+        // Register built-in WebRTC signaling adapters (e.g. "http_json")
+        // before the kind_schemas validators, since the `webrtc` validator
+        // delegates protocol-blob validation to the adapter registered
+        // under the trunk's `signaling` name. Both calls are idempotent.
+        crate::proxy::bridge::signaling::register_builtins();
+
+        // Register built-in trunk kind_config validators (sip, webrtc).
+        // Idempotent — safe across multiple AppState builds in tests.
+        crate::models::kind_schemas::register_builtins();
+
         let addon_registry = Arc::new(crate::addons::registry::AddonRegistry::new());
 
         // Run addon migrations if not skipped
@@ -286,10 +308,22 @@ impl AppStateBuilder {
                 crate::config::SipFlowConfig::Local { upload, .. } => upload.clone(),
                 crate::config::SipFlowConfig::Remote { upload, .. } => upload.clone(),
             });
+        // uploads_recording() is true only when enabled AND type is S3/Http.
+        // We allow RecordingUploadHook to coexist with sipflow: local sipflow
+        // captures SIP+RTP packets; the hook uploads WAV audio to S3.
+        //
+        // BUT we skip the hook when [callrecord] is S3 with with_media=true —
+        // the callrecord saver already uploads the WAV (and deletes the local
+        // file when keep_media_copy=false), so the hook would just fail with
+        // "missing local media" warnings.
+        let callrecord_handles_media = matches!(
+            config.callrecord.as_ref(),
+            Some(crate::config::CallRecordConfig::S3 { with_media: Some(true), .. })
+        );
         let recording_upload_policy = config
             .recording
             .as_ref()
-            .filter(|policy| policy.uploads_recording() && sipflow_backend_arc.is_none())
+            .filter(|policy| policy.uploads_recording() && !callrecord_handles_media)
             .cloned();
 
         let callrecord_formatter = if let Some(formatter) = self.callrecord_formatter {
@@ -315,10 +349,14 @@ impl AppStateBuilder {
             //  - [callrecord] is configured (CDR JSON files / S3), or
             //  - [sipflow.upload] is configured (post-call WAV upload)
             //  - [recording].type exports live recorder WAV after call completion.
-            // DatabaseHook is always included so call records reach the DB.
+            // DatabaseHook is registered once, AFTER the upload hooks below, so
+            // it persists the recording_url they set. The hook chain runs
+            // continue-on-error (callrecord::recv_loop), so a failing upload
+            // hook does not skip the DB write.
             let mut builder = CallRecordManagerBuilder::new()
                 .with_cancel_token(token.child_token())
-                .with_formatter(callrecord_formatter.clone());
+                .with_formatter(callrecord_formatter.clone())
+                .with_pending_db(db_conn.clone());
 
             if let Some(ref callrecord) = config.callrecord {
                 builder = builder.with_config(callrecord.clone());
@@ -342,7 +380,9 @@ impl AppStateBuilder {
             }
 
             if let Some(policy) = recording_upload_policy.as_ref() {
-                builder = builder.with_hook(Box::new(RecordingUploadHook::new(policy.clone())));
+                builder = builder.with_hook(Box::new(
+                    RecordingUploadHook::new(policy.clone()).with_db(db_conn.clone()),
+                ));
             }
 
             builder = builder.with_hook(Box::new(DatabaseHook {
@@ -507,6 +547,11 @@ impl AppStateBuilder {
             });
         }
 
+        // Spawn the failed-S3-upload retry scheduler. The loop is a no-op
+        // unless callrecord is configured for S3, so it's safe to start
+        // unconditionally.
+        crate::upload_retry::spawn(app_state.clone());
+
         // Initialize addons
         if let Err(e) = addon_registry.initialize_all(app_state.clone()).await {
             tracing::error!("Failed to initialize addons: {}", e);
@@ -540,9 +585,6 @@ impl AppStateBuilder {
         #[cfg(feature = "console")]
         {
             if let Some(ref console_state) = app_state.console {
-                // Spawn background update checker only when the console is enabled
-                // (checks miuda.ai/api/check_update at startup, then every 24 hours).
-                crate::version::spawn_update_checker(db_conn.clone(), token.clone());
                 console_state.set_sip_server(Some(app_state.sip_server().get_inner()));
                 // Register addon locale directories into the i18n manager before
                 // binding the app_state so that all subsequent renders pick up the
@@ -787,6 +829,7 @@ pub fn create_router(state: AppState) -> Router {
 
     // Merge call and WebSocket handlers with static file serving
     let call_routes = crate::handler::ami_router(state.clone()).with_state(state.clone());
+    let api_v1 = crate::handler::api_v1::api_v1_router(state.clone());
     #[allow(unused_mut)]
     let mut router = router
         .route(
@@ -800,6 +843,7 @@ pub fn create_router(state: AppState) -> Router {
         .merge(state.addon_registry.get_routers(state.clone()))
         .nest_service(&static_path, static_files_service)
         .merge(call_routes)
+        .merge(api_v1)
         .layer(cors);
 
     // Add RWI WebSocket endpoint if configured

@@ -1,5 +1,5 @@
 use crate::call::{DialDirection, Dialplan, TransactionCookie};
-use crate::callrecord::{CallRecordHangupMessage, CallRecordHangupReason};
+use crate::callrecord::{CallRecordHangupMessage, CallRecordHangupReason, FailureSource};
 use crate::proxy::active_call_registry::{
     ActiveProxyCallEntry, ActiveProxyCallRegistry, ActiveProxyCallStatus,
 };
@@ -19,6 +19,7 @@ pub struct CallSessionRecordSnapshot {
     pub ring_time: Option<Instant>,
     pub answer_time: Option<Instant>,
     pub last_error: Option<(StatusCode, Option<String>)>,
+    pub failure_source: Option<FailureSource>,
     pub hangup_reason: Option<CallRecordHangupReason>,
     pub hangup_messages: Vec<CallRecordHangupMessage>,
     pub original_caller: Option<String>,
@@ -40,6 +41,7 @@ pub struct SessionHangupMessage {
     pub code: u16,
     pub reason: Option<String>,
     pub target: Option<String>,
+    pub endpoint: Option<String>,
 }
 
 impl From<&SessionHangupMessage> for CallRecordHangupMessage {
@@ -48,6 +50,7 @@ impl From<&SessionHangupMessage> for CallRecordHangupMessage {
             code: message.code,
             reason: message.reason.clone(),
             target: message.target.clone(),
+            endpoint: message.endpoint.clone(),
         }
     }
 }
@@ -293,6 +296,7 @@ impl SipSessionShared {
                 started_at: inner.started_at,
                 answered_at: inner.answer_time,
                 status: ActiveProxyCallStatus::Ringing,
+                trunk_group_name: None,
             };
             registry.upsert(entry, handle.clone());
             // Also register the server dialog
@@ -746,6 +750,7 @@ mod tests {
             started_at: Utc::now(),
             answered_at: None,
             status: ActiveProxyCallStatus::Ringing,
+            trunk_group_name: None,
         };
 
         registry.upsert(entry, handle.clone());

@@ -359,7 +359,9 @@ mod tests {
                 tags: None,
                 rewrite: Default::default(),
                 last_error: None,
+                failure_source: None,
                 metadata: None,
+                sipflow_available: false,
             },
             extensions: http::Extensions::new(),
         }

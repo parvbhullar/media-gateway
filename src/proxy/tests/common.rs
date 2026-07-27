@@ -46,7 +46,11 @@ pub async fn create_test_server_with_config(
     let locator = Arc::new(Box::new(MemoryLocator::new()) as Box<dyn Locator>);
     let config = Arc::new(config);
 
-    let endpoint = rsipstack::EndpointBuilder::new().build();
+    let endpoint = rsipstack::EndpointBuilder::new()
+        .with_domain_resolver(Box::new(
+            crate::proxy::dns_resolver::RobustDomainResolver::new(),
+        ))
+        .build();
     // Add a mock transport to the endpoint so it can send out-of-dialog requests in tests
     let (tx_chan, _rx_chan) = tokio::sync::mpsc::unbounded_channel();
     let mock_addr = SipAddr {
@@ -110,6 +114,18 @@ pub async fn create_test_server_with_config(
         cluster_peer_ips: vec![],
         media_policy: Arc::new(crate::call::DefaultMediaPolicy),
         trunk_health: None,
+        webhook_sender: {
+            let (tx, _) = tokio::sync::broadcast::channel::<crate::proxy::webhook::WebhookEvent>(8);
+            tx
+        },
+        webhook_cancel_registry: std::sync::Arc::new(crate::proxy::webhook::WebhookCancelRegistry::new()),
+        trunk_capacity: std::sync::Arc::new(crate::proxy::trunk_capacity_state::TrunkCapacityState::new()),
+        bridge_sessions: std::sync::Arc::new(
+            crate::proxy::bridge_sessions::BridgeSessions::new(),
+        ),
+        rejected_invites: std::sync::Arc::new(
+            crate::proxy::bridge_sessions::RejectedInviteCache::new(),
+        ),
     });
 
     // Add test users
@@ -160,7 +176,7 @@ pub async fn create_transaction(
     let connection = ChannelConnection::create_connection(rx, tx, mock_addr, None)
         .await
         .expect("failed to create channel connection");
-    let transport_layer = rsipstack::transport::TransportLayer::new(CancellationToken::new());
+    let transport_layer = crate::proxy::dns_resolver::new_transport_layer(CancellationToken::new());
     let sip_conn: rsipstack::transport::SipConnection = connection.into();
     transport_layer.add_transport(sip_conn.clone());
 

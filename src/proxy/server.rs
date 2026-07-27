@@ -35,7 +35,7 @@ use rsipstack::{
         transaction::Transaction,
     },
     transport::{
-        TcpListenerConnection, TlsConfig, TlsListenerConnection, TransportLayer,
+        TcpListenerConnection, TlsConfig, TlsListenerConnection,
         WebSocketListenerConnection, udp::UdpConnection,
     },
 };
@@ -96,6 +96,24 @@ pub struct SipServerInner {
     pub media_policy: Arc<dyn crate::call::MediaPolicy>,
     /// Trunk health check states (populated by trunk_health background loop).
     pub trunk_health: Option<crate::proxy::trunk_health::HealthStateMap>,
+    /// Phase 7 — broadcast channel for webhook events.
+    pub webhook_sender: crate::proxy::webhook::WebhookEventSender,
+    /// Phase 7 — in-memory cancel registry for in-flight webhook retries.
+    pub webhook_cancel_registry: Arc<crate::proxy::webhook::WebhookCancelRegistry>,
+    /// Phase R-full/T — trunk capacity bookkeeping (concurrent calls + CPS).
+    /// Constructed at boot, queried by the INVITE-path enforcement gates
+    /// (which only fire when `[trunk.enforcement] enabled = true`).
+    pub trunk_capacity: Arc<crate::proxy::trunk_capacity_state::TrunkCapacityState>,
+    /// Per-dialog state for active SIP↔external-bridge sessions
+    /// (`kind="webrtc"` today, `kind="livekit"` once that lands). Populated
+    /// by the `ExternalBridge` arm in `proxy::call::CallModule`, drained on
+    /// BYE for teardown (`teardown.close()` + bridge drop).
+    pub bridge_sessions: Arc<crate::proxy::bridge_sessions::BridgeSessions>,
+    /// TTL cache replaying final rejections to retried external-bridge
+    /// INVITEs (same Call-ID + From-tag) without re-running routing,
+    /// capacity, or dispatch. Kill-switch:
+    /// `proxy.disable_rejected_invite_cache`.
+    pub rejected_invites: Arc<crate::proxy::bridge_sessions::RejectedInviteCache>,
 }
 
 pub type SipServerRef = Arc<SipServerInner>;
@@ -370,7 +388,11 @@ impl SipServerBuilder {
         let rtp_config = self.rtp_config.unwrap_or_default();
         let cancel_token = self.cancel_token.unwrap_or_default();
         let config = self.config.clone();
-        let transport_layer = TransportLayer::new(cancel_token.clone());
+        // Crash-proof resolver: rsipstack's default panics at startup when
+        // the host's resolv.conf has entries hickory can't parse (e.g.
+        // macOS scoped-IPv6 nameservers).
+        let transport_layer =
+            crate::proxy::dns_resolver::new_transport_layer(cancel_token.clone());
         // Clone of TLS listener for hot-reload support (initialized inside if !self.no_bind block)
         let mut tls_listener_clone: Option<rsipstack::transport::TlsListenerConnection> = None;
 
@@ -665,6 +687,46 @@ impl SipServerBuilder {
         // Create conference manager with in-server audio mixing
         let conference_manager = Arc::new(crate::call::runtime::ConferenceManager::new());
 
+        // Phase 7 — webhook broadcast channel (capacity 1024).
+        let (webhook_sender, _) =
+            tokio::sync::broadcast::channel::<crate::proxy::webhook::WebhookEvent>(1024);
+        let webhook_cancel_registry =
+            Arc::new(crate::proxy::webhook::WebhookCancelRegistry::new());
+
+        // Phase R-full/T — trunk capacity bookkeeping. Queried only by the
+        // INVITE-path enforcement gates, which are gated by
+        // `[trunk.enforcement] enabled` (default false).
+        let trunk_capacity =
+            Arc::new(crate::proxy::trunk_capacity_state::TrunkCapacityState::new());
+        // Spawn webhook delivery processor if DB is available.
+        if let Some(db_for_processor) = database.clone() {
+            let sender_for_processor = webhook_sender.clone();
+            let registry_for_processor = webhook_cancel_registry.clone();
+            let generated_dir = self.config.generated_dir.clone();
+            let cancel_for_processor = cancel_token.child_token();
+            tokio::spawn(crate::proxy::webhook::run_webhook_processor(
+                db_for_processor,
+                sender_for_processor,
+                registry_for_processor,
+                generated_dir,
+                cancel_for_processor,
+            ));
+
+            // task 2.1 — redelivery worker: re-drives outbox rows orphaned by a
+            // crash mid-delivery, so a committed webhook event is never lost.
+            if let Some(db_for_redelivery) = database.clone() {
+                let registry_for_redelivery = webhook_cancel_registry.clone();
+                let generated_dir_redelivery = self.config.generated_dir.clone();
+                let cancel_for_redelivery = cancel_token.child_token();
+                tokio::spawn(crate::proxy::webhook::run_webhook_redelivery_worker(
+                    db_for_redelivery,
+                    registry_for_redelivery,
+                    generated_dir_redelivery,
+                    cancel_for_redelivery,
+                ));
+            }
+        }
+
         let inner = Arc::new(SipServerInner {
             rtp_config,
             proxy_config: self.config.clone(),
@@ -703,6 +765,13 @@ impl SipServerBuilder {
                 .media_policy
                 .unwrap_or_else(|| Arc::new(crate::call::DefaultMediaPolicy)),
             trunk_health: self.trunk_health.clone(),
+            webhook_sender,
+            webhook_cancel_registry,
+            trunk_capacity,
+            bridge_sessions: Arc::new(crate::proxy::bridge_sessions::BridgeSessions::new()),
+            rejected_invites: Arc::new(
+                crate::proxy::bridge_sessions::RejectedInviteCache::new(),
+            ),
         });
 
         let inner_weak = Arc::downgrade(&inner);
@@ -812,6 +881,30 @@ impl SipServerBuilder {
             .set(allow_methods.clone())
             .map_err(|_| anyhow!("advertised SIP methods already initialized"))?;
         inner.endpoint.inner.allows.lock().replace(allow_methods);
+
+        // Plan 1: spawn the gateway OPTIONS health monitor. Outbound trunks
+        // get periodically probed and `trunk.status` is flipped between
+        // `healthy`/`offline` on threshold crossings.
+        //
+        // Per-kind probing is dispatched via the
+        // [`crate::proxy::health_probers`] registry. We register the built-in
+        // probers here once we have the SIP endpoint in hand: the SIP prober
+        // needs it for OPTIONS; the WebRTC prober uses HTTP and doesn't need
+        // any sip state.
+        if let Some(db) = inner.database.clone() {
+            let endpoint_inner = inner.endpoint.inner.clone();
+            crate::proxy::health_probers::register_builtins(Some(endpoint_inner.clone()));
+            let monitor = Arc::new(crate::proxy::gateway_health::GatewayHealthMonitor::new(
+                db,
+                Some(endpoint_inner),
+            ));
+            let cancel = inner.cancel_token.child_token();
+            info!("starting gateway_health monitor");
+            crate::utils::spawn(async move {
+                monitor.run(cancel).await;
+            });
+        }
+
         Ok(SipServer {
             inner,
             modules: Arc::new(modules),
@@ -898,6 +991,18 @@ impl SipServer {
         self.inner.cancel_token.clone()
     }
 
+    /// Phase 7 — accessor for the webhook broadcast sender.
+    pub fn webhook_sender(&self) -> crate::proxy::webhook::WebhookEventSender {
+        self.inner.webhook_sender.clone()
+    }
+
+    /// Phase 7 — accessor for the webhook cancel registry.
+    pub fn webhook_cancel_registry(
+        &self,
+    ) -> Arc<crate::proxy::webhook::WebhookCancelRegistry> {
+        self.inner.webhook_cancel_registry.clone()
+    }
+
     async fn handle_incoming(&self, mut incoming: TransactionReceiver) -> Result<()> {
         while let Some(mut tx) = incoming.recv().await {
             let modules = self.modules.clone();
@@ -924,26 +1029,33 @@ impl SipServer {
                     .ok();
                 continue;
             }
-            // Spam protection for OPTIONS requests
-            // If the OPTIONS request is out-of-dialog and the tag is not present, ignore it
+            // Out-of-dialog OPTIONS keepalives (RFC 3261 §11) must be answered so
+            // upstream peers can probe liveness; reply 200 OK directly without
+            // routing into the module chain. INFO/REFER/UPDATE outside a dialog are
+            // still dropped when spam protection is enabled.
             if matches!(
                 tx.original.method,
                 rsipstack::sip::Method::Options
                     | rsipstack::sip::method::Method::Info
                     | rsipstack::sip::method::Method::Refer
                     | rsipstack::sip::method::Method::Update
-            ) && self.inner.ignore_out_of_dialog_request
-            {
+            ) {
                 let to_tag = tx
                     .original
                     .to_header()
                     .and_then(|to| to.tag())
                     .ok()
                     .flatten();
-                let via = tx.original.via_header()?.value();
                 if to_tag.is_none() {
-                    info!(key = %tx.key, via, "ignoring out-of-dialog {} request", tx.original.method);
-                    continue;
+                    if matches!(tx.original.method, rsipstack::sip::Method::Options) {
+                        tx.reply(rsipstack::sip::StatusCode::OK).await.ok();
+                        continue;
+                    }
+                    if self.inner.ignore_out_of_dialog_request {
+                        let via = tx.original.via_header()?.value();
+                        info!(key = %tx.key, via, "ignoring out-of-dialog {} request", tx.original.method);
+                        continue;
+                    }
                 }
             }
             crate::utils::spawn(async move {
@@ -1046,22 +1158,84 @@ impl Drop for SipServerInner {
     }
 }
 
+/// Ask the OS which local IP address it would use to send traffic to
+/// `peer`. Uses a scratch UDP socket — `connect()` is non-blocking and
+/// never transmits a packet; it just populates the kernel's routing
+/// decision so `local_addr()` returns the chosen source IP.
+pub fn local_ip_for_peer(peer: IpAddr) -> Option<IpAddr> {
+    let bind: SocketAddr = match peer {
+        IpAddr::V4(_) => "0.0.0.0:0".parse().ok()?,
+        IpAddr::V6(_) => "[::]:0".parse().ok()?,
+    };
+    let sock = std::net::UdpSocket::bind(bind).ok()?;
+    sock.connect(SocketAddr::new(peer, 1)).ok()?;
+    sock.local_addr().ok().map(|a| a.ip())
+}
+
+pub fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            !v4.is_private()
+                && !v4.is_loopback()
+                && !v4.is_link_local()
+                && !v4.is_broadcast()
+                && !v4.is_documentation()
+                && !v4.is_unspecified()
+        }
+        IpAddr::V6(v6) => {
+            !v6.is_loopback() && !v6.is_unspecified() && !v6.is_unique_local()
+        }
+    }
+}
+
 impl SipServerInner {
     pub fn default_contact_uri(&self) -> Option<rsipstack::sip::Uri> {
+        self.contact_uri_for_peer(None)
+    }
+
+    /// Build a Contact URI whose host is the local IP that the kernel would
+    /// use to reach `peer`. Falls back to the endpoint's first listener when
+    /// the peer is not provided or routing lookup fails. This is critical
+    /// on hosts with multiple interfaces (e.g. a private carrier-facing
+    /// interface plus a public one) — the Contact must be reachable from
+    /// the peer's network, otherwise the peer can't send ACK/BYE back.
+    pub fn contact_uri_for_peer(&self, peer: Option<IpAddr>) -> Option<rsipstack::sip::Uri> {
         let addr = self.endpoint.get_addrs().first()?.clone();
+        let transport = addr.r#type;
+
+        // For public peers, use the endpoint's advertised address — it
+        // carries `external_ip` when behind NAT. Kernel routing would
+        // return our private source IP (e.g. AWS 172.31/16), which the
+        // peer can't route back to, breaking ACK/BYE.
+        // For private peers, fall back to kernel routing so multi-homed
+        // hosts with a carrier-facing NIC pick the right interface.
+        let host_with_port = match peer {
+            Some(p) if is_public_ip(p) => addr.addr,
+            Some(p) => match local_ip_for_peer(p) {
+                Some(local_ip) => rsipstack::sip::HostWithPort {
+                    host: rsipstack::sip::Host::IpAddr(local_ip),
+                    port: addr.addr.port.clone(),
+                },
+                None => addr.addr,
+            },
+            None => addr.addr,
+        };
+
         let mut params = Vec::new();
-        if let Some(transport) = addr.r#type
-            && !matches!(transport, Transport::Udp)
-        {
-            params.push(Param::Transport(transport));
+        if let Some(t) = transport {
+            if !matches!(t, Transport::Udp) {
+                params.push(Param::Transport(t));
+            }
         }
         Some(rsipstack::sip::Uri {
-            scheme: addr.r#type.map(|t| t.sip_scheme()),
+            scheme: transport.map(|t| t.sip_scheme()),
             auth: Some(Auth {
-                user: "rustpbx".to_string(),
+                user: crate::version::brand_sip_user_from_ua(
+                    self.proxy_config.useragent.as_deref(),
+                ),
                 password: None,
             }),
-            host_with_port: addr.addr,
+            host_with_port,
             params,
             ..Default::default()
         })

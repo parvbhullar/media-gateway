@@ -302,23 +302,22 @@ async fn test_full_duplex_media_bridge() {
 #[tokio::test]
 async fn test_transcoding_pipeline() {
     use audio_codec::CodecType;
-    use rustpbx::media::transcoding_pipeline::TranscodingPipeline;
 
     // Test PCMU to PCMU (no transcoding needed)
-    let mut pipeline = TranscodingPipeline::new(CodecType::PCMU, CodecType::PCMU);
+    let mut encoder = audio_codec::create_encoder(CodecType::PCMU);
+    let mut decoder = audio_codec::create_decoder(CodecType::PCMU);
 
     let pcm: Vec<i16> = (0..160).map(|i| (i as i16 * 100) % 32767).collect();
-    let encoded = pipeline.encode_from_pcm(&pcm);
+    let encoded = encoder.encode(&pcm);
     assert!(!encoded.is_empty());
 
-    let decoded = pipeline.decode_to_pcm(&encoded);
+    let decoded = decoder.decode(&encoded);
     assert_eq!(decoded.len(), 160);
 }
 
 #[tokio::test]
 async fn test_conference_with_transcoding() {
     use audio_codec::CodecType;
-    use rustpbx::media::transcoding_pipeline::TranscodingPipeline;
 
     let manager = ConferenceManager::new();
     manager
@@ -343,12 +342,13 @@ async fn test_conference_with_transcoding() {
         .unwrap();
 
     // Simulate transcoding: encode PCMU, decode to PCM, send to mixer
-    let mut pipeline = TranscodingPipeline::new(CodecType::PCMU, CodecType::PCMU);
+    let mut encoder = audio_codec::create_encoder(CodecType::PCMU);
+    let mut decoder = audio_codec::create_decoder(CodecType::PCMU);
 
     // Create test PCM audio
     let pcm: Vec<i16> = (0..160).map(|i| (i as i16 * 100) % 32767).collect();
-    let encoded = pipeline.encode_from_pcm(&pcm);
-    let decoded = pipeline.decode_to_pcm(&encoded);
+    let encoded = encoder.encode(&pcm);
+    let decoded = decoder.decode(&encoded);
 
     // Send decoded PCM to mixer
     tx_a.send(AudioFrame::new(decoded, 8000)).await.unwrap();

@@ -194,6 +194,12 @@ async fn reload_trunks_handler(State(state): State<AppState>, client_ip: ClientA
     {
         Ok(metrics) => {
             let total = metrics.total;
+            state
+                .sip_server()
+                .inner
+                .data_context
+                .reload_did_index()
+                .await;
             if let Some(ref console) = state.console {
                 console.clear_pending_reload();
             }
@@ -205,7 +211,7 @@ async fn reload_trunks_handler(State(state): State<AppState>, client_ip: ClientA
         }
         .into_response(),
         Err(error) => {
-            warn!(%client_ip, error = %error, "Trunk reload failed");
+            warn!(%client_ip, error = ?error, "Trunk reload failed");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({

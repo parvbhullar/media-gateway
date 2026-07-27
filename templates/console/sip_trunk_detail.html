@@ -37,14 +37,27 @@ default('RustPBX') }}{% endblock %}
             </div>
             <div class="rounded-xl bg-white p-5 text-sm text-slate-600 shadow-sm ring-1 ring-black/5"
                 x-show="mode === 'edit'" x-cloak>
-                <div class="flex items-center justify-between">
+                <div class="flex items-center justify-between gap-3">
                     <div class="font-semibold text-slate-900">{{ "sip_trunk_detail.trunk_summary" | t }}</div>
-                    <span class="inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-semibold"
-                        :class="statusBadgeClasses(form.status)">
-                        <span class="h-1.5 w-1.5 rounded-full" :class="statusDotClasses(form.status)"></span>
-                        <span x-text="statusBadgeLabel(form.status)"></span>
-                    </span>
+                    <div class="flex items-center gap-2">
+                        <span class="inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-semibold"
+                            :class="statusBadgeClasses(form.status)">
+                            <span class="h-1.5 w-1.5 rounded-full" :class="statusDotClasses(form.status)"></span>
+                            <span x-text="statusBadgeLabel(form.status)"></span>
+                        </span>
+                        <button type="button" @click="probeNow()" :disabled="probing || !model?.id"
+                            class="inline-flex items-center gap-1 rounded-md border border-slate-200 px-2.5 py-1 text-xs font-medium text-slate-600 transition hover:bg-slate-100 disabled:opacity-50"
+                            :title="probeMessage || 'Run an immediate health probe and refresh the status'">
+                            <svg class="h-3 w-3" :class="probing ? 'animate-spin' : ''" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8">
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M4 10a6 6 0 0 1 10.6-3.8M16 10a6 6 0 0 1-10.6 3.8M14 4v3h-3M6 16v-3h3"/>
+                            </svg>
+                            <span x-text="probing ? 'Checking…' : 'Check now'"></span>
+                        </button>
+                    </div>
                 </div>
+                <template x-if="probeMessage">
+                    <p class="mt-2 text-xs" :class="probeOk ? 'text-emerald-600' : 'text-rose-600'" x-text="probeMessage"></p>
+                </template>
                 <dl class="mt-4 space-y-3 text-xs text-slate-500">
                     <div class="flex items-center justify-between gap-6">
                         <dt class="uppercase tracking-wide">{{ "sip_trunk_detail.summary_trunk" | t }}</dt>
@@ -73,7 +86,29 @@ default('RustPBX') }}{% endblock %}
         </template>
 
         <form class="space-y-6" @submit.prevent="submit">
-            <div class="rounded-xl bg-white p-3 shadow-sm ring-1 ring-black/5">
+            <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
+                <div class="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                    <div>
+                        <h2 class="text-sm font-semibold text-slate-900">Trunk kind</h2>
+                        <p class="text-xs text-slate-500">Pick how this trunk talks to the outside world. SIP is the
+                            default; WebRTC bridges to a signaling-adapter endpoint.</p>
+                    </div>
+                    <div class="inline-flex rounded-lg border border-slate-200 bg-slate-50 p-1 text-xs font-semibold">
+                        <template x-for="opt in kindOptions" :key="opt.value">
+                            <button type="button" @click="setKind(opt.value)"
+                                :disabled="mode === 'edit'"
+                                :class="form.kind === opt.value ? 'bg-white text-sky-700 shadow-sm' : 'text-slate-500 hover:text-slate-700'"
+                                class="rounded-md px-3 py-1.5 transition disabled:cursor-not-allowed disabled:opacity-60">
+                                <span x-text="opt.label"></span>
+                            </button>
+                        </template>
+                    </div>
+                </div>
+                <p class="mt-2 text-[11px] text-slate-400" x-show="mode === 'edit'">Trunk kind cannot be changed after
+                    creation — delete and recreate to switch kinds.</p>
+            </section>
+
+            <div class="rounded-xl bg-white p-3 shadow-sm ring-1 ring-black/5" x-show="form.kind === 'sip'" x-cloak>
                 <nav class="inline-flex w-full flex-wrap gap-2 rounded-lg border border-slate-200 bg-slate-50 p-1 text-xs font-semibold text-slate-600"
                     role="tablist" aria-label="SIP trunk configuration tabs">
                     <button type="button" class="flex-1 rounded-md px-4 py-2 text-left transition sm:flex-none"
@@ -131,6 +166,7 @@ default('RustPBX') }}{% endblock %}
                 </nav>
             </div>
 
+            <template x-if="form.kind === 'sip'">
             <div class="space-y-6" x-show="activeTab === 'general'" x-transition.opacity x-cloak
                 id="sip-trunk-tab-general" role="tabpanel" tabindex="0">
                 <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
@@ -212,6 +248,57 @@ default('RustPBX') }}{% endblock %}
                                     x-text="form.is_active ? t.sip_trunk_detail?.status_enabled : t.sip_trunk_detail?.status_disabled"></span>
                             </button>
                         </div>
+                        <div class="flex flex-col gap-2">
+                            <span class="flex items-center gap-1.5 text-sm font-medium text-slate-700">
+                                {{ "sip_trunk_detail.field_rewrite_hostport" | t }}
+                                <span class="group relative">
+                                    <svg class="h-3.5 w-3.5 cursor-help text-slate-400" viewBox="0 0 20 20" fill="currentColor">
+                                        <path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a.75.75 0 000 1.5h.253a.25.25 0 01.244.304l-.459 2.066A1.75 1.75 0 0010.747 15H11a.75.75 0 000-1.5h-.253a.25.25 0 01-.244-.304l.459-2.066A1.75 1.75 0 009.253 9H9z" clip-rule="evenodd" />
+                                    </svg>
+                                    <span class="pointer-events-none absolute left-5 top-0 z-10 hidden w-72 rounded-lg bg-slate-800 px-3 py-2 text-xs font-normal leading-relaxed text-white shadow-lg group-hover:block">
+                                        {{ "sip_trunk_detail.field_rewrite_hostport_hint" | t }}
+                                    </span>
+                                </span>
+                            </span>
+                            <button type="button" @click="form.rewrite_hostport = !form.rewrite_hostport"
+                                class="inline-flex items-center gap-2 rounded-lg px-3 py-1 text-xs font-semibold ring-2 transition"
+                                :class="form.rewrite_hostport ? 'bg-emerald-50 text-emerald-600 ring-emerald-200' : 'bg-slate-100 text-slate-500 ring-slate-200'">
+                                <svg class="h-3.5 w-3.5" viewBox="0 0 20 20" fill="none" stroke="currentColor"
+                                    stroke-width="1.6">
+                                    <path stroke-linecap="round" stroke-linejoin="round" d="M5 10l4 4 6-8"
+                                        x-show="form.rewrite_hostport"></path>
+                                    <path stroke-linecap="round" stroke-linejoin="round" d="M6 6l8 8M6 14l8-8"
+                                        x-show="!form.rewrite_hostport"></path>
+                                </svg>
+                                <span
+                                    x-text="form.rewrite_hostport ? t.sip_trunk_detail?.status_enabled : t.sip_trunk_detail?.status_disabled"></span>
+                            </button>
+                        </div>
+                        <div class="flex flex-col gap-2">
+                            <span class="flex items-center gap-1.5 text-sm font-medium text-slate-700">
+                                HD codec upgrade
+                                <span class="group relative">
+                                    <svg class="h-3.5 w-3.5 cursor-help text-slate-400" viewBox="0 0 20 20" fill="currentColor">
+                                        <path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a.75.75 0 000 1.5h.253a.25.25 0 01.244.304l-.459 2.066A1.75 1.75 0 0010.747 15H11a.75.75 0 000-1.5h-.253a.25.25 0 01-.244-.304l.459-2.066A1.75 1.75 0 009.253 9H9z" clip-rule="evenodd" />
+                                    </svg>
+                                    <span class="pointer-events-none absolute left-5 top-0 z-10 hidden w-72 rounded-lg bg-slate-800 px-3 py-2 text-xs font-normal leading-relaxed text-white shadow-lg group-hover:block">
+                                        On by default: offers opus, g722, pcmu, pcma, g729 (best-first) toward this trunk and transcodes a low-quality caller up to the best codec it accepts. Turn off to use the global codec defaults for this trunk (no forced upgrade). Only matters where the far end supports HD.
+                                    </span>
+                                </span>
+                            </span>
+                            <button type="button" @click="form.prefer_hd = !form.prefer_hd"
+                                class="inline-flex items-center gap-2 rounded-lg px-3 py-1 text-xs font-semibold ring-2 transition"
+                                :class="form.prefer_hd ? 'bg-emerald-50 text-emerald-600 ring-emerald-200' : 'bg-slate-100 text-slate-500 ring-slate-200'">
+                                <svg class="h-3.5 w-3.5" viewBox="0 0 20 20" fill="none" stroke="currentColor"
+                                    stroke-width="1.6">
+                                    <path stroke-linecap="round" stroke-linejoin="round" d="M5 10l4 4 6-8"
+                                        x-show="form.prefer_hd"></path>
+                                    <path stroke-linecap="round" stroke-linejoin="round" d="M6 6l8 8M6 14l8-8"
+                                        x-show="!form.prefer_hd"></path>
+                                </svg>
+                                <span x-text="form.prefer_hd ? 'Enabled' : 'Disabled'"></span>
+                            </button>
+                        </div>
                     </div>
                     <label class="mt-4 flex flex-col gap-2 text-sm font-medium text-slate-700">
                         {{ "sip_trunk_detail.field_description" | t }}
@@ -245,7 +332,9 @@ default('RustPBX') }}{% endblock %}
                     </div>
                 </section>
             </div>
+            </template>
 
+            <template x-if="form.kind === 'sip'">
             <div class="space-y-6" x-show="activeTab === 'access'" x-transition.opacity x-cloak
                 id="sip-trunk-tab-access" role="tabpanel" tabindex="0">
                 <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
@@ -301,16 +390,34 @@ default('RustPBX') }}{% endblock %}
                                 class="font-mono rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
                                 placeholder="{{ "sip_trunk_detail.field_allowed_ips_placeholder" | t }}"></textarea>
                         </label>
-                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
-                            {{ "sip_trunk_detail.field_did_numbers" | t }}
-                            <textarea rows="6" x-model="form.did_numbers"
-                                class="font-mono rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
-                                placeholder="{{ "sip_trunk_detail.field_did_numbers_placeholder" | t }}"></textarea>
-                        </label>
+                        <div class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            <span>{{ "sip_trunk_detail.field_did_numbers" | t }}</span>
+                            <div class="rounded-lg border border-dashed border-slate-200 bg-slate-50 px-3 py-3 text-sm text-slate-600">
+                                {% if dids_count and dids_count > 0 %}
+                                    <p class="font-semibold text-slate-800">{{ dids_count }} number(s) assigned</p>
+                                    {% if dids_numbers %}
+                                        <ul class="mt-2 flex flex-wrap gap-1.5">
+                                            {% for number in dids_numbers %}
+                                                <li class="inline-flex items-center rounded-md bg-white px-2 py-0.5 font-mono text-xs text-slate-700 ring-1 ring-slate-200">{{ number }}</li>
+                                            {% endfor %}
+                                        </ul>
+                                    {% endif %}
+                                {% else %}
+                                    <p class="text-slate-500">No numbers assigned</p>
+                                {% endif %}
+                                <p class="mt-2 text-xs text-slate-500">
+                                    Managed on the
+                                    <a href="{{ (base_path | default('/console')) }}/dids/page"
+                                        class="font-semibold text-sky-600 hover:text-sky-500">Numbers page</a>.
+                                </p>
+                            </div>
+                        </div>
                     </div>
                 </section>
             </div>
+            </template>
 
+            <template x-if="form.kind === 'sip'">
             <div class="space-y-6" x-show="activeTab === 'registration'" x-transition.opacity x-cloak
                 id="sip-trunk-tab-registration" role="tabpanel" tabindex="0">
                 <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
@@ -388,7 +495,7 @@ default('RustPBX') }}{% endblock %}
                                 <dt class="font-medium text-slate-500">{{ "sip_trunk_detail.reg_last_register" | t }}
                                 </dt>
                                 <dd class="text-slate-700"
-                                    x-text="regStatus.last_register_at ? new Date(regStatus.last_register_at).toLocaleString() : '—'">
+                                    x-text="regStatus.last_register_at ? formatDate(regStatus.last_register_at) : '—'">
                                 </dd>
                             </div>
                             <template x-if="regStatus.error">
@@ -401,6 +508,531 @@ default('RustPBX') }}{% endblock %}
                     </section>
                 </template>
             </div>
+            </template>
+
+            <!-- WebRTC kind: shared general fields + signaling adapter config -->
+            <template x-if="form.kind === 'webrtc'">
+            <div class="space-y-6">
+                <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
+                    <h2 class="text-sm font-semibold text-slate-900">General</h2>
+                    <div class="mt-4 grid gap-4 md:grid-cols-2">
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Trunk name
+                            <input type="text" x-model.trim="form.name" maxlength="120" required
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="pipecat_bot">
+                            <span class="text-xs font-normal text-slate-400">Unique identifier used by routing rules.</span>
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Display name
+                            <input type="text" x-model.trim="form.display_name" maxlength="160"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Status
+                            <select x-model="form.status"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <template x-for="option in statusOptions" :key="option.value">
+                                    <option :value="option.value" x-text="option.label"></option>
+                                </template>
+                            </select>
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Direction
+                            <select x-model="form.direction"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <template x-for="option in directionOptions" :key="option.value">
+                                    <option :value="option.value" x-text="option.label"></option>
+                                </template>
+                            </select>
+                        </label>
+                        <div class="flex flex-col gap-2">
+                            <span class="text-sm font-medium text-slate-700">Active</span>
+                            <button type="button" @click="toggleActive()"
+                                class="inline-flex items-center gap-2 rounded-lg px-3 py-1 text-xs font-semibold ring-2 transition"
+                                :class="form.is_active ? 'bg-emerald-50 text-emerald-600 ring-emerald-200' : 'bg-slate-100 text-slate-500 ring-slate-200'">
+                                <span x-text="form.is_active ? 'Enabled' : 'Disabled'"></span>
+                            </button>
+                        </div>
+                    </div>
+                    <label class="mt-4 flex flex-col gap-2 text-sm font-medium text-slate-700">
+                        Description
+                        <textarea rows="2" x-model.trim="form.description"
+                            class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"></textarea>
+                    </label>
+                </section>
+
+                <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
+                    <h2 class="text-sm font-semibold text-slate-900">WebRTC signaling</h2>
+                    <p class="mt-1 text-sm text-slate-500">Configures the WebRTC bridge that forwards SIP audio to a
+                        peer over a registered signaling adapter.</p>
+                    <div class="mt-4 grid gap-4 md:grid-cols-2">
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Signaling adapter
+                            <select x-model="form.webrtc_signaling"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <template x-for="opt in signalingAdapters" :key="opt">
+                                    <option :value="opt" x-text="opt"></option>
+                                </template>
+                            </select>
+                            <span class="text-xs font-normal text-slate-400">Built-ins: http_json. Custom adapters register at startup.</span>
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Audio codec
+                            <select x-model="form.webrtc_audio_codec"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <template x-for="opt in webrtcAudioCodecs" :key="opt">
+                                    <option :value="opt" x-text="opt"></option>
+                                </template>
+                            </select>
+                        </label>
+                        <label class="md:col-span-2 flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Endpoint URL
+                            <input type="text" x-model.trim="form.webrtc_endpoint_url" maxlength="512" required
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="https://signal.example.com/offer">
+                            <span class="text-xs font-normal text-slate-400">Adapter-specific signaling endpoint.</span>
+                        </label>
+                        <label class="md:col-span-2 flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Health-check URL
+                            <input type="text" x-model.trim="form.webrtc_health_check_url" maxlength="512"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="https://signal.example.com/healthz">
+                            <span class="text-xs font-normal text-slate-400">Optional. HEAD probed every 30 s / 300 s. Leave blank to probe the Endpoint URL.</span>
+                        </label>
+                        <label class="md:col-span-2 flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Authorization header
+                            <input type="text" x-model.trim="form.webrtc_auth_header" maxlength="512"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="Bearer ...">
+                            <span class="text-xs font-normal text-slate-400">Optional. Sent as Authorization on outbound requests.</span>
+                        </label>
+                        <label class="md:col-span-2 flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            ICE servers (JSON array)
+                            <textarea rows="4" x-model="form.webrtc_ice_servers"
+                                class="font-mono rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder='[{"urls":["stun:stun.l.google.com:19302"]}]'></textarea>
+                            <span class="text-xs font-normal text-slate-400">Optional. Overrides the global ICE config if set.</span>
+                        </label>
+                        <label class="md:col-span-2 flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Protocol config (adapter-specific JSON)
+                            <textarea rows="6" x-model="form.webrtc_protocol"
+                                class="font-mono rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder='{"request_body_template":"{\"sdp\":\"{offer_sdp}\",\"type\":\"offer\"}","response_answer_path":"$.sdp"}'></textarea>
+                            <span class="text-xs font-normal text-slate-400">Validated by the selected adapter on save.</span>
+                        </label>
+                    </div>
+                </section>
+            </div>
+            </template>
+
+            <!-- LiveKit kind: shared general fields + LiveKit room config -->
+            <template x-if="form.kind === 'livekit'">
+            <div class="space-y-6">
+                <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
+                    <h2 class="text-sm font-semibold text-slate-900">General</h2>
+                    <div class="mt-4 grid gap-4 md:grid-cols-2">
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Trunk name
+                            <input type="text" x-model.trim="form.name" maxlength="120" required
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="livekit_room_bot">
+                            <span class="text-xs font-normal text-slate-400">Unique identifier used by routing rules.</span>
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Display name
+                            <input type="text" x-model.trim="form.display_name" maxlength="160"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Status
+                            <select x-model="form.status"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <template x-for="option in statusOptions" :key="option.value">
+                                    <option :value="option.value" x-text="option.label"></option>
+                                </template>
+                            </select>
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Direction
+                            <select x-model="form.direction"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <template x-for="option in directionOptions" :key="option.value">
+                                    <option :value="option.value" x-text="option.label"></option>
+                                </template>
+                            </select>
+                        </label>
+                        <div class="flex flex-col gap-2">
+                            <span class="text-sm font-medium text-slate-700">Active</span>
+                            <button type="button" @click="toggleActive()"
+                                class="inline-flex items-center gap-2 rounded-lg px-3 py-1 text-xs font-semibold ring-2 transition"
+                                :class="form.is_active ? 'bg-emerald-50 text-emerald-600 ring-emerald-200' : 'bg-slate-100 text-slate-500 ring-slate-200'">
+                                <span x-text="form.is_active ? 'Enabled' : 'Disabled'"></span>
+                            </button>
+                        </div>
+                    </div>
+                    <label class="mt-4 flex flex-col gap-2 text-sm font-medium text-slate-700">
+                        Description
+                        <textarea rows="2" x-model.trim="form.description"
+                            class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"></textarea>
+                    </label>
+                </section>
+
+                <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
+                    <h2 class="text-sm font-semibold text-slate-900">LiveKit connection</h2>
+                    <p class="mt-1 text-sm text-slate-500">Templates support
+                        <code>{call_id} {from_user} {to_user} {did} {trunk_name}</code>.</p>
+                    <div class="mt-4 grid gap-4 md:grid-cols-2">
+                        <label class="md:col-span-2 flex flex-col gap-1 text-sm font-medium text-slate-700">
+                            Server URL <span class="text-rose-500">*</span>
+                            <input type="text" x-model.trim="form.livekit_server_url" maxlength="512" required
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="wss://livekit.example.com">
+                            <span class="text-xs font-normal text-slate-400">
+                                LiveKit signaling endpoint. <code>ws://</code> for self-host (e.g. <code>ws://localhost:7880</code>),
+                                <code>wss://</code> for LiveKit Cloud.
+                            </span>
+                        </label>
+                        <label class="flex flex-col gap-1 text-sm font-medium text-slate-700">
+                            API key <span class="text-rose-500">*</span>
+                            <input type="text" x-model.trim="form.livekit_api_key" maxlength="256" required
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                            <span class="text-xs font-normal text-slate-400">
+                                From the LiveKit project dashboard (or <code>livekit-server --dev</code> output).
+                            </span>
+                        </label>
+                        <label class="flex flex-col gap-1 text-sm font-medium text-slate-700">
+                            API secret <span class="text-rose-500">*</span>
+                            <input type="password" x-model.trim="form.livekit_api_secret" maxlength="256"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="(unchanged when blank on edit)">
+                            <span class="text-xs font-normal text-slate-400">
+                                Pairs with the API key. Mints participant JWTs and authenticates the
+                                <code>CreateAgentDispatch</code> / <code>DeleteRoom</code> admin RPCs.
+                                Blank on edit keeps the stored value.
+                            </span>
+                        </label>
+                        <label class="flex flex-col gap-1 text-sm font-medium text-slate-700">
+                            Room template
+                            <input type="text" x-model.trim="form.livekit_room_template" maxlength="256" required
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="room-{call_id}">
+                            <span class="text-xs font-normal text-slate-400">
+                                The LiveKit room each call joins (auto-created on first connect). Vars
+                                <code>{call_id} {from_user} {to_user} {did} {trunk_name}</code> are substituted.
+                                Same room across calls = group room; per-call var = one room per call.
+                            </span>
+                        </label>
+                        <label class="flex flex-col gap-1 text-sm font-medium text-slate-700">
+                            Identity template
+                            <input type="text" x-model.trim="form.livekit_identity_template" maxlength="256" required
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="caller-{from_user}">
+                            <span class="text-xs font-normal text-slate-400">
+                                Becomes the LiveKit participant identity the bot sees. Must be unique per
+                                concurrent participant in the same room — include <code>{call_id}</code>
+                                or <code>{from_user}</code> to avoid collisions.
+                            </span>
+                        </label>
+                    </div>
+                </section>
+
+                <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
+                    <h2 class="text-sm font-semibold text-slate-900">Bot routing</h2>
+                    <p class="mt-1 text-sm text-slate-500">
+                        <strong>Set at least one</strong> — agent name (server-side dispatch) or
+                        dispatch endpoint (HTTP webhook). Both can be used together.
+                    </p>
+                    <div class="mt-4 grid gap-4 md:grid-cols-2">
+                        <label class="md:col-span-2 flex flex-col gap-1 text-sm font-medium text-slate-700">
+                            Agent name
+                            <input type="text" x-model.trim="form.livekit_agent_name" maxlength="256"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="voice-agent">
+                            <span class="text-xs font-normal text-slate-400">
+                                Name registered by your LiveKit agent worker. After the caller joins, rustpbx
+                                calls <code>CreateAgentDispatch</code> so LiveKit spins that named agent into
+                                the same room. Zero external infrastructure required.
+                            </span>
+                        </label>
+                        <label class="md:col-span-2 flex flex-col gap-1 text-sm font-medium text-slate-700">
+                            Dispatch endpoint URL
+                            <input type="text" x-model.trim="form.livekit_dispatch_endpoint" maxlength="512"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="https://control.example.com/livekit/dispatch">
+                            <span class="text-xs font-normal text-slate-400">
+                                HTTP webhook called <em>before</em> we connect to LiveKit. Must return
+                                Decision-API JSON: <code>{"decision":"accept"}</code> proceeds,
+                                <code>{"decision":"reject","reject_code":486}</code> aborts with that SIP code.
+                                May also override the templated <code>room</code>, <code>identity</code>,
+                                <code>metadata</code>, or request a <code>wait_ms</code> delay.
+                            </span>
+                        </label>
+                        <label class="md:col-span-2 flex flex-col gap-1 text-sm">
+                            <div class="flex items-center gap-2">
+                                <input type="checkbox" id="livekit_require_agent_dispatch"
+                                    x-model="form.livekit_require_agent_dispatch"
+                                    class="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-300">
+                                <span class="font-medium text-slate-700">Require agent dispatch</span>
+                            </div>
+                            <span class="text-xs font-normal text-slate-400 pl-6">
+                                ON (default): a failed <code>CreateAgentDispatch</code> RPC aborts the call
+                                with 503 and shows up in the CDR as <em>ServerUnavailable</em>. OFF: log a
+                                warning and continue — the no-bot watchdog (below) catches the silent room.
+                            </span>
+                        </label>
+                        <label class="md:col-span-2 flex flex-col gap-1 text-sm">
+                            <div class="flex items-center gap-2">
+                                <input type="checkbox" id="livekit_require_webhook_ack"
+                                    x-model="form.livekit_require_webhook_ack"
+                                    class="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-300">
+                                <span class="font-medium text-slate-700">Require webhook ack</span>
+                            </div>
+                            <span class="text-xs font-normal text-slate-400 pl-6">
+                                ON (default): webhook 5xx / timeout / non-JSON aborts the call. OFF: those
+                                transient failures fall through as "accept with no overrides". Schema
+                                violations (e.g. <code>{"decision":"bogus"}</code>) always abort regardless.
+                            </span>
+                        </label>
+                    </div>
+                </section>
+
+                <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
+                    <h2 class="text-sm font-semibold text-slate-900">Wait behaviour</h2>
+                    <p class="mt-1 text-sm text-slate-500">What the caller hears + how long we hold before giving up.</p>
+                    <div class="mt-4 grid gap-4 md:grid-cols-2">
+                        <label class="flex flex-col gap-1 text-sm font-medium text-slate-700">
+                            No-bot watchdog (ms)
+                            <input type="number" min="0" max="600000" x-model.number="form.livekit_bot_join_timeout_ms"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="15000">
+                            <span class="text-xs font-normal text-slate-400">
+                                Hard timeout: if no remote participant has subscribed an audio track within
+                                this many ms, drop the call cleanly (CDR <em>hangup=ByCallee</em>). Defense
+                                against agent dispatch / webhook silently failing to surface a bot.
+                                <code>0</code> or blank disables.
+                            </span>
+                        </label>
+                        <label class="flex flex-col gap-1 text-sm font-medium text-slate-700">
+                            Hold tone (Hz)
+                            <input type="number" min="0" max="3400" x-model.number="form.livekit_hold_tone_hz"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="0">
+                            <span class="text-xs font-normal text-slate-400">
+                                Continuous low-amplitude sine tone on the SIP side while no participant is
+                                publishing audio. <code>0</code> / blank = silence (most carriers generate
+                                comfort noise on their side anyway). <code>220</code>-<code>440</code> Hz
+                                for an audible "please hold". Above 3400 is clipped by SIP narrowband codecs.
+                            </span>
+                        </label>
+                    </div>
+                </section>
+
+                <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
+                    <button type="button" @click="livekitShowAdvanced = !livekitShowAdvanced"
+                        class="flex w-full items-center justify-between text-left">
+                        <h2 class="text-sm font-semibold text-slate-900">Advanced</h2>
+                        <span class="text-xs text-slate-400" x-text="livekitShowAdvanced ? 'Hide' : 'Show'"></span>
+                    </button>
+                    <div x-show="livekitShowAdvanced" x-cloak class="mt-4 grid gap-4 md:grid-cols-2">
+                        <label class="flex flex-col gap-1 text-sm font-medium text-slate-700">
+                            Audio codec
+                            <select x-model="form.livekit_audio_codec"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <template x-for="opt in livekitAudioCodecs" :key="opt">
+                                    <option :value="opt" x-text="opt"></option>
+                                </template>
+                            </select>
+                            <span class="text-xs font-normal text-slate-400">
+                                Codec used on the LiveKit publish track. <strong>opus</strong> = 48 kHz wideband
+                                (default, recommended). <strong>g722</strong> = 16 kHz wideband (legacy compat).
+                                SIP-side codec is negotiated separately from the carrier's INVITE offer.
+                            </span>
+                        </label>
+                        <label class="flex flex-col gap-1 text-sm font-medium text-slate-700">
+                            Signaling timeout (ms)
+                            <input type="number" min="0" x-model="form.livekit_signaling_timeout_ms"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="5000">
+                            <span class="text-xs font-normal text-slate-400">
+                                Applied to BOTH the dispatch webhook POST and the LiveKit <code>Room::connect</code>
+                                handshake. Raise for bots with cold-start latency (model load, container boot).
+                                Default <code>5000</code>.
+                            </span>
+                        </label>
+                        <label class="flex flex-col gap-1 text-sm font-medium text-slate-700">
+                            JWT TTL (seconds)
+                            <input type="number" min="0" x-model="form.livekit_jwt_ttl_secs"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="1800">
+                            <span class="text-xs font-normal text-slate-400">
+                                Lifetime of the JWT we mint to join the room. Once a participant is in the
+                                room the TTL stops mattering — but the SDK's <em>auto-reconnect</em> after a
+                                network blip re-uses this token, so calls longer than the TTL can fail to
+                                recover. Default <code>1800</code> (30 min). Raise for long-running calls.
+                            </span>
+                        </label>
+                        <label class="md:col-span-2 flex flex-col gap-1 text-sm font-medium text-slate-700">
+                            Health-check URL
+                            <input type="text" x-model.trim="form.livekit_health_check_url" maxlength="512"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="https://livekit.example.com/healthz">
+                            <span class="text-xs font-normal text-slate-400">
+                                The gateway-health prober hits this URL with HTTP HEAD periodically to mark
+                                the trunk Healthy / Unhealthy. Unhealthy trunks are skipped by the routing
+                                matcher. Blank = fall back to a TCP-connect to the server URL host:port.
+                            </span>
+                        </label>
+                        <label class="md:col-span-2 flex flex-col gap-1 text-sm font-medium text-slate-700">
+                            Metadata template (JSON)
+                            <textarea rows="2" x-model="form.livekit_metadata_template"
+                                class="font-mono rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder='{"caller":"{from_user}","trunk":"{trunk_name}"}'></textarea>
+                            <span class="text-xs font-normal text-slate-400">
+                                Per-call participant metadata stamped into the JWT and exposed to the bot via
+                                LiveKit's <code>participant.metadata()</code>. Same vars as the room/identity
+                                templates. Must be valid JSON after substitution (validated at save). This is
+                                NOT the webhook body — see the "Dispatch protocol blob" below for that.
+                            </span>
+                        </label>
+                        <label class="md:col-span-2 flex flex-col gap-1 text-sm font-medium text-slate-700">
+                            Dispatch Authorization header
+                            <input type="text" x-model.trim="form.livekit_dispatch_endpoint_auth_header" maxlength="512"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="Bearer ...">
+                            <span class="text-xs font-normal text-slate-400">
+                                Sent as the <code>Authorization</code> header on every dispatch webhook POST.
+                                Typical values: <code>Bearer &lt;token&gt;</code>, <code>Basic &lt;base64&gt;</code>.
+                                Only used when "Dispatch endpoint URL" is set.
+                            </span>
+                        </label>
+                        <label class="md:col-span-2 flex flex-col gap-1 text-sm font-medium text-slate-700">
+                            Dispatch protocol blob (JSON)
+                            <textarea rows="5" x-model="form.livekit_dispatch_endpoint_protocol"
+                                class="font-mono rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder='{"request_body_template":"..."}'></textarea>
+                            <span class="text-xs font-normal text-slate-400">
+                                The rendered <code>request_body_template</code> (after <code>{var}</code> substitution)
+                                becomes the <strong>entire HTTP POST body</strong>, not a metadata field. Leave blank
+                                to use rustpbx's built-in default body.
+                            </span>
+                        </label>
+                        <label class="md:col-span-2 flex flex-col gap-1 text-sm">
+                            <div class="flex items-center gap-2">
+                                <input type="checkbox" id="livekit_delete_room_on_hangup"
+                                    x-model="form.livekit_delete_room_on_hangup"
+                                    class="h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-300">
+                                <span class="font-medium text-slate-700">Delete LiveKit room on hangup</span>
+                            </div>
+                            <span class="text-xs font-normal text-slate-400 pl-6">
+                                After the SIP call ends and rustpbx disconnects its participant, also call
+                                LiveKit's <code>DeleteRoom</code> admin RPC. <strong>Kicks any remaining
+                                participants</strong> — use only for single-use rooms (one call per room).
+                                Default OFF leaves the room alive for other participants / lets it idle-timeout
+                                naturally.
+                            </span>
+                        </label>
+                    </div>
+                </section>
+            </div>
+            </template>
+
+            <!-- ExternalMedia kind: shared general fields + sidecar PCM config -->
+            <template x-if="form.kind === 'external_media'">
+            <div class="space-y-6">
+                <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
+                    <h2 class="text-sm font-semibold text-slate-900">General</h2>
+                    <div class="mt-4 grid gap-4 md:grid-cols-2">
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Trunk name
+                            <input type="text" x-model.trim="form.name" maxlength="120" required
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="external_media_bot">
+                            <span class="text-xs font-normal text-slate-400">Unique identifier used by routing rules.</span>
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Display name
+                            <input type="text" x-model.trim="form.display_name" maxlength="160"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Status
+                            <select x-model="form.status"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <template x-for="option in statusOptions" :key="option.value">
+                                    <option :value="option.value" x-text="option.label"></option>
+                                </template>
+                            </select>
+                        </label>
+                        <label class="flex flex-col gap-2 text-sm font-medium text-slate-700">
+                            Direction
+                            <select x-model="form.direction"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <template x-for="option in directionOptions" :key="option.value">
+                                    <option :value="option.value" x-text="option.label"></option>
+                                </template>
+                            </select>
+                        </label>
+                        <div class="flex flex-col gap-2">
+                            <span class="text-sm font-medium text-slate-700">Active</span>
+                            <button type="button" @click="toggleActive()"
+                                class="inline-flex items-center gap-2 rounded-lg px-3 py-1 text-xs font-semibold ring-2 transition"
+                                :class="form.is_active ? 'bg-emerald-50 text-emerald-600 ring-emerald-200' : 'bg-slate-100 text-slate-500 ring-slate-200'">
+                                <span x-text="form.is_active ? 'Enabled' : 'Disabled'"></span>
+                            </button>
+                        </div>
+                    </div>
+                    <label class="mt-4 flex flex-col gap-2 text-sm font-medium text-slate-700">
+                        Description
+                        <textarea rows="2" x-model.trim="form.description"
+                            class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"></textarea>
+                    </label>
+                </section>
+
+                <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
+                    <h2 class="text-sm font-semibold text-slate-900">Sidecar bridge</h2>
+                    <p class="mt-1 text-sm text-slate-500">rustpbx terminates SIP/RTP and pipes 48&nbsp;kHz mono PCM over
+                        localhost UDP to the sidecar process, which owns the far-end media (e.g. a LiveKit room
+                        participant). LiveKit credentials live in the sidecar's own environment, not here.</p>
+                    <div class="mt-4 grid gap-4 md:grid-cols-2">
+                        <label class="md:col-span-2 flex flex-col gap-1 text-sm font-medium text-slate-700">
+                            Sidecar command <span class="text-rose-500">*</span>
+                            <input type="text" x-model.trim="form.external_media_command" maxlength="1024" required
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="python3 /opt/livekit/sip_bridge_sidecar.py">
+                            <span class="text-xs font-normal text-slate-400">
+                                Spawn command for the per-call sidecar. rustpbx appends
+                                <code>--call-id &lt;id&gt; --did &lt;to&gt; --caller &lt;from&gt; --port &lt;P&gt;</code>.
+                            </span>
+                        </label>
+                        <label class="flex flex-col gap-1 text-sm font-medium text-slate-700">
+                            Audio codec
+                            <select x-model="form.external_media_audio_codec"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                <template x-for="opt in externalMediaAudioCodecs" :key="opt">
+                                    <option :value="opt" x-text="opt"></option>
+                                </template>
+                            </select>
+                            <span class="text-xs font-normal text-slate-400">SIP-side voice codec rustpbx negotiates and transcodes.</span>
+                        </label>
+                        <label class="flex flex-col gap-1 text-sm font-medium text-slate-700">
+                            Bot join timeout (ms)
+                            <input type="number" min="0" step="500" x-model="form.external_media_bot_join_timeout_ms"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="15000">
+                            <span class="text-xs font-normal text-slate-400">How long to hold the INVITE awaiting the sidecar's READY before answering. Default 15000.</span>
+                        </label>
+                        <label class="flex flex-col gap-1 text-sm font-medium text-slate-700">
+                            Hold tone (Hz)
+                            <input type="number" min="0" step="10" x-model="form.external_media_hold_tone_hz"
+                                class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                placeholder="(blank = silence)">
+                            <span class="text-xs font-normal text-slate-400">Optional comfort tone while no sidecar audio arrives. Blank = silence.</span>
+                        </label>
+                    </div>
+                </section>
+            </div>
+            </template>
 
             <div class="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <p class="text-xs text-slate-400">{{ "sip_trunk_detail.save_hint" | t }}</p>
@@ -446,7 +1078,18 @@ default('RustPBX') }}{% endblock %}
                 { value: 'tcp', label: 'TCP' },
                 { value: 'tls', label: 'TLS' },
             ],
+            kindOptions: [
+                { value: 'sip', label: 'SIP' },
+                { value: 'webrtc', label: 'WebRTC' },
+                { value: 'livekit', label: 'LiveKit' },
+                { value: 'external_media', label: 'External Media' },
+            ],
+            signalingAdapters: [],
+            webrtcAudioCodecs: ['opus', 'g722'],
+            livekitAudioCodecs: ['opus', 'g722'],
+            externalMediaAudioCodecs: ['opus', 'g722', 'pcmu', 'pcma'],
             form: {
+                kind: 'sip',
                 name: '',
                 display_name: '',
                 carrier: '',
@@ -470,14 +1113,67 @@ default('RustPBX') }}{% endblock %}
                 incoming_to_user_prefix: '',
                 metadata: '',
                 is_active: true,
+                rewrite_hostport: true,
+                prefer_hd: true,
                 register_enabled: false,
                 register_expires: '',
                 register_extra_headers: '',
+                webrtc_signaling: 'http_json',
+                webrtc_endpoint_url: '',
+                webrtc_audio_codec: 'opus',
+                webrtc_auth_header: '',
+                webrtc_health_check_url: '',
+                webrtc_ice_servers: '',
+                webrtc_protocol: '',
+                livekit_server_url: '',
+                livekit_api_key: '',
+                livekit_api_secret: '',
+                livekit_room_template: 'room-{call_id}',
+                livekit_identity_template: 'caller-{from_user}',
+                livekit_metadata_template: '',
+                livekit_audio_codec: 'opus',
+                livekit_dispatch_endpoint: '',
+                livekit_dispatch_endpoint_auth_header: '',
+                // Pre-filled template that produces the SAME body rustpbx
+                // would send when this field is left empty — operators
+                // can edit / add fields without breaking the contract.
+                // The string assigned to `request_body_template` is itself
+                // a JSON template; `{var}` placeholders are substituted at
+                // call time (vars: call_id, from_user, to_user, did,
+                // trunk_name, room, identity, sip_sdp_offer).
+                livekit_dispatch_endpoint_protocol: JSON.stringify({
+                    request_body_template: JSON.stringify({
+                        call_id: '{call_id}',
+                        from_user: '{from_user}',
+                        to_user: '{to_user}',
+                        did: '{did}',
+                        trunk_name: '{trunk_name}',
+                        room: '{room}',
+                        identity: '{identity}',
+                    }),
+                }, null, 2),
+                livekit_require_webhook_ack: true,
+                livekit_health_check_url: '',
+                livekit_signaling_timeout_ms: '',
+                livekit_delete_room_on_hangup: false,
+                livekit_agent_name: '',
+                livekit_require_agent_dispatch: true,
+                livekit_bot_join_timeout_ms: 15000,
+                livekit_hold_tone_hz: '',
+                livekit_jwt_ttl_secs: '',
+                external_media_command: '',
+                external_media_audio_codec: 'opus',
+                external_media_bot_join_timeout_ms: 15000,
+                external_media_hold_tone_hz: '',
             },
+            livekitShowAdvanced: false,
             regStatus: null,
             success: null,
             error: null,
             saving: false,
+            probing: false,
+            probeMessage: null,
+            probeOk: false,
             activeTab: 'general',
             init() {
                 this.loadOptions();
@@ -500,9 +1196,34 @@ default('RustPBX') }}{% endblock %}
                     value: String(value).toLowerCase(),
                     label: this.directionLabel(value),
                 }));
+
+                const adapters = Array.isArray(this.filters.signaling_adapters) && this.filters.signaling_adapters.length
+                    ? this.filters.signaling_adapters
+                    : ['http_json'];
+                this.signalingAdapters = adapters.map((a) => String(a));
+                if (this.signalingAdapters.length && !this.signalingAdapters.includes(this.form.webrtc_signaling)) {
+                    this.form.webrtc_signaling = this.signalingAdapters[0];
+                }
+                const codecs = Array.isArray(this.filters.webrtc_audio_codecs) && this.filters.webrtc_audio_codecs.length
+                    ? this.filters.webrtc_audio_codecs
+                    : ['opus', 'g722'];
+                this.webrtcAudioCodecs = codecs.map((c) => String(c));
+                const lkCodecs = Array.isArray(this.filters.livekit_audio_codecs) && this.filters.livekit_audio_codecs.length
+                    ? this.filters.livekit_audio_codecs
+                    : ['opus', 'g722'];
+                this.livekitAudioCodecs = lkCodecs.map((c) => String(c));
+                const emCodecs = Array.isArray(this.filters.external_media_audio_codecs) && this.filters.external_media_audio_codecs.length
+                    ? this.filters.external_media_audio_codecs
+                    : ['opus', 'g722', 'pcmu', 'pcma'];
+                this.externalMediaAudioCodecs = emCodecs.map((c) => String(c));
+            },
+            setKind(value) {
+                if (this.mode === 'edit') return;
+                this.form.kind = value;
             },
             populateFromModel() {
                 const model = this.model || {};
+                this.form.kind = (model.kind || 'sip').toLowerCase();
                 this.form.name = model.name || '';
                 this.form.display_name = model.display_name || '';
                 this.form.carrier = model.carrier || '';
@@ -530,12 +1251,61 @@ default('RustPBX') }}{% endblock %}
                 this.form.incoming_to_user_prefix = model.incoming_to_user_prefix || '';
                 this.form.metadata = this.formatJson(model.metadata);
                 this.form.is_active = model.is_active !== false;
+                this.form.rewrite_hostport = model.rewrite_hostport !== false;
+                this.form.prefer_hd = model.prefer_hd !== false;
                 this.form.register_enabled = model.register_enabled === true;
                 this.form.register_expires = model.register_expires != null ? String(model.register_expires) : '';
                 this.form.register_extra_headers = this.formatJson(model.register_extra_headers);
                 if (this.form.register_enabled && this.mode === 'edit') {
                     this.loadRegStatus();
                 }
+                // WebRTC fields. The server flattens `WebRtcTrunkConfig` into
+                // `webrtc_*`-prefixed keys on the model JSON; mirror those onto
+                // the form so editing round-trips cleanly.
+                this.form.webrtc_signaling = model.webrtc_signaling || 'http_json';
+                this.form.webrtc_endpoint_url = model.webrtc_endpoint_url || '';
+                this.form.webrtc_audio_codec = model.webrtc_audio_codec || 'opus';
+                this.form.webrtc_auth_header = model.webrtc_auth_header || '';
+                this.form.webrtc_health_check_url = model.webrtc_health_check_url || '';
+                this.form.webrtc_ice_servers = this.formatJson(model.webrtc_ice_servers);
+                this.form.webrtc_protocol = this.formatJson(model.webrtc_protocol);
+                // LiveKit fields. Server flattens `LiveKitTrunkConfig` into
+                // `livekit_*`-prefixed keys on the model JSON; mirror those
+                // onto the form so editing round-trips cleanly.
+                this.form.livekit_server_url = model.livekit_server_url || '';
+                this.form.livekit_api_key = model.livekit_api_key || '';
+                // API secret never round-trips into the edit form for
+                // safety. Blank means "leave existing secret unchanged" on
+                // submit; user can re-enter to rotate.
+                this.form.livekit_api_secret = '';
+                this.form.livekit_room_template = model.livekit_room_template || 'room-{call_id}';
+                this.form.livekit_identity_template = model.livekit_identity_template || 'sip-{from_user}';
+                this.form.livekit_metadata_template = model.livekit_metadata_template || '';
+                this.form.livekit_audio_codec = model.livekit_audio_codec || 'opus';
+                this.form.livekit_dispatch_endpoint = model.livekit_dispatch_endpoint || '';
+                this.form.livekit_dispatch_endpoint_auth_header = model.livekit_dispatch_endpoint_auth_header || '';
+                this.form.livekit_dispatch_endpoint_protocol = this.formatJson(model.livekit_dispatch_endpoint_protocol);
+                this.form.livekit_require_webhook_ack = model.livekit_require_webhook_ack === true;
+                this.form.livekit_health_check_url = model.livekit_health_check_url || '';
+                this.form.livekit_signaling_timeout_ms = model.livekit_signaling_timeout_ms != null
+                    ? String(model.livekit_signaling_timeout_ms) : '';
+                this.form.livekit_delete_room_on_hangup = model.livekit_delete_room_on_hangup === true;
+                this.form.livekit_agent_name = model.livekit_agent_name || '';
+                this.form.livekit_require_agent_dispatch = model.livekit_require_agent_dispatch === true;
+                this.form.livekit_bot_join_timeout_ms = model.livekit_bot_join_timeout_ms != null
+                    ? String(model.livekit_bot_join_timeout_ms) : '';
+                this.form.livekit_hold_tone_hz = model.livekit_hold_tone_hz != null
+                    ? String(model.livekit_hold_tone_hz) : '';
+                this.form.livekit_jwt_ttl_secs = model.livekit_jwt_ttl_secs != null
+                    ? String(model.livekit_jwt_ttl_secs) : '';
+                // ExternalMedia fields. Server flattens `ExternalMediaTrunkConfig`
+                // into `external_media_*`-prefixed keys on the model JSON.
+                this.form.external_media_command = model.external_media_command || '';
+                this.form.external_media_audio_codec = model.external_media_audio_codec || 'opus';
+                this.form.external_media_bot_join_timeout_ms = model.external_media_bot_join_timeout_ms != null
+                    ? String(model.external_media_bot_join_timeout_ms) : '';
+                this.form.external_media_hold_tone_hz = model.external_media_hold_tone_hz != null
+                    ? String(model.external_media_hold_tone_hz) : '';
             },
             get pageTitle() {
                 const td = (this.t || {}).sip_trunk_detail || {};
@@ -597,7 +1367,20 @@ default('RustPBX') }}{% endblock %}
                 if (!value) return '—';
                 const date = new Date(value);
                 if (Number.isNaN(date.getTime())) return value;
-                return date.toLocaleString();
+                try {
+                    return new Intl.DateTimeFormat(undefined, {
+                        timeZone: window.DISPLAY_TIMEZONE || 'Asia/Kolkata',
+                        year: 'numeric',
+                        month: '2-digit',
+                        day: '2-digit',
+                        hour: '2-digit',
+                        minute: '2-digit',
+                        second: '2-digit',
+                        hour12: false,
+                    }).format(date);
+                } catch (_) {
+                    return date.toLocaleString();
+                }
             },
             formatMultilineList(value, preferredKeys = []) {
                 const keys = Array.isArray(preferredKeys) ? preferredKeys : [];
@@ -690,12 +1473,91 @@ default('RustPBX') }}{% endblock %}
             },
             buildPayload() {
                 const params = new URLSearchParams();
+                params.set('kind', (this.form.kind || 'sip').trim());
                 params.set('name', this.form.name.trim());
                 params.set('display_name', this.form.display_name.trim());
-                params.set('carrier', this.form.carrier.trim());
                 params.set('description', this.form.description.trim());
                 params.set('status', this.form.status.trim());
                 params.set('direction', this.form.direction.trim());
+                params.set('is_active', this.form.is_active ? 'true' : 'false');
+                if (this.form.kind === 'webrtc') {
+                    params.set('webrtc_signaling', (this.form.webrtc_signaling || '').trim());
+                    params.set('webrtc_endpoint_url', (this.form.webrtc_endpoint_url || '').trim());
+                    params.set('webrtc_audio_codec', (this.form.webrtc_audio_codec || 'opus').trim());
+                    if ((this.form.webrtc_auth_header || '').trim()) {
+                        params.set('webrtc_auth_header', this.form.webrtc_auth_header.trim());
+                    }
+                    // Always post webrtc_health_check_url (even when empty) so
+                    // the operator can clear an existing override by blanking
+                    // the field. The handler treats Some("") as a clear,
+                    // None as "leave unchanged".
+                    params.set('webrtc_health_check_url', (this.form.webrtc_health_check_url || '').trim());
+                    if ((this.form.webrtc_ice_servers || '').trim()) {
+                        params.set('webrtc_ice_servers', this.form.webrtc_ice_servers.trim());
+                    }
+                    if ((this.form.webrtc_protocol || '').trim()) {
+                        params.set('webrtc_protocol', this.form.webrtc_protocol.trim());
+                    }
+                    return params;
+                }
+                if (this.form.kind === 'livekit') {
+                    // Mirror the webrtc branch — every livekit_* form field
+                    // must be submitted, otherwise the backend's "Option missing
+                    // → preserve existing" path keeps the old value and the
+                    // edit appears to revert silently.
+                    const setStr = (key, val) => {
+                        params.set(key, (val ?? '').toString().trim());
+                    };
+                    const setNum = (key, val) => {
+                        if (val === '' || val == null) return;
+                        const n = Number(val);
+                        if (!Number.isNaN(n)) params.set(key, String(Math.max(0, Math.round(n))));
+                    };
+                    const setBool = (key, val) => {
+                        params.set(key, val ? 'true' : 'false');
+                    };
+                    setStr('livekit_server_url', this.form.livekit_server_url);
+                    setStr('livekit_api_key', this.form.livekit_api_key);
+                    if ((this.form.livekit_api_secret || '').trim()) {
+                        // Treat blank api_secret as "keep stored" — never echo
+                        // the cleared field as an empty string, which would
+                        // fail kind_schemas validation.
+                        params.set('livekit_api_secret', this.form.livekit_api_secret.trim());
+                    }
+                    setStr('livekit_room_template', this.form.livekit_room_template);
+                    setStr('livekit_identity_template', this.form.livekit_identity_template);
+                    setStr('livekit_metadata_template', this.form.livekit_metadata_template);
+                    setStr('livekit_audio_codec', this.form.livekit_audio_codec || 'opus');
+                    setStr('livekit_dispatch_endpoint', this.form.livekit_dispatch_endpoint);
+                    setStr('livekit_dispatch_endpoint_auth_header', this.form.livekit_dispatch_endpoint_auth_header);
+                    setStr('livekit_dispatch_endpoint_protocol', this.form.livekit_dispatch_endpoint_protocol);
+                    setStr('livekit_health_check_url', this.form.livekit_health_check_url);
+                    setStr('livekit_agent_name', this.form.livekit_agent_name);
+                    setBool('livekit_require_webhook_ack', this.form.livekit_require_webhook_ack);
+                    setBool('livekit_require_agent_dispatch', this.form.livekit_require_agent_dispatch);
+                    setBool('livekit_delete_room_on_hangup', this.form.livekit_delete_room_on_hangup);
+                    setNum('livekit_signaling_timeout_ms', this.form.livekit_signaling_timeout_ms);
+                    setNum('livekit_bot_join_timeout_ms', this.form.livekit_bot_join_timeout_ms);
+                    setNum('livekit_hold_tone_hz', this.form.livekit_hold_tone_hz);
+                    setNum('livekit_jwt_ttl_secs', this.form.livekit_jwt_ttl_secs);
+                    return params;
+                }
+                if (this.form.kind === 'external_media') {
+                    const setStr = (key, val) => {
+                        params.set(key, (val ?? '').toString().trim());
+                    };
+                    const setNum = (key, val) => {
+                        if (val === '' || val == null) return;
+                        const n = Number(val);
+                        if (!Number.isNaN(n)) params.set(key, String(Math.max(0, Math.round(n))));
+                    };
+                    setStr('external_media_command', this.form.external_media_command);
+                    setStr('external_media_audio_codec', this.form.external_media_audio_codec || 'opus');
+                    setNum('external_media_bot_join_timeout_ms', this.form.external_media_bot_join_timeout_ms);
+                    setNum('external_media_hold_tone_hz', this.form.external_media_hold_tone_hz);
+                    return params;
+                }
+                params.set('carrier', this.form.carrier.trim());
                 params.set('sip_transport', this.form.sip_transport.trim());
 
                 if (this.form.sip_server.trim()) params.set('sip_server', this.form.sip_server.trim());
@@ -718,7 +1580,7 @@ default('RustPBX') }}{% endblock %}
                 });
 
                 params.set('allowed_ips', this.form.allowed_ips.trim());
-                params.set('did_numbers', this.form.did_numbers.trim());
+                // did_numbers are now managed on the Numbers page; do not submit from trunk form.
                 params.set('billing_snapshot', this.form.billing_snapshot.trim());
                 params.set('analytics', this.form.analytics.trim());
                 params.set('tags', this.form.tags.trim());
@@ -726,6 +1588,8 @@ default('RustPBX') }}{% endblock %}
                 params.set('incoming_to_user_prefix', this.form.incoming_to_user_prefix.trim());
                 params.set('metadata', this.form.metadata.trim());
                 params.set('is_active', this.form.is_active ? 'true' : 'false');
+                params.set('rewrite_hostport', this.form.rewrite_hostport ? 'true' : 'false');
+                params.set('prefer_hd', this.form.prefer_hd ? 'true' : 'false');
                 params.set('register_enabled', this.form.register_enabled ? 'true' : 'false');
                 if (this.form.register_expires !== '' && this.form.register_expires != null) {
                     const expNum = Number(this.form.register_expires);
@@ -738,6 +1602,33 @@ default('RustPBX') }}{% endblock %}
                 }
 
                 return params;
+            },
+            async probeNow() {
+                if (!this.model?.id || this.probing) return;
+                this.probing = true;
+                this.probeMessage = null;
+                try {
+                    const response = await fetch(`${this.basePath}/sip-trunk/${this.model.id}/probe`, {
+                        method: 'POST',
+                        headers: { 'Accept': 'application/json' },
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        throw new Error(data?.message || `Probe failed (HTTP ${response.status})`);
+                    }
+                    this.probeOk = !!data.ok;
+                    if (data.status) {
+                        this.form.status = data.status;
+                    }
+                    const latency = data.latency_ms != null ? ` (${data.latency_ms} ms)` : '';
+                    this.probeMessage = `${data.ok ? 'OK' : 'Failed'}: ${data.detail || 'no detail'}${latency}`;
+                } catch (err) {
+                    console.error(err);
+                    this.probeOk = false;
+                    this.probeMessage = err?.message || 'Probe failed';
+                } finally {
+                    this.probing = false;
+                }
             },
             async submit() {
                 const td = (this.t || {}).sip_trunk_detail || {};

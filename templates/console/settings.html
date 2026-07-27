@@ -234,6 +234,11 @@
 
         <section x-show="activeTab === 'platform'" x-cloak x-transition.opacity class="space-y-6"
             id="settings-tab-platform" role="tabpanel" tabindex="0">
+            <div x-show="tabDirty('platform', platformDraft)" x-cloak
+                class="rounded-md bg-amber-50 px-4 py-2 text-xs text-amber-800 ring-1 ring-amber-200 flex items-center gap-2">
+                <svg class="h-4 w-4 flex-none" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01M5 19h14a2 2 0 001.84-2.75L13.74 4a2 2 0 00-3.48 0L3.16 16.25A2 2 0 005 19z"></path></svg>
+                <span>You have unsaved platform changes — a service restart is required after saving.</span>
+            </div>
             <div class="grid gap-6 lg:grid-cols-2">
                 <div class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
                     <div class="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
@@ -424,6 +429,83 @@
 
         </section>
 
+        <!-- ── Display settings ───────────────────────────────────────────────── -->
+        <section x-show="activeTab === 'display'" x-cloak x-transition.opacity class="space-y-6"
+            id="settings-tab-display" role="tabpanel" tabindex="0"
+            x-data="{
+                displayDraft: { timezone: (rawSettings?.display?.timezone || window.DISPLAY_TIMEZONE || 'Asia/Kolkata') },
+                displayProcessing: false,
+                displaySaved: false,
+                displayError: null,
+                timezones: [
+                    { value: 'Asia/Kolkata', label: 'India Standard Time (IST, UTC+5:30)' },
+                    { value: 'UTC', label: 'UTC (Coordinated Universal Time)' },
+                    { value: 'America/New_York', label: 'Eastern Time (ET, UTC-5/−4)' },
+                    { value: 'America/Chicago', label: 'Central Time (CT, UTC-6/−5)' },
+                    { value: 'America/Denver', label: 'Mountain Time (MT, UTC-7/−6)' },
+                    { value: 'America/Los_Angeles', label: 'Pacific Time (PT, UTC-8/−7)' },
+                    { value: 'Europe/London', label: 'Greenwich Mean Time (GMT/BST)' },
+                    { value: 'Europe/Paris', label: 'Central European Time (CET, UTC+1/+2)' },
+                    { value: 'Europe/Berlin', label: 'Central European Time (CET, UTC+1/+2)' },
+                    { value: 'Asia/Dubai', label: 'Gulf Standard Time (GST, UTC+4)' },
+                    { value: 'Asia/Singapore', label: 'Singapore Time (SGT, UTC+8)' },
+                    { value: 'Asia/Tokyo', label: 'Japan Standard Time (JST, UTC+9)' },
+                    { value: 'Australia/Sydney', label: 'Australian Eastern Time (AEST, UTC+10/+11)' },
+                ],
+                async saveDisplaySettings() {
+                    this.displayProcessing = true;
+                    this.displayError = null;
+                    this.displaySaved = false;
+                    try {
+                        const res = await fetch(`{{ base_path | default('/console') }}/settings/config/display`, {
+                            method: 'PATCH',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ display_timezone: this.displayDraft.timezone }),
+                        });
+                        const body = await res.json();
+                        if (!res.ok) {
+                            this.displayError = body.message || 'Failed to save';
+                        } else {
+                            window.DISPLAY_TIMEZONE = this.displayDraft.timezone;
+                            this.displaySaved = true;
+                            setTimeout(() => { this.displaySaved = false; }, 3000);
+                        }
+                    } catch (e) {
+                        this.displayError = e.message || 'Network error';
+                    } finally {
+                        this.displayProcessing = false;
+                    }
+                }
+            }">
+            <div class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
+                <h2 class="text-base font-semibold text-slate-900">Display settings</h2>
+                <p class="mt-1 text-sm text-slate-500">Timestamps are stored in UTC. This setting controls how they are displayed in the console.</p>
+
+                <form class="mt-6 space-y-5" @submit.prevent="saveDisplaySettings">
+                    <div>
+                        <label for="display_timezone" class="block text-sm font-medium text-slate-700">Display timezone</label>
+                        <p class="mt-1 text-xs text-slate-500">All timestamps in call records, CDRs, and diagnostic views will be shown in this timezone.</p>
+                        <select id="display_timezone" x-model="displayDraft.timezone"
+                            class="mt-2 block w-full max-w-md rounded-md border border-slate-300 bg-white px-3 py-2 text-sm shadow-sm focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500">
+                            <template x-for="tz in timezones" :key="tz.value">
+                                <option :value="tz.value" x-text="tz.label"></option>
+                            </template>
+                        </select>
+                    </div>
+
+                    <div class="flex items-center gap-3">
+                        <button type="submit"
+                            class="rounded-md bg-sky-600 px-4 py-2 text-sm font-medium text-white hover:bg-sky-700 disabled:opacity-50"
+                            :disabled="displayProcessing">
+                            <span x-text="displayProcessing ? 'Saving…' : 'Save'"></span>
+                        </button>
+                        <span x-show="displaySaved" x-cloak class="text-sm text-emerald-600">Saved</span>
+                        <span x-show="displayError" x-cloak class="text-sm text-rose-600" x-text="displayError"></span>
+                    </div>
+                </form>
+            </div>
+        </section>
+
         <section x-show="activeTab === 'logs'" x-cloak x-transition.opacity class="space-y-6" id="settings-tab-logs"
             role="tabpanel" tabindex="0">
             <div class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
@@ -511,6 +593,11 @@
 
         <section x-show="activeTab === 'proxy'" x-cloak x-transition.opacity class="space-y-6" id="settings-tab-proxy"
             role="tabpanel" tabindex="0">
+            <div x-show="tabDirty('proxy', proxyDraft)" x-cloak
+                class="rounded-md bg-amber-50 px-4 py-2 text-xs text-amber-800 ring-1 ring-amber-200 flex items-center gap-2">
+                <svg class="h-4 w-4 flex-none" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01M5 19h14a2 2 0 001.84-2.75L13.74 4a2 2 0 00-3.48 0L3.16 16.25A2 2 0 005 19z"></path></svg>
+                <span>You have unsaved proxy changes — a service restart is required after saving.</span>
+            </div>
             <div class="grid gap-6 lg:grid-cols-1">
                 <div class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
                     <div class="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
@@ -949,6 +1036,11 @@
 
         <section x-show="activeTab === 'sipflow'" x-cloak x-transition.opacity class="space-y-6"
             id="settings-tab-sipflow" role="tabpanel" tabindex="0">
+            <div x-show="tabDirty('sipflow', sipflowDraft)" x-cloak
+                class="rounded-md bg-amber-50 px-4 py-2 text-xs text-amber-800 ring-1 ring-amber-200 flex items-center gap-2">
+                <svg class="h-4 w-4 flex-none" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01M5 19h14a2 2 0 001.84-2.75L13.74 4a2 2 0 00-3.48 0L3.16 16.25A2 2 0 005 19z"></path></svg>
+                <span>You have unsaved SipFlow changes — a service restart is required after saving.</span>
+            </div>
             <div class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
                 <div class="flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
                     <div>
@@ -1095,6 +1187,11 @@
 
         <section x-show="activeTab === 'recording'" x-cloak x-transition.opacity class="space-y-6"
             id="settings-tab-recording" role="tabpanel" tabindex="0">
+            <div x-show="tabDirty('recording', storageDraft)" x-cloak
+                class="rounded-md bg-amber-50 px-4 py-2 text-xs text-amber-800 ring-1 ring-amber-200 flex items-center gap-2">
+                <svg class="h-4 w-4 flex-none" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01M5 19h14a2 2 0 001.84-2.75L13.74 4a2 2 0 00-3.48 0L3.16 16.25A2 2 0 005 19z"></path></svg>
+                <span>You have unsaved recording changes — a service restart is required after saving.</span>
+            </div>
             <div class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
                 <div class="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
                     <div>
@@ -1226,46 +1323,147 @@
                             settings remain available below.
                         </div>
                     </template>
-                    <div class="border-t border-slate-200 pt-4 space-y-4">
+                    <div class="border-t border-slate-200 pt-4 space-y-6">
+                        <!-- ── Audio recordings ──────────────────────────── -->
                         <div>
-                            <h3 class="text-sm font-semibold text-slate-800">Recorder storage</h3>
-                            <p class="text-xs text-slate-500">Manage recorder output paths and call record storage
-                                targets.</p>
+                            <h3 class="text-sm font-semibold text-slate-800">Audio recordings</h3>
+                            <p class="text-xs text-slate-500">Where the raw call audio (one <code class="rounded bg-slate-100 px-1 font-mono text-[11px]">.wav</code> per call) and per-session event logs are written on this server.</p>
                         </div>
                         <div class="grid gap-4 md:grid-cols-2">
                             <div>
-                                <label
-                                    class="block text-xs font-semibold uppercase tracking-wide text-slate-400">Recorder
-                                    root path</label>
+                                <label class="block text-xs font-semibold uppercase tracking-wide text-slate-400">Audio recording directory</label>
                                 <input type="text" x-model="storageDraft.recorder_path" :disabled="storageProcessing"
                                     class="mt-1 w-full rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
-                                    placeholder="/tmp/recorder" />
+                                    placeholder="./config/recorders" />
+                                <p class="mt-1 text-[11px] text-slate-400">Files land at <code class="font-mono">&lt;dir&gt;/&lt;session_id&gt;.wav</code>. Relative paths resolve against the service's working directory. Created on first use.</p>
                             </div>
                             <div>
-                                <label class="block text-xs font-semibold uppercase tracking-wide text-slate-400">Call
-                                    record root path</label>
-                                <input type="text" x-model="storageDraft.callrecord_root" :disabled="storageProcessing"
-                                    class="mt-1 w-full rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
-                                    placeholder="/tmp/cdr" />
-                            </div>
-                        </div>
-                        <div class="grid gap-4 md:grid-cols-2">
-                            <div>
-                                <label class="block text-xs font-semibold uppercase tracking-wide text-slate-400">Media
-                                    cache path</label>
+                                <label class="block text-xs font-semibold uppercase tracking-wide text-slate-400">Media cache directory</label>
                                 <input type="text" x-model="storageDraft.media_cache_path" :disabled="storageProcessing"
                                     class="mt-1 w-full rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
-                                    placeholder="/tmp/mediacache" />
+                                    placeholder="./config/mediacache" />
+                                <p class="mt-1 text-[11px] text-slate-400">Staging directory for media that is being recorded or post-processed. Usually kept on fast local disk.</p>
+                            </div>
+                        </div>
+                        <div>
+                            <label class="block text-xs font-semibold uppercase tracking-wide text-slate-400">Audio format</label>
+                            <select x-model="storageDraft.recorder_format" :disabled="storageProcessing"
+                                class="mt-1 w-full rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200 md:w-1/2">
+                                <option value="">Default</option>
+                                <option value="wav">WAV (PCM)</option>
+                            </select>
+                            <p class="mt-1 text-[11px] text-slate-400">Codec for the saved audio files. WAV/PCM is uncompressed and broadly compatible.</p>
+                        </div>
+
+                        <!-- ── Call records (CDR) ─────────────────────────── -->
+                        <div class="rounded-lg border border-slate-200 bg-slate-50 p-4 space-y-4">
+                            <div class="flex flex-col gap-1">
+                                <h4 class="text-sm font-semibold text-slate-800">Call detail records (CDR)</h4>
+                                <p class="text-xs text-slate-500">Per-call metadata written when each call ends — one JSON document per call with caller, callee, direction, duration, disposition, media refs and so on. This is separate from the audio files above and does <strong>not</strong> replace them.</p>
                             </div>
                             <div>
-                                <label
-                                    class="block text-xs font-semibold uppercase tracking-wide text-slate-400">Recorder
-                                    format</label>
-                                <select x-model="storageDraft.recorder_format" :disabled="storageProcessing"
-                                    class="mt-1 w-full rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
-                                    <option value="">Default</option>
-                                    <option value="wav">WAV (PCM)</option>
+                                <label class="block text-xs font-semibold uppercase tracking-wide text-slate-400">CDR destination</label>
+                                <select x-model="storageDraft.callrecord_mode" :disabled="storageProcessing"
+                                    class="mt-1 w-full rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200 md:w-1/2">
+                                    <option value="local">Local filesystem</option>
+                                    <option value="s3">S3 / S3-compatible bucket</option>
                                 </select>
+                                <p class="mt-1 text-[11px] text-slate-400">Local keeps CDR JSON on this host; S3 uploads each CDR (and optionally the recorded media) to an S3-compatible bucket.</p>
+                            </div>
+
+                            <div x-show="storageDraft.callrecord_mode === 'local'" x-cloak>
+                                <label class="block text-xs font-semibold uppercase tracking-wide text-slate-400">CDR directory</label>
+                                <input type="text" x-model="storageDraft.callrecord_root" :disabled="storageProcessing"
+                                    class="mt-1 w-full rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                    placeholder="./config/cdr" />
+                                <p class="mt-1 text-[11px] text-slate-400">CDR files land at <code class="font-mono">&lt;dir&gt;/YYYYMMDD/&lt;call_id&gt;.json</code>. Created on first use. Safe to point at the same tree as the audio directory — filenames don't collide.</p>
+                            </div>
+
+                            <div x-show="storageDraft.callrecord_mode === 's3'" x-cloak class="space-y-4">
+                                <div class="grid gap-4 md:grid-cols-2">
+                                    <div>
+                                        <label class="block text-xs font-semibold uppercase tracking-wide text-slate-400">Vendor</label>
+                                        <select x-model="storageDraft.callrecord_s3_vendor" :disabled="storageProcessing"
+                                            class="mt-1 w-full rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200">
+                                            <option value="aws">AWS</option>
+                                            <option value="gcp">Google Cloud Storage</option>
+                                            <option value="azure">Azure Blob</option>
+                                            <option value="aliyun">Alibaba Cloud OSS</option>
+                                            <option value="tencent">Tencent Cloud COS</option>
+                                            <option value="minio">MinIO</option>
+                                            <option value="digitalocean">DigitalOcean Spaces</option>
+                                        </select>
+                                    </div>
+                                    <div>
+                                        <label class="block text-xs font-semibold uppercase tracking-wide text-slate-400">Region</label>
+                                        <input type="text" x-model="storageDraft.callrecord_s3_region" :disabled="storageProcessing"
+                                            class="mt-1 w-full rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                            placeholder="us-east-1" />
+                                    </div>
+                                </div>
+                                <div class="grid gap-4 md:grid-cols-2">
+                                    <div>
+                                        <label class="block text-xs font-semibold uppercase tracking-wide text-slate-400">Bucket</label>
+                                        <input type="text" x-model="storageDraft.callrecord_s3_bucket" :disabled="storageProcessing"
+                                            class="mt-1 w-full rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                            placeholder="my-recordings" />
+                                    </div>
+                                    <div>
+                                        <label class="block text-xs font-semibold uppercase tracking-wide text-slate-400">Endpoint (optional)</label>
+                                        <input type="text" x-model="storageDraft.callrecord_s3_endpoint" :disabled="storageProcessing"
+                                            class="mt-1 w-full rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                            placeholder="https://s3.example.com" />
+                                    </div>
+                                </div>
+                                <div class="grid gap-4 md:grid-cols-2">
+                                    <div>
+                                        <label class="block text-xs font-semibold uppercase tracking-wide text-slate-400">Access key</label>
+                                        <input type="password" autocomplete="off" x-model="storageDraft.callrecord_s3_access_key" :disabled="storageProcessing"
+                                            class="mt-1 w-full rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                            placeholder="AKIA..." />
+                                    </div>
+                                    <div>
+                                        <label class="block text-xs font-semibold uppercase tracking-wide text-slate-400">Secret key</label>
+                                        <input type="password" autocomplete="off" x-model="storageDraft.callrecord_s3_secret_key" :disabled="storageProcessing"
+                                            class="mt-1 w-full rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                            placeholder="••••••••" />
+                                    </div>
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-semibold uppercase tracking-wide text-slate-400">Key prefix</label>
+                                    <input type="text" x-model="storageDraft.callrecord_s3_root" :disabled="storageProcessing"
+                                        class="mt-1 w-full rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
+                                        placeholder="recordings" />
+                                    <p class="mt-1 text-[11px] text-slate-400">Optional path prepended to every uploaded object key (e.g. <code class="font-mono">recordings/YYYYMMDD/&lt;call_id&gt;.json</code>).</p>
+                                </div>
+                                <div class="grid gap-2 md:grid-cols-1 lg:grid-cols-2 pt-1">
+                                    <label class="inline-flex items-start gap-2 text-sm text-slate-600">
+                                        <input type="checkbox"
+                                            class="mt-0.5 h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
+                                            x-model="storageDraft.callrecord_s3_with_media" :disabled="storageProcessing">
+                                        <span>
+                                            <span class="block font-medium">Upload recorded media</span>
+                                            <span class="block text-[11px] text-slate-400">Also upload the call's <code class="font-mono">.wav</code> audio alongside the CDR JSON. Leave off to upload only the metadata.</span>
+                                        </span>
+                                    </label>
+                                    <label class="inline-flex items-start gap-2 text-sm text-slate-600">
+                                        <input type="checkbox"
+                                            class="mt-0.5 h-4 w-4 rounded border-slate-300 text-sky-600 focus:ring-sky-500"
+                                            x-model="storageDraft.callrecord_s3_keep_media_copy" :disabled="storageProcessing">
+                                        <span>
+                                            <span class="block font-medium">Keep local copy after upload</span>
+                                            <span class="block text-[11px] text-slate-400">After a successful upload, keep the local audio file too. Off means the local file is deleted once S3 upload succeeds.</span>
+                                        </span>
+                                    </label>
+                                </div>
+                                <div class="flex flex-col-reverse gap-2 pt-1 sm:flex-row sm:items-center sm:justify-between">
+                                    <p class="text-[11px] text-slate-400">Credentials display masked — leave Access key / Secret key blank to keep the ones already saved.</p>
+                                    <button type="button"
+                                        class="inline-flex items-center justify-center rounded-md border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-600 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-60"
+                                        @click="testStorageConnection" :disabled="storageProcessing">
+                                        Test S3 connection
+                                    </button>
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -1288,10 +1486,107 @@
                     </div>
                 </form>
             </div>
+
+            <!-- ── Pending S3 uploads (failed-upload retry queue) ── -->
+            <div class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5"
+                x-init="loadPendingUploads()">
+                <div class="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+                    <div>
+                        <h2 class="text-base font-semibold text-slate-900">Pending S3 uploads</h2>
+                        <p class="text-xs text-slate-500">When an S3 upload fails, the file is retained locally and queued here. The retry scheduler reattempts every minute with exponential backoff. After 10 attempts a row is marked <span class="font-mono text-amber-700">failed_permanent</span> and waits for manual action.</p>
+                    </div>
+                    <div class="flex gap-2">
+                        <button type="button"
+                            class="inline-flex items-center justify-center rounded-md border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-60"
+                            @click="loadPendingUploads" :disabled="pendingUploadsBusy">
+                            Refresh
+                        </button>
+                        <button type="button"
+                            class="inline-flex items-center justify-center rounded-md bg-sky-600 px-3 py-2 text-xs font-semibold text-white shadow-sm transition hover:bg-sky-500 disabled:cursor-not-allowed disabled:opacity-60"
+                            @click="retryPendingUploads" :disabled="pendingUploadsBusy">
+                            <span x-text="pendingUploadsBusy ? 'Working…' : 'Retry all now'"></span>
+                        </button>
+                        <button type="button"
+                            class="inline-flex items-center justify-center rounded-md border border-rose-200 px-3 py-2 text-xs font-semibold text-rose-600 transition hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-60"
+                            @click="clearPendingFailures" :disabled="pendingUploadsBusy">
+                            Clear failures
+                        </button>
+                    </div>
+                </div>
+
+                <div class="mt-4 grid gap-3 sm:grid-cols-3">
+                    <div class="rounded-md bg-amber-50 px-3 py-2 ring-1 ring-amber-200">
+                        <div class="text-[11px] uppercase tracking-wide text-amber-700">Pending</div>
+                        <div class="text-lg font-semibold text-amber-900" x-text="pendingUploads.counts.pending ?? 0"></div>
+                    </div>
+                    <div class="rounded-md bg-rose-50 px-3 py-2 ring-1 ring-rose-200">
+                        <div class="text-[11px] uppercase tracking-wide text-rose-700">Failed permanent</div>
+                        <div class="text-lg font-semibold text-rose-900" x-text="pendingUploads.counts.failed_permanent ?? 0"></div>
+                    </div>
+                    <div class="rounded-md bg-slate-50 px-3 py-2 ring-1 ring-slate-200">
+                        <div class="text-[11px] uppercase tracking-wide text-slate-600">Source missing</div>
+                        <div class="text-lg font-semibold text-slate-900" x-text="pendingUploads.counts.failed_missing_source ?? 0"></div>
+                    </div>
+                </div>
+
+                <template x-if="pendingUploads.entries.length === 0 && !pendingUploadsLoading">
+                    <div class="mt-4 rounded-lg border border-dashed border-slate-200 bg-slate-50 px-4 py-6 text-center text-xs text-slate-500">
+                        Nothing pending. All recent S3 uploads succeeded.
+                    </div>
+                </template>
+
+                <template x-if="pendingUploadsLoading">
+                    <div class="mt-4 rounded-lg border border-dashed border-slate-200 bg-slate-50 px-4 py-6 text-center text-xs text-slate-500">
+                        Loading…
+                    </div>
+                </template>
+
+                <div class="mt-4 overflow-x-auto" x-show="pendingUploads.entries.length > 0" x-cloak>
+                    <table class="min-w-full divide-y divide-slate-200 text-sm">
+                        <thead class="bg-slate-50">
+                            <tr>
+                                <th class="px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-wide text-slate-500">Status</th>
+                                <th class="px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-wide text-slate-500">Kind</th>
+                                <th class="px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-wide text-slate-500">Call ID</th>
+                                <th class="px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-wide text-slate-500">Local file</th>
+                                <th class="px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-wide text-slate-500">Target key</th>
+                                <th class="px-3 py-2 text-right text-[11px] font-semibold uppercase tracking-wide text-slate-500">Attempts</th>
+                                <th class="px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-wide text-slate-500">Last error</th>
+                                <th class="px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-wide text-slate-500">Last attempt</th>
+                            </tr>
+                        </thead>
+                        <tbody class="divide-y divide-slate-100">
+                            <template x-for="entry in pendingUploads.entries" :key="entry.id">
+                                <tr class="text-xs text-slate-600">
+                                    <td class="px-3 py-2 font-mono">
+                                        <span :class="{
+                                            'text-amber-700': entry.status === 'pending',
+                                            'text-rose-700': entry.status === 'failed_permanent',
+                                            'text-slate-500': entry.status === 'failed_missing_source'
+                                        }" x-text="entry.status"></span>
+                                    </td>
+                                    <td class="px-3 py-2 font-mono" x-text="entry.kind"></td>
+                                    <td class="px-3 py-2 font-mono" x-text="entry.call_id"></td>
+                                    <td class="px-3 py-2 font-mono break-all" x-text="entry.local_path"></td>
+                                    <td class="px-3 py-2 font-mono break-all" x-text="entry.target_key"></td>
+                                    <td class="px-3 py-2 text-right tabular-nums" x-text="entry.attempts"></td>
+                                    <td class="px-3 py-2 text-slate-500" x-text="entry.last_error || ''"></td>
+                                    <td class="px-3 py-2 text-slate-500" x-text="entry.last_attempt_at ? formatDateTime(entry.last_attempt_at) : '—'"></td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
         </section>
 
         <section x-show="activeTab === 'security'" x-cloak x-transition.opacity class="space-y-6"
             id="settings-tab-security" role="tabpanel" tabindex="0">
+            <div x-show="tabDirty('security', securityDraft)" x-cloak
+                class="rounded-md bg-emerald-50 px-4 py-2 text-xs text-emerald-800 ring-1 ring-emerald-200 flex items-center gap-2">
+                <svg class="h-4 w-4 flex-none" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg>
+                <span>You have unsaved ACL changes — they will hot-reload on save (no restart needed).</span>
+            </div>
             <div class="grid gap-6 lg:grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)]">
                 <div class="space-y-6">
                     <div class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
@@ -1564,6 +1859,11 @@
 
         <section x-show="activeTab === 'rwi'" x-cloak x-transition.opacity class="space-y-6" id="settings-tab-rwi"
             role="tabpanel" tabindex="0">
+            <div x-show="tabDirty('rwi', rwiDraft)" x-cloak
+                class="rounded-md bg-amber-50 px-4 py-2 text-xs text-amber-800 ring-1 ring-amber-200 flex items-center gap-2">
+                <svg class="h-4 w-4 flex-none" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01M5 19h14a2 2 0 001.84-2.75L13.74 4a2 2 0 00-3.48 0L3.16 16.25A2 2 0 005 19z"></path></svg>
+                <span>You have unsaved RWI changes — a service restart is required after saving.</span>
+            </div>
             <div class="grid gap-6 lg:grid-cols-[minmax(0,2fr)_minmax(0,1fr)]">
                 <div class="space-y-6">
                     <div class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
@@ -1797,6 +2097,147 @@
                                 <span x-text="rwiProcessing ? tt('common.saving') : tt('common.save_changes')"></span>
                             </button>
                         </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section x-show="activeTab === 'db_config'" x-cloak x-transition.opacity class="space-y-6"
+            id="settings-tab-db_config" role="tabpanel" tabindex="0" x-init="loadDbConfig()">
+            <div class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
+                <div class="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+                    <div>
+                        <h2 class="text-base font-semibold text-slate-900">Database Config Overrides</h2>
+                        <p class="mt-1 text-sm text-slate-500">
+                            Every row here is a key-value pair stored in the <code>system_config</code> table.
+                            These overrides are merged with <code>config.toml</code> on every startup to produce
+                            <code>config.generated.toml</code>. Changes require a restart to take effect.
+                        </p>
+                    </div>
+                    <div class="flex items-center gap-2">
+                        <button type="button" class="inline-flex items-center gap-2 rounded-md bg-white px-3 py-2 text-sm font-medium text-slate-700 ring-1 ring-slate-300 hover:bg-slate-50"
+                            @click="loadDbConfig()" :disabled="dbConfig.loading">
+                            <span x-show="!dbConfig.loading">Refresh</span>
+                            <span x-show="dbConfig.loading">Loading…</span>
+                        </button>
+                        <button type="button" class="inline-flex items-center gap-2 rounded-md bg-sky-600 px-3 py-2 text-sm font-medium text-white shadow-sm hover:bg-sky-500"
+                            @click="dbConfigBeginAdd()">
+                            + Add entry
+                        </button>
+                    </div>
+                </div>
+
+                <div class="mt-4">
+                    <input type="text" placeholder="Filter by key or value…"
+                        class="block w-full rounded-md border-slate-300 shadow-sm focus:border-sky-500 focus:ring-sky-500 sm:text-sm px-3 py-2 ring-1 ring-slate-300"
+                        x-model="dbConfig.filter" />
+                </div>
+
+                <template x-if="dbConfig.error">
+                    <div class="mt-4 rounded-md bg-red-50 p-3 text-sm text-red-700" x-text="dbConfig.error"></div>
+                </template>
+
+                <div class="mt-4 space-y-4">
+                    <template x-for="group in dbConfigGroupedEntries" :key="group.name">
+                        <div class="overflow-hidden rounded-lg ring-1 ring-slate-200">
+                            <div class="flex items-center justify-between bg-slate-100 px-4 py-2">
+                                <div class="flex items-center gap-2">
+                                    <span class="text-sm font-semibold text-slate-700"
+                                        x-text="prettyGroup(group.name)"></span>
+                                    <span class="text-[11px] text-slate-400" x-text="group.name === 'general' ? '' : '· ' + group.name"></span>
+                                    <span class="rounded-full bg-slate-200 px-2 py-0.5 text-[11px] font-medium text-slate-600"
+                                        x-text="group.entries.length"></span>
+                                </div>
+                                <button type="button"
+                                    class="text-xs font-medium text-red-600 hover:text-red-700 disabled:text-slate-400"
+                                    @click="dbConfigDeleteGroup(group)"
+                                    :disabled="dbConfig.processing"
+                                    :title="'Delete every row in ' + (group.name === 'general' ? 'the general group' : group.name + '.*')">
+                                    Delete group
+                                </button>
+                            </div>
+                            <table class="min-w-full divide-y divide-slate-200 text-sm">
+                                <thead class="bg-slate-50">
+                                    <tr>
+                                        <th class="px-3 py-2 text-left font-semibold text-slate-600">Key</th>
+                                        <th class="px-3 py-2 text-left font-semibold text-slate-600">Value (JSON)</th>
+                                        <th class="px-3 py-2 text-left font-semibold text-slate-600">Manual Override</th>
+                                        <th class="px-3 py-2 text-left font-semibold text-slate-600">Updated</th>
+                                        <th class="px-3 py-2 text-right font-semibold text-slate-600">Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="divide-y divide-slate-100 bg-white">
+                                    <template x-for="entry in group.entries" :key="entry.key">
+                                        <tr class="hover:bg-slate-50">
+                                            <td class="px-3 py-2">
+                                                <div class="text-sm font-semibold text-slate-800" x-text="prettyKey(entry.key)"></div>
+                                                <div class="mt-0.5 font-mono text-[11px] text-slate-400" x-text="entry.key"></div>
+                                            </td>
+                                            <td class="px-3 py-2 font-mono text-xs text-slate-600 max-w-md truncate" x-text="entry.value" :title="entry.value"></td>
+                                            <td class="px-3 py-2">
+                                                <span x-show="entry.is_override" class="inline-flex items-center rounded-full bg-amber-50 px-2 py-1 text-xs font-medium text-amber-700 ring-1 ring-amber-200">yes</span>
+                                                <span x-show="!entry.is_override" class="text-xs text-slate-400">—</span>
+                                            </td>
+                                            <td class="px-3 py-2 text-xs text-slate-500" x-text="entry.updated_at"></td>
+                                            <td class="px-3 py-2 text-right space-x-2">
+                                                <button type="button" class="text-xs font-medium text-sky-600 hover:text-sky-700"
+                                                    @click="dbConfigBeginEdit(entry)">Edit</button>
+                                                <button type="button" class="text-xs font-medium text-red-600 hover:text-red-700"
+                                                    @click="dbConfigDelete(entry.key)" :disabled="dbConfig.processing">Delete</button>
+                                            </td>
+                                        </tr>
+                                    </template>
+                                </tbody>
+                            </table>
+                        </div>
+                    </template>
+                    <div x-show="dbConfigFilteredEntries.length === 0 && !dbConfig.loading"
+                        class="rounded-lg border border-dashed border-slate-300 px-3 py-8 text-center text-sm text-slate-400">
+                        No entries. Click "Add entry" to create one, or save a setting from another tab.
+                    </div>
+                </div>
+            </div>
+
+            <!-- Edit/Add modal -->
+            <div x-show="dbConfig.editing" x-cloak
+                class="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4"
+                @keydown.escape.window="dbConfigCancelEdit()">
+                <div class="w-full max-w-lg rounded-xl bg-white p-6 shadow-xl ring-1 ring-black/10">
+                    <h3 class="text-base font-semibold text-slate-900"
+                        x-text="dbConfig.editing?.original_key ? 'Edit entry' : 'Add entry'"></h3>
+                    <p class="mt-1 text-xs text-slate-500">Values must be valid JSON. Examples: <code>"debug"</code>, <code>5060</code>, <code>true</code>, <code>["a","b"]</code>.</p>
+
+                    <div class="mt-4 space-y-4">
+                        <div>
+                            <label class="block text-xs font-semibold text-slate-600">Key</label>
+                            <input type="text" x-model="dbConfig.editing.key"
+                                :disabled="!!dbConfig.editing?.original_key"
+                                class="mt-1 block w-full rounded-md border-slate-300 px-3 py-2 font-mono text-xs shadow-sm ring-1 ring-slate-300 focus:border-sky-500 focus:ring-sky-500"
+                                placeholder="e.g. log_level or proxy.udp_port" />
+                            <p class="mt-1 text-[11px] text-slate-400">Use dot-notation for section fields (<code>section.field</code>).</p>
+                        </div>
+                        <div>
+                            <label class="block text-xs font-semibold text-slate-600">Value (JSON-encoded)</label>
+                            <textarea x-model="dbConfig.editing.value" rows="4"
+                                class="mt-1 block w-full rounded-md border-slate-300 px-3 py-2 font-mono text-xs shadow-sm ring-1 ring-slate-300 focus:border-sky-500 focus:ring-sky-500"
+                                placeholder='"debug"'></textarea>
+                        </div>
+                        <div class="flex items-center gap-2">
+                            <input type="checkbox" id="db_cfg_override" x-model="dbConfig.editing.is_override" class="rounded border-slate-300" />
+                            <label for="db_cfg_override" class="text-xs text-slate-600">
+                                Manual override (skip auto-detection — only meaningful for <code>external_ip</code>)
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="mt-6 flex justify-end gap-2">
+                        <button type="button" class="rounded-md bg-white px-3 py-2 text-sm font-medium text-slate-700 ring-1 ring-slate-300 hover:bg-slate-50"
+                            @click="dbConfigCancelEdit()">Cancel</button>
+                        <button type="button" class="rounded-md bg-sky-600 px-3 py-2 text-sm font-medium text-white shadow-sm hover:bg-sky-500"
+                            @click="dbConfigSaveEdit()" :disabled="dbConfig.processing">
+                            <span x-show="!dbConfig.processing">Save</span>
+                            <span x-show="dbConfig.processing">Saving…</span>
+                        </button>
                     </div>
                 </div>
             </div>
@@ -2660,6 +3101,134 @@
                 </div>
             </div>
         </section>
+
+        <!-- API Keys tab -->
+        <section x-show="activeTab === 'api_keys' && currentUser?.is_superuser" x-cloak x-transition.opacity
+            class="space-y-6" id="settings-tab-api-keys" role="tabpanel" tabindex="0">
+
+            <!-- New token reveal modal -->
+            <div x-show="apiKeyNewTokenModal !== null" x-cloak
+                class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+                <div class="w-full max-w-lg rounded-xl bg-white p-6 shadow-xl">
+                    <h3 class="mb-1 text-base font-semibold text-slate-900">API key created</h3>
+                    <p class="mb-4 text-xs text-slate-500">Copy this token now — it will not be shown again.</p>
+                    <div class="flex items-center gap-2 rounded-lg bg-slate-100 px-3 py-2">
+                        <code class="flex-1 break-all text-xs font-mono text-slate-800" x-text="apiKeyNewTokenModal"></code>
+                        <button type="button" @click="copyApiKeyToken()"
+                            class="shrink-0 rounded px-2 py-1 text-xs font-medium text-sky-700 hover:bg-sky-50">Copy</button>
+                    </div>
+                    <div class="mt-4 flex justify-end">
+                        <button type="button" @click="apiKeyNewTokenModal = null"
+                            class="rounded-lg bg-sky-600 px-4 py-2 text-sm font-medium text-white hover:bg-sky-700">Done</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
+                <div class="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+                    <div>
+                        <h2 class="text-base font-semibold text-slate-900">API Keys</h2>
+                        <p class="text-xs text-slate-500">Bearer tokens used to authenticate requests to the API V1
+                            endpoints. Only the key hash is stored — the plaintext is shown once at creation.</p>
+                    </div>
+                    <button type="button" @click="fetchApiKeys()"
+                        class="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 hover:border-sky-300 hover:text-sky-700">
+                        <svg class="h-3.5 w-3.5" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.8">
+                            <path stroke-linecap="round" stroke-linejoin="round"
+                                d="M4 4v5h5M16 16v-5h-5M4 9a8 8 0 0114 0M16 11a8 8 0 01-14 0" />
+                        </svg>
+                        Refresh
+                    </button>
+                </div>
+
+                <!-- Create form -->
+                <div class="mt-5 rounded-lg border border-dashed border-slate-300 bg-slate-50 p-4">
+                    <p class="mb-3 text-xs font-semibold text-slate-700">Create new API key</p>
+                    <div class="flex flex-col gap-3 sm:flex-row">
+                        <input type="text" x-model="apiKeyNewName" placeholder="Key name (unique)"
+                            class="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm placeholder-slate-400 focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500"
+                            :disabled="apiKeyProcessing" @keydown.enter="createApiKey()" />
+                        <input type="text" x-model="apiKeyNewDescription" placeholder="Description (optional)"
+                            class="flex-1 rounded-lg border border-slate-300 px-3 py-2 text-sm placeholder-slate-400 focus:border-sky-500 focus:outline-none focus:ring-1 focus:ring-sky-500"
+                            :disabled="apiKeyProcessing" @keydown.enter="createApiKey()" />
+                        <button type="button" @click="createApiKey()"
+                            :disabled="apiKeyProcessing || !apiKeyNewName.trim()"
+                            class="inline-flex items-center gap-2 rounded-lg bg-sky-600 px-4 py-2 text-sm font-medium text-white hover:bg-sky-700 disabled:opacity-50">
+                            <svg x-show="!apiKeyProcessing" class="h-4 w-4" viewBox="0 0 20 20" fill="none"
+                                stroke="currentColor" stroke-width="1.8">
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M10 4v12m6-6H4" />
+                            </svg>
+                            <svg x-show="apiKeyProcessing" class="h-4 w-4 animate-spin" viewBox="0 0 24 24"
+                                fill="none">
+                                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor"
+                                    stroke-width="4" />
+                                <path class="opacity-75" fill="currentColor"
+                                    d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                            </svg>
+                            <span x-text="apiKeyProcessing ? 'Creating…' : 'Create'"></span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Key list -->
+                <div class="mt-5">
+                    <template x-if="apiKeysLoading">
+                        <div class="py-8 text-center text-xs text-slate-400">Loading…</div>
+                    </template>
+                    <template x-if="apiKeysError && !apiKeysLoading">
+                        <div class="rounded-lg bg-red-50 px-4 py-3 text-xs text-red-700" x-text="apiKeysError"></div>
+                    </template>
+                    <template x-if="!apiKeysLoading && !apiKeysError && apiKeys.length === 0">
+                        <div class="py-8 text-center text-xs text-slate-400">No API keys yet.</div>
+                    </template>
+                    <template x-if="!apiKeysLoading && apiKeys.length > 0">
+                        <div class="overflow-x-auto rounded-lg border border-slate-200">
+                            <table class="w-full text-sm">
+                                <thead class="bg-slate-50 text-xs text-slate-500">
+                                    <tr>
+                                        <th class="px-4 py-2.5 text-left font-medium">Name</th>
+                                        <th class="px-4 py-2.5 text-left font-medium">Description</th>
+                                        <th class="px-4 py-2.5 text-left font-medium">Status</th>
+                                        <th class="px-4 py-2.5 text-left font-medium">Created</th>
+                                        <th class="px-4 py-2.5 text-left font-medium">Last used</th>
+                                        <th class="px-4 py-2.5 text-right font-medium">Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="divide-y divide-slate-100">
+                                    <template x-for="key in apiKeys" :key="key.id">
+                                        <tr class="hover:bg-slate-50">
+                                            <td class="px-4 py-3 font-mono text-xs text-slate-800" x-text="key.name"></td>
+                                            <td class="px-4 py-3 text-xs text-slate-500"
+                                                x-text="key.description || '—'"></td>
+                                            <td class="px-4 py-3">
+                                                <span :class="key.is_active
+                                                    ? 'bg-emerald-100 text-emerald-700'
+                                                    : 'bg-red-100 text-red-600'"
+                                                    class="inline-flex rounded-full px-2 py-0.5 text-xs font-medium"
+                                                    x-text="key.is_active ? 'Active' : 'Revoked'"></span>
+                                            </td>
+                                            <td class="px-4 py-3 text-xs text-slate-500"
+                                                x-text="formatDateTime(key.created_at)"></td>
+                                            <td class="px-4 py-3 text-xs text-slate-500"
+                                                x-text="key.last_used_at ? formatDateTime(key.last_used_at) : 'Never'"></td>
+                                            <td class="px-4 py-3 text-right">
+                                                <button x-show="key.is_active" type="button"
+                                                    @click="revokeApiKey(key.id, key.name)"
+                                                    class="rounded px-2 py-1 text-xs font-medium text-red-600 hover:bg-red-50">
+                                                    Revoke
+                                                </button>
+                                                <span x-show="!key.is_active"
+                                                    class="text-xs text-slate-400">—</span>
+                                            </td>
+                                        </tr>
+                                    </template>
+                                </tbody>
+                            </table>
+                        </div>
+                    </template>
+                </div>
+            </div>
+        </section>
     </div>
 </div>
 
@@ -2683,6 +3252,7 @@
                 const tt = options?.t || {};
                 return [
                     { id: 'platform', label: tget(tt, 'settings_page.platform_overview') || 'Platform overview' },
+                    { id: 'display', label: 'Display' },
                     { id: 'proxy', label: tget(tt, 'settings_page.proxy_settings') || 'Proxy settings' },
                     { id: 'sipflow', label: tget(tt, 'settings_page.sipflow_recording') || 'SipFlow recording' },
                     { id: 'storage', label: tget(tt, 'settings_page.storage_destinations') || 'Storage' },
@@ -2690,13 +3260,33 @@
                     { id: 'security', label: tget(tt, 'settings_page.security_posture') || 'Security posture' },
                     { id: 'logs', label: tget(tt, 'settings_page.logs_viewer') || 'Logs', requiresSuperuser: true },
                     { id: 'rwi', label: tget(tt, 'settings_page.rwi_settings') || 'RWI' },
+                    { id: 'db_config', label: 'Database Config', description: 'Raw system_config overrides' },
                     { id: 'cluster', label: tget(tt, 'settings_page.cluster') || 'Cluster', requireClusterData: true },
                     { id: 'departments', label: tget(tt, 'settings_page.departments') || 'Departments' },
                     { id: 'users', label: tget(tt, 'settings_page.users_title') || 'Users', requiresPermission: 'users:manage' },
                     { id: 'roles', label: tget(tt, 'settings_page.roles_title') || 'Roles', requiresPermission: 'users:manage' },
+                    { id: 'api_keys', label: 'API Keys', requiresSuperuser: true },
                 ];
             })(),
             activeTab: 'platform',
+            // Snapshot of each tab's draft taken at load/reset time. Compared
+            // against the live draft to decide whether the "restart required"
+            // banner should appear.
+            draftBaselines: {},
+            // Pending S3 uploads panel state.
+            pendingUploads: {
+                counts: { pending: 0, failed_permanent: 0, failed_missing_source: 0 },
+                entries: [],
+            },
+            pendingUploadsLoading: false,
+            pendingUploadsBusy: false,
+            apiKeys: [],
+            apiKeysLoading: false,
+            apiKeysError: null,
+            apiKeyNewName: '',
+            apiKeyNewDescription: '',
+            apiKeyProcessing: false,
+            apiKeyNewTokenModal: null,
             platform: {},
             proxyConfig: {},
             stats: {},
@@ -2732,6 +3322,15 @@
                 media_cache_path: '',
                 callrecord_mode: 'local',
                 callrecord_root: '',
+                callrecord_s3_vendor: 'aws',
+                callrecord_s3_region: '',
+                callrecord_s3_bucket: '',
+                callrecord_s3_endpoint: '',
+                callrecord_s3_access_key: '',
+                callrecord_s3_secret_key: '',
+                callrecord_s3_root: '',
+                callrecord_s3_with_media: false,
+                callrecord_s3_keep_media_copy: false,
                 recording_enabled: false,
                 recording_auto_start: true,
                 recording_direction_inbound: true,
@@ -2807,6 +3406,16 @@
                 contexts: [],
             },
             rwiProcessing: false,
+            dbConfig: {
+                entries: [],
+                effective: null,
+                loading: false,
+                error: null,
+                editing: null,
+                draft: { key: '', value: '', is_override: false },
+                processing: false,
+                filter: '',
+            },
             clusterDraft: { peers: [] },
             clusterProcessing: false,
             clusterPinging: false,
@@ -2979,6 +3588,7 @@
                     })),
                     contexts: this.rwi.contexts || [],
                 };
+                this.snapshotDraft('rwi', this.rwiDraft);
 
                 const storageMeta = this.server.storage || {};
                 this.selectedStorageProfile = storageMeta.active_profile
@@ -3021,6 +3631,7 @@
                 this.fetchDepartments();
                 this.fetchUsers();
                 this.fetchRoles();
+                this.fetchApiKeys();
                 this.resetAclReloadModal();
                 this.resetReloadModal();
                 window.addEventListener('roles:create', () => this.openRoleCreate());
@@ -3201,7 +3812,16 @@
                     if (Number.isNaN(date.getTime())) {
                         return value;
                     }
-                    return date.toLocaleString();
+                    return new Intl.DateTimeFormat(undefined, {
+                        timeZone: window.DISPLAY_TIMEZONE || 'Asia/Kolkata',
+                        year: 'numeric',
+                        month: '2-digit',
+                        day: '2-digit',
+                        hour: '2-digit',
+                        minute: '2-digit',
+                        second: '2-digit',
+                        hour12: false,
+                    }).format(date);
                 } catch (err) {
                     return value;
                 }
@@ -4558,6 +5178,26 @@
                 }
                 return `${Math.round(value)}ms`;
             },
+            // Store a deep-clone of the draft so later edits can be compared
+            // against the baseline for dirty detection.
+            snapshotDraft(name, draft) {
+                try {
+                    this.draftBaselines[name] = JSON.parse(JSON.stringify(draft ?? {}));
+                } catch (_) {
+                    this.draftBaselines[name] = {};
+                }
+            },
+            // Returns true when the tab's current draft differs from its
+            // baseline snapshot. Used to gate "restart required" banners.
+            tabDirty(name, draft) {
+                const base = this.draftBaselines[name];
+                if (base === undefined) return false;
+                try {
+                    return JSON.stringify(draft ?? {}) !== JSON.stringify(base);
+                } catch (_) {
+                    return true;
+                }
+            },
             logsRecentEndpoint() {
                 return `${this.basePath}/settings/logs/recent`;
             },
@@ -4732,6 +5372,7 @@
                     rtp_start_port: toStringOrEmpty(rtp?.start_port),
                     rtp_end_port: toStringOrEmpty(rtp?.end_port),
                 };
+                this.snapshotDraft('platform', this.platformDraft);
             },
             initProxyDraft() {
                 const proxy = this.proxyConfig || {};
@@ -4749,6 +5390,7 @@
                     },
                     user_backends: JSON.parse(JSON.stringify(proxy.user_backends || [])),
                 };
+                this.snapshotDraft('proxy', this.proxyDraft);
             },
             resetProxyDraft() {
                 this.initProxyDraft();
@@ -4989,28 +5631,30 @@
                 const directionOutbound = directionDefault ? true : directionList.includes('outbound');
                 const directionInternal = directionDefault ? true : directionList.includes('internal');
 
-                // Load callrecord profile from storage_profiles
-                const crProfile = Array.isArray(this.server?.storage_profiles)
-                    ? this.server.storage_profiles.find(p => String(p?.id || '').startsWith('callrecord'))
-                    : null;
-                const crConfig = crProfile?.config || {};
-                const crType = crConfig?.type || (meta?.mode === 's3' ? 's3' : (meta?.mode === 'local' ? 'local' : 'disabled'));
+                // Hydrate callrecord fields from the active storage profile.
+                const profiles = Array.isArray(this.server?.storage_profiles) ? this.server.storage_profiles : [];
+                const callrecordProfile = profiles.find((p) => String(p?.id || '').startsWith('callrecord-'));
+                const cr = callrecordProfile?.config || {};
+                const mode = (meta?.mode || cr?.type || 'local').toString();
+                const looksMasked = (v) => typeof v === 'string' && v.includes('*');
 
                 this.storageDraft = {
                     recorder_path: recorderPath,
                     recorder_format: recorderFormat || 'wav',
                     media_cache_path: mediaCache,
-                    callrecord_mode: crType,
-                    callrecord_root: crConfig?.root || '',
-                    callrecord_s3_vendor: crConfig?.vendor || 'aws',
-                    callrecord_s3_bucket: crConfig?.bucket || '',
-                    callrecord_s3_region: crConfig?.region || '',
-                    callrecord_s3_endpoint: crConfig?.endpoint || '',
-                    callrecord_s3_access_key: '',
-                    callrecord_s3_secret_key: '',
-                    callrecord_s3_root: crConfig?.root || '',
-                    callrecord_s3_with_media: !!crConfig?.with_media,
-                    callrecord_s3_keep_media_copy: !!crConfig?.keep_media_copy,
+                    callrecord_mode: mode === 's3' ? 's3' : 'local',
+                    callrecord_root: mode === 'local' ? (cr?.root || recorderPath || '') : '',
+                    callrecord_s3_vendor: cr?.vendor || 'aws',
+                    callrecord_s3_region: cr?.region || '',
+                    callrecord_s3_bucket: cr?.bucket || '',
+                    callrecord_s3_endpoint: cr?.endpoint || '',
+                    // Masked keys come back from the server as `****` — start blank
+                    // so the user must re-enter to actually change them.
+                    callrecord_s3_access_key: looksMasked(cr?.access_key) ? '' : (cr?.access_key || ''),
+                    callrecord_s3_secret_key: looksMasked(cr?.secret_key) ? '' : (cr?.secret_key || ''),
+                    callrecord_s3_root: cr?.root || '',
+                    callrecord_s3_with_media: !!cr?.with_media,
+                    callrecord_s3_keep_media_copy: !!cr?.keep_media_copy,
                     recording_enabled: !!recording?.enabled,
                     recording_auto_start: recording?.auto_start !== undefined ? !!recording.auto_start : true,
                     recording_direction_inbound: directionInbound,
@@ -5024,6 +5668,11 @@
                     recording_ptime: recording?.ptime ? String(recording.ptime) : '',
                     recording_filename_pattern: recording?.filename_pattern || '',
                 };
+                // Storage tab carries both "storage" (callrecord + paths) and
+                // "recording" (policy) sections — snapshot both so each banner
+                // lights up independently.
+                this.snapshotDraft('storage', this.storageDraft);
+                this.snapshotDraft('recording', this.storageDraft);
             },
             resetStorageDraft() {
                 this.initStorageDraft();
@@ -5081,41 +5730,43 @@
                 if (recordingDirections.length && recordingDirections.length < 3) {
                     recordingPayload.directions = recordingDirections;
                 }
-                // Build callrecord payload based on mode
-                let callrecordPayload = null;
-                const crMode = this.storageDraft.callrecord_mode || 'disabled';
-                if (crMode === 'disabled') {
-                    callrecordPayload = { mode: 'disabled' };
-                } else if (crMode === 'local') {
-                    callrecordPayload = {
-                        mode: 'local',
-                        root: this.normalizeOptionalString(this.storageDraft.callrecord_root),
-                    };
-                } else if (crMode === 's3') {
-                    const s3Vendor = this.normalizeOptionalString(this.storageDraft.callrecord_s3_vendor);
-                    const s3Bucket = this.normalizeOptionalString(this.storageDraft.callrecord_s3_bucket);
-                    const s3Region = this.normalizeOptionalString(this.storageDraft.callrecord_s3_region);
-                    const s3AccessKey = this.normalizeOptionalString(this.storageDraft.callrecord_s3_access_key);
-                    const s3SecretKey = this.normalizeOptionalString(this.storageDraft.callrecord_s3_secret_key);
-                    if (!s3Vendor || !s3Bucket || !s3Region || !s3AccessKey || !s3SecretKey) {
-                        this.$dispatch('toast', {
-                            title: 'Missing S3 fields',
-                            message: 'Vendor, bucket, region, access key, and secret key are required.',
-                        });
-                        return;
+                // Build callrecord payload based on the selected mode.
+                // If the user picked s3 but hasn't filled all required fields
+                // (common after a reload when keys come back masked), we
+                // simply omit callrecord from the body — the DB value is
+                // preserved and the user sees a hint instead of clobbering.
+                let callrecordPayload;
+                const crMode = this.storageDraft.callrecord_mode || 'local';
+                if (crMode === 'local') {
+                    const root = this.normalizeOptionalString(this.storageDraft.callrecord_root);
+                    if (root) {
+                        callrecordPayload = { mode: 'local', root };
                     }
-                    callrecordPayload = {
-                        mode: 's3',
-                        vendor: s3Vendor,
-                        bucket: s3Bucket,
-                        region: s3Region,
-                        access_key: s3AccessKey,
-                        secret_key: s3SecretKey,
-                        endpoint: this.normalizeOptionalString(this.storageDraft.callrecord_s3_endpoint),
-                        root: this.normalizeOptionalString(this.storageDraft.callrecord_s3_root),
-                        with_media: !!this.storageDraft.callrecord_s3_with_media,
-                        keep_media_copy: !!this.storageDraft.callrecord_s3_keep_media_copy,
-                    };
+                } else if (crMode === 's3') {
+                    const vendor = this.normalizeOptionalString(this.storageDraft.callrecord_s3_vendor);
+                    const bucket = this.normalizeOptionalString(this.storageDraft.callrecord_s3_bucket);
+                    const region = this.normalizeOptionalString(this.storageDraft.callrecord_s3_region);
+                    const access_key = this.normalizeOptionalString(this.storageDraft.callrecord_s3_access_key);
+                    const secret_key = this.normalizeOptionalString(this.storageDraft.callrecord_s3_secret_key);
+                    if (vendor && bucket && region && access_key && secret_key) {
+                        callrecordPayload = {
+                            mode: 's3',
+                            vendor,
+                            bucket,
+                            region,
+                            access_key,
+                            secret_key,
+                            endpoint: this.normalizeOptionalString(this.storageDraft.callrecord_s3_endpoint),
+                            root: this.normalizeOptionalString(this.storageDraft.callrecord_s3_root),
+                            with_media: !!this.storageDraft.callrecord_s3_with_media,
+                            keep_media_copy: !!this.storageDraft.callrecord_s3_keep_media_copy,
+                        };
+                    } else {
+                        this.$dispatch('toast', {
+                            title: 'S3 credentials required',
+                            message: 'Enter vendor, bucket, region, access key, and secret key to save S3 mode. Other fields will still be saved.',
+                        });
+                    }
                 }
                 const body = {
                     recorder_path: this.normalizeOptionalString(this.storageDraft.recorder_path),
@@ -5124,6 +5775,9 @@
                     recording_policy: recordingPayload,
                     callrecord: callrecordPayload,
                 };
+                if (callrecordPayload) {
+                    body.callrecord = callrecordPayload;
+                }
                 this.storageProcessing = true;
                 try {
                     const response = await fetch(`${this.basePath}/settings/config/storage`, {
@@ -5163,6 +5817,67 @@
                     this.storageProcessing = false;
                 }
             },
+            // API Keys tab functions
+            async fetchApiKeys() {
+                if (!this.currentUser?.is_superuser) return;
+                this.apiKeysLoading = true;
+                this.apiKeysError = null;
+                try {
+                    const r = await fetch(this.basePath + '/settings/api-keys', {
+                        headers: { Accept: 'application/json' },
+                    });
+                    const d = await r.json().catch(() => ({}));
+                    if (!r.ok) throw new Error(d.message || 'Failed to load API keys');
+                    this.apiKeys = Array.isArray(d.items) ? d.items : [];
+                } catch (e) {
+                    this.apiKeysError = e.message;
+                } finally {
+                    this.apiKeysLoading = false;
+                }
+            },
+            async createApiKey() {
+                const name = this.apiKeyNewName.trim();
+                if (!name) return;
+                this.apiKeyProcessing = true;
+                try {
+                    const r = await fetch(this.basePath + '/settings/api-keys', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+                        body: JSON.stringify({ name, description: this.apiKeyNewDescription.trim() || null }),
+                    });
+                    const d = await r.json().catch(() => ({}));
+                    if (!r.ok) throw new Error(d.message || 'Failed to create API key');
+                    this.apiKeyNewName = '';
+                    this.apiKeyNewDescription = '';
+                    this.apiKeyNewTokenModal = d.plaintext;
+                    await this.fetchApiKeys();
+                } catch (e) {
+                    this.$dispatch('toast', { title: 'Error', message: e.message });
+                } finally {
+                    this.apiKeyProcessing = false;
+                }
+            },
+            async revokeApiKey(id, name) {
+                if (!confirm(`Revoke API key "${name}"? This cannot be undone.`)) return;
+                try {
+                    const r = await fetch(this.basePath + '/settings/api-keys/' + id + '/revoke', {
+                        method: 'POST',
+                        headers: { Accept: 'application/json' },
+                    });
+                    const d = await r.json().catch(() => ({}));
+                    if (!r.ok) throw new Error(d.message || 'Failed to revoke API key');
+                    await this.fetchApiKeys();
+                    this.$dispatch('toast', { title: 'Revoked', message: `Key "${name}" revoked.` });
+                } catch (e) {
+                    this.$dispatch('toast', { title: 'Error', message: e.message });
+                }
+            },
+            copyApiKeyToken() {
+                if (!this.apiKeyNewTokenModal) return;
+                navigator.clipboard.writeText(this.apiKeyNewTokenModal).then(() => {
+                    this.$dispatch('toast', { title: 'Copied', message: 'Token copied to clipboard.' });
+                });
+            },
             async fetchSipFlowSettings() {
                 try {
                     const response = await fetch(`${this.basePath}/sipflow/settings`, {
@@ -5201,6 +5916,7 @@
                     remote_http_addr: backendType === 'remote' ? (config.http_addr || '') : '',
                     remote_timeout_secs: backendType === 'remote' ? (config.timeout_secs || 10) : 10,
                 };
+                this.snapshotDraft('sipflow', this.sipflowDraft);
             },
             resetSipFlowDraft() {
                 this.initSipFlowDraft();
@@ -5270,6 +5986,8 @@
                         backend_type: backendType,
                         config,
                     };
+                    // Re-baseline so the "unsaved changes" banner disappears.
+                    this.snapshotDraft('sipflow', this.sipflowDraft);
 
                     this.$dispatch('toast', {
                         title: this.tt('settings_page.settings_saved'),
@@ -5349,6 +6067,85 @@
                     this.storageProcessing = false;
                 }
             },
+            // ── Pending S3 uploads panel ─────────────────────────────────
+            async loadPendingUploads() {
+                this.pendingUploadsLoading = true;
+                try {
+                    const response = await fetch(`${this.basePath}/settings/uploads/pending`, {
+                        headers: { Accept: 'application/json' },
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        throw new Error(data?.message || 'Failed to load pending uploads');
+                    }
+                    this.pendingUploads = {
+                        counts: data.counts || { pending: 0, failed_permanent: 0, failed_missing_source: 0 },
+                        entries: Array.isArray(data.entries) ? data.entries : [],
+                    };
+                } catch (err) {
+                    console.error('loadPendingUploads:', err);
+                    this.$dispatch('toast', {
+                        title: 'Failed to load pending uploads',
+                        message: err?.message || '',
+                    });
+                } finally {
+                    this.pendingUploadsLoading = false;
+                }
+            },
+            async retryPendingUploads() {
+                if (this.pendingUploadsBusy) return;
+                this.pendingUploadsBusy = true;
+                try {
+                    const response = await fetch(`${this.basePath}/settings/uploads/pending/retry`, {
+                        method: 'POST',
+                        headers: { Accept: 'application/json' },
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        throw new Error(data?.message || 'Retry sweep failed');
+                    }
+                    this.$dispatch('toast', {
+                        title: 'Retry sweep complete',
+                        message: `Reset ${data.reset_to_pending || 0} row(s); ${data?.counts?.pending || 0} still pending after sweep.`,
+                    });
+                    await this.loadPendingUploads();
+                } catch (err) {
+                    console.error('retryPendingUploads:', err);
+                    this.$dispatch('toast', {
+                        title: 'Retry failed',
+                        message: err?.message || '',
+                    });
+                } finally {
+                    this.pendingUploadsBusy = false;
+                }
+            },
+            async clearPendingFailures() {
+                if (this.pendingUploadsBusy) return;
+                this.pendingUploadsBusy = true;
+                try {
+                    const response = await fetch(`${this.basePath}/settings/uploads/pending/clear`, {
+                        method: 'POST',
+                        headers: { Accept: 'application/json' },
+                    });
+                    const data = await response.json().catch(() => ({}));
+                    if (!response.ok) {
+                        throw new Error(data?.message || 'Clear failed');
+                    }
+                    this.$dispatch('toast', {
+                        title: 'Failures cleared',
+                        message: `Removed ${data.cleared || 0} row(s).`,
+                    });
+                    await this.loadPendingUploads();
+                } catch (err) {
+                    console.error('clearPendingFailures:', err);
+                    this.$dispatch('toast', {
+                        title: 'Clear failed',
+                        message: err?.message || '',
+                    });
+                } finally {
+                    this.pendingUploadsBusy = false;
+                }
+            },
             normalizeMultilineList(value) {
                 if (value === undefined || value === null) {
                     return null;
@@ -5376,6 +6173,7 @@
                 this.securityDraft.emergency_enabled = emg.enabled ?? false;
                 this.securityDraft.emergency_numbers = Array.isArray(emg.numbers) ? emg.numbers.join(', ') : '';
                 this.securityDraft.emergency_trunk = emg.emergency_trunk || '';
+                this.snapshotDraft('security', this.securityDraft);
             },
             resetSecurityDraft() {
                 this.initSecurityDraft();
@@ -5416,6 +6214,7 @@
                     const acl_rules = Array.isArray(data?.security?.acl_rules) ? data.security.acl_rules : [];
                     this.acl.active_rules = acl_rules;
                     this.securityDraft.acl_rules = this.formatAclRules(this.acl.active_rules);
+                    this.snapshotDraft('security', this.securityDraft);
                     this.$dispatch('toast', {
                         title: 'Settings saved',
                         message: data?.message || 'Security settings saved. Restart required to apply.',
@@ -5492,6 +6291,7 @@
                     }
                     // Update the current RWI config
                     this.rwi = data.rwi || this.rwiDraft;
+                    this.snapshotDraft('rwi', this.rwiDraft);
                     this.$dispatch('toast', {
                         title: 'Settings saved',
                         message: data?.message || 'RWI settings saved.',
@@ -5509,6 +6309,202 @@
                 } finally {
                     this.rwiProcessing = false;
                 }
+            },
+
+            // ─── Database Config tab ──────────────────────────────────────
+            async loadDbConfig() {
+                this.dbConfig.loading = true;
+                this.dbConfig.error = null;
+                try {
+                    const response = await fetch(`${this.basePath}/settings/config`, {
+                        headers: { Accept: 'application/json' },
+                    });
+                    const data = await response.json();
+                    if (!response.ok) {
+                        throw new Error(data?.error || 'Failed to load config');
+                    }
+                    const overridesMap = data?.db_overrides || {};
+                    this.dbConfig.entries = Object.keys(overridesMap)
+                        .sort()
+                        .map((key) => ({
+                            key,
+                            value: JSON.stringify(overridesMap[key].value),
+                            is_override: !!overridesMap[key].is_override,
+                            updated_at: overridesMap[key].updated_at,
+                        }));
+                    this.dbConfig.effective = data?.effective_config || null;
+                } catch (err) {
+                    this.dbConfig.error = err?.message || 'Failed to load config';
+                } finally {
+                    this.dbConfig.loading = false;
+                }
+            },
+            dbConfigBeginEdit(entry) {
+                this.dbConfig.editing = {
+                    key: entry.key,
+                    value: entry.value,
+                    is_override: entry.is_override,
+                    original_key: entry.key,
+                };
+            },
+            dbConfigCancelEdit() {
+                this.dbConfig.editing = null;
+            },
+            dbConfigBeginAdd() {
+                this.dbConfig.editing = {
+                    key: '',
+                    value: '""',
+                    is_override: false,
+                    original_key: null, // null means "new entry"
+                };
+            },
+            async dbConfigSaveEdit() {
+                const edit = this.dbConfig.editing;
+                if (!edit) return;
+                const key = (edit.key || '').trim();
+                if (!key) {
+                    this.$dispatch('toast', { type: 'error', title: 'Error', message: 'Key must not be empty.' });
+                    return;
+                }
+                try { JSON.parse(edit.value); } catch (e) {
+                    this.$dispatch('toast', { type: 'error', title: 'Error',
+                        message: 'Value must be valid JSON (e.g. "debug" for strings, 5060 for numbers, true for booleans).' });
+                    return;
+                }
+                this.dbConfig.processing = true;
+                try {
+                    const response = await fetch(`${this.basePath}/settings/config/entry`, {
+                        method: 'PATCH',
+                        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+                        body: JSON.stringify({
+                            key,
+                            value: edit.value,
+                            is_override: !!edit.is_override,
+                        }),
+                    });
+                    const data = await response.json();
+                    if (!response.ok) throw new Error(data?.error || 'Save failed');
+                    this.$dispatch('toast', {
+                        type: 'success',
+                        title: 'Saved',
+                        message: data?.message || 'Entry saved. Restart required to apply.',
+                    });
+                    this.dbConfig.editing = null;
+                    await this.loadDbConfig();
+                } catch (err) {
+                    this.$dispatch('toast', { type: 'error', title: 'Error', message: err?.message || 'Save failed' });
+                } finally {
+                    this.dbConfig.processing = false;
+                }
+            },
+            async dbConfigDelete(key) {
+                if (!confirm(`Delete DB override "${key}"?\n\nThe effective value will revert to config.toml on next restart.`)) {
+                    return;
+                }
+                this.dbConfig.processing = true;
+                try {
+                    const response = await fetch(`${this.basePath}/settings/config/entry/${encodeURIComponent(key)}`, {
+                        method: 'DELETE',
+                        headers: { Accept: 'application/json' },
+                    });
+                    const data = await response.json();
+                    if (!response.ok) throw new Error(data?.error || 'Delete failed');
+                    this.$dispatch('toast', {
+                        type: 'success',
+                        title: 'Deleted',
+                        message: `Removed "${key}". Restart to apply.`,
+                    });
+                    await this.loadDbConfig();
+                } catch (err) {
+                    this.$dispatch('toast', { type: 'error', title: 'Error', message: err?.message || 'Delete failed' });
+                } finally {
+                    this.dbConfig.processing = false;
+                }
+            },
+            async dbConfigDeleteGroup(group) {
+                const count = group.entries.length;
+                const displayName = this.prettyGroup(group.name);
+                const detail = group.name === 'general'
+                    ? `${count} top-level key${count === 1 ? '' : 's'}`
+                    : `${count} ${group.name}.* row${count === 1 ? '' : 's'}`;
+                if (!confirm(`Delete the entire "${displayName}" group?\n\nThis removes ${detail} in one go. Effective values revert to config.toml on next restart.`)) {
+                    return;
+                }
+                this.dbConfig.processing = true;
+                try {
+                    const response = await fetch(`${this.basePath}/settings/config/group/${encodeURIComponent(group.name)}`, {
+                        method: 'DELETE',
+                        headers: { Accept: 'application/json' },
+                    });
+                    const data = await response.json();
+                    if (!response.ok) throw new Error(data?.error || 'Delete failed');
+                    this.$dispatch('toast', {
+                        type: 'success',
+                        title: 'Group deleted',
+                        message: `Removed ${data.deleted} row(s) from "${displayName}". Restart to apply.`,
+                    });
+                    await this.loadDbConfig();
+                } catch (err) {
+                    this.$dispatch('toast', { type: 'error', title: 'Error', message: err?.message || 'Delete failed' });
+                } finally {
+                    this.dbConfig.processing = false;
+                }
+            },
+            get dbConfigFilteredEntries() {
+                const q = (this.dbConfig.filter || '').trim().toLowerCase();
+                if (!q) return this.dbConfig.entries;
+                return this.dbConfig.entries.filter((e) =>
+                    e.key.toLowerCase().includes(q) || (e.value || '').toLowerCase().includes(q)
+                );
+            },
+            // Pretty-print a config key (e.g. "proxy.udp_port" → "UDP Port",
+            // "log_level" → "Log Level", "rtp_start_port" → "RTP Start Port").
+            // Only the leaf part after the last dot is used — the group header
+            // already shows the section name.
+            prettyKey(key) {
+                if (!key) return '';
+                const acronyms = new Set([
+                    'ip', 'rtp', 'udp', 'tcp', 'tls', 'ssl', 'http', 'https',
+                    'url', 'uri', 'dns', 'sip', 'ami', 'rwi', 'acl', 'api',
+                    'json', 'xml', 'id', 'db', 'os', 'ws', 'wss', 'srv',
+                    'nat', 'ipv4', 'ipv6', 'mfa', 'cdr', 'cors', 'rbac',
+                    'jwt', 'oauth', 'sso', 's3',
+                ]);
+                const leaf = key.includes('.') ? key.slice(key.lastIndexOf('.') + 1) : key;
+                return leaf
+                    .split(/[_\-]/)
+                    .filter(Boolean)
+                    .map((w) => {
+                        const lw = w.toLowerCase();
+                        if (acronyms.has(lw)) return lw.toUpperCase();
+                        return lw.charAt(0).toUpperCase() + lw.slice(1);
+                    })
+                    .join(' ');
+            },
+            prettyGroup(name) {
+                if (!name || name === 'general') return 'General';
+                return this.prettyKey(name);
+            },
+            // Returns [{ name, entries: [...] }] grouped by the top-level namespace.
+            // Keys without a dot land in the "general" group. Groups are sorted
+            // with "general" first, then alphabetically.
+            get dbConfigGroupedEntries() {
+                const groups = {};
+                for (const entry of this.dbConfigFilteredEntries) {
+                    const dot = entry.key.indexOf('.');
+                    const group = dot === -1 ? 'general' : entry.key.slice(0, dot);
+                    if (!groups[group]) groups[group] = [];
+                    groups[group].push(entry);
+                }
+                const names = Object.keys(groups).sort((a, b) => {
+                    if (a === 'general') return -1;
+                    if (b === 'general') return 1;
+                    return a.localeCompare(b);
+                });
+                return names.map((name) => ({
+                    name,
+                    entries: groups[name].sort((a, b) => a.key.localeCompare(b.key)),
+                }));
             },
             // ── Cluster methods ────────────────────────────────────────────
             initClusterDraft() {

@@ -14,9 +14,9 @@ impl MigrationTrait for Migration {
             manager
                 .alter_table(
                     Table::alter()
-                        .table(super::sip_trunk::Entity)
+                        .table(super::sip_trunk::legacy::Entity)
                         .add_column(
-                            ColumnDef::new(super::sip_trunk::Column::RewriteHostport)
+                            ColumnDef::new(super::sip_trunk::legacy::Column::RewriteHostport)
                                 .boolean()
                                 .not_null()
                                 .default(true),

@@ -382,6 +382,24 @@
                                         <span class="h-1.5 w-1.5 rounded-full" :class="statusDot(record.status)"></span>
                                         <span class="font-mono text-xs" x-text="statusCodeText(record)"></span>
                                     </span>
+                                    <template x-if="errorReasonLabel(record)">
+                                        <div class="mt-1 text-[11px] font-medium leading-tight text-rose-700"
+                                            x-text="errorReasonLabel(record)"></div>
+                                    </template>
+                                    <template x-if="errorOrigin(record)">
+                                        <div x-data="{ o: errorOrigin(record) }"
+                                            class="mt-1 flex flex-wrap items-center gap-1 text-[10px] leading-tight text-rose-600"
+                                            :title="errorOriginTitle(record)">
+                                            <span class="font-semibold" x-text="o.label"></span>
+                                            <span class="font-mono" x-text="o.code"></span>
+                                            <span class="text-slate-500" x-show="o.reason"
+                                                x-text="o.reason"></span>
+                                            <template x-if="o.endpoint">
+                                                <span class="font-mono text-slate-400"
+                                                    x-text="o.endpoint"></span>
+                                            </template>
+                                        </div>
+                                    </template>
                                 </td>
                                 <td class="px-4 py-2">
                                     <div class="flex flex-wrap gap-1 text-[11px]">
@@ -1275,6 +1293,7 @@
                     this.t.csv_started_at || 'Started At',
                     this.t.csv_direction || 'Direction',
                     this.t.csv_status || 'Status',
+                    this.t.csv_error_reason || 'Error Reason',
                     this.t.csv_from || 'From',
                     this.t.csv_to || 'To',
                     this.t.csv_duration || 'Duration (s)',
@@ -1293,6 +1312,7 @@
                             this.formatDateTime(record?.started_at),
                             this.directionLabel(record?.direction),
                             this.statusLabel(record?.status),
+                            this.errorReasonLabel(record),
                             record?.from || '',
                             record?.to || '',
                             record?.duration_secs || 0,
@@ -1551,10 +1571,79 @@
                 }
             },
             statusCodeText(record) {
-                if (record && record.status_code) {
-                    return String(record.status_code);
+                // Only surface the raw SIP code when it carries signal (a
+                // failure). For answered/2xx calls the human status label
+                // ("Completed") is clearer than a bare "200".
+                const code = record && record.status_code;
+                if (code && (code < 200 || code >= 300)) {
+                    return String(code);
                 }
                 return this.statusLabel(record && record.status ? record.status : '');
+            },
+            legSideLabel(target) {
+                const t = String(target || '').toLowerCase();
+                if (t === 'caller') return this.t.error_from_caller || 'From caller';
+                if (t === 'callee') return this.t.error_from_callee || 'From callee';
+                if (t === 'b2bua') return this.t.error_from_b2bua || 'From B2BUA';
+                if (t === 'auth') return this.t.error_from_auth || 'Auth rejected';
+                return this.t.error_from_endpoint || 'Error';
+            },
+            errorReasonLabel(record) {
+                const key = record && record.error_reason;
+                if (!key) {
+                    return '';
+                }
+                const labels = {
+                    rang_no_answer: this.t.error_reason_rang_no_answer || 'Rang but not answered',
+                    temporarily_unavailable: this.t.error_reason_temporarily_unavailable || 'Temporarily unavailable (no ring)',
+                    service_unavailable_after_ring: this.t.error_reason_service_unavailable_after_ring || 'Service unavailable (after ring)',
+                    service_unavailable_upstream: this.t.error_reason_service_unavailable_upstream || 'Service unavailable (upstream)',
+                    busy: this.t.error_reason_busy || 'Busy',
+                    caller_cancelled: this.t.error_reason_caller_cancelled || 'Caller cancelled',
+                    unroutable: this.t.error_reason_unroutable || 'Not found / unroutable',
+                    no_answer_timeout: this.t.error_reason_no_answer_timeout || 'No answer (timeout)',
+                    server_error: this.t.error_reason_server_error || 'Server error',
+                    rejected: this.t.error_reason_rejected || 'Rejected',
+                    failed: this.t.error_reason_failed || 'Failed',
+                };
+                let label = labels[key] || key;
+                const detail = record.error_reason_detail;
+                if (detail && (key === 'server_error' || key === 'failed')) {
+                    label = `${label}: ${detail}`;
+                }
+                return label;
+            },
+            errorOrigin(record) {
+                // Surface which leg produced the failure (and the hop that sent
+                // it) so a 500 from a downstream trunk is visible at a glance.
+                const code = record && record.status_code;
+                const isFailure = code && (code < 200 || code >= 300);
+                if (!isFailure) {
+                    return null;
+                }
+                const msgs = record && Array.isArray(record.hangup_messages)
+                    ? record.hangup_messages
+                    : [];
+                // Prefer the message matching the final status code (the leg
+                // that produced it); otherwise fall back to the last recorded.
+                let msg = msgs.find(m => m && m.code === code);
+                if (!msg && msgs.length) {
+                    msg = msgs[msgs.length - 1];
+                }
+                return {
+                    label: this.legSideLabel(msg && msg.target),
+                    code: String((msg && msg.code) || code),
+                    reason: (msg && msg.reason) || '',
+                    endpoint: (msg && msg.endpoint) || null,
+                };
+            },
+            errorOriginTitle(record) {
+                const o = this.errorOrigin(record);
+                if (!o) {
+                    return '';
+                }
+                const parts = [o.label, o.code, o.reason].filter(Boolean);
+                return o.endpoint ? `${parts.join(' ')} · ${o.endpoint}` : parts.join(' ');
             },
             directionLabel(value) {
                 switch ((value || '').toLowerCase()) {
@@ -1809,7 +1898,16 @@
                     if (Number.isNaN(date.getTime())) {
                         return value;
                     }
-                    return date.toLocaleString();
+                    return new Intl.DateTimeFormat(undefined, {
+                        timeZone: window.DISPLAY_TIMEZONE || 'Asia/Kolkata',
+                        year: 'numeric',
+                        month: '2-digit',
+                        day: '2-digit',
+                        hour: '2-digit',
+                        minute: '2-digit',
+                        second: '2-digit',
+                        hour12: false,
+                    }).format(date);
                 } catch (err) {
                     return value;
                 }

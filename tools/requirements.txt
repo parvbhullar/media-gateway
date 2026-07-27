@@ -1,0 +1,9 @@
+# Python dependencies for the external_media sidecar (tools/sip_bridge_sidecar.py).
+# The sidecar joins a LiveKit room and bridges 48 kHz mono PCM to rustpbx over
+# a localhost UDP socket. Install with:  pip install -r tools/requirements.txt
+#
+# Pinned to the versions validated against rustpbx's external_media bridge.
+livekit==1.1.7          # rtc: room join, AudioSource/AudioStream
+livekit-api==1.1.0      # api: AccessToken, AgentDispatch
+numpy==2.4.3            # PCM framing / tone generation
+python-dotenv==1.2.2    # loads LIVEKIT_* / AGENT_NAME from .env

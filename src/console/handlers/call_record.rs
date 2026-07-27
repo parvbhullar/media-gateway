@@ -11,6 +11,7 @@ use crate::models::{
         Column as DepartmentColumn, Entity as DepartmentEntity, Model as DepartmentModel,
     },
     extension::{Entity as ExtensionEntity, Model as ExtensionModel},
+    routing::{Entity as RoutingEntity, Model as RoutingModel},
     sip_trunk::{Column as SipTrunkColumn, Entity as SipTrunkEntity, Model as SipTrunkModel},
 };
 use axum::{
@@ -158,8 +159,16 @@ async fn download_call_record_sip_flow(
     State(state): State<Arc<ConsoleState>>,
     AuthRequired(_): AuthRequired,
 ) -> Response {
+    build_sip_flow_response(&state, &identifier).await
+}
+
+/// Build the sip-flow JSON for a call: resolve it by db id or call_id, then
+/// query the SipFlow backend across all legs. Shared by the console route and
+/// the carrier API `/api/v1/cdrs/{id}/sip-flow` (enrich-cdr-api). Auth is the
+/// caller's responsibility (the api_v1 route is already behind its middleware).
+pub(crate) async fn build_sip_flow_response(state: &ConsoleState, identifier: &str) -> Response {
     let db = state.db();
-    let record = match resolve_call_record_by_id_or_call_id(db, &identifier).await {
+    let record = match resolve_call_record_by_id_or_call_id(db, identifier).await {
         Ok(model) => model,
         Err(resp) => return resp,
     };
@@ -306,7 +315,19 @@ async fn stream_call_recording(
                 .into_response();
         }
     };
+    stream_recording_response(&state, pk, stream_leg, &headers).await
+}
 
+/// Stream a call's recording (file → S3 → sipflow fallback, with HTTP range
+/// support for the file path). Shared by the console route and the carrier API
+/// `/api/v1/cdrs/{id}/recording` (enrich-cdr-api). Auth is the caller's
+/// responsibility (the api_v1 route is already behind its middleware).
+pub(crate) async fn stream_recording_response(
+    state: &ConsoleState,
+    pk: i64,
+    stream_leg: Option<i32>,
+    headers: &HeaderMap,
+) -> Response {
     let db = state.db();
     let record = match CallRecordEntity::find_by_id(pk).one(db).await {
         Ok(Some(model)) => model,
@@ -355,6 +376,21 @@ async fn stream_call_recording(
         }
         // Fall through for mixed stream, non-WAV files, or extraction failure
         return stream_file_with_range(path, meta.len(), &headers).await;
+    }
+
+    // S3 fallback: when the recording_url has the `s3://bucket/key` form,
+    // use the configured callrecord storage to fetch the object and
+    // stream it back to the client. Works for any vendor supported by
+    // crate::storage (AWS, MinIO, GCP, Azure, …). No HTTP range support
+    // in this first cut: we read the whole object into memory, which is
+    // fine for typical .wav recordings; high-volume deployments should
+    // generate presigned URLs instead.
+    if let Some(raw_url) = record.recording_url.as_ref() {
+        if let Some(s3_key) = raw_url.strip_prefix("s3://") {
+            if let Some(resp) = stream_s3_recording(&state, s3_key).await {
+                return resp;
+            }
+        }
     }
 
     // Fallback: Try to get recording from sipflow backend
@@ -509,6 +545,109 @@ async fn stream_file_with_range(
     }
 
     response
+}
+
+/// Fetch a recording from the configured S3 callrecord storage and stream
+/// it to the client. The `bucket_and_key` argument is the suffix after
+/// `s3://`, i.e. `<bucket>/<key>`. We don't trust the bucket part — the
+/// real bucket comes from the running callrecord config — but the key is
+/// what we read.
+///
+/// Returns `None` when the request can't be satisfied (callrecord isn't
+/// in S3 mode, the storage client can't be built, the read fails, etc.).
+/// `None` lets `stream_call_recording` fall through to its sipflow path
+/// instead of short-circuiting with a 5xx.
+async fn stream_s3_recording(
+    state: &ConsoleState,
+    bucket_and_key: &str,
+) -> Option<Response> {
+    use crate::config::CallRecordConfig;
+    use crate::storage::{Storage, StorageConfig};
+
+    // Split into <bucket>/<key>. We use the bucket to sanity-check the
+    // current config matches; if it doesn't, the saved URL is from a
+    // different config and we can't recover it here.
+    let (claimed_bucket, key) = match bucket_and_key.split_once('/') {
+        Some((b, k)) if !b.is_empty() && !k.is_empty() => (b, k),
+        _ => {
+            warn!(value = bucket_and_key, "stream_s3_recording: malformed s3 url");
+            return None;
+        }
+    };
+
+    let app_state = state.app_state()?;
+    let callrecord = app_state.config().callrecord.clone()?;
+    let CallRecordConfig::S3 {
+        vendor,
+        bucket,
+        region,
+        access_key,
+        secret_key,
+        endpoint,
+        ..
+    } = callrecord
+    else {
+        warn!("stream_s3_recording: recording_url is s3:// but callrecord is not S3 mode");
+        return None;
+    };
+
+    if bucket != claimed_bucket {
+        warn!(
+            current = %bucket,
+            saved = %claimed_bucket,
+            "stream_s3_recording: stored bucket does not match current callrecord bucket; cannot fetch"
+        );
+        return None;
+    }
+
+    let storage_cfg = StorageConfig::S3 {
+        vendor: vendor.clone(),
+        bucket: bucket.clone(),
+        region: region.clone(),
+        access_key: access_key.clone(),
+        secret_key: secret_key.clone(),
+        endpoint: Some(endpoint.clone()),
+        prefix: None,
+    };
+    let storage = match Storage::new(&storage_cfg) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("stream_s3_recording: failed to build storage client: {}", e);
+            return None;
+        }
+    };
+
+    let bytes = match storage.read(key).await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(key, "stream_s3_recording: read failed: {}", e);
+            return None;
+        }
+    };
+
+    let file_name = Path::new(key)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("recording.wav");
+    let mime = guess_audio_mime(file_name);
+    let safe_file_name = file_name.replace('"', "'");
+    let mut response = Response::new(Body::from(bytes.clone()));
+    *response.status_mut() = StatusCode::OK;
+    let h = response.headers_mut();
+    if let Ok(v) = HeaderValue::from_str(mime) {
+        h.insert(http::header::CONTENT_TYPE, v);
+    }
+    h.insert(
+        http::header::CONTENT_LENGTH,
+        HeaderValue::from_str(&bytes.len().to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0")),
+    );
+    if let Ok(disposition) =
+        HeaderValue::from_str(&format!("inline; filename=\"{}\"", safe_file_name))
+    {
+        h.insert(http::header::CONTENT_DISPOSITION, disposition);
+    }
+    Some(response)
 }
 
 fn parse_range_header(range: &str, file_len: u64) -> Option<(u64, u64)> {
@@ -1037,10 +1176,11 @@ fn build_condition(filters: &Option<QueryCallRecordFilters>) -> Condition {
         if let Some(q_raw) = filters.q.as_ref() {
             let trimmed = q_raw.trim();
             if !trimmed.is_empty() {
+                let pat = format!("%{}%", trimmed);
                 let mut q_condition = Condition::any();
-                q_condition = q_condition.add(CallRecordColumn::CallId.eq(trimmed));
-                q_condition = q_condition.add(CallRecordColumn::ToNumber.eq(trimmed));
-                q_condition = q_condition.add(CallRecordColumn::FromNumber.eq(trimmed));
+                q_condition = q_condition.add(CallRecordColumn::CallId.like(pat.clone()));
+                q_condition = q_condition.add(CallRecordColumn::ToNumber.like(pat.clone()));
+                q_condition = q_condition.add(CallRecordColumn::FromNumber.like(pat));
                 condition = condition.add(q_condition);
             }
         }
@@ -1146,6 +1286,7 @@ async fn load_related_context(
     let mut extension_ids = HashSet::new();
     let mut department_ids = HashSet::new();
     let mut sip_trunk_ids = HashSet::new();
+    let mut route_ids = HashSet::new();
 
     for record in records {
         if let Some(id) = record.extension_id {
@@ -1156,6 +1297,9 @@ async fn load_related_context(
         }
         if let Some(id) = record.sip_trunk_id {
             sip_trunk_ids.insert(id);
+        }
+        if let Some(id) = record.route_id {
+            route_ids.insert(id);
         }
     }
 
@@ -1185,6 +1329,26 @@ async fn load_related_context(
             .collect()
     };
 
+    let routes = if route_ids.is_empty() {
+        HashMap::new()
+    } else {
+        let ids: Vec<i64> = route_ids.into_iter().collect();
+        RoutingEntity::find()
+            .filter(crate::models::routing::Column::Id.is_in(ids))
+            .all(db)
+            .await?
+            .into_iter()
+            .map(|model| (model.id, model))
+            .collect()
+    };
+
+    // also pull in the outbound trunk referenced by each route's default_trunk_id
+    for route in routes.values() {
+        if let Some(tid) = route.default_trunk_id {
+            sip_trunk_ids.insert(tid);
+        }
+    }
+
     let sip_trunks = if sip_trunk_ids.is_empty() {
         HashMap::new()
     } else {
@@ -1198,10 +1362,19 @@ async fn load_related_context(
             .collect()
     };
 
+    let local_name = crate::models::system_config::Model::get(db, "site_name")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|row| serde_json::from_str::<String>(&row.value).ok())
+        .unwrap_or_else(|| "RustPBX".to_string());
+
     Ok(RelatedContext {
         extensions,
         departments,
         sip_trunks,
+        routes,
+        local_name,
     })
 }
 
@@ -1209,6 +1382,8 @@ struct RelatedContext {
     extensions: HashMap<i64, ExtensionModel>,
     departments: HashMap<i64, DepartmentModel>,
     sip_trunks: HashMap<i64, SipTrunkModel>,
+    routes: HashMap<i64, RoutingModel>,
+    local_name: String,
 }
 
 fn resolve_cdr_storage(state: &ConsoleState) -> Option<CdrStorage> {
@@ -1227,6 +1402,69 @@ pub struct CdrData {
     pub raw_content: String,
     pub cdr_path: String,
     pub storage: Option<CdrStorage>,
+}
+
+/// Human outcome classification for a call, derived from the final SIP code,
+/// whether the callee alerted (`rang`), and the recorded hangup messages.
+/// Mirrors the logic in scripts/qa_call_records_csv.py.
+pub(crate) struct ErrorReason {
+    pub(crate) key: &'static str,
+    pub(crate) detail: Option<String>,
+}
+
+/// Reason text from the hangup_message whose `code` matches the final status
+/// code; falls back to the last recorded message. Same selection errorOrigin
+/// uses on the frontend.
+fn extract_hangup_detail(hangup_messages: &[Value], code: i16) -> Option<String> {
+    hangup_messages
+        .iter()
+        .find(|m| m.get("code").and_then(|c| c.as_i64()) == Some(code as i64))
+        .or_else(|| hangup_messages.last())
+        .and_then(|m| m.get("reason"))
+        .and_then(|r| r.as_str())
+        .map(|s| s.to_string())
+}
+
+/// `None` => answered/normal call (no error reason). Otherwise a stable key
+/// plus optional detail text.
+pub(crate) fn classify_error_reason(
+    status: &str,
+    status_code: Option<i16>,
+    rang: bool,
+    hangup_messages: &[Value],
+) -> Option<ErrorReason> {
+    let code = status_code.unwrap_or(0);
+    let _ = status; // 2xx is authoritative; status string kept for signature parity
+    if (200..300).contains(&code) {
+        return None;
+    }
+    let key = match code {
+        480 => {
+            if rang {
+                "rang_no_answer"
+            } else {
+                "temporarily_unavailable"
+            }
+        }
+        503 => {
+            if rang {
+                "service_unavailable_after_ring"
+            } else {
+                "service_unavailable_upstream"
+            }
+        }
+        486 => "busy",
+        487 => "caller_cancelled",
+        404 | 604 => "unroutable",
+        408 => "no_answer_timeout",
+        500 | 502 => "server_error",
+        401 | 403 | 407 => "rejected",
+        _ => "failed",
+    };
+    Some(ErrorReason {
+        key,
+        detail: extract_hangup_detail(hangup_messages, code),
+    })
 }
 
 fn build_record_payload(
@@ -1269,11 +1507,34 @@ fn build_record_payload(
     let rewrite_callee_final = callee_uri.clone();
     let rewrite_contact = Option::<String>::None;
     let rewrite_destination = Option::<String>::None;
-    let status_code = Option::<u16>::None;
-    let ring_time = Option::<String>::None;
-    let answer_time = Option::<String>::None;
-    let hangup_reason = Option::<String>::None;
-    let hangup_messages = Vec::<Value>::new();
+    let status_code = record.status_code;
+    let ring_time = record.ring_time.map(|dt| dt.to_rfc3339());
+    let answer_time = record.answer_time.map(|dt| dt.to_rfc3339());
+    let hangup_reason = record.hangup_reason.clone();
+    // hangup_messages live under a reserved key in the metadata JSON (CDR-02b).
+    let hangup_messages: Vec<Value> = record
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("hangup_messages"))
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+
+    // "rang" = callee alerted. ring_time is authoritative; for legacy rows
+    // (NULL ring_time) fall back to answered-or-elapsed>3s.
+    let rang = record.ring_time.is_some()
+        || record.answer_time.is_some()
+        || record
+            .ended_at
+            .map(|end| (end - record.started_at).num_seconds() > 3)
+            .unwrap_or(false);
+    let error_reason = classify_error_reason(
+        &record.status,
+        record.status_code,
+        rang,
+        &hangup_messages,
+    );
+    let error_reason_key = error_reason.as_ref().map(|r| r.key);
+    let error_reason_detail = error_reason.and_then(|r| r.detail);
 
     json!({
         "id": record.id,
@@ -1306,6 +1567,8 @@ fn build_record_payload(
         "status_code": status_code,
         "hangup_reason": hangup_reason,
         "hangup_messages": hangup_messages,
+        "error_reason": error_reason_key,
+        "error_reason_detail": error_reason_detail,
         "rewrite": {
             "caller": {
                 "original": rewrite_caller_original,
@@ -1666,10 +1929,19 @@ fn build_participants(record: &CallRecordModel, related: &RelatedContext) -> Val
         .and_then(|id| related.extensions.get(&id))
         .map(|ext| ext.extension.clone());
 
-    let gateway_label = record
+    let trunk_label = record
         .sip_gateway
         .clone()
         .unwrap_or_else(|| "External".to_string());
+
+    // RustPBX is always the B2BUA in the middle.
+    // Inbound: external caller arrives via trunk → caller shows trunk, callee shows local.
+    // Outbound: local agent originates → caller shows local, callee shows trunk.
+    let (caller_network, callee_network_default) = if record.direction == "inbound" {
+        (trunk_label.clone(), related.local_name.clone())
+    } else {
+        (related.local_name.clone(), trunk_label.clone())
+    };
 
     let mut participants = Vec::new();
 
@@ -1682,7 +1954,7 @@ fn build_participants(record: &CallRecordModel, related: &RelatedContext) -> Val
             .or_else(|| record.caller_uri.clone()),
         "number": record.from_number.clone(),
         "uri": record.caller_uri.clone(),
-        "network": gateway_label.clone(),
+        "network": caller_network,
     }));
 
     if record.callee_uri.is_some() || record.to_number.is_some() || record.agent_name.is_some() {
@@ -1691,17 +1963,14 @@ fn build_participants(record: &CallRecordModel, related: &RelatedContext) -> Val
             .clone()
             .or_else(|| record.to_number.clone())
             .or_else(|| record.agent_name.clone());
-        let remote_network = record
-            .sip_gateway
-            .clone()
-            .unwrap_or_else(|| "Remote".to_string());
+        let callee_network = callee_network_default.clone();
         participants.push(json!({
             "role": "callee",
             "label": "Callee",
             "name": callee_name,
             "number": record.to_number.clone(),
             "uri": record.callee_uri.clone(),
-            "network": remote_network,
+            "network": callee_network,
         }));
     }
 
@@ -1713,6 +1982,20 @@ fn build_participants(record: &CallRecordModel, related: &RelatedContext) -> Val
             "number": extension_number.clone(),
             "uri": extension_number.clone(),
             "network": "PBX",
+        }));
+    }
+
+    if let Some(route) = record.route_id.and_then(|id| related.routes.get(&id)) {
+        let outbound_trunk = route.default_trunk_id
+            .and_then(|id| related.sip_trunks.get(&id))
+            .map(|t| t.display_name.clone().unwrap_or_else(|| t.name.clone()));
+        participants.push(json!({
+            "role": "proxy",
+            "label": "Proxy Route",
+            "name": route.name.clone(),
+            "number": Value::Null,
+            "uri": Value::Null,
+            "network": outbound_trunk,
         }));
     }
 
@@ -1909,6 +2192,190 @@ mod tests {
             .expect("related context");
         let payload = build_record_payload(&record, &related, &state, None);
         assert_eq!(payload["id"], 1);
+    }
+
+    #[tokio::test]
+    async fn ring_time_round_trips_through_db() {
+        let db = setup_db().await;
+        let ring = Utc::now();
+        let record = call_record::ActiveModel {
+            call_id: Set("ring-rt-1".into()),
+            direction: Set("outbound".into()),
+            status: Set("failed".into()),
+            status_code: Set(Some(480)),
+            started_at: Set(Utc::now()),
+            ring_time: Set(Some(ring)),
+            duration_secs: Set(20),
+            has_transcript: Set(false),
+            transcript_status: Set("pending".into()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("insert call record");
+        assert!(record.ring_time.is_some());
+    }
+
+    #[test]
+    fn classify_answered_is_none() {
+        assert!(classify_error_reason("completed", Some(200), true, &[]).is_none());
+        // any 2xx counts as answered regardless of status string
+        assert!(classify_error_reason("failed", Some(204), false, &[]).is_none());
+    }
+
+    #[test]
+    fn classify_480_splits_on_ring() {
+        assert_eq!(
+            classify_error_reason("failed", Some(480), true, &[]).unwrap().key,
+            "rang_no_answer"
+        );
+        assert_eq!(
+            classify_error_reason("failed", Some(480), false, &[]).unwrap().key,
+            "temporarily_unavailable"
+        );
+    }
+
+    #[test]
+    fn classify_503_splits_on_ring() {
+        assert_eq!(
+            classify_error_reason("failed", Some(503), true, &[]).unwrap().key,
+            "service_unavailable_after_ring"
+        );
+        assert_eq!(
+            classify_error_reason("failed", Some(503), false, &[]).unwrap().key,
+            "service_unavailable_upstream"
+        );
+    }
+
+    #[test]
+    fn classify_simple_codes() {
+        let cases = [
+            (486, "busy"),
+            (487, "caller_cancelled"),
+            (404, "unroutable"),
+            (604, "unroutable"),
+            (408, "no_answer_timeout"),
+            (500, "server_error"),
+            (502, "server_error"),
+            (401, "rejected"),
+            (403, "rejected"),
+            (407, "rejected"),
+            (481, "failed"),
+        ];
+        for (code, key) in cases {
+            assert_eq!(
+                classify_error_reason("failed", Some(code), false, &[]).unwrap().key,
+                key,
+                "code {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_extracts_matching_detail() {
+        let msgs = vec![
+            json!({"code": 487, "reason": "Caller cancelled"}),
+            json!({"code": 500, "reason": "Internal Error"}),
+        ];
+        let r = classify_error_reason("failed", Some(500), true, &msgs).unwrap();
+        assert_eq!(r.key, "server_error");
+        assert_eq!(r.detail.as_deref(), Some("Internal Error"));
+    }
+
+    #[test]
+    fn classify_detail_falls_back_to_last_message() {
+        let msgs = vec![json!({"code": 480, "reason": "Temporarily Unavailable"})];
+        // final code 503 has no exact match → use last message's reason
+        let r = classify_error_reason("failed", Some(503), false, &msgs).unwrap();
+        assert_eq!(r.detail.as_deref(), Some("Temporarily Unavailable"));
+    }
+
+    #[tokio::test]
+    async fn payload_has_error_reason_for_failure_and_null_for_answered() {
+        let db = setup_db().await;
+        let state = create_console_state(db.clone()).await;
+
+        let failed = call_record::ActiveModel {
+            call_id: Set("er-480".into()),
+            direction: Set("outbound".into()),
+            status: Set("failed".into()),
+            status_code: Set(Some(480)),
+            started_at: Set(Utc::now()),
+            ring_time: Set(Some(Utc::now())),
+            duration_secs: Set(20),
+            has_transcript: Set(false),
+            transcript_status: Set("pending".into()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("insert failed record");
+
+        let answered = call_record::ActiveModel {
+            call_id: Set("er-200".into()),
+            direction: Set("outbound".into()),
+            status: Set("completed".into()),
+            status_code: Set(Some(200)),
+            started_at: Set(Utc::now()),
+            answer_time: Set(Some(Utc::now())),
+            duration_secs: Set(42),
+            has_transcript: Set(false),
+            transcript_status: Set("pending".into()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("insert answered record");
+
+        let related = load_related_context(&db, &[failed.clone(), answered.clone()])
+            .await
+            .expect("related context");
+
+        let p_fail = build_record_payload(&failed, &related, &state, None);
+        assert_eq!(p_fail["error_reason"], "rang_no_answer");
+
+        let p_ok = build_record_payload(&answered, &related, &state, None);
+        assert!(p_ok["error_reason"].is_null());
+    }
+
+    #[tokio::test]
+    async fn payload_surfaces_server_error_detail() {
+        let db = setup_db().await;
+        let state = create_console_state(db.clone()).await;
+
+        let record = call_record::ActiveModel {
+            call_id: Set("er-500".into()),
+            direction: Set("outbound".into()),
+            status: Set("failed".into()),
+            status_code: Set(Some(500)),
+            started_at: Set(Utc::now()),
+            ring_time: Set(Some(Utc::now())),
+            duration_secs: Set(10),
+            has_transcript: Set(false),
+            transcript_status: Set("pending".into()),
+            metadata: Set(Some(json!({
+                "hangup_messages": [{"code": 500, "reason": "Internal Error"}]
+            }))),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(&db)
+        .await
+        .expect("insert 500 record");
+
+        let related = load_related_context(&db, &[record.clone()])
+            .await
+            .expect("related context");
+        let payload = build_record_payload(&record, &related, &state, None);
+        assert_eq!(payload["error_reason"], "server_error");
+        assert_eq!(payload["error_reason_detail"], "Internal Error");
     }
 
     #[tokio::test]

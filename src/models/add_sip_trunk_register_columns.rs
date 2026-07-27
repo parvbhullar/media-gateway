@@ -15,9 +15,9 @@ impl MigrationTrait for Migration {
             manager
                 .alter_table(
                     Table::alter()
-                        .table(super::sip_trunk::Entity)
+                        .table(super::sip_trunk::legacy::Entity)
                         .add_column(
-                            ColumnDef::new(super::sip_trunk::Column::RegisterEnabled)
+                            ColumnDef::new(super::sip_trunk::legacy::Column::RegisterEnabled)
                                 .boolean()
                                 .not_null()
                                 .default(false),
@@ -31,9 +31,9 @@ impl MigrationTrait for Migration {
             manager
                 .alter_table(
                     Table::alter()
-                        .table(super::sip_trunk::Entity)
+                        .table(super::sip_trunk::legacy::Entity)
                         .add_column(
-                            ColumnDef::new(super::sip_trunk::Column::RegisterExpires)
+                            ColumnDef::new(super::sip_trunk::legacy::Column::RegisterExpires)
                                 .integer()
                                 .null(),
                         )
@@ -49,9 +49,9 @@ impl MigrationTrait for Migration {
             manager
                 .alter_table(
                     Table::alter()
-                        .table(super::sip_trunk::Entity)
+                        .table(super::sip_trunk::legacy::Entity)
                         .add_column(
-                            ColumnDef::new(super::sip_trunk::Column::RegisterExtraHeaders)
+                            ColumnDef::new(super::sip_trunk::legacy::Column::RegisterExtraHeaders)
                                 .json()
                                 .null(),
                         )

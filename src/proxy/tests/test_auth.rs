@@ -467,7 +467,11 @@ async fn test_guest_call_allowed_extension() {
     let user_backend = MemoryUserBackend::new(Some(builtin_users));
     let locator = Arc::new(Box::new(MemoryLocator::new()) as Box<dyn Locator>);
     let config = Arc::new(proxy_config);
-    let endpoint = EndpointBuilder::new().build();
+    let endpoint = EndpointBuilder::new()
+        .with_domain_resolver(Box::new(
+            crate::proxy::dns_resolver::RobustDomainResolver::new(),
+        ))
+        .build();
     let dialog_layer = Arc::new(DialogLayer::new(endpoint.inner.clone()));
 
     let data_context = Arc::new(
@@ -512,6 +516,18 @@ async fn test_guest_call_allowed_extension() {
         cluster_peer_ips: vec![],
         media_policy: Arc::new(crate::call::DefaultMediaPolicy),
         trunk_health: None,
+        webhook_sender: {
+            let (tx, _) = tokio::sync::broadcast::channel::<crate::proxy::webhook::WebhookEvent>(8);
+            tx
+        },
+        webhook_cancel_registry: std::sync::Arc::new(crate::proxy::webhook::WebhookCancelRegistry::new()),
+        trunk_capacity: std::sync::Arc::new(crate::proxy::trunk_capacity_state::TrunkCapacityState::new()),
+        bridge_sessions: std::sync::Arc::new(
+            crate::proxy::bridge_sessions::BridgeSessions::new(),
+        ),
+        rejected_invites: std::sync::Arc::new(
+            crate::proxy::bridge_sessions::RejectedInviteCache::new(),
+        ),
     });
 
     let module = AuthModule::new(server_inner.clone(), server_inner.proxy_config.clone());
@@ -800,7 +816,7 @@ async fn test_auth_no_credentials() {
 
     // Create an INVITE request with no auth headers
     let request = create_sip_request(rsipstack::sip::Method::Invite, "alice", "rustpbx.com");
-    let transport_layer = TransportLayer::new(CancellationToken::new());
+    let transport_layer = crate::proxy::dns_resolver::new_transport_layer(CancellationToken::new());
     let endpoint_inner = EndpointInner::new(
         "RustPBX Test".to_string(),
         transport_layer,
@@ -831,7 +847,7 @@ async fn test_auth_bypass_for_non_invite_register() {
 
     // Create a BYE request
     let request = create_sip_request(rsipstack::sip::Method::Bye, "alice", "rustpbx.com");
-    let transport_layer = TransportLayer::new(CancellationToken::new());
+    let transport_layer = crate::proxy::dns_resolver::new_transport_layer(CancellationToken::new());
     let endpoint_inner = EndpointInner::new(
         "RustPBX Test".to_string(),
         transport_layer,
@@ -883,7 +899,7 @@ async fn test_auth_disabled_user() {
         request.authorization_header().is_some()
     );
 
-    let transport_layer = TransportLayer::new(CancellationToken::new());
+    let transport_layer = crate::proxy::dns_resolver::new_transport_layer(CancellationToken::new());
     let endpoint_inner = EndpointInner::new(
         "RustPBX Test".to_string(),
         transport_layer,

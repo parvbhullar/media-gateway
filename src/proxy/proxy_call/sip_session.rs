@@ -25,10 +25,14 @@ pub struct SessionSnapshot {
     pub answer_sdp: Option<String>,
     #[serde(skip)]
     pub callee_dialogs: Vec<DialogId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_consult_leg_id: Option<String>,
 }
 use crate::call::domain::SessionPolicy;
 use crate::call::sip::{ClientDialogGuard, ServerDialogGuard};
-use crate::callrecord::{CallRecordHangupMessage, CallRecordHangupReason, CallRecordSender};
+use crate::callrecord::{
+    CallRecordHangupMessage, CallRecordHangupReason, CallRecordSender, FailureSource,
+};
 use crate::config::MediaProxyMode;
 use crate::media::bridge::{BridgeEndpoint, BridgePeerBuilder};
 use crate::media::mixer::MediaMixer;
@@ -37,6 +41,7 @@ use crate::media::recorder::Recorder;
 use crate::media::{FileTrack, PlaybackEndReason, RtpTrackBuilder, Track};
 use crate::proxy::proxy_call::{
     dtmf::RtpDtmfDetector,
+    failure_source::classify_failure_source,
     media_peer::{MediaPeer, VoiceEnginePeer},
     reporter::CallReporter,
     session_timer::{
@@ -83,6 +88,52 @@ mod transfer;
 enum TimerAction {
     Refresh,
     Expired,
+}
+
+// Phase 7 D-06: webhook event builders for the two emit sites in this file.
+// `call.started` fires from `accept_call` after 200 OK; `call.failed` fires
+// from `cleanup` when no answer was ever observed.
+pub(crate) fn build_call_started_event(
+    session_id: &str,
+    caller_number: Option<&str>,
+    destination_number: Option<&str>,
+    direction: &str,
+) -> crate::proxy::webhook::WebhookEvent {
+    crate::proxy::webhook::WebhookEvent {
+        // task 2.2: stable id keyed on the session so a redelivery dedups.
+        event_id: crate::proxy::webhook::derive_event_id(session_id, "call.started"),
+        event: "call.started".to_string(),
+        timestamp: crate::proxy::webhook::current_unix_timestamp(),
+        data: serde_json::json!({
+            "session_id": session_id,
+            "caller_number": caller_number,
+            "destination_number": destination_number,
+            "started_at": crate::proxy::webhook::current_unix_timestamp(),
+            "direction": direction,
+        }),
+    }
+}
+
+pub(crate) fn build_call_failed_event(
+    session_id: &str,
+    caller_number: Option<&str>,
+    destination_number: Option<&str>,
+    failure_reason: &str,
+    sip_code: Option<u16>,
+) -> crate::proxy::webhook::WebhookEvent {
+    crate::proxy::webhook::WebhookEvent {
+        // task 2.2: stable id keyed on the session so a redelivery dedups.
+        event_id: crate::proxy::webhook::derive_event_id(session_id, "call.failed"),
+        event: "call.failed".to_string(),
+        timestamp: crate::proxy::webhook::current_unix_timestamp(),
+        data: serde_json::json!({
+            "session_id": session_id,
+            "caller_number": caller_number,
+            "destination_number": destination_number,
+            "failure_reason": failure_reason,
+            "sip_code": sip_code,
+        }),
+    }
 }
 
 enum UpdateRefreshOutcome {
@@ -139,6 +190,9 @@ pub struct SipSession {
     pub hangup_reason: Option<CallRecordHangupReason>,
     pub hangup_messages: Vec<SessionHangupMessage>,
     pub last_error: Option<(StatusCode, Option<String>)>,
+    /// Originating side of the call failure, classified from the SIP
+    /// `TerminatedReason` when `last_error` is set (CDR 503/error attribution).
+    pub failure_source: Option<FailureSource>,
     pub recording_state: Option<(String, Instant)>,
 
     pub routed_caller: Option<String>,
@@ -164,7 +218,14 @@ pub struct SipSession {
     callee_offer_uses_media_bridge: bool,
     media_bridge_started: bool,
     bridge_playback_track_id: Option<String>,
-
+    #[allow(dead_code)]
+    pub caller_is_webrtc: bool,
+    #[allow(dead_code)]
+    pub callee_is_webrtc: bool,
+    /// IP of the caller (from the incoming INVITE's Via/Contact). Used to
+    /// pick the correct local interface IP for Contact and SDP so the
+    /// caller can actually reach us for ACK/RTP.
+    pub caller_peer_ip: Option<std::net::IpAddr>,
     pub conference_bridge: crate::call::runtime::SessionConferenceBridge,
 
     /// Per-leg transport mode (canonical source).
@@ -308,6 +369,29 @@ impl AppFactory for BuiltinAppFactory {
     }
 }
 
+/// Extract the caller's IP from an incoming request. Prefers the Via
+/// `received` parameter (set by the transport on arrival), falls back to
+/// the Via sent-by host. This is the address the caller can receive
+/// responses from — matching interfaces is based on it.
+fn extract_peer_ip_from_request(req: &rsipstack::sip::Request) -> Option<std::net::IpAddr> {
+    use rsipstack::sip::{ToTypedHeader, prelude::HeadersExt};
+    let via = req.via_header().ok()?;
+    let typed = via.typed().ok()?;
+
+    for param in &typed.params {
+        if let rsipstack::sip::Param::Received(r) = param {
+            if let Ok(ip) = r.parse() {
+                return Some(ip);
+            }
+        }
+    }
+
+    match typed.uri.host() {
+        rsipstack::sip::Host::IpAddr(ip) => Some(*ip),
+        rsipstack::sip::Host::Domain(_) => None,
+    }
+}
+
 impl SipSession {
     pub const CALLER_TRACK_ID: &'static str = "caller-track";
     pub const CALLEE_TRACK_ID: &'static str = "callee-track";
@@ -316,6 +400,37 @@ impl SipSession {
 
     pub const QUEUE_HOLD_TRACK_ID: &'static str = "queue-hold";
     const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+
+    /// IP to advertise in caller-side SDP (c=/o= lines). For public callers,
+    /// prefer the configured `external_ip` — kernel routing returns the
+    /// host's private source IP on AWS/NAT setups, which the peer can't
+    /// route RTP back to. For private callers, use kernel routing to pick
+    /// the correct local interface on multi-homed hosts.
+    ///
+    /// Loopback peers (127.0.0.0/8, ::1) bypass the override entirely — we
+    /// only return whatever `external_ip` config explicitly set. Without
+    /// this, the rustrtc track would be told its external IP is 127.0.0.1,
+    /// which changes its socket-bind behaviour and breaks the proxy/RTP
+    /// e2e tests (`test_p2p_*`, `test_wholesale_*`) — those exercise the
+    /// full forward path on loopback and need rustrtc's default address
+    /// selection. Regression introduced by commit `a5385a7 "Fix tcp"`.
+    fn caller_facing_ip_str(&self) -> Option<String> {
+        match self.caller_peer_ip {
+            Some(ip) if ip.is_loopback() => self.server.rtp_config.external_ip.clone(),
+            Some(ip) if crate::proxy::server::is_public_ip(ip) => self
+                .server
+                .rtp_config
+                .external_ip
+                .clone()
+                .or_else(|| {
+                    crate::proxy::server::local_ip_for_peer(ip).map(|i| i.to_string())
+                }),
+            Some(ip) => crate::proxy::server::local_ip_for_peer(ip)
+                .map(|i| i.to_string())
+                .or_else(|| self.server.rtp_config.external_ip.clone()),
+            None => self.server.rtp_config.external_ip.clone(),
+        }
+    }
 
     pub fn with_handle(id: SessionId) -> (SipSessionHandle, mpsc::UnboundedReceiver<CallCommand>) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
@@ -433,6 +548,7 @@ impl SipSession {
         } else {
             Some(String::from_utf8_lossy(initial.body()).to_string())
         };
+        let caller_peer_ip = extract_peer_ip_from_request(&initial);
 
         let session = Self {
             id: session_id.clone(),
@@ -479,6 +595,7 @@ impl SipSession {
             hangup_reason: None,
             hangup_messages: Vec::new(),
             last_error: None,
+            failure_source: None,
             recording_state: None,
             routed_caller: None,
             routed_callee: None,
@@ -499,7 +616,9 @@ impl SipSession {
             callee_offer_uses_media_bridge: false,
             media_bridge_started: false,
             bridge_playback_track_id: None,
-
+            caller_is_webrtc: false,
+            callee_is_webrtc: false,
+            caller_peer_ip,
             conference_bridge: crate::call::runtime::SessionConferenceBridge::new(),
             cmd_tx: Some(cmd_tx.clone()),
             leg_tasks: std::collections::HashMap::new(),
@@ -521,12 +640,18 @@ impl SipSession {
         let session_id = context.session_id.clone();
         info!(session_id = %session_id, "Starting unified SIP session");
 
+        // Determine the caller's IP from the incoming INVITE so Contact/SDP
+        // advertise the local interface that is actually reachable from the
+        // caller's network. Without this, a private-network carrier would
+        // see our external IP in Contact/SDP and fail to deliver ACK/RTP.
+        let caller_peer_ip = extract_peer_ip_from_request(&tx.original);
+
         let local_contact = context
             .dialplan
             .caller_contact
             .as_ref()
             .map(|c| c.uri.clone())
-            .or_else(|| server.default_contact_uri());
+            .or_else(|| server.contact_uri_for_peer(caller_peer_ip));
 
         let (state_tx, state_rx) = mpsc::unbounded_channel();
 
@@ -594,7 +719,7 @@ impl SipSession {
             .dialplan
             .max_ring_time
             .clamp(Duration::from_secs(30), Duration::from_secs(120));
-        let teardown_duration = Duration::from_secs(2);
+        let teardown_duration = Duration::from_secs(5);
         let mut timeout = tokio::time::sleep(max_setup_duration).boxed();
         let mut cancelled = false;
 
@@ -616,9 +741,15 @@ impl SipSession {
                     timeout = tokio::time::sleep(teardown_duration).boxed();
                 }
                 _ = &mut timeout => {
-                    warn!(session_id = %session_id, "Call setup timed out");
-                    cancel_token.cancel();
-                    break;
+                    if !cancelled {
+                        warn!(session_id = %session_id, "Call setup timed out");
+                        cancel_token.cancel();
+                        cancelled = true;
+                        timeout = tokio::time::sleep(teardown_duration).boxed();
+                    } else {
+                        warn!(session_id = %session_id, "Teardown grace period expired");
+                        break;
+                    }
                 }
             }
         }
@@ -1243,8 +1374,10 @@ impl SipSession {
 
             let code = status_code.clone();
             let _ = self.server_dialog.reject(Some(code), reason.clone());
-            // Store error so cleanup/CDR can report the failure reason
+            // Store error so cleanup/CDR can report the failure reason.
+            // A dialplan execution failure is generated by our own SBC.
             self.last_error = Some((status_code.clone(), reason));
+            self.failure_source = Some(FailureSource::Sbc);
             self.hangup_reason = Some(CallRecordHangupReason::Failed);
             // Ensure cleanup runs (generates CDR) even on early failure
             self.cleanup().await;
@@ -1279,8 +1412,24 @@ impl SipSession {
 
             tokio::select! {
                 res = hangup_futures.next(), if !hangup_futures.is_empty() => {
-                    if let Some(res) = res {
-                        tracing::info!("Hangup completed for dialog_id: {:?}", &res);
+                    match res {
+                        Some(Ok(dialog_id)) => {
+                            tracing::info!("Hangup completed for dialog_id: {:?}", dialog_id);
+                        }
+                        Some(Err(e)) => {
+                            // The BYE send itself failed (e.g. transport error), so the
+                            // dialog was left Confirmed (see server_dialog.rs bye ordering).
+                            // Cancel the session so teardown still completes within the
+                            // drain timeout; cleanup() will make one bounded retry on the
+                            // still-Confirmed caller dialog.
+                            warn!(
+                                session_id = %self.context.session_id,
+                                error = %e,
+                                "Hangup send failed; cancelling session to complete teardown"
+                            );
+                            self.cancel_token.cancel();
+                        }
+                        None => {}
                     }
                 }
                 _ = self.cancel_token.cancelled(), if !cancelled => {
@@ -1387,6 +1536,7 @@ impl SipSession {
             media_path: self.media_profile.path,
             answer_sdp: self.answer.clone(),
             callee_dialogs,
+            pending_consult_leg_id: None,
         };
 
         *self.snapshot_cache.write() = Some(snapshot);
@@ -1760,6 +1910,9 @@ impl SipSession {
                     // when it completes (via AppAction::Hangup). The app has built-in
                     // timeouts (DTMF 10s, recording 30s) so it cannot hang indefinitely.
                 } else {
+                    // Classify the originating side before `reason` is consumed
+                    // by the match below (SBC vs upstream carrier vs caller).
+                    let failure_source = classify_failure_source(&reason);
                     let (code, reason_str) = match reason {
                         TerminatedReason::UasBusy => {
                             (Some(StatusCode::BusyHere), Some("Busy Here".to_string()))
@@ -1794,6 +1947,7 @@ impl SipSession {
                             "Callee rejected the call"
                         );
                         self.last_error = Some((code.clone(), reason_str.clone()));
+                        self.failure_source = failure_source;
                         if let Err(e) = self.server_dialog.reject(code.into(), reason_str) {
                             warn!(session_id = %self.context.session_id, error = %e, "Failed to send rejection response to caller");
                         }
@@ -2366,6 +2520,7 @@ impl SipSession {
                         caller_offer,
                         callee_is_webrtc,
                         allow_codecs,
+                        self.context.dialplan.media.codec_strategy,
                     );
                     crate::media::negotiate::MediaNegotiator::rewrite_sdp_codec_list(
                         caller_offer,
@@ -2403,6 +2558,15 @@ impl SipSession {
             .map(|c| c.uri.clone())
             .unwrap_or_else(|| caller.clone());
 
+        // Present rustpbx's own external SIP address (the same host:port we
+        // advertise in Contact) as the From host, keeping the original caller's
+        // user part — standard B2BUA behaviour. The true caller identity is
+        // preserved in P-Asserted-Identity. When no external contact is known
+        // (fallback above), host_with_port equals the caller's, so From is
+        // unchanged.
+        let mut from_uri = caller.clone();
+        from_uri.host_with_port = contact_uri.host_with_port.clone();
+
         let callee_call_id = self.context.dialplan.call_id.clone().unwrap_or_else(|| {
             rsipstack::transaction::make_call_id(
                 self.server.endpoint.inner.option.callid_suffix.as_deref(),
@@ -2426,17 +2590,23 @@ impl SipSession {
 
         info!(session_id = %self.context.session_id, %caller, %callee_uri, callee_call_id, "Sending INVITE to callee");
 
+        // When routing via home_proxy, the transport destination must be the
+        // home proxy node, not the callee's own registered contact — otherwise
+        // the packet bypasses the home proxy entirely and goes straight to the
+        // remote UA, which never receives it (wrong node, no route back).
+        let destination = if route_via_home_proxy {
+            target.home_proxy.clone()
+        } else {
+            target.destination.clone()
+        };
+
         let mut invite_option = InviteOption {
             caller_display_name: self.context.dialplan.caller_display_name.clone(),
             callee: callee_uri.clone(),
-            caller: caller.clone(),
+            caller: from_uri,
             content_type,
             offer,
-            destination: if route_via_home_proxy {
-                None
-            } else {
-                target.destination.clone()
-            },
+            destination,
             contact: contact_uri,
             credential: target.credential.clone(),
             headers: Some(headers),
@@ -2453,6 +2623,7 @@ impl SipSession {
 
         let dialog_layer = self.server.dialog_layer.clone();
         let mut retry_count = 0;
+        let mut pipe_retry_count = 0;
         let mut invitation = dialog_layer
             .do_invite(invite_option.clone(), state_tx.clone())
             .boxed();
@@ -2546,14 +2717,78 @@ impl SipSession {
                                 } else {
 
                                     let code = StatusCode::from(resp.status_code.code());
-
-                                    Err((code, None))
+                                    // Prefer the Q.850 Reason header (richer carrier cause);
+                                    // fall back to the canonical status-line phrase.
+                                    let reason = crate::proxy::proxy_call::callee_reason::callee_reason_text(
+                                        get_header_value(&resp.headers, "Reason"),
+                                    ).or_else(|| resp.reason_phrase().map(|r| r.to_string()));
+                                    // The concrete downstream hop that rejected us, so
+                                    // the CDR/console can show "500 from <trunk>".
+                                    let endpoint = target
+                                        .destination
+                                        .as_ref()
+                                        .map(|d| d.addr.to_string())
+                                        .unwrap_or_else(|| callee_uri.host_with_port.to_string());
+                                    warn!(
+                                        session_id = %self.context.session_id,
+                                        code = code.code(),
+                                        ?reason,
+                                        %endpoint,
+                                        "Callee leg returned non-2xx final response"
+                                    );
+                                    self.hangup_messages.push(SessionHangupMessage {
+                                        code: code.code(),
+                                        reason: reason.clone(),
+                                        target: Some("callee".to_string()),
+                                        endpoint: Some(endpoint),
+                                    });
+                                    // The carrier leg returned a final non-2xx: upstream failure.
+                                    self.failure_source = Some(FailureSource::Upstream);
+                                    Err((code, reason))
                                 }
                             } else {
+                                // Do NOT record a hangup message here. The
+                                // "no final response" case is remapped below
+                                // (map_callee_terminated_reason) to an accurate
+                                // status — e.g. 403 for an unanswerable trunk
+                                // auth challenge. Pushing a hardcoded 500 entry
+                                // now would contradict that remapped status in
+                                // the CDR. The reporter synthesises a consistent
+                                // hangup message from the final last_error.
                                 Err((StatusCode::ServerInternalError, Some("No response from callee".to_string())))
                             }
                         }
-                        Err(e) => Err((StatusCode::ServerInternalError, Some(format!("Invite failed: {}", e)))),
+                        Err(e) => {
+                            // Stale pooled TCP/TLS connection: the pool returned a socket
+                            // that was already closed by the far end.  Evict it (Option A
+                            // in endpoint.rs handles the pool; the eviction races here are
+                            // covered by retrying once so a fresh dial is attempted).
+                            let is_stale_conn = matches!(&e, rsipstack::Error::IoError(io)
+                                if matches!(io.kind(),
+                                    std::io::ErrorKind::BrokenPipe
+                                    | std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::ConnectionAborted));
+
+                            if is_stale_conn && pipe_retry_count < 1 {
+                                pipe_retry_count += 1;
+                                if let Some(dest) = invite_option.destination.as_ref() {
+                                    self.server.dialog_layer.endpoint.transport_layer
+                                        .del_connection(dest);
+                                }
+                                warn!(
+                                    session_id = %self.context.session_id,
+                                    error = %e,
+                                    attempt = retry_count,
+                                    "Callee INVITE hit stale TCP connection; retrying on fresh connection"
+                                );
+                                invitation = dialog_layer
+                                    .do_invite(invite_option.clone(), state_tx.clone())
+                                    .boxed();
+                                continue;
+                            }
+
+                            Err((StatusCode::ServerInternalError, Some(format!("Invite failed: {}", e))))
+                        }
                     };
                 }
 
@@ -2622,6 +2857,38 @@ impl SipSession {
                     }
                 }
             }
+        };
+
+        // rsipstack reports several terminal failures — notably an auth
+        // challenge we can't answer — as `Ok((_, None))`, which the loop above
+        // turns into a blanket `500 / "No response from callee"`. The real
+        // cause is carried as a `Terminated` dialog state on the callee
+        // channel. Drain any pending states and, if the dialog terminated for a
+        // concrete reason, surface an accurate status to the caller instead.
+        let result = match result {
+            Err((StatusCode::ServerInternalError, ref reason))
+                if reason.as_deref() == Some("No response from callee") =>
+            {
+                let mut mapped = None;
+                while let Ok(state) = callee_state_rx.try_recv() {
+                    if let DialogState::Terminated(_, reason) = state {
+                        mapped = Some(map_callee_terminated_reason(&reason));
+                    }
+                }
+                match mapped {
+                    Some((code, msg)) => {
+                        warn!(
+                            session_id = %self.context.session_id,
+                            status = %code,
+                            reason = %msg,
+                            "Callee dialog terminated without a final response; surfacing mapped status"
+                        );
+                        Err((code, Some(msg)))
+                    }
+                    None => result,
+                }
+            }
+            other => other,
         };
 
         let (dialog_id, response): (DialogId, Option<rsipstack::sip::Response>) = result?;
@@ -3019,8 +3286,8 @@ impl SipSession {
                     .with_cancel_token(self.caller_peer.cancel_token())
                     .with_enable_latching(self.server.proxy_config.enable_latching);
 
-                if let Some(ref external_ip) = self.server.rtp_config.external_ip {
-                    track_builder = track_builder.with_external_ip(external_ip.clone());
+                if let Some(ip) = self.caller_facing_ip_str() {
+                    track_builder = track_builder.with_external_ip(ip);
                 }
                 if let Some(ref bind_ip) = self.server.rtp_config.bind_ip {
                     track_builder = track_builder.with_bind_ip(bind_ip.clone());
@@ -3112,6 +3379,18 @@ impl SipSession {
         let Some(bridge) = self.media_bridge.as_ref() else {
             return;
         };
+        // Trunk media_config jitter policies apply to the leg receiving
+        // media FROM each trunk: egress trunk → callee side, inbound
+        // trunk → caller side. Set before the transcoder decision so
+        // they hold for passthrough calls too.
+        bridge.set_ingress_jitter(
+            self.leg_bridge_endpoint(&LegId::from("callee")),
+            self.context.dialplan.media.jitter_buffer_callee,
+        );
+        bridge.set_ingress_jitter(
+            self.leg_bridge_endpoint(&LegId::from("caller")),
+            self.context.dialplan.media.jitter_buffer_caller,
+        );
         let Some(caller_answer_sdp) = caller_answer_sdp else {
             return;
         };
@@ -3267,7 +3546,7 @@ impl SipSession {
 
         use crate::media::recorder::Leg;
 
-        let session_id = &self.context.session_id;
+        let session_id = self.context.session_id.clone();
 
         let caller_pc = if self.caller_answer_uses_media_bridge {
             let Some(bridge) = self.media_bridge.as_ref() else {
@@ -3311,6 +3590,27 @@ impl SipSession {
                 needs_transcoding = (ca.codec != ce.codec),
                 "Anchored media: leg profiles extracted"
             );
+        }
+
+        // Auto-start recording when enabled and recorder not yet initialized.
+        // For anchored media (SIP-to-SIP), start_recording is not triggered by
+        // any external command, so we initialize it here before wiring the tracks.
+        let recording = &self.context.dialplan.recording;
+        if recording.enabled && recording.auto_start && self.recording_state.is_none() {
+            if let Some(opt) = recording.option.as_ref() {
+                if !opt.recorder_file.is_empty() {
+                    if let Err(e) = self
+                        .start_recording(&opt.recorder_file.clone(), None, false)
+                        .await
+                    {
+                        warn!(
+                            session_id = %session_id,
+                            error = %e,
+                            "Failed to auto-start recording for anchored media"
+                        );
+                    }
+                }
+            }
         }
 
         let shared_recorder = self.recorder.clone();
@@ -3363,7 +3663,7 @@ impl SipSession {
             shared_recorder.clone(),
             Leg::A,
             caller_sipflow_tx,
-            session_id,
+            &session_id,
             "caller→callee",
         ) {
             Ok(forwarding) => {
@@ -3391,7 +3691,7 @@ impl SipSession {
             shared_recorder,
             Leg::B,
             callee_sipflow_tx,
-            session_id,
+            &session_id,
             "callee→caller",
         ) {
             Ok(forwarding) => {
@@ -3953,8 +4253,8 @@ impl SipSession {
                 info!(session_id = %self.id, "RTP caller offered BUNDLE, using Standard SDP mode + latching for RTP side");
             }
 
-            if let Some(ref external_ip) = self.server.rtp_config.external_ip {
-                bridge_builder = bridge_builder.with_external_ip(external_ip.clone());
+            if let Some(ip) = self.caller_facing_ip_str() {
+                bridge_builder = bridge_builder.with_external_ip(ip);
             }
             if let Some(ref bind_ip) = self.server.rtp_config.bind_ip {
                 bridge_builder = bridge_builder.with_bind_ip(bind_ip.clone());
@@ -4100,8 +4400,8 @@ impl SipSession {
                 .with_cancel_token(self.callee_peer.cancel_token())
                 .with_enable_latching(self.server.proxy_config.enable_latching);
 
-            if let Some(ref external_ip) = self.server.rtp_config.external_ip {
-                track_builder = track_builder.with_external_ip(external_ip.clone());
+            if let Some(ip) = self.caller_facing_ip_str() {
+                track_builder = track_builder.with_external_ip(ip);
             }
             if let Some(ref bind_ip) = self.server.rtp_config.bind_ip {
                 track_builder = track_builder.with_bind_ip(bind_ip.clone());
@@ -4128,6 +4428,7 @@ impl SipSession {
                     caller_offer,
                     callee_is_webrtc,
                     &self.context.dialplan.allow_codecs,
+                    self.context.dialplan.media.codec_strategy,
                 );
                 if !codecs.is_empty() {
                     track_builder = track_builder.with_codec_info(codecs);
@@ -4206,8 +4507,8 @@ impl SipSession {
             .with_cancel_token(self.caller_peer.cancel_token())
             .with_enable_latching(self.server.proxy_config.enable_latching);
 
-        if let Some(ref external_ip) = self.server.rtp_config.external_ip {
-            track_builder = track_builder.with_external_ip(external_ip.clone());
+        if let Some(ip) = self.caller_facing_ip_str() {
+            track_builder = track_builder.with_external_ip(ip);
         }
         if let Some(ref bind_ip) = self.server.rtp_config.bind_ip {
             track_builder = track_builder.with_bind_ip(bind_ip.clone());
@@ -4360,6 +4661,15 @@ impl SipSession {
                     entry.callee = callee.clone();
                 }
             });
+
+        // Phase 7 D-06: emit call.started after 200 OK accept. Non-fatal.
+        let started_event = build_call_started_event(
+            &session_id,
+            caller.as_deref(),
+            callee.as_deref(),
+            "inbound",
+        );
+        let _ = self.server.webhook_sender.send(started_event);
 
         // Auto-start recording when the call is answered if configured.
         if self.context.dialplan.recording.enabled
@@ -4803,11 +5113,10 @@ impl SipSession {
         _max_duration: Option<Duration>,
         beep: bool,
     ) -> Result<()> {
-        if self.server.sip_flow.is_some() {
-            return Err(anyhow!(
-                "Live recording is disabled when SipFlow is enabled"
-            ));
-        }
+        // Whether recording should run alongside sipflow is decided by
+        // apply_recording_policy() in proxy::call (gates dialplan.recording.enabled
+        // on policy.uploads_recording()). If we got here, the policy already
+        // approved recording — don't double-gate on sip_flow presence.
         let mut recorder = Recorder::new(path, CodecType::PCMU)?;
         if let Some(forwarding) =
             Self::get_forwarding_track(&self.caller_peer, Self::CALLER_FORWARDING_TRACK_ID).await
@@ -4878,6 +5187,20 @@ impl SipSession {
     async fn cleanup(&mut self) {
         debug!(session_id = %self.context.session_id, "Cleaning up session");
 
+        // Phase 7 D-06: emit call.failed when no answer was ever observed
+        // (suppressed when the call answered — in that case call.started has
+        // already fired and the lifecycle is closed by call.completed).
+        if self.answer_time.is_none() {
+            let failed_event = build_call_failed_event(
+                &self.context.session_id,
+                Some(self.context.original_caller.as_str()),
+                Some(self.context.original_callee.as_str()),
+                "no_answer",
+                None,
+            );
+            let _ = self.server.webhook_sender.send(failed_event);
+        }
+
         self.stop_caller_ingress_monitor().await;
 
         if self.recording_state.is_some() {
@@ -4904,7 +5227,15 @@ impl SipSession {
 
         self.callee_event_tx = None;
 
-        let dialogs_to_hangup = self.pending_hangup.clone();
+        let mut dialogs_to_hangup = self.pending_hangup.clone();
+
+        // If the caller-leg BYE never completed (a failed send leaves the dialog
+        // Confirmed and retryable after the bye ordering fix), make one more
+        // bounded attempt here so the caller is still told to hang up. No-ops
+        // in the normal case where the dialog is already Terminated.
+        if !self.server_dialog.state().is_terminated() {
+            dialogs_to_hangup.insert(self.server_dialog.id());
+        }
 
         if !dialogs_to_hangup.is_empty() {
             let hangup_dialogs = dialogs_to_hangup
@@ -5422,6 +5753,7 @@ impl SipSession {
             ring_time: self.ring_time,
             answer_time: self.answer_time,
             last_error: self.last_error.clone(),
+            failure_source: self.failure_source,
             hangup_reason: self.hangup_reason.clone(),
             hangup_messages: self.recorded_hangup_messages(),
             original_caller: Some(self.context.original_caller.clone()),
@@ -6072,9 +6404,15 @@ impl SipSession {
             .map(|c| c.uri.clone())
             .unwrap_or_else(|| caller.clone());
 
+        // Present rustpbx's own external SIP address as the From host (same as
+        // Contact), keeping the original caller's user part — standard B2BUA
+        // behaviour, matching try_single_target.
+        let mut from_uri = caller.clone();
+        from_uri.host_with_port = contact.host_with_port.clone();
+
         let invite_option = rsipstack::dialog::invitation::InviteOption {
             callee: callee_uri.clone(),
-            caller: caller.clone(),
+            caller: from_uri,
             contact: contact.clone(),
             content_type: Some("application/sdp".to_string()),
             offer: Some(sdp_offer.into_bytes()),
@@ -6330,6 +6668,7 @@ impl SipSession {
         }
         SessionState::Initializing
     }
+
 
     async fn handle_play(
         &mut self,
@@ -7063,6 +7402,51 @@ impl SipSession {
             Ok(None) => Err(anyhow!("re-INVITE timed out")),
             Err(e) => Err(anyhow!("re-INVITE failed: {}", e)),
         }
+    }
+}
+
+/// Map a terminated callee dialog reason to a truthful SIP status for the
+/// caller leg.
+///
+/// rsipstack's `process_invite` returns `Ok((_, None))` (no final response)
+/// in several terminal cases — most notably when the upstream answers a
+/// 401/407 auth challenge but we hold no trunk credential to satisfy it, the
+/// challenge response is dropped and only a `Terminated(ProxyAuthRequired)`
+/// dialog state is emitted. Without this mapping every such case collapses
+/// into a misleading `500 / "No response from callee"`. Here we translate the
+/// terminated reason into an accurate status so the caller (e.g. an upstream
+/// switch) sees the real cause.
+fn map_callee_terminated_reason(
+    reason: &rsipstack::dialog::dialog::TerminatedReason,
+) -> (StatusCode, String) {
+    use rsipstack::dialog::dialog::TerminatedReason;
+    match reason {
+        TerminatedReason::ProxyAuthRequired => (
+            StatusCode::Forbidden,
+            "Upstream trunk requires authentication (missing or invalid trunk credentials)"
+                .to_string(),
+        ),
+        TerminatedReason::Timeout => {
+            (StatusCode::RequestTimeout, "No response from callee".to_string())
+        }
+        TerminatedReason::UacBusy | TerminatedReason::UasBusy => {
+            (StatusCode::BusyHere, "Callee busy".to_string())
+        }
+        TerminatedReason::UasDecline => (StatusCode::Decline, "Callee declined".to_string()),
+        TerminatedReason::UacCancel => {
+            (StatusCode::RequestTerminated, "Call cancelled".to_string())
+        }
+        TerminatedReason::ProxyError(code)
+        | TerminatedReason::UacOther(code)
+        | TerminatedReason::UasOther(code) => {
+            (code.clone(), format!("Callee returned {}", code))
+        }
+        // UacBye/UasBye and any future variants pre-answer are unexpected here;
+        // fall back to the original generic behaviour.
+        _ => (
+            StatusCode::ServerInternalError,
+            "No response from callee".to_string(),
+        ),
     }
 }
 

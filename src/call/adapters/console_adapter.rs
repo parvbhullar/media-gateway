@@ -4,7 +4,7 @@
 
 use crate::call::domain::*;
 use crate::callrecord::CallRecordHangupReason;
-use crate::console::handlers::call_control::CallCommandPayload;
+use crate::console::handlers::call_control::{CallCommandPayload, Leg, PlaySource};
 use anyhow::Result;
 
 /// Convert hangup reason string to CallRecordHangupReason
@@ -19,6 +19,14 @@ fn parse_hangup_reason(reason: Option<&str>) -> Option<CallRecordHangupReason> {
         "failed" => Some(CallRecordHangupReason::Failed),
         _ => None,
     })
+}
+
+/// Map the simple caller/callee `Leg` enum to a `LegId` using the session id as base.
+fn leg_to_leg_id(leg: Leg, session_id: &str) -> LegId {
+    match leg {
+        Leg::Caller => LegId::new(format!("{}-caller", session_id)),
+        Leg::Callee => LegId::new(format!("{}-callee", session_id)),
+    }
 }
 
 /// Convert Console CallCommandPayload to unified CallCommand
@@ -66,6 +74,116 @@ pub fn console_to_call_command(
         CallCommandPayload::Mute { track_id } => Ok(CallCommand::MuteTrack { track_id }),
 
         CallCommandPayload::Unmute { track_id } => Ok(CallCommand::UnmuteTrack { track_id }),
+
+        // ── Extended API variants ────────────────────────────────────────────
+
+        CallCommandPayload::ApiHangup { reason, code } => {
+            let cdr_reason = parse_hangup_reason(reason.as_deref());
+            let mut cmd = HangupCommand::local("api", cdr_reason, code);
+            cmd = cmd.with_cascade(HangupCascade::All);
+            Ok(CallCommand::Hangup(cmd))
+        }
+
+        CallCommandPayload::ApiMute { leg } => {
+            let leg_id = leg_to_leg_id(leg, session_id);
+            Ok(CallCommand::MuteTrack {
+                track_id: leg_id.into(),
+            })
+        }
+
+        CallCommandPayload::ApiUnmute { leg } => {
+            let leg_id = leg_to_leg_id(leg, session_id);
+            Ok(CallCommand::UnmuteTrack {
+                track_id: leg_id.into(),
+            })
+        }
+
+        CallCommandPayload::BlindTransfer { target, leg } => {
+            let leg_id = leg
+                .map(|l| leg_to_leg_id(l, session_id))
+                .unwrap_or_else(|| LegId::new(session_id));
+            Ok(CallCommand::Transfer {
+                leg_id,
+                target,
+                attended: false,
+            })
+        }
+
+        CallCommandPayload::AttendedTransferStart { target, leg } => {
+            let leg_id = leg
+                .map(|l| leg_to_leg_id(l, session_id))
+                .unwrap_or_else(|| LegId::new(session_id));
+            Ok(CallCommand::Transfer {
+                leg_id,
+                target,
+                attended: true,
+            })
+        }
+
+        CallCommandPayload::AttendedTransferComplete { consult_leg } => {
+            Ok(CallCommand::TransferComplete {
+                consult_leg: LegId::new(consult_leg),
+            })
+        }
+
+        CallCommandPayload::AttendedTransferCancel { consult_leg } => {
+            Ok(CallCommand::TransferCancel {
+                consult_leg: LegId::new(consult_leg),
+            })
+        }
+
+        CallCommandPayload::Play {
+            source,
+            leg,
+            options,
+        } => {
+            let media_source = match source {
+                PlaySource::File { path } => MediaSource::File { path },
+                PlaySource::Url { url } => MediaSource::Url { url },
+                PlaySource::Tts { text, voice } => MediaSource::Tts { text, voice },
+            };
+            let leg_id = leg.map(|l| leg_to_leg_id(l, session_id));
+            let play_opts = options.map(|o| PlayOptions {
+                loop_playback: o.loop_playback,
+                interrupt_on_dtmf: o.interrupt_on_dtmf,
+                ..PlayOptions::default()
+            });
+            Ok(CallCommand::Play {
+                leg_id,
+                source: media_source,
+                options: play_opts,
+            })
+        }
+
+        CallCommandPayload::Dtmf {
+            digits,
+            leg,
+            duration_ms: _,
+            inter_digit_ms: _,
+        } => {
+            let leg_id = leg
+                .map(|l| leg_to_leg_id(l, session_id))
+                .unwrap_or_else(|| LegId::new(session_id));
+            Ok(CallCommand::SendDtmf { leg_id, digits })
+        }
+
+        CallCommandPayload::Record {
+            path,
+            format,
+            beep,
+            max_duration_secs,
+            transcribe: _,
+        } => {
+            let resolved_path = path.unwrap_or_else(|| format!("/tmp/{}.wav", session_id));
+            Ok(CallCommand::StartRecording {
+                config: RecordConfig {
+                    path: resolved_path,
+                    max_duration_secs,
+                    beep: beep.unwrap_or(false),
+                    format,
+                },
+            })
+        }
     }
 }
 

@@ -58,6 +58,9 @@ pub struct ExtensionPayload {
 
 #[derive(Deserialize, Default, Clone)]
 pub struct SipTrunkForm {
+    /// Trunk kind discriminator: "sip" (default) or "webrtc". When omitted on
+    /// update, the existing kind is preserved.
+    pub kind: Option<String>,
     pub name: Option<String>,
     pub display_name: Option<String>,
     pub carrier: Option<String>,
@@ -85,10 +88,75 @@ pub struct SipTrunkForm {
     pub incoming_from_user_prefix: Option<String>,
     pub incoming_to_user_prefix: Option<String>,
     pub metadata: Option<String>,
+    /// Per-trunk HD codec upgrade (SIP kind). When true, the egress offer to
+    /// this trunk is pinned to `opus,g722,pcmu,pcma,g729` and flips to the
+    /// Quality strategy, so a low-quality caller is transcoded up to the best
+    /// codec this trunk accepts. Stored in `metadata.media.codecs`.
+    pub prefer_hd: Option<bool>,
     pub is_active: Option<bool>,
+    pub rewrite_hostport: Option<bool>,
     pub register_enabled: Option<bool>,
     pub register_expires: Option<i32>,
     pub register_extra_headers: Option<String>,
+    // ---- WebRTC kind fields. Populated only when `kind = "webrtc"`. ----
+    pub webrtc_signaling: Option<String>,
+    pub webrtc_endpoint_url: Option<String>,
+    pub webrtc_audio_codec: Option<String>,
+    pub webrtc_auth_header: Option<String>,
+    pub webrtc_health_check_url: Option<String>,
+    pub webrtc_ice_servers: Option<String>,
+    pub webrtc_protocol: Option<String>,
+    // ---- LiveKit kind fields. Populated only when `kind = "livekit"`. ----
+    pub livekit_server_url: Option<String>,
+    pub livekit_api_key: Option<String>,
+    pub livekit_api_secret: Option<String>,
+    pub livekit_room_template: Option<String>,
+    pub livekit_identity_template: Option<String>,
+    pub livekit_metadata_template: Option<String>,
+    pub livekit_audio_codec: Option<String>,
+    pub livekit_dispatch_endpoint: Option<String>,
+    pub livekit_dispatch_endpoint_auth_header: Option<String>,
+    /// JSON-encoded protocol blob — mirrors `webrtc_protocol`. Parsed to
+    /// `serde_json::Value` in `apply_form_to_active_model`.
+    pub livekit_dispatch_endpoint_protocol: Option<String>,
+    pub livekit_require_webhook_ack: Option<bool>,
+    pub livekit_health_check_url: Option<String>,
+    pub livekit_signaling_timeout_ms: Option<u64>,
+    pub livekit_delete_room_on_hangup: Option<bool>,
+    /// LiveKit explicit agent name to dispatch into the room. Either this
+    /// or `livekit_dispatch_endpoint` must be set.
+    #[serde(default)]
+    pub livekit_agent_name: Option<String>,
+    /// When true, agent_dispatch RPC failure aborts the call.
+    #[serde(default)]
+    pub livekit_require_agent_dispatch: Option<bool>,
+    /// Watchdog: cancel the call if no remote participant joins within
+    /// this many milliseconds.
+    #[serde(default)]
+    pub livekit_bot_join_timeout_ms: Option<u64>,
+    /// Hold-tone frequency (Hz) emitted on the SIP side while waiting
+    /// for the bot. 0 = silence.
+    #[serde(default)]
+    pub livekit_hold_tone_hz: Option<u16>,
+    /// JWT TTL in seconds. Default 1800 (30 min). Bumps the auto-
+    /// reconnect window after a mid-call network blip.
+    #[serde(default)]
+    pub livekit_jwt_ttl_secs: Option<u64>,
+    // ---- ExternalMedia kind fields. Populated only when
+    // ---- `kind = "external_media"`. ----
+    /// Command used to spawn the per-call sidecar. rustpbx appends
+    /// `--call-id/--did/--caller/--port`. Required for this kind.
+    pub external_media_command: Option<String>,
+    /// SIP-side voice codec to negotiate. Allowed: opus, g722, pcmu, pcma.
+    pub external_media_audio_codec: Option<String>,
+    /// How long (ms) to hold the SIP INVITE waiting for the sidecar's
+    /// `READY` datagram before answering. Default 15000.
+    #[serde(default)]
+    pub external_media_bot_join_timeout_ms: Option<u64>,
+    /// Optional hold-tone frequency (Hz) while no sidecar audio arrives.
+    /// Blank = silence.
+    #[serde(default)]
+    pub external_media_hold_tone_hz: Option<u16>,
 }
 
 #[derive(Deserialize, Default, Clone)]

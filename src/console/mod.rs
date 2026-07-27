@@ -36,6 +36,8 @@ pub struct ConsoleState {
     pub pending_reload: Arc<AtomicBool>,
     /// Addon-specific state storage using http::Extensions for type-safe access
     addon_extensions: Arc<std::sync::RwLock<http::Extensions>>,
+    /// Cached display timezone (IANA name). Persisted in system_config as "display.timezone".
+    display_timezone: Arc<RwLock<String>>,
 }
 
 /// Trait for addon state types that can be stored in ConsoleState.
@@ -70,6 +72,15 @@ impl ConsoleState {
         };
         let i18n = Arc::new(I18n::new(locale_config));
 
+        let display_timezone = crate::models::system_config::Model::get(&db, "display.timezone")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|row| {
+                serde_json::from_str::<String>(&row.value).ok()
+            })
+            .unwrap_or_else(|| "Asia/Kolkata".to_string());
+
         Ok(Arc::new(Self {
             db,
             config,
@@ -81,6 +92,7 @@ impl ConsoleState {
             perm_cache: Arc::new(Mutex::new(HashMap::new())),
             pending_reload: Arc::new(AtomicBool::new(false)),
             addon_extensions: Arc::new(std::sync::RwLock::new(http::Extensions::new())),
+            display_timezone: Arc::new(RwLock::new(display_timezone)),
         }))
     }
 
@@ -122,92 +134,94 @@ impl ConsoleState {
     ) -> Response {
         let mut ctx = ctx;
         if ctx.is_object()
-            && let Some(map) = ctx.as_object_mut()
-        {
-            map.entry("base_path")
-                .or_insert_with(|| serde_json::Value::String(self.base_path().to_string()));
-            map.entry("api_prefix")
-                .or_insert_with(|| serde_json::Value::String(self.api_prefix().to_string()));
-            // Inject addon sidebar items
-            if let Some(app_state) = self.app_state() {
-                let addon_items = app_state
-                    .addon_registry
-                    .get_sidebar_items(app_state.clone());
-                map.entry("addon_sidebar_items").or_insert_with(|| {
-                    serde_json::to_value(addon_items).unwrap_or(serde_json::Value::Null)
+            && let Some(map) = ctx.as_object_mut() {
+                map.entry("base_path")
+                    .or_insert_with(|| serde_json::Value::String(self.base_path().to_string()));
+                map.entry("api_prefix")
+                    .or_insert_with(|| serde_json::Value::String(self.api_prefix().to_string()));
+                // Inject addon sidebar items
+                if let Some(app_state) = self.app_state() {
+                    let addon_items = app_state
+                        .addon_registry
+                        .get_sidebar_items(app_state.clone());
+                    map.entry("addon_sidebar_items").or_insert_with(|| {
+                        serde_json::to_value(addon_items).unwrap_or(serde_json::Value::Null)
+                    });
+                }
+                map.entry("logout_url")
+                    .or_insert_with(|| serde_json::Value::String(self.url_for("/logout")));
+                map.entry("forgot_url")
+                    .or_insert_with(|| serde_json::Value::String(self.forgot_url()));
+                map.entry("login_url")
+                    .or_insert_with(|| serde_json::Value::String(self.url_for("/login")));
+                map.entry("register_url")
+                    .or_insert_with(|| serde_json::Value::String(self.register_url(None)));
+                map.entry("username").or_insert(serde_json::Value::Null);
+                map.entry("email").or_insert(serde_json::Value::Null);
+                map.entry("site_version").or_insert_with(|| {
+                    serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string())
+                });
+                map.entry("edition").or_insert_with(|| {
+                    if cfg!(feature = "commerce") {
+                        serde_json::Value::String("commerce".to_string())
+                    } else {
+                        serde_json::Value::String("community".to_string())
+                    }
+                });
+                map.entry("site_name")
+                    .or_insert_with(|| serde_json::Value::String("RustPBX".to_string()));
+                map.entry("page_title")
+                    .or_insert_with(|| serde_json::Value::String("RustPBX admin".to_string()));
+                map.entry("site_description").or_insert_with(|| {
+                    serde_json::Value::String("RustPBX - A Rust-based PBX system".to_string())
+                });
+                map.entry("site_url").or_insert_with(|| {
+                    serde_json::Value::String("https://rustpbx.com".to_string())
+                });
+                map.entry("site_footer").or_insert_with(|| {
+                    serde_json::Value::String("© 2025 RustPBX. All rights reserved.".to_string())
+                });
+                let static_path = self.config().static_path();
+                map.entry("site_logo").or_insert_with(|| {
+                    serde_json::Value::String(format!("{}/images/logo.png", static_path))
+                });
+                map.entry("site_logo_mini").or_insert_with(|| {
+                    serde_json::Value::String(format!("{}/images/logo-mini.png", static_path))
+                });
+                map.entry("favicon_url").or_insert_with(|| {
+                    serde_json::Value::String(format!("{}/images/favicon.png", static_path))
+                });
+                map.entry("demo_mode")
+                    .or_insert_with(|| serde_json::Value::Bool(self.config().demo_mode));
+                map.entry("display_timezone")
+                    .or_insert_with(|| serde_json::Value::String(self.display_timezone()));
+                if let Some(ref alpine_js) = self.config.alpine_js {
+                    map.entry("alpine_js")
+                        .or_insert_with(|| serde_json::Value::String(alpine_js.clone()));
+                }
+                if let Some(ref tailwind_js) = self.config.tailwind_js {
+                    map.entry("tailwind_js")
+                        .or_insert_with(|| serde_json::Value::String(tailwind_js.clone()));
+                }
+                if let Some(ref chart_js) = self.config.chart_js {
+                    map.entry("chart_js")
+                        .or_insert_with(|| serde_json::Value::String(chart_js.clone()));
+                }
+                if let Some(ref jssip_js) = self.config.jssip_js {
+                    map.entry("jssip_js")
+                        .or_insert_with(|| serde_json::Value::String(jssip_js.clone()));
+                }
+
+                // ── i18n context injection ──────────────────────────────
+                map.entry("locale")
+                    .or_insert_with(|| serde_json::Value::String(locale.to_string()));
+                map.entry("t")
+                    .or_insert_with(|| self.i18n.get_translations_json(locale));
+                map.entry("available_locales").or_insert_with(|| {
+                    serde_json::to_value(self.i18n.available_locales())
+                        .unwrap_or(serde_json::Value::Array(vec![]))
                 });
             }
-            map.entry("logout_url")
-                .or_insert_with(|| serde_json::Value::String(self.url_for("/logout")));
-            map.entry("forgot_url")
-                .or_insert_with(|| serde_json::Value::String(self.forgot_url()));
-            map.entry("login_url")
-                .or_insert_with(|| serde_json::Value::String(self.url_for("/login")));
-            map.entry("register_url")
-                .or_insert_with(|| serde_json::Value::String(self.register_url(None)));
-            map.entry("username").or_insert(serde_json::Value::Null);
-            map.entry("email").or_insert(serde_json::Value::Null);
-            map.entry("site_version").or_insert_with(|| {
-                serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string())
-            });
-            map.entry("edition").or_insert_with(|| {
-                if cfg!(feature = "commerce") {
-                    serde_json::Value::String("commerce".to_string())
-                } else {
-                    serde_json::Value::String("community".to_string())
-                }
-            });
-            map.entry("site_name")
-                .or_insert_with(|| serde_json::Value::String("RustPBX".to_string()));
-            map.entry("page_title")
-                .or_insert_with(|| serde_json::Value::String("RustPBX admin".to_string()));
-            map.entry("site_description").or_insert_with(|| {
-                serde_json::Value::String("RustPBX - A Rust-based PBX system".to_string())
-            });
-            map.entry("site_url")
-                .or_insert_with(|| serde_json::Value::String("https://rustpbx.com".to_string()));
-            map.entry("site_footer").or_insert_with(|| {
-                serde_json::Value::String("© 2025 RustPBX. All rights reserved.".to_string())
-            });
-            let static_path = self.config().static_path();
-            map.entry("site_logo").or_insert_with(|| {
-                serde_json::Value::String(format!("{}/images/logo.png", static_path))
-            });
-            map.entry("site_logo_mini").or_insert_with(|| {
-                serde_json::Value::String(format!("{}/images/logo-mini.png", static_path))
-            });
-            map.entry("favicon_url").or_insert_with(|| {
-                serde_json::Value::String(format!("{}/images/favicon.png", static_path))
-            });
-            map.entry("demo_mode")
-                .or_insert_with(|| serde_json::Value::Bool(self.config().demo_mode));
-            if let Some(ref alpine_js) = self.config.alpine_js {
-                map.entry("alpine_js")
-                    .or_insert_with(|| serde_json::Value::String(alpine_js.clone()));
-            }
-            if let Some(ref tailwind_js) = self.config.tailwind_js {
-                map.entry("tailwind_js")
-                    .or_insert_with(|| serde_json::Value::String(tailwind_js.clone()));
-            }
-            if let Some(ref chart_js) = self.config.chart_js {
-                map.entry("chart_js")
-                    .or_insert_with(|| serde_json::Value::String(chart_js.clone()));
-            }
-            if let Some(ref jssip_js) = self.config.jssip_js {
-                map.entry("jssip_js")
-                    .or_insert_with(|| serde_json::Value::String(jssip_js.clone()));
-            }
-
-            // ── i18n context injection ──────────────────────────────
-            map.entry("locale")
-                .or_insert_with(|| serde_json::Value::String(locale.to_string()));
-            map.entry("t")
-                .or_insert_with(|| self.i18n.get_translations_json(locale));
-            map.entry("available_locales").or_insert_with(|| {
-                serde_json::to_value(self.i18n.available_locales())
-                    .unwrap_or(serde_json::Value::Array(vec![]))
-            });
-        }
 
         let mut tmpl_env = Environment::new();
 
@@ -422,6 +436,30 @@ impl ConsoleState {
 
     pub fn db(&self) -> &DatabaseConnection {
         &self.db
+    }
+
+    pub fn display_timezone(&self) -> String {
+        self.display_timezone
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_else(|_| "Asia/Kolkata".to_string())
+    }
+
+    pub async fn set_display_timezone(&self, tz: &str) -> Result<(), sea_orm::DbErr> {
+        crate::models::system_config::Model::upsert(
+            &self.db,
+            "display.timezone",
+            &serde_json::to_string(tz).unwrap_or_else(|_| format!("\"{}\"", tz)),
+            true,
+        )
+        .await?;
+        match self.display_timezone.write() {
+            Ok(mut guard) => *guard = tz.to_string(),
+            Err(e) => {
+                tracing::warn!("display_timezone RwLock poisoned, in-memory cache not updated: {}", e);
+            }
+        }
+        Ok(())
     }
 
     pub fn mark_pending_reload(&self) {

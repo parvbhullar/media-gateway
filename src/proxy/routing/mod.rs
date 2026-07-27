@@ -14,12 +14,17 @@ use std::{
 };
 use tokio::net::lookup_host;
 
+pub mod codec_normalize;
+pub mod did_index;
 pub mod http;
 #[cfg(test)]
 mod http_tests;
+pub mod match_types;
 pub mod matcher;
+pub mod table_matcher;
 #[cfg(test)]
 mod tests;
+pub mod trunk_group_resolver;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ConfigOrigin {
@@ -115,6 +120,22 @@ pub struct TrunkConfig {
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub did_numbers: Vec<String>,
+
+    /// Trunk kind discriminator. `"sip"` (default) for SIP trunks; `"webrtc"`
+    /// for WebRTC bridge trunks. The routing matcher branches on this in the
+    /// `Forward` arm — SIP trunks take the legacy SIP forward path; WebRTC
+    /// trunks short-circuit into [`crate::proxy::bridge::dispatch_webrtc`].
+    #[serde(default = "default_trunk_kind")]
+    pub kind: String,
+    /// Raw `kind_config` JSON for non-SIP kinds. Only populated when
+    /// `kind != "sip"`. Cached here so the matcher's WebRTC branch can hand
+    /// it directly to `dispatch_webrtc` without a second DB hit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind_config: Option<serde_json::Value>,
+}
+
+fn default_trunk_kind() -> String {
+    "sip".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -212,6 +233,8 @@ impl Default for TrunkConfig {
             video_policy: None,
             did_numbers: Vec::new(),
             origin: ConfigOrigin::embedded(),
+            kind: default_trunk_kind(),
+            kind_config: None,
         }
     }
 }
@@ -366,6 +389,9 @@ pub enum DestConfig {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct RouteRule {
     pub name: String,
+    /// DB primary key — set when the rule was loaded from the database.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub db_id: Option<i64>,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]
@@ -408,6 +434,7 @@ impl Default for RouteRule {
     fn default() -> Self {
         Self {
             name: String::new(),
+            db_id: None,
             description: None,
             priority: 0,
             direction: RouteDirection::Any,

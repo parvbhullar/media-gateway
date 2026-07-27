@@ -13,21 +13,30 @@ use std::{
 use tracing::info;
 
 use crate::{
-    call::{DialDirection, RoutingState, policy::PolicyCheckStatus},
+    call::{DialDirection, MatchedRouteContext, RoutingState, policy::PolicyCheckStatus},
     config::{DialplanHints, RouteResult},
     proxy::routing::{ActionType, RouteQueueConfig, RouteRule, SourceTrunk, TrunkConfig},
 };
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct RouteTrace {
     pub matched_rule: Option<String>,
     pub selected_trunk: Option<String>,
+    /// Set when the route dest resolved through a trunk_group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trunk_group_name: Option<String>,
     pub used_default_route: bool,
     pub rewrite_operations: Vec<String>,
     pub abort: Option<RouteAbortTrace>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_record_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_table: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_record_index: Option<i32>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RouteAbortTrace {
     pub code: u16,
     pub reason: Option<String>,
@@ -274,15 +283,19 @@ async fn match_invite_impl(
             }
         }
 
-        let hints = if !rule.codecs.is_empty() || rule.disable_ice_servers.is_some() {
+        let mut hints = {
             let mut hints = DialplanHints::default();
             if !rule.codecs.is_empty() {
                 hints.allow_codecs = Some(rule.codecs.clone());
             }
             hints.disable_ice_servers = rule.disable_ice_servers;
+            if let Some(id) = rule.db_id {
+                hints.extensions.insert(MatchedRouteContext {
+                    id,
+                    name: rule.name.clone(),
+                });
+            }
             Some(hints)
-        } else {
-            None
         };
 
         // Handle based on action type
@@ -343,10 +356,26 @@ async fn match_invite_impl(
                         trace.selected_trunk = Some(selected_trunk.clone());
                     }
 
+                    if let Some(h) = hints.as_mut() {
+                        apply_trunk_media_hints(h, &routing_state, &selected_trunk).await;
+                    }
+
                     if let Some(trunk_config) = trunks
                         .as_ref()
                         .and_then(|trunks| trunks.get(&selected_trunk))
                     {
+                        // Per-trunk HD upgrade: a non-empty codec list on
+                        // the selected trunk (from metadata.media.codecs,
+                        // loaded in-memory) pins the egress offer and flips
+                        // to Quality strategy in call.rs, transcoding a
+                        // low-quality caller up to the best the callee
+                        // accepts. Overrides the (dormant) group config.
+                        if !trunk_config.codec.is_empty()
+                            && let Some(h) = hints.as_mut()
+                        {
+                            h.trunk_media_codecs = Some(trunk_config.codec.clone());
+                        }
+
                         // Check Trunk Policy
                         if let Some(policy) = &trunk_config.policy
                             && let Some(guard) = &routing_state.policy_guard
@@ -382,11 +411,96 @@ async fn match_invite_impl(
                             }
                         }
 
-                        apply_trunk_config(&mut option, trunk_config)?;
-                        info!(
-                            "Selected trunk: {} for destination: {}",
-                            selected_trunk, trunk_config.dest
-                        );
+                        // Branch on trunk kind (Phase 7). WebRTC and
+                        // LiveKit trunks short-circuit into the bridge
+                        // dispatcher; SIP trunks fall through to the
+                        // legacy Forward path.
+                        match trunk_config.kind.as_str() {
+                            "webrtc" => {
+                                let kind_config = trunk_config
+                                    .kind_config
+                                    .clone()
+                                    .unwrap_or(serde_json::Value::Null);
+                                info!(
+                                    trunk = %selected_trunk,
+                                    kind = "webrtc",
+                                    "routing INVITE to WebRTC bridge dispatcher"
+                                );
+                                return Ok(RouteResult::ExternalBridge {
+                                    kind: crate::proxy::bridge::session::BridgeKind::WebRtc,
+                                    trunk_name: selected_trunk,
+                                    kind_config,
+                                    option,
+                                    hints,
+                                });
+                            }
+                            "livekit" => {
+                                let kind_config = trunk_config
+                                    .kind_config
+                                    .clone()
+                                    .unwrap_or(serde_json::Value::Null);
+                                info!(
+                                    trunk = %selected_trunk,
+                                    kind = "livekit",
+                                    "routing INVITE to LiveKit bridge dispatcher"
+                                );
+                                return Ok(RouteResult::ExternalBridge {
+                                    kind: crate::proxy::bridge::session::BridgeKind::LiveKit,
+                                    trunk_name: selected_trunk,
+                                    kind_config,
+                                    option,
+                                    hints,
+                                });
+                            }
+                            "external_media" => {
+                                let kind_config = trunk_config
+                                    .kind_config
+                                    .clone()
+                                    .unwrap_or(serde_json::Value::Null);
+                                info!(
+                                    trunk = %selected_trunk,
+                                    kind = "external_media",
+                                    "routing INVITE to external_media (PCM sidecar) dispatcher"
+                                );
+                                return Ok(RouteResult::ExternalBridge {
+                                    kind: crate::proxy::bridge::session::BridgeKind::ExternalMedia,
+                                    trunk_name: selected_trunk,
+                                    kind_config,
+                                    option,
+                                    hints,
+                                });
+                            }
+                            "sip" | "" => {
+                                apply_trunk_config(&mut option, trunk_config)?;
+                                info!(
+                                    "Selected trunk: {} for destination: {}",
+                                    selected_trunk, trunk_config.dest
+                                );
+                            }
+                            other => {
+                                tracing::warn!(
+                                    trunk = %selected_trunk,
+                                    kind = %other,
+                                    "trunk has unsupported kind; rejecting with 503"
+                                );
+                                if let Some(trace) = &mut trace {
+                                    trace.abort = Some(RouteAbortTrace {
+                                        code: rsipstack::sip::StatusCode::ServiceUnavailable.into(),
+                                        reason: Some(format!(
+                                            "trunk '{}' has unsupported kind '{}'",
+                                            selected_trunk, other
+                                        )),
+                                    });
+                                }
+                                return Ok(RouteResult::Abort(
+                                    rsipstack::sip::StatusCode::ServiceUnavailable,
+                                    Some(format!(
+                                        "trunk '{}' has unsupported kind '{}'",
+                                        selected_trunk, other
+                                    )),
+                                ));
+                            }
+                        }
                     } else {
                         info!("Trunk '{}' not found in configuration", selected_trunk);
                     }
@@ -450,10 +564,26 @@ async fn match_invite_impl(
                             trace.selected_trunk = Some(selected_trunk.clone());
                         }
 
+                        if let Some(h) = hints.as_mut() {
+                            apply_trunk_media_hints(h, &routing_state, &selected_trunk).await;
+                        }
+
                         if let Some(trunk_config) = trunks
                             .as_ref()
                             .and_then(|trunks| trunks.get(&selected_trunk))
                         {
+                            // Per-trunk HD upgrade: a non-empty codec list on
+                            // the selected trunk (from metadata.media.codecs,
+                            // loaded in-memory) pins the egress offer and flips
+                            // to Quality strategy in call.rs, transcoding a
+                            // low-quality caller up to the best the callee
+                            // accepts. Overrides the (dormant) group config.
+                            if !trunk_config.codec.is_empty()
+                                && let Some(h) = hints.as_mut()
+                            {
+                                h.trunk_media_codecs = Some(trunk_config.codec.clone());
+                            }
+
                             // Check Trunk Policy
                             if let Some(policy) = &trunk_config.policy
                                 && let Some(guard) = &routing_state.policy_guard
@@ -1021,7 +1151,88 @@ fn update_uri_host(uri: &rsipstack::sip::Uri, new_host: &str) -> Result<rsipstac
 }
 
 /// Select trunk
-fn select_trunk(
+/// Enrich hints with the selected trunk's group `media_config` (Phase-5
+/// hot-path enforcement): the group's codecs shape the egress offer (HD
+/// upgrade — offered even when the caller didn't offer them; the bridge
+/// transcoder covers the mismatch) and its jitter policy rides along to
+/// the bridge. Best-effort: routing never fails over media policy.
+///
+/// `media_config` lives on `rustpbx_trunk_groups`; the selected name may
+/// be the group itself or a member gateway, so try both keys.
+async fn apply_trunk_media_hints(
+    hints: &mut DialplanHints,
+    routing_state: &RoutingState,
+    trunk_name: &str,
+) {
+    let Some(db) = routing_state.db() else { return };
+    let Some(cfg) = trunk_group_media_config(db, trunk_name).await else {
+        return;
+    };
+
+    if !cfg.codecs.is_empty() {
+        let codecs: Vec<String> = cfg
+            .codecs
+            .iter()
+            .filter_map(|c| super::codec_normalize::normalize_codec(c).map(str::to_string))
+            .collect();
+        if !codecs.is_empty() {
+            info!(trunk = %trunk_name, ?codecs, "trunk media_config codecs applied to egress offer");
+            hints.trunk_media_codecs = Some(codecs);
+        }
+    }
+    if cfg.jitter_buffer.is_some() {
+        hints.trunk_jitter_buffer = cfg.jitter_buffer;
+    }
+}
+
+/// Load a trunk's group `media_config`, keyed by group name or member
+/// gateway name (the config lives on `rustpbx_trunk_groups`). Returns
+/// `None` on any miss or error — media policy is always best-effort.
+pub(crate) async fn trunk_group_media_config(
+    db: &sea_orm::DatabaseConnection,
+    trunk_name: &str,
+) -> Option<crate::handler::api_v1::trunk_media::TrunkMediaConfig> {
+    use crate::models::{trunk_group, trunk_group_member};
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+    let group = match trunk_group::Entity::find()
+        .filter(trunk_group::Column::Name.eq(trunk_name))
+        .one(db)
+        .await
+    {
+        Ok(Some(g)) => Some(g),
+        Ok(None) => {
+            // Maybe a member gateway name — resolve to its group.
+            match trunk_group_member::Entity::find()
+                .filter(trunk_group_member::Column::GatewayName.eq(trunk_name))
+                .one(db)
+                .await
+            {
+                Ok(Some(member)) => trunk_group::Entity::find_by_id(member.trunk_group_id)
+                    .one(db)
+                    .await
+                    .ok()
+                    .flatten(),
+                _ => None,
+            }
+        }
+        Err(e) => {
+            tracing::debug!(trunk = %trunk_name, error = %e, "trunk_group media lookup failed");
+            None
+        }
+    };
+
+    let json = group.and_then(|g| g.media_config)?;
+    match serde_json::from_value(json) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::warn!(trunk = %trunk_name, error = %e, "stored media_config is malformed; ignoring");
+            None
+        }
+    }
+}
+
+pub(crate) fn select_trunk(
     dest_config: &crate::proxy::routing::DestConfig,
     select_method: &str,
     hash_key: &Option<String>,
@@ -1164,12 +1375,37 @@ pub(crate) fn apply_trunk_config(option: &mut InviteOption, trunk: &TrunkConfig)
         addr: dest_uri.host_with_port.clone(),
     });
 
-    // Save original caller before potential rewrite for P-Asserted-Identity header
+    // Original caller, preserved for the P-Asserted-Identity header below.
     let original_caller = option.caller.clone();
 
     if trunk.rewrite_hostport {
+        // Rewrite only the Request-URI/callee host to the trunk destination so
+        // the INVITE is addressed to the trunk. The From/caller is deliberately
+        // NOT rewritten here: the outbound leg presents rustpbx's own external
+        // SIP address as the From host (standard B2BUA identity), and the
+        // original caller is carried in P-Asserted-Identity below.
         option.callee.host_with_port = dest_uri.host_with_port.clone();
-        option.caller.host_with_port = dest_uri.host_with_port.clone();
+    }
+
+    // Stamp the transport onto the callee URI so downstream CANCEL/BYE/ACK
+    // transactions inherit it. rsipstack's send_dialog_request only sets
+    // tx.destination from a Route header — without ;transport=X on the
+    // Request-URI, subsequent requests fall back to UDP via
+    // SipAddr::try_from(uri), even when the original INVITE went over TCP.
+    if let Some(t) = transport {
+        if !matches!(t, rsipstack::sip::transport::Transport::Udp) {
+            let has_transport = option
+                .callee
+                .params
+                .iter()
+                .any(|p| matches!(p, rsipstack::sip::Param::Transport(_)));
+            if !has_transport {
+                option
+                    .callee
+                    .params
+                    .push(rsipstack::sip::Param::Transport(t));
+            }
+        }
     }
 
     // Set authentication info
@@ -1198,4 +1434,189 @@ pub(crate) fn apply_trunk_config(option: &mut InviteOption, trunk: &TrunkConfig)
     }
 
     Ok(())
+}
+
+// ─── DID-first inbound resolution ───────────────────────────────────────────
+use crate::proxy::routing::did_index::DidIndex;
+
+/// Outcome of a DID-first lookup against a [`DidIndex`].
+#[derive(Debug)]
+pub enum DidLookup {
+    /// Route directly to this extension, skipping the rule engine.
+    ShortCircuitExtension(String),
+    /// Known DID, no extension — fall through to rules (caller may want to
+    /// tag context).
+    KnownNoExtension { trunk_name: String, number: String },
+    /// DID owned by another trunk; strict mode → reject with this reason.
+    Reject(String),
+    /// Not a DID we know (unparseable, unknown, or loose-mode mismatch);
+    /// continue with existing matching.
+    FallThrough,
+}
+
+/// DID-first inbound resolution. Pure function — no I/O.
+///
+/// * `index` — current DID snapshot.
+/// * `default_country` — ISO alpha-2 (e.g. `"US"`) for normalizing
+///   local-format numbers.
+/// * `callee_user` — the `To:` user part as received on the wire.
+/// * `source_trunk_name` — the trunk the INVITE arrived on.
+/// * `strict_mode` — when true, mismatched ownership is a reject; otherwise
+///   it's a warn + fall-through.
+pub fn did_lookup_result(
+    index: &DidIndex,
+    default_country: Option<&str>,
+    callee_user: &str,
+    source_trunk_name: &str,
+    strict_mode: bool,
+) -> DidLookup {
+    let region_upper = default_country.map(|c| c.to_ascii_uppercase());
+    let normalized = match crate::models::did::normalize_did(callee_user, region_upper.as_deref()) {
+        Ok(n) => n,
+        Err(_) => return DidLookup::FallThrough,
+    };
+
+    let Some(entry) = index.lookup(&normalized) else {
+        return DidLookup::FallThrough;
+    };
+
+    // Soft-disabled numbers must reject inbound traffic outright rather
+    // than fall through to rule-based routing. Returning Reject here
+    // produces 403 Forbidden with "Number is disabled" reason.
+    if !entry.enabled {
+        return DidLookup::Reject(format!("Number is disabled: {}", normalized));
+    }
+
+    let Some(owner_trunk) = entry.trunk_name.as_deref() else {
+        tracing::debug!(
+            did = %normalized,
+            source = %source_trunk_name,
+            "inbound DID is unassigned (no owning trunk), falling through"
+        );
+        return DidLookup::FallThrough;
+    };
+
+    if owner_trunk != source_trunk_name {
+        if strict_mode {
+            return DidLookup::Reject(format!(
+                "DID {} belongs to trunk '{}', call arrived on '{}'",
+                normalized, owner_trunk, source_trunk_name
+            ));
+        }
+        tracing::warn!(
+            did = %normalized,
+            owner = %owner_trunk,
+            source = %source_trunk_name,
+            "inbound DID ownership mismatch (loose mode, falling through)"
+        );
+        return DidLookup::FallThrough;
+    }
+
+    if let Some(ext) = &entry.extension_number {
+        DidLookup::ShortCircuitExtension(ext.clone())
+    } else {
+        DidLookup::KnownNoExtension {
+            trunk_name: owner_trunk.to_string(),
+            number: normalized,
+        }
+    }
+}
+
+/// Build the [`RouteResult::Forward`] used when a DID short-circuits to an
+/// on-net extension. Mirrors the `ActionType::Forward` branch in
+/// [`match_invite_impl`] for the "no dest trunk" case (internal extension):
+/// the callee user is rewritten to the extension number and the result is
+/// wrapped in a bare `Forward(option, None)`. No `DialplanHints`, no trunk
+/// config, no rewrite of host/port — the local registrar resolves the
+/// contact from the extension user, just like a rule-driven internal-only
+/// forward.
+pub fn build_did_extension_route_result(
+    mut option: InviteOption,
+    extension: &str,
+) -> Result<RouteResult> {
+    option.callee = update_uri_user(&option.callee, extension)?;
+    Ok(RouteResult::Forward(option, None))
+}
+
+#[cfg(test)]
+mod trunk_config_tests {
+    use super::*;
+    use rsipstack::sip::Uri;
+
+    fn invite_with(caller: &str, callee: &str) -> InviteOption {
+        InviteOption {
+            caller: Uri::try_from(caller).unwrap(),
+            callee: Uri::try_from(callee).unwrap(),
+            ..Default::default()
+        }
+    }
+
+    /// With `rewrite_hostport = true`, only the Request-URI/callee host is
+    /// rewritten to the trunk destination. The From/caller host must be left
+    /// untouched — the outbound leg sets the From to rustpbx's external SIP
+    /// address (B2BUA identity), and the original caller is carried in
+    /// P-Asserted-Identity. Regression for the bug where an outbound trunk
+    /// INVITE leaked the upstream caller's host into the From.
+    #[test]
+    fn rewrite_hostport_rewrites_callee_but_not_caller() {
+        let mut option = invite_with(
+            "sip:+919228883071@44.229.228.186:5060",
+            "sip:917011324474@example.invalid:5060",
+        );
+        let trunk = TrunkConfig {
+            dest: "sip:159.65.144.179:5060".to_string(),
+            rewrite_hostport: true,
+            ..Default::default()
+        };
+
+        apply_trunk_config(&mut option, &trunk).unwrap();
+
+        assert_eq!(
+            option.callee.host().to_string(),
+            "159.65.144.179",
+            "callee/Request-URI host must be rewritten to the trunk destination"
+        );
+        assert_eq!(
+            option.caller.host().to_string(),
+            "44.229.228.186",
+            "caller/From host must NOT be rewritten by apply_trunk_config"
+        );
+        assert_eq!(
+            option.caller.user().unwrap_or_default(),
+            "+919228883071",
+            "caller user part must be preserved"
+        );
+    }
+
+    /// P-Asserted-Identity carries the original (un-rewritten) caller so the
+    /// downstream carrier still sees the true source identity.
+    #[test]
+    fn trunk_with_auth_adds_pai_with_original_caller() {
+        let mut option = invite_with(
+            "sip:+919228883071@44.229.228.186:5060",
+            "sip:917011324474@example.invalid:5060",
+        );
+        let trunk = TrunkConfig {
+            dest: "sip:159.65.144.179:5060".to_string(),
+            rewrite_hostport: true,
+            username: Some("user".to_string()),
+            password: Some("pass".to_string()),
+            ..Default::default()
+        };
+
+        apply_trunk_config(&mut option, &trunk).unwrap();
+
+        let headers = option.headers.expect("headers populated");
+        let pai = headers.iter().find_map(|h| match h {
+            rsipstack::sip::Header::Other(name, value) if name == "P-Asserted-Identity" => {
+                Some(value.clone())
+            }
+            _ => None,
+        });
+        assert_eq!(
+            pai.as_deref(),
+            Some("<sip:+919228883071@44.229.228.186:5060>"),
+            "P-Asserted-Identity must carry the original caller identity"
+        );
+    }
 }

@@ -1,5 +1,5 @@
 use crate::{
-    call::{CalleeDisplayName, TransactionCookie, TrunkContext},
+    call::{CalleeDisplayName, MatchedRouteContext, TransactionCookie, TrunkContext},
     callrecord::{
         CallDetails, CallRecord, CallRecordHangupMessage, CallRecordHangupReason,
         CallRecordLastError, CallRecordMedia, CallRecordRewrite, CallRecordSender,
@@ -104,6 +104,7 @@ impl CallReporter {
                 code: u16::from(code.clone()),
                 reason: reason.clone(),
                 target: None,
+                endpoint: None,
             });
         }
 
@@ -144,6 +145,12 @@ impl CallReporter {
         } else {
             (None, None)
         };
+        let route_id = self
+            .context
+            .dialplan
+            .extensions
+            .get::<MatchedRouteContext>()
+            .map(|r| r.id);
 
         let mut recorder = Vec::new();
 
@@ -161,12 +168,23 @@ impl CallReporter {
                 extra: None,
             });
         }
-        tracing::info!(
-            recording = ?self.context.dialplan.recording,
-            has_sipflow_backend = ?has_sipflow_backend,
-            "Call recording files collected: {:?}",
-            recorder
-        );
+        if recorder.is_empty() {
+            tracing::warn!(
+                recording_enabled = self.context.dialplan.recording.enabled,
+                has_recorder_option = self.context.dialplan.recording.option.is_some(),
+                recorder_file = self.context.dialplan.recording.option
+                    .as_ref().map(|o| o.recorder_file.as_str()).unwrap_or(""),
+                has_sipflow_backend,
+                "reporter: no media files collected — recording WAV will NOT be uploaded"
+            );
+        } else {
+            tracing::info!(
+                has_sipflow_backend,
+                count = recorder.len(),
+                "reporter: collected {} media file(s) for upload",
+                recorder.len()
+            );
+        }
         // Copy values from cookie to extras_map
         // (Removed as TransactionCookie no longer has values)
 
@@ -183,10 +201,12 @@ impl CallReporter {
             department_id,
             extension_id,
             sip_trunk_id,
+            route_id,
             sip_gateway,
             recording_url: recording_path_for_db,
             rewrite,
             last_error,
+            failure_source: snapshot.failure_source,
             metadata: snapshot
                 .extensions
                 .get::<HashMap<String, String>>()
@@ -430,6 +450,7 @@ mod tests {
             ring_time: None,
             answer_time: None,
             last_error: None,
+            failure_source: None,
             hangup_reason: None,
             hangup_messages: vec![],
             original_caller: None,

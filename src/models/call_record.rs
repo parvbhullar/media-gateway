@@ -9,7 +9,7 @@ use sea_orm_migration::sea_query::{ColumnDef, ForeignKeyAction as MigrationForei
 use sea_query::Expr;
 use serde::{Deserialize, Serialize};
 
-use crate::callrecord::{CallRecord, CallRecordHook};
+use crate::callrecord::{CallRecord, CallRecordHook, FailureSource};
 
 // CallRecordPersistArgs removed
 
@@ -68,6 +68,10 @@ pub async fn persist_call_record(
     let transcript_language = details.transcript_language.clone();
     let tags = details.tags.clone();
     let duration_secs = (record.end_time - record.start_time).num_seconds().max(0) as i32;
+    // task 2.3: billable (answered) seconds — NULL when the call never answered.
+    let billable_duration_secs = record
+        .answer_time
+        .map(|ans| (record.end_time - ans).num_seconds().max(0) as i32);
 
     let caller_uri = normalize_endpoint_uri(&record.caller);
     let callee_uri = normalize_endpoint_uri(&record.callee);
@@ -82,14 +86,67 @@ pub async fn persist_call_record(
         serde_json::to_value(&record.leg_timeline).ok()
     };
 
+    // Build the metadata JSON object: start from the string map in
+    // `details.metadata`, then fold in `sip_leg_roles` and `hangup_messages`
+    // under reserved keys (CDR-07 / CDR-02b). `From<Model>` splits these back
+    // out, so the reserved keys must not collide with user metadata keys.
+    let metadata_json = {
+        let mut map = details
+            .metadata
+            .as_ref()
+            .and_then(|m| serde_json::to_value(m).ok())
+            .and_then(|v| match v {
+                serde_json::Value::Object(o) => Some(o),
+                _ => None,
+            })
+            .unwrap_or_default();
+        if !record.sip_leg_roles.is_empty()
+            && let Ok(v) = serde_json::to_value(&record.sip_leg_roles)
+        {
+            map.insert("sip_leg_roles".to_string(), v);
+        }
+        if !record.hangup_messages.is_empty()
+            && let Ok(v) = serde_json::to_value(&record.hangup_messages)
+        {
+            map.insert("hangup_messages".to_string(), v);
+        }
+        if map.is_empty() {
+            None
+        } else {
+            Some(serde_json::Value::Object(map))
+        }
+    };
+
+    // Denormalize the OK/USR/SYS class + Q.850 detail at call end (enrich-cdr-api).
+    // "rang" mirrors the console: ring_time authoritative, else answered/elapsed>3s.
+    let rang = record.ring_time.is_some()
+        || record.answer_time.is_some()
+        || (record.end_time - record.start_time).num_seconds() > 3;
+    let outcome = crate::callrecord::outcome::from_messages(
+        record.status_code,
+        &record.hangup_messages,
+        rang,
+    );
+
     let active = ActiveModel {
         call_id: Set(record.call_id.clone()),
         display_id: Set(None),
         direction: Set(direction.clone()),
         status: Set(status.clone()),
+        // status_code 0 means "no SIP code captured" → store NULL.
+        status_code: Set((record.status_code != 0).then_some(record.status_code as i16)),
+        hangup_reason: Set(record.hangup_reason.as_ref().map(|r| r.as_db_str())),
+        failure_source: Set(details.failure_source.map(|f| f.as_db_str().to_string())),
+        outcome_kind: Set(Some(outcome.kind.as_db_str().to_string())),
+        q850_cause: Set(outcome.q850_cause.map(|c| c as i16)),
+        q850_text: Set(outcome.q850_text.clone()),
+        sipflow_available: Set(details.sipflow_available),
         started_at: Set(record.start_time),
         ended_at: Set(Some(record.end_time)),
+        answer_time: Set(record.answer_time),
+        ring_time: Set(record.ring_time),
         duration_secs: Set(duration_secs),
+        billable_duration_secs: Set(billable_duration_secs),
         from_number: Set(from_number.clone()),
         to_number: Set(to_number.clone()),
         caller_name: Set(caller_name.clone()),
@@ -111,10 +168,7 @@ pub async fn persist_call_record(
         transcript_language: Set(transcript_language.clone()),
         tags: Set(tags.clone()),
         leg_timeline: Set(leg_timeline_json),
-        metadata: Set(details
-            .metadata
-            .as_ref()
-            .and_then(|m| serde_json::to_value(m).ok())),
+        metadata: Set(metadata_json),
         created_at: Set(record.start_time),
         updated_at: Set(record.end_time),
         archived_at: Set(None),
@@ -128,8 +182,16 @@ pub async fn persist_call_record(
                     Column::DisplayId,
                     Column::Direction,
                     Column::Status,
+                    Column::StatusCode,
+                    Column::HangupReason,
+                    Column::OutcomeKind,
+                    Column::Q850Cause,
+                    Column::Q850Text,
+                    Column::SipflowAvailable,
                     Column::StartedAt,
                     Column::EndedAt,
+                    Column::RingTime,
+                    Column::AnswerTime,
                     Column::DurationSecs,
                     Column::FromNumber,
                     Column::ToNumber,
@@ -185,6 +247,45 @@ pub async fn update_recording_url(
         Entity::update(active).exec(db).await?;
     }
     Ok(())
+}
+
+/// Set `recording_url` on the row matching `call_id`. Used by the
+/// upload-retry scheduler after a successful re-upload, so the playback
+/// handler can find the file in S3 instead of looking for the (possibly
+/// deleted) local copy.
+pub async fn update_recording_url_by_call_id(
+    db: &sea_orm::DatabaseConnection,
+    call_id: &str,
+    recording_url: &str,
+) -> Result<u64, sea_orm::DbErr> {
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    let res = Entity::update_many()
+        .col_expr(Column::RecordingUrl, Expr::value(recording_url.to_string()))
+        .col_expr(Column::UpdatedAt, Expr::value(chrono::Utc::now()))
+        .filter(Column::CallId.eq(call_id))
+        .exec(db)
+        .await?;
+    Ok(res.rows_affected)
+}
+
+/// Mark `sipflow_available` on the row matching `call_id`. Called from the
+/// background SipFlow upload task once a non-empty capture is confirmed,
+/// since the synchronous hook has already returned by that point and can no
+/// longer mutate the in-flight `CallRecord` before it's persisted.
+pub async fn mark_sipflow_available(
+    db: &sea_orm::DatabaseConnection,
+    call_id: &str,
+) -> Result<u64, sea_orm::DbErr> {
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    let res = Entity::update_many()
+        .col_expr(Column::SipflowAvailable, Expr::value(true))
+        .col_expr(Column::UpdatedAt, Expr::value(chrono::Utc::now()))
+        .filter(Column::CallId.eq(call_id))
+        .exec(db)
+        .await?;
+    Ok(res.rows_affected)
 }
 
 pub fn extract_sip_username(input: &str) -> Option<String> {
@@ -249,9 +350,41 @@ pub struct Model {
     pub display_id: Option<String>,
     pub direction: String,
     pub status: String,
+    /// Final SIP response code for the call (e.g. 200, 486, 503). Nullable so
+    /// rows written before this column existed deserialize cleanly.
+    pub status_code: Option<i16>,
+    /// Stable hangup-reason token (e.g. "by_caller", "no_answer"). See
+    /// `CallRecordHangupReason::as_db_str`.
+    pub hangup_reason: Option<String>,
+    /// Failure-origin token ("sbc" | "upstream" | "caller"); NULL for a
+    /// successful or clean-hangup call. See `FailureSource::as_db_str`.
+    pub failure_source: Option<String>,
+    /// Denormalized outcome class: "OK" | "USR" | "SYS" (enrich-cdr-api).
+    /// Written at call end via `crate::callrecord::outcome`; NULL only on
+    /// rows from before this column existed (then base-backfilled). Lets the
+    /// summary `GROUP BY` the class without re-parsing the metadata JSON.
+    pub outcome_kind: Option<String>,
+    /// Parsed Q.850 cause code (e.g. 31, 102) from the selected hangup message;
+    /// NULL when absent or on legacy rows. Set on new writes only.
+    pub q850_cause: Option<i16>,
+    /// Parsed Q.850 cause text (e.g. "NORMAL_UNSPECIFIED"); NULL when absent.
+    pub q850_text: Option<String>,
+    /// Whether a SipFlow capture exists for this call (enrich-cdr-api). Set by
+    /// `SipFlowUploadHook`; `false` for legacy rows and when capture is off.
+    pub sipflow_available: bool,
     pub started_at: DateTimeUtc,
     pub ended_at: Option<DateTimeUtc>,
+    /// When the call was answered (200 OK). NULL for unanswered calls.
+    /// Billable duration = ended_at - answer_time; PDD = answer_time - started_at.
+    pub answer_time: Option<DateTimeUtc>,
+    /// When the callee started alerting (180/183 received). NULL for rows
+    /// written before this column existed, or calls that never rang.
+    pub ring_time: Option<DateTimeUtc>,
     pub duration_secs: i32,
+    /// Answered (billable) seconds: `ended_at − answer_time`, clamped ≥ 0; NULL
+    /// for unanswered calls (task 2.3). `duration_secs` remains wall-clock
+    /// (`ended_at − started_at`), so billing reads this column, not that one.
+    pub billable_duration_secs: Option<i32>,
     pub from_number: Option<String>,
     pub to_number: Option<String>,
     pub caller_name: Option<String>,
@@ -461,6 +594,32 @@ impl MigrationTrait for Migration {
 
 impl From<Model> for CallRecord {
     fn from(val: Model) -> Self {
+        // Split the metadata JSON: reserved keys (CDR-07 / CDR-02b) become typed
+        // fields; remaining string-valued keys go back into details.metadata.
+        // This must not panic when nested (non-string) reserved values are present.
+        let (details_metadata, sip_leg_roles, hangup_messages) = match val.metadata {
+            Some(serde_json::Value::Object(mut map)) => {
+                let sip_leg_roles = map
+                    .remove("sip_leg_roles")
+                    .and_then(|v| serde_json::from_value(v).ok())
+                    .unwrap_or_default();
+                let hangup_messages = map
+                    .remove("hangup_messages")
+                    .and_then(|v| serde_json::from_value(v).ok())
+                    .unwrap_or_default();
+                let string_map: std::collections::HashMap<String, String> = map
+                    .into_iter()
+                    .filter_map(|(k, v)| match v {
+                        serde_json::Value::String(s) => Some((k, s)),
+                        _ => None,
+                    })
+                    .collect();
+                let details_metadata = (!string_map.is_empty()).then_some(string_map);
+                (details_metadata, sip_leg_roles, hangup_messages)
+            }
+            _ => (None, std::collections::HashMap::new(), Vec::new()),
+        };
+
         let details = crate::callrecord::CallDetails {
             direction: val.direction,
             status: val.status,
@@ -480,7 +639,7 @@ impl From<Model> for CallRecord {
             transcript_status: Some(val.transcript_status),
             transcript_language: val.transcript_language,
             tags: val.tags,
-            metadata: val.metadata.and_then(|v| serde_json::from_value(v).ok()),
+            metadata: details_metadata,
             rewrite: crate::callrecord::CallRecordRewrite {
                 caller_original: val.rewrite_original_from.unwrap_or_default(),
                 caller_final: String::new(),
@@ -490,6 +649,11 @@ impl From<Model> for CallRecord {
                 destination: None,
             },
             last_error: None,
+            failure_source: val
+                .failure_source
+                .as_deref()
+                .and_then(FailureSource::from_db_str),
+            sipflow_available: val.sipflow_available,
         };
 
         let leg_timeline = val
@@ -500,8 +664,8 @@ impl From<Model> for CallRecord {
         CallRecord {
             call_id: val.call_id,
             start_time: val.started_at,
-            ring_time: None,   // No ring_time in Model
-            answer_time: None, // No answer_time in Model
+            ring_time: val.ring_time,
+            answer_time: val.answer_time,
             end_time: val.ended_at.unwrap_or(val.started_at),
             caller: val
                 .caller_uri
@@ -509,14 +673,169 @@ impl From<Model> for CallRecord {
             callee: val
                 .callee_uri
                 .unwrap_or_else(|| val.to_number.unwrap_or_default()),
-            status_code: 0,                                  // No status_code in Model
-            hangup_reason: None,                             // No hangup_reason in Model
-            hangup_messages: Vec::new(),                     // No hangup_messages in Model
-            recorder: Vec::new(),                            // No recorder list in Model
-            sip_leg_roles: std::collections::HashMap::new(), // No sip_leg_roles in Model
+            status_code: val.status_code.map(|c| c as u16).unwrap_or(0),
+            hangup_reason: val
+                .hangup_reason
+                .as_deref()
+                .map(crate::callrecord::CallRecordHangupReason::from_db_str),
+            hangup_messages,
+            recorder: Vec::new(), // recorder list not persisted (single stereo file)
+            sip_leg_roles,
             leg_timeline,
             details,
             extensions: http::Extensions::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod cdr_phase1_tests {
+    use super::*;
+    use crate::callrecord::{CallRecord, CallRecordHangupReason, FailureSource};
+
+    fn sample_model() -> Model {
+        let now = chrono::Utc::now();
+        Model {
+            id: 1,
+            call_id: "call-1".to_string(),
+            display_id: None,
+            direction: "inbound".to_string(),
+            status: "completed".to_string(),
+            status_code: Some(200),
+            hangup_reason: Some("by_callee".to_string()),
+            failure_source: None,
+            outcome_kind: Some("OK".to_string()),
+            q850_cause: None,
+            q850_text: None,
+            sipflow_available: false,
+            started_at: now,
+            ended_at: Some(now),
+            answer_time: Some(now),
+            ring_time: None,
+            duration_secs: 10,
+            billable_duration_secs: Some(10),
+            from_number: Some("1001".to_string()),
+            to_number: Some("2002".to_string()),
+            caller_name: None,
+            agent_name: None,
+            queue: None,
+            department_id: None,
+            extension_id: None,
+            sip_trunk_id: None,
+            route_id: None,
+            sip_gateway: None,
+            rewrite_original_from: None,
+            rewrite_original_to: None,
+            caller_uri: Some("sip:1001@host".to_string()),
+            callee_uri: Some("sip:2002@host".to_string()),
+            recording_url: None,
+            recording_duration_secs: None,
+            has_transcript: false,
+            transcript_status: "none".to_string(),
+            transcript_language: None,
+            tags: None,
+            leg_timeline: None,
+            metadata: None,
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+        }
+    }
+
+    #[test]
+    fn hangup_reason_db_str_roundtrips() {
+        for r in [
+            CallRecordHangupReason::ByCaller,
+            CallRecordHangupReason::ByCallee,
+            CallRecordHangupReason::NoAnswer,
+            CallRecordHangupReason::Rejected,
+            CallRecordHangupReason::Failed,
+            CallRecordHangupReason::ServerUnavailable,
+        ] {
+            assert_eq!(CallRecordHangupReason::from_db_str(&r.as_db_str()), r);
+        }
+        let other = CallRecordHangupReason::Other("custom".to_string());
+        assert_eq!(CallRecordHangupReason::from_db_str(&other.as_db_str()), other);
+    }
+
+    #[test]
+    fn from_model_maps_new_columns() {
+        let rec: CallRecord = sample_model().into();
+        assert_eq!(rec.status_code, 200);
+        assert_eq!(rec.hangup_reason, Some(CallRecordHangupReason::ByCallee));
+        assert!(rec.answer_time.is_some());
+    }
+
+    #[test]
+    fn from_model_null_status_code_becomes_zero_and_answer_none() {
+        let mut m = sample_model();
+        m.status_code = None;
+        m.answer_time = None;
+        let rec: CallRecord = m.into();
+        assert_eq!(rec.status_code, 0);
+        assert_eq!(rec.answer_time, None);
+    }
+
+    #[test]
+    fn from_model_maps_failure_source() {
+        let mut m = sample_model();
+        m.failure_source = Some("upstream".to_string());
+        let rec: CallRecord = m.into();
+        assert_eq!(rec.details.failure_source, Some(FailureSource::Upstream));
+    }
+
+    #[test]
+    fn from_model_failure_source_none_and_unknown_become_none() {
+        let mut m = sample_model();
+        m.failure_source = None;
+        let rec: CallRecord = m.clone().into();
+        assert_eq!(rec.details.failure_source, None);
+
+        // An unrecognized token must not panic; it maps to None.
+        m.failure_source = Some("garbage".to_string());
+        let rec2: CallRecord = m.into();
+        assert_eq!(rec2.details.failure_source, None);
+    }
+
+    #[test]
+    fn metadata_reserved_keys_split_out_and_strings_kept() {
+        let mut m = sample_model();
+        m.metadata = Some(serde_json::json!({
+            "tenant": "acme",
+            "sip_leg_roles": { "call-1": "caller" },
+            "hangup_messages": [
+                {
+                    "code": 500,
+                    "reason": "Server Internal Error",
+                    "target": "callee",
+                    "endpoint": "103.146.242.234:5060"
+                },
+                // legacy row shape (no target/endpoint) still deserializes
+                { "code": 503, "reason": "busy" }
+            ],
+        }));
+        let rec: CallRecord = m.into();
+        assert_eq!(
+            rec.sip_leg_roles.get("call-1").map(|s| s.as_str()),
+            Some("caller")
+        );
+        assert_eq!(rec.hangup_messages.len(), 2);
+        assert_eq!(rec.hangup_messages[0].code, 500);
+        assert_eq!(
+            rec.hangup_messages[0].target.as_deref(),
+            Some("callee"),
+            "leg side should round-trip"
+        );
+        assert_eq!(
+            rec.hangup_messages[0].endpoint.as_deref(),
+            Some("103.146.242.234:5060"),
+            "downstream hop should round-trip"
+        );
+        assert_eq!(rec.hangup_messages[1].code, 503);
+        assert_eq!(rec.hangup_messages[1].endpoint, None);
+        let md = rec.details.metadata.expect("string metadata preserved");
+        assert_eq!(md.get("tenant").map(|s| s.as_str()), Some("acme"));
+        assert!(!md.contains_key("sip_leg_roles"));
+        assert!(!md.contains_key("hangup_messages"));
     }
 }

@@ -1,3 +1,4 @@
+use crate::media::negotiate::CodecSelectionStrategy;
 use crate::rwi::auth::RwiConfig;
 use crate::{
     call::{CallRecordingConfig, DialDirection, QueuePlan, user::SipUser},
@@ -258,6 +259,42 @@ pub struct Config {
     pub rwi: Option<RwiConfig>,
     #[serde(default)]
     pub cluster: Option<ClusterConfig>,
+    /// Trunk-enforcement gates (Phase 5/T). Default: OFF — call routing
+    /// behavior is unchanged unless `[trunk.enforcement] enabled = true`.
+    #[serde(default)]
+    pub trunk: TrunkConfigSection,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct TrunkConfigSection {
+    #[serde(default)]
+    pub enforcement: TrunkEnforcementConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct TrunkEnforcementConfig {
+    /// Master switch. When `false` (default) all 3 INVITE-path gates
+    /// (ACL, capacity, CPS) short-circuit and the proxy behaves as it
+    /// did before Phase 5/T landed.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Fallback per-trunk-group concurrent-call cap when no row exists
+    /// in `supersip_trunk_capacity`. None = unlimited (allow).
+    #[serde(default)]
+    pub default_max_calls: Option<u32>,
+    /// Fallback per-trunk-group calls-per-second cap. None = unlimited.
+    #[serde(default)]
+    pub default_max_cps: Option<u32>,
+}
+
+impl Default for TrunkEnforcementConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_max_calls: None,
+            default_max_cps: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -711,6 +748,19 @@ pub struct ProxyConfig {
 
     #[serde(default)]
     pub emergency: Option<EmergencyConfig>,
+
+    /// Codec selection strategy for WebRTC endpoints.
+    /// `quality` (default): prefer Opus > G722 > G711 > G729 (may require
+    /// transcoding — wideband is negotiated whenever the far end supports it).
+    /// `performance`: avoid transcoding, keep caller's codecs only.
+    #[serde(default)]
+    pub codec_strategy: CodecSelectionStrategy,
+    /// Kill-switch for the external-bridge rejected-INVITE replay cache
+    /// (carrier failover retries replay the cached final status instead of
+    /// re-running routing/capacity/dispatch). Mirrors liv-sip's
+    /// `disable_rejected_invite_cache` knob. Default `false` (cache on).
+    #[serde(default)]
+    pub disable_rejected_invite_cache: bool,
 }
 
 /// Emergency number routing configuration.
@@ -800,6 +850,13 @@ pub struct DialplanHints {
     pub max_duration: Option<std::time::Duration>,
     pub enable_sipflow: Option<bool>,
     pub allow_codecs: Option<Vec<String>>,
+    /// Egress trunk_group `media_config.codecs` (lowercase canonical).
+    /// Unlike `allow_codecs` (a filter), these are offered toward the
+    /// trunk even when the caller didn't offer them — the bridge
+    /// transcoder covers the mismatch (HD upgrade).
+    pub trunk_media_codecs: Option<Vec<String>>,
+    /// Egress trunk_group `media_config.jitter_buffer` policy.
+    pub trunk_jitter_buffer: Option<crate::media::jitter::JitterBufferPolicy>,
     pub extensions: http::Extensions,
     pub disable_ice_servers: Option<bool>,
     /// Media mode override from trunk config
@@ -825,6 +882,24 @@ impl std::fmt::Debug for DialplanHints {
 #[allow(clippy::large_enum_variant)]
 pub enum RouteResult {
     Forward(InviteOption, Option<DialplanHints>),
+    /// Route resolved to an external-bridge trunk (`kind="webrtc"` today,
+    /// `kind="livekit"` as of Phase 5). The matcher returns this variant
+    /// instead of [`RouteResult::Forward`] so the SIP-side caller can hand
+    /// the INVITE's SDP offer to the kind-specific bridge dispatcher rather
+    /// than running the usual SIP forward machinery. The matcher itself
+    /// doesn't have the INVITE SDP body, so dispatch happens at the call
+    /// layer.
+    ///
+    /// `kind_config` is the raw JSON blob from the trunk row's `kind_config`
+    /// column. `option`/`hints` mirror the `Forward` shape for trace
+    /// logging.
+    ExternalBridge {
+        kind: crate::proxy::bridge::session::BridgeKind,
+        trunk_name: String,
+        kind_config: serde_json::Value,
+        option: InviteOption,
+        hints: Option<DialplanHints>,
+    },
     Queue {
         option: InviteOption,
         queue: QueuePlan,
@@ -838,6 +913,15 @@ pub enum RouteResult {
     },
     NotHandled(InviteOption, Option<DialplanHints>),
     Abort(StatusCode, Option<String>),
+    /// Phase 5/T — Trunk-enforcement reject. Distinct from `Abort` because
+    /// it carries a structured reason code (e.g. `trunk_capacity_exhausted`,
+    /// `trunk_cps_exhausted`, `trunk_acl_blocked`) and an optional
+    /// `Retry-After` value that maps to the SIP 503 header.
+    Reject {
+        code: u16,
+        reason: String,
+        retry_after_secs: Option<u32>,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize, Default)]
@@ -1017,6 +1101,8 @@ impl Default for ProxyConfig {
             uri_max_length: default_uri_max_length(),
             uri_reject_malformed: false,
             emergency: None,
+            codec_strategy: CodecSelectionStrategy::default(),
+            disable_rejected_invite_cache: false,
         }
     }
 }
@@ -1070,6 +1156,7 @@ impl Default for Config {
             #[cfg(feature = "commerce")]
             licenses: None,
             cluster: None,
+            trunk: TrunkConfigSection::default(),
         }
     }
 }

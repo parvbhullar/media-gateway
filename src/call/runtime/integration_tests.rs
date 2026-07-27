@@ -30,6 +30,7 @@ mod tests {
             started_at: chrono::Utc::now(),
             answered_at: None,
             status: ActiveProxyCallStatus::Ringing,
+            trunk_group_name: None,
         }
     }
 

@@ -5,9 +5,12 @@ use dotenvy::dotenv;
 use rustpbx::{
     app::{AppStateBuilder, create_router},
     config::Config,
+    handler::api_v1::auth::issue_api_key,
     handler::middleware::request_log::AccessLogEventFormat,
+    models::{api_key, create_db},
     observability, preflight, version,
 };
+use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::net::SocketAddr;
@@ -251,6 +254,78 @@ enum Commands {
     CheckConfig,
     /// Initialize with fixture data (extensions, routes, wholesale demo data)
     Fixtures,
+    /// Manage `/api/v1/*` Bearer-token API keys.
+    #[command(subcommand)]
+    ApiKey(ApiKeyCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum ApiKeyCmd {
+    /// Create a new API key. Prints the plaintext token exactly once.
+    Create {
+        /// Human-readable name. Must be unique.
+        name: String,
+        /// Optional free-form description stored alongside the hash.
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// List every API key row (active + revoked).
+    List,
+    /// Revoke an API key by name. Subsequent requests will fail with 401.
+    Revoke {
+        /// Name of the key to revoke.
+        name: String,
+    },
+}
+
+async fn run_api_key_cmd(database_url: &str, cmd: ApiKeyCmd) -> Result<()> {
+    let db = create_db(database_url).await?;
+    match cmd {
+        ApiKeyCmd::Create { name, description } => {
+            let issued = issue_api_key();
+            let am = api_key::ActiveModel {
+                name: Set(name.clone()),
+                hash_sha256: Set(issued.hash.clone()),
+                description: Set(description),
+                created_at: Set(Utc::now()),
+                ..Default::default()
+            };
+            am.insert(&db).await?;
+            println!("API key created. Store this token — it will NOT be shown again:");
+            println!("  {}", issued.plaintext);
+            println!("name={} sha256={}", name, issued.hash);
+        }
+        ApiKeyCmd::List => {
+            let rows = api_key::Entity::find().all(&db).await?;
+            if rows.is_empty() {
+                println!("(no api keys)");
+            } else {
+                for r in rows {
+                    let status = if r.revoked_at.is_some() {
+                        "revoked"
+                    } else {
+                        "active"
+                    };
+                    println!(
+                        "{:<24} {:<8} created={} last_used={:?}",
+                        r.name, status, r.created_at, r.last_used_at
+                    );
+                }
+            }
+        }
+        ApiKeyCmd::Revoke { name } => {
+            let row = api_key::Entity::find()
+                .filter(api_key::Column::Name.eq(name.clone()))
+                .one(&db)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("api key '{}' not found", name))?;
+            let mut am: api_key::ActiveModel = row.into();
+            am.revoked_at = Set(Some(Utc::now()));
+            am.update(&db).await?;
+            println!("Revoked {}", name);
+        }
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -264,7 +339,25 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let config_path = cli.conf.clone();
-    let config = if let Some(ref path) = config_path {
+
+    // Merge base config with DB overrides → config.generated.toml.
+    // Falls back to the original path if the merge step fails (e.g. no DB yet).
+    let effective_config_path = if let Some(ref path) = config_path {
+        match rustpbx::config_merge::apply(path).await {
+            Ok(generated) => {
+                println!("Config merged: {}", generated);
+                Some(generated)
+            }
+            Err(e) => {
+                println!("Config merge skipped ({}), using base config.", e);
+                Some(path.clone())
+            }
+        }
+    } else {
+        None
+    };
+
+    let config = if let Some(ref path) = effective_config_path {
         println!("Loading config from: {}", path);
         Config::load(path).expect("Failed to load config")
     } else {
@@ -292,6 +385,14 @@ async fn main() -> Result<()> {
 
         rustpbx::fixtures::run_fixtures(state).await?;
         println!("Fixtures initialized successfully.");
+        return Ok(());
+    }
+
+    if matches!(cli.command, Some(Commands::ApiKey(_))) {
+        let Some(Commands::ApiKey(cmd)) = cli.command else {
+            unreachable!()
+        };
+        run_api_key_cmd(&config.database_url, cmd).await?;
         return Ok(());
     }
 
@@ -459,7 +560,14 @@ async fn main() -> Result<()> {
     let _ = guard_holder; // keep the guard alive
 
     let mut cached_config = Some(config);
-    let mut next_config_path = config_path.clone();
+    // base_config_path is always config.toml — used as the merge source on every restart.
+    // effective_config_path (config.generated.toml) is stored in app_state so the
+    // console settings page reads the actual merged/effective values from disk.
+    // base_config_path is always config.toml — used as the merge source on every restart.
+    // effective_config_path (config.generated.toml) is stored in app_state so the
+    // console settings page reads the actual merged/effective values from disk.
+    let base_config_path = config_path.clone();
+    let mut current_effective_path = effective_config_path.clone();
     let mut retry_count = 0;
     let max_retries = 10;
     let retry_interval = Duration::from_secs(5);
@@ -467,8 +575,21 @@ async fn main() -> Result<()> {
     loop {
         let config = if let Some(cfg) = cached_config.take() {
             cfg
-        } else if let Some(ref path) = next_config_path {
-            match Config::load(path) {
+        } else if let Some(ref path) = base_config_path {
+            // Always re-merge from base config.toml (not the generated file) so DB
+            // overrides are applied fresh and never stacked on top of themselves.
+            let effective = match rustpbx::config_merge::apply(path).await {
+                Ok(generated) => {
+                    current_effective_path = Some(generated.clone());
+                    generated
+                }
+                Err(e) => {
+                    tracing::warn!("Config merge skipped on restart ({}), using base.", e);
+                    current_effective_path = Some(path.clone());
+                    path.clone()
+                }
+            };
+            match Config::load(&effective) {
                 Ok(cfg) => cfg,
                 Err(err) => {
                     retry_count += 1;
@@ -498,7 +619,8 @@ async fn main() -> Result<()> {
 
         let mut state_builder = AppStateBuilder::new()
             .with_config(config.clone())
-            .with_config_metadata(next_config_path.clone(), Utc::now());
+            // Store effective (generated) path so the console settings page reads merged values.
+            .with_config_metadata(current_effective_path.clone(), Utc::now());
         if cli.skip_migrate {
             state_builder = state_builder.with_skip_migrate();
         }
@@ -607,7 +729,7 @@ async fn main() -> Result<()> {
 
         if app_reload_requested {
             info!("Reload requested; restarting with updated configuration");
-            next_config_path = app_config_path;
+            let _ = app_config_path; // noted but base_config_path is always used for merge
             cached_config = None;
             retry_count = 0;
 
