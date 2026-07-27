@@ -801,21 +801,12 @@ mod cdr_phase1_tests {
     }
 
     async fn test_db() -> sea_orm::DatabaseConnection {
+        use crate::models::migration::Migrator;
         use sea_orm_migration::MigratorTrait;
         let db = sea_orm::Database::connect("sqlite::memory:")
             .await
             .expect("failed to connect to test db");
-        struct TestMigrator;
-        #[async_trait::async_trait]
-        impl sea_orm_migration::MigratorTrait for TestMigrator {
-            fn migrations() -> Vec<Box<dyn sea_orm_migration::MigrationTrait>> {
-                vec![
-                    Box::new(super::Migration),
-                    Box::new(super::super::add_org_id_call_record::Migration),
-                ]
-            }
-        }
-        TestMigrator::up(&db, None)
+        Migrator::up(&db, None)
             .await
             .expect("failed to run migrations");
         db
