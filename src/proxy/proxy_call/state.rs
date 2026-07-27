@@ -296,6 +296,7 @@ impl SipSessionShared {
                 answered_at: inner.answer_time,
                 status: ActiveProxyCallStatus::Ringing,
                 trunk_group_name: None,
+                org_id: None,
             };
             registry.upsert(entry, handle.clone());
             // Also register the server dialog
@@ -749,6 +750,7 @@ mod tests {
             answered_at: None,
             status: ActiveProxyCallStatus::Ringing,
             trunk_group_name: None,
+            org_id: None,
         };
 
         registry.upsert(entry, handle.clone());

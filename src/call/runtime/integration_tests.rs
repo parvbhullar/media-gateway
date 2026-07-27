@@ -31,6 +31,7 @@ mod tests {
             answered_at: None,
             status: ActiveProxyCallStatus::Ringing,
             trunk_group_name: None,
+            org_id: None,
         }
     }
 

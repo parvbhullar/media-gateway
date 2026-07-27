@@ -1047,6 +1047,7 @@ impl TransferController {
                 answered_at: None,
                 status: ActiveProxyCallStatus::Ringing,
                 trunk_group_name: None,
+                org_id: None,
             };
             registry.upsert(entry, handle.clone());
 
@@ -1384,6 +1385,7 @@ mod tests {
             answered_at: Some(chrono::Utc::now()),
             status: ActiveProxyCallStatus::Talking,
             trunk_group_name: None,
+            org_id: None,
         };
         registry.upsert(entry, handle);
         cmd_rx
@@ -1402,6 +1404,7 @@ mod tests {
             answered_at: None,
             status: ActiveProxyCallStatus::Ringing,
             trunk_group_name: None,
+            org_id: None,
         };
         registry.upsert(entry, handle);
     }

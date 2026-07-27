@@ -34,6 +34,11 @@ pub struct ActiveProxyCallEntry {
     /// row was configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trunk_group_name: Option<String>,
+    /// Owning org of this call, set post-hoc once org resolution completes
+    /// (mirrors how `trunk_group_name` is set — see `update`). `None` when
+    /// unassigned or enforcement is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_id: Option<String>,
 }
 
 #[derive(Default)]
@@ -48,6 +53,10 @@ struct RegistryState {
     /// is neither Clone nor Serialize. Removed when the session is
     /// removed; Drop releases the trunk-capacity slot.
     permits: HashMap<String, crate::proxy::trunk_capacity_state::Permit>,
+    /// Org-level capacity Permits, mirroring `permits` but keyed to the same
+    /// `session_id`. Separate map because a call can hold both a trunk
+    /// permit and an org permit simultaneously.
+    org_permits: HashMap<String, crate::proxy::trunk_capacity_state::Permit>,
 }
 
 pub struct ActiveProxyCallRegistry {
@@ -117,6 +126,7 @@ impl ActiveProxyCallRegistry {
         // Phase R-full/T — drop the capacity Permit (if held). Drop fires
         // here releasing the trunk-capacity slot.
         guard.permits.remove(session_id);
+        guard.org_permits.remove(session_id);
         // Remove all dialog handles registered for this session
         if let Some(dialog_ids) = guard.dialog_by_session.remove(session_id) {
             for dialog_id in dialog_ids {
@@ -135,6 +145,33 @@ impl ActiveProxyCallRegistry {
     ) {
         let mut guard = self.inner.lock().unwrap();
         guard.permits.insert(session_id.to_string(), permit);
+    }
+
+    pub fn store_org_permit(
+        &self,
+        session_id: &str,
+        permit: crate::proxy::trunk_capacity_state::Permit,
+    ) {
+        self.inner
+            .lock()
+            .unwrap()
+            .org_permits
+            .insert(session_id.to_string(), permit);
+    }
+
+    pub fn set_org_id(&self, session_id: &str, org_id: Option<String>) {
+        self.update(session_id, |entry| entry.org_id = org_id.clone());
+    }
+
+    pub fn session_ids_by_org(&self, org_id: &str) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .entries
+            .values()
+            .filter(|e| e.org_id.as_deref() == Some(org_id))
+            .map(|e| e.session_id.clone())
+            .collect()
     }
 
     pub fn count(&self) -> usize {
@@ -191,6 +228,7 @@ impl ActiveProxyCallRegistry {
             answered_at: None,
             status: ActiveProxyCallStatus::Ringing,
             trunk_group_name: None,
+            org_id: None,
         };
         self.upsert(entry, handle);
     }
@@ -260,6 +298,7 @@ mod tests {
             answered_at: None,
             status: ActiveProxyCallStatus::Ringing,
             trunk_group_name: None,
+            org_id: None,
         }
     }
 
@@ -385,5 +424,41 @@ mod tests {
         registry.remove("s2");
         assert_eq!(registry.count(), 0);
         assert_eq!(registry.handles_by_dialog_count(), 0);
+    }
+
+    #[test]
+    fn set_org_id_and_session_ids_by_org_round_trip() {
+        let registry = ActiveProxyCallRegistry::new();
+        registry.upsert(make_entry("call-1"), make_handle("call-1"));
+        registry.upsert(make_entry("call-2"), make_handle("call-2"));
+        registry.upsert(make_entry("call-3"), make_handle("call-3"));
+
+        registry.set_org_id("call-1", Some("acme".to_string()));
+        registry.set_org_id("call-2", Some("acme".to_string()));
+        registry.set_org_id("call-3", Some("globex".to_string()));
+
+        let mut acme_calls = registry.session_ids_by_org("acme");
+        acme_calls.sort();
+        assert_eq!(acme_calls, vec!["call-1".to_string(), "call-2".to_string()]);
+
+        assert_eq!(registry.session_ids_by_org("globex"), vec!["call-3".to_string()]);
+        assert_eq!(registry.session_ids_by_org("no-such-org"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn store_org_permit_is_dropped_on_remove() {
+        let registry = ActiveProxyCallRegistry::new();
+        let state = crate::proxy::org_capacity_state::OrgCapacityState::new();
+        registry.upsert(make_entry("call-1"), make_handle("call-1"));
+
+        let permit = match state.try_acquire("acme", Some(1), None) {
+            crate::proxy::trunk_capacity_state::AcquireOutcome::Ok(p) => p,
+            other => panic!("expected Ok, got {other:?}"),
+        };
+        registry.store_org_permit("call-1", permit);
+        assert_eq!(state.current_active("acme"), 1);
+
+        registry.remove("call-1");
+        assert_eq!(state.current_active("acme"), 0);
     }
 }
