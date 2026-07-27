@@ -57,7 +57,7 @@ impl From<OrgModel> for OrganizationView {
 /// Today's resource counts for one org — used by the list/detail views and
 /// the console Organizations tab.
 #[derive(Debug, Serialize)]
-pub(crate) struct OrgTodayCounts {
+pub struct OrgTodayCounts {
     pub did_count: i64,
     pub trunk_count: i64,
     pub extension_count: i64,
