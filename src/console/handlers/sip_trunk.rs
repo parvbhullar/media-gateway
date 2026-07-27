@@ -956,6 +956,12 @@ fn apply_form_to_active_model(
         active.status = Set(form.status.unwrap_or_default());
         active.direction = Set(form.direction.unwrap_or_default());
         active.is_active = Set(form.is_active.unwrap_or(true));
+        active.org_id = Set(form
+            .org_id
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| crate::models::organization::UNASSIGNED_ORG_ID.to_string()));
         active.created_at = Set(now);
     } else {
         if let Some(name) = super::normalize_optional_string(&form.name) {
@@ -1430,6 +1436,17 @@ fn apply_form_to_active_model(
         return Err(bad_request(format!("invalid {kind} trunk config: {err}")));
     }
     active.kind_config = Set(kind_config_json);
+
+    if is_update {
+        if let Some(org_id) = form.org_id.as_ref() {
+            let trimmed = org_id.trim();
+            active.org_id = Set(if trimmed.is_empty() {
+                crate::models::organization::UNASSIGNED_ORG_ID.to_string()
+            } else {
+                trimmed.to_string()
+            });
+        }
+    }
 
     active.updated_at = Set(now);
 
@@ -2059,5 +2076,90 @@ mod tests {
         let cfg = row.webrtc().expect("webrtc decode");
         assert_eq!(cfg.signaling, "http_json");
         assert_eq!(cfg.audio_codec, "opus");
+    }
+
+    #[tokio::test]
+    async fn create_trunk_with_org_id_persists_it() {
+        use axum::body::to_bytes;
+        let state = setup_state().await;
+        let mut form = SipTrunkForm::default();
+        form.name = Some("trunk-with-org".into());
+        form.sip_server = Some("sip.example.com".into());
+        form.org_id = Some("acme".into());
+
+        let resp = create_sip_trunk(
+            State(state.clone()),
+            AuthRequired(superuser()),
+            axum::extract::Form(form),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let id = v["id"].as_i64().expect("trunk id");
+
+        let row = SipTrunkEntity::find_by_id(id)
+            .one(state.db())
+            .await
+            .unwrap()
+            .expect("row");
+        assert_eq!(row.org_id, "acme");
+    }
+
+    #[tokio::test]
+    async fn create_trunk_without_org_id_defaults_to_unassigned() {
+        use axum::body::to_bytes;
+        let state = setup_state().await;
+        let mut form = SipTrunkForm::default();
+        form.name = Some("trunk-no-org".into());
+        form.sip_server = Some("sip.example.com".into());
+        // org_id is None
+
+        let resp = create_sip_trunk(
+            State(state.clone()),
+            AuthRequired(superuser()),
+            axum::extract::Form(form),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let id = v["id"].as_i64().expect("trunk id");
+
+        let row = SipTrunkEntity::find_by_id(id)
+            .one(state.db())
+            .await
+            .unwrap()
+            .expect("row");
+        assert_eq!(row.org_id, crate::models::organization::UNASSIGNED_ORG_ID);
+    }
+
+    #[tokio::test]
+    async fn update_trunk_org_id_changes_it() {
+        use axum::body::to_bytes;
+        let state = setup_state().await;
+        let trunk_id = seed_trunk(&state, "update-test").await;
+
+        // Now update with a new org_id
+        let mut update_form = SipTrunkForm::default();
+        update_form.org_id = Some("neworg".into());
+
+        let resp = update_sip_trunk(
+            AxumPath(trunk_id),
+            State(state.clone()),
+            AuthRequired(superuser()),
+            axum::extract::Form(update_form),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let row = SipTrunkEntity::find_by_id(trunk_id)
+            .one(state.db())
+            .await
+            .unwrap()
+            .expect("row");
+        assert_eq!(row.org_id, "neworg");
     }
 }
