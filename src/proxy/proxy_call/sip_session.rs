@@ -747,7 +747,7 @@ impl SipSession {
             .dialplan
             .max_ring_time
             .clamp(Duration::from_secs(30), Duration::from_secs(120));
-        let teardown_duration = Duration::from_secs(2);
+        let teardown_duration = Duration::from_secs(5);
         let mut timeout = tokio::time::sleep(max_setup_duration).boxed();
         let mut cancelled = false;
 
@@ -769,9 +769,15 @@ impl SipSession {
                     timeout = tokio::time::sleep(teardown_duration).boxed();
                 }
                 _ = &mut timeout => {
-                    warn!(session_id = %session_id, "Call setup timed out");
-                    cancel_token.cancel();
-                    break;
+                    if !cancelled {
+                        warn!(session_id = %session_id, "Call setup timed out");
+                        cancel_token.cancel();
+                        cancelled = true;
+                        timeout = tokio::time::sleep(teardown_duration).boxed();
+                    } else {
+                        warn!(session_id = %session_id, "Teardown grace period expired");
+                        break;
+                    }
                 }
             }
         }

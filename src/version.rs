@@ -50,18 +50,13 @@ pub fn brand() -> String {
 }
 
 /// Format a full User-Agent for a given brand token. Pure core of
-/// [`get_useragent`]; version and build date are compile-time.
+/// [`get_useragent`]; version is compile-time.
 fn useragent_with(brand: &str) -> String {
-    format!(
-        "{}/{} (built {})",
-        brand,
-        env!("CARGO_PKG_VERSION"),
-        env!("BUILD_DATE")
-    )
+    format!("{}/{}", brand, env!("CARGO_PKG_VERSION"))
 }
 
 /// Full User-Agent string, emitted identically across the SIP and webhook
-/// surfaces: `{brand}/{version} (built {date})`.
+/// surfaces: `{brand}/{version}`.
 pub fn get_useragent() -> String {
     useragent_with(&brand())
 }
@@ -229,11 +224,7 @@ mod tests {
 
     #[test]
     fn useragent_shape_for_default_brand() {
-        let expected = format!(
-            "SuperSBC/{} (built {})",
-            env!("CARGO_PKG_VERSION"),
-            env!("BUILD_DATE")
-        );
+        let expected = format!("SuperSBC/{}", env!("CARGO_PKG_VERSION"));
         assert_eq!(useragent_with("SuperSBC"), expected);
     }
 
@@ -242,7 +233,6 @@ mod tests {
         let ua = useragent_with("AcmeSBC");
         assert!(ua.starts_with("AcmeSBC/"), "got: {ua}");
         assert!(ua.contains(env!("CARGO_PKG_VERSION")));
-        assert!(ua.contains("(built "));
     }
 
     #[test]
