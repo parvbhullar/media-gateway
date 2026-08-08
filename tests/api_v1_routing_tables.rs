@@ -127,6 +127,69 @@ async fn create_table_minimal_returns_200_with_defaults() {
     assert_eq!(body["priority"], 100);
     assert_eq!(body["is_active"], true);
     assert_eq!(body["record_count"], 0);
+    assert_eq!(body["org_id"], "default");
+}
+
+// =========================================================================
+// 3b. POST with org_id → persisted; PUT without org_id leaves it unchanged
+// =========================================================================
+
+#[tokio::test]
+async fn create_table_with_org_id_persists_and_update_preserves_it() {
+    let (state, token) = test_state_with_api_key("rt-org-id").await;
+    let app = rustpbx::app::create_router(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/routing/tables")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"name": "org-tagged", "org_id": "acme"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert_eq!(body["org_id"], "acme");
+
+    // PUT without org_id in the body leaves the stored value unchanged.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/routing/tables/org-tagged")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"priority": 200}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert_eq!(body["priority"], 200);
+    assert_eq!(body["org_id"], "acme");
+
+    // PUT with an explicit org_id changes it.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/routing/tables/org-tagged")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"org_id": "globex"}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert_eq!(body["org_id"], "globex");
 }
 
 // =========================================================================

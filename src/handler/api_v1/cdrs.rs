@@ -78,6 +78,9 @@ pub struct CdrView {
     /// Matched route + terminating extension, for call attribution (task 2.4).
     pub route_id: Option<i64>,
     pub extension_id: Option<i64>,
+    /// Owning org (org-level multi-tenancy), when resolved at call time.
+    /// `None` for calls with no attributable org.
+    pub org_id: Option<String>,
     pub caller_uri: Option<String>,
     pub callee_uri: Option<String>,
     /// Per-leg SIP role map, lifted from the CDR metadata JSON (task 2.4).
@@ -138,6 +141,7 @@ impl From<CdrModel> for CdrView {
             sip_trunk_id: m.sip_trunk_id,
             route_id: m.route_id,
             extension_id: m.extension_id,
+            org_id: m.org_id,
             caller_uri: m.caller_uri,
             callee_uri: m.callee_uri,
             sip_leg_roles,
@@ -177,6 +181,13 @@ pub struct CdrListQuery {
     /// filters AND together. Use this when you don't care which side.
     #[serde(default)]
     pub number: Option<String>,
+    /// Filter by owning org (org-level multi-tenancy). Exact match against
+    /// `call_record.org_id`; calls with no org attribution never match this
+    /// filter (there is no "unassigned" sentinel for this column — it's a
+    /// true nullable column, unlike the DID/trunk/extension `"default"`
+    /// sentinel).
+    #[serde(default)]
+    pub org_id: Option<String>,
     #[serde(default)]
     pub start_date: Option<DateTime<Utc>>,
     #[serde(default)]
@@ -242,6 +253,9 @@ async fn list_cdrs(
                 .add(CdrColumn::ToNumber.like(pat)),
         );
     }
+    if let Some(v) = q.org_id.as_ref().filter(|s| !s.is_empty()) {
+        conds = conds.add(CdrColumn::OrgId.eq(v.clone()));
+    }
     if let Some(v) = q.start_date {
         conds = conds.add(CdrColumn::StartedAt.gte(v));
     }
@@ -295,6 +309,10 @@ pub struct CdrSummaryQuery {
     pub number: Option<String>,
     #[serde(default)]
     pub sip_trunk_id: Option<i64>,
+    /// Filter by owning org (org-level multi-tenancy). Exact match; see
+    /// `CdrListQuery::org_id` for the nullable-column caveat.
+    #[serde(default)]
+    pub org_id: Option<String>,
     /// Bucket granularity: `hour` | `day` | `month`. Defaults to `day`.
     #[serde(default)]
     pub group_by: Option<String>,
@@ -330,6 +348,9 @@ fn summary_conditions(q: &CdrSummaryQuery) -> Condition {
     }
     if let Some(v) = q.sip_trunk_id {
         conds = conds.add(CdrColumn::SipTrunkId.eq(v));
+    }
+    if let Some(v) = q.org_id.as_ref().filter(|s| !s.is_empty()) {
+        conds = conds.add(CdrColumn::OrgId.eq(v.clone()));
     }
     if let Some(v) = q.start_date {
         conds = conds.add(CdrColumn::StartedAt.gte(v));

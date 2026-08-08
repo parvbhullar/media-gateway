@@ -51,6 +51,8 @@ pub struct RoutingTableView {
     pub priority: i32,
     pub is_active: bool,
     pub record_count: u32,
+    /// Owning org (org-level multi-tenancy). `"default"` means unassigned.
+    pub org_id: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -69,6 +71,7 @@ impl From<&RtModel> for RoutingTableView {
             priority: m.priority,
             is_active: m.is_active,
             record_count,
+            org_id: m.org_id.clone(),
             created_at: m.created_at,
             updated_at: m.updated_at,
         }
@@ -98,6 +101,10 @@ pub struct CreateRoutingTableRequest {
     /// most one `is_default: true` (D-18).
     #[serde(default)]
     pub records: Option<Vec<Value>>,
+    /// Owning org (org-level multi-tenancy). Omitted or empty means
+    /// unassigned (stored as the `"default"` sentinel).
+    #[serde(default)]
+    pub org_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,6 +118,10 @@ pub struct UpdateRoutingTableRequest {
     pub priority: Option<i32>,
     #[serde(default)]
     pub is_active: Option<bool>,
+    /// Omitted leaves the existing org_id unchanged (PATCH-style, matching
+    /// every other field on this endpoint).
+    #[serde(default)]
+    pub org_id: Option<String>,
     // NO `records` field — records-only-via-records-endpoints (D-04, D-27).
     // `deny_unknown_fields` rejects any client that sends `records` here.
 }
@@ -263,6 +274,13 @@ async fn create_table(
         )));
     }
 
+    let org_id = req
+        .org_id
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| crate::models::organization::UNASSIGNED_ORG_ID.to_string());
+
     let now = Utc::now();
     let am = routing_tables::ActiveModel {
         name: Set(req.name.clone()),
@@ -271,6 +289,7 @@ async fn create_table(
         priority: Set(priority),
         is_active: Set(is_active),
         records: Set(records_json),
+        org_id: Set(org_id),
         created_at: Set(now),
         updated_at: Set(now),
         ..Default::default()
@@ -347,6 +366,14 @@ async fn update_table(
     }
     if let Some(act) = req.is_active {
         am.is_active = Set(act);
+    }
+    if let Some(org_id) = req.org_id {
+        let trimmed = org_id.trim();
+        am.org_id = Set(if trimmed.is_empty() {
+            crate::models::organization::UNASSIGNED_ORG_ID.to_string()
+        } else {
+            trimmed.to_string()
+        });
     }
     am.updated_at = Set(Utc::now());
 

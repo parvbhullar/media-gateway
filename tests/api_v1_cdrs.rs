@@ -160,6 +160,60 @@ async fn list_cdrs_filters_by_direction() {
 }
 
 #[tokio::test]
+async fn list_cdrs_filters_by_org_id() {
+    let (state, token) = test_state_with_api_key("cdr-filter-org-id").await;
+
+    let now = Utc::now();
+    let with_org = CdrAm {
+        call_id: Set("call-org-acme".to_string()),
+        direction: Set("inbound".to_string()),
+        status: Set("completed".to_string()),
+        started_at: Set(now),
+        ended_at: Set(Some(now + ChronoDuration::seconds(30))),
+        duration_secs: Set(30),
+        has_transcript: Set(false),
+        transcript_status: Set("pending".to_string()),
+        org_id: Set(Some("acme".to_string())),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    };
+    with_org.insert(state.db()).await.expect("seed cdr with org");
+    seed_cdr(&state, "call-no-org", "inbound", "completed", None, None).await;
+
+    let app = rustpbx::app::create_router(state);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/cdrs?org_id=acme")
+                .header(header::AUTHORIZATION, bearer(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body["total"], 1);
+    assert_eq!(body["items"][0]["call_id"], "call-org-acme");
+    assert_eq!(body["items"][0]["org_id"], "acme");
+
+    // Summary respects the same filter.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/cdrs/summary?org_id=acme")
+                .header(header::AUTHORIZATION, bearer(&token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn list_cdrs_filters_by_status_and_pagination() {
     let (state, token) = test_state_with_api_key("cdr-filter-status").await;
     for i in 0..5 {
