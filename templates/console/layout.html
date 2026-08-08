@@ -5,9 +5,9 @@
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="description" content="{{site_description|default('RustPBX Admin Console')}}" />
+    <meta name="description" content="{{site_description|default('SuperSBC Admin Console')}}" />
     <meta name="locale" content="{{ locale | default('en') }}" />
-    <title>{% block title %}{{page_title|default('RustPBX Admin')}}{% endblock %}</title>
+    <title>{% block title %}{{page_title|default('SuperSBC Admin')}}{% endblock %}</title>
     <script type="application/json" id="__currentUser">{{ current_user | json | safe }}</script>
     <script type="application/json" id="__locales">{{ available_locales | json | safe }}</script>
     {% block js_head %}
@@ -39,10 +39,10 @@
     <script
         src="{{tailwind_js|default('https://cdnjs.cloudflare.com/ajax/libs/tailwindcss-browser/4.1.13/index.global.min.js')|safe}}"></script>
     <script>
-        window.RustPBX = window.RustPBX || {};
-        window.RustPBX.plugins = [];
+        window.SuperSBC = window.SuperSBC || {};
+        window.SuperSBC.plugins = [];
         window.registerConsolePlugin = (plugin) => {
-            window.RustPBX.plugins.push(plugin);
+            window.SuperSBC.plugins.push(plugin);
         };
     </script>
     <script>
@@ -231,7 +231,7 @@
                     <div class="flex items-center gap-2">
                         <div class="h-8 w-8 rounded-lg bg-sky-600 text-white grid place-content-center font-bold">R
                         </div>
-                        <div class="font-semibold" x-show="!sidebarCollapsed" x-transition.opacity x-cloak>RustPBX</div>
+                        <div class="font-semibold" x-show="!sidebarCollapsed" x-transition.opacity x-cloak>SuperSBC</div>
                     </div>
                     <button class="hidden rounded-lg p-2 hover:bg-slate-100 lg:inline-flex"
                         @click="toggleSidebarCollapse()" aria-label="Toggle sidebar">
@@ -401,8 +401,8 @@
                 </nav>
                 <div class="border-t border-slate-100 p-4 text-xs text-slate-500" x-show="!sidebarCollapsed"
                     x-transition.opacity x-cloak>
-                    <a :href='"https://rustpbx.com?version={{site_version}}&edition={{edition}}&utm_source="+location.origin'
-                        target="_blank" class="underline hover:text-slate-700">{{site_name|default('RustPBX')}} -
+                    <a :href='"https://supersbc.com?version={{site_version}}&edition={{edition}}&utm_source="+location.origin'
+                        target="_blank" class="underline hover:text-slate-700">{{site_name|default('SuperSBC')}} -
                         {{site_version}}</a> / <span>{{edition}}</span>
                 </div>
             </div>
@@ -538,7 +538,7 @@
             </main>
 
             <footer class="py-6 text-center text-xs text-slate-500">
-                {{site_name|default('RustPBX')}} · {{site_footer}}
+                {{site_name|default('SuperSBC')}} · {{site_footer}}
             </footer>
         </div>
     </div>

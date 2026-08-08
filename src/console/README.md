@@ -1,1 +1,1 @@
-# Admin console for rustpbx
+# Admin console for SuperSBC

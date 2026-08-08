@@ -1,5 +1,5 @@
 {% extends "console/layout.html" %}
-{% block title %}Extensions · {{ site_name | default('RustPBX') }}{% endblock %}
+{% block title %}Extensions · {{ site_name | default('SuperSBC') }}{% endblock %}
 {% block content %}
 <div class="p-4 sm:p-6" x-data='extensionsPage({
     basePath: {{ (base_path | default("/console")) | tojson }},

@@ -537,7 +537,7 @@ mod tests {
         let now = Utc::now();
         crate::models::user::Model {
             id: 1,
-            email: "admin@rustpbx.com".into(),
+            email: "admin@supersbc.com".into(),
             username: "admin".into(),
             password_hash: "hashed".into(),
             reset_token: None,
@@ -559,7 +559,7 @@ mod tests {
         let now = Utc::now();
         crate::models::user::Model {
             id: 99,
-            email: "limited@rustpbx.com".into(),
+            email: "limited@supersbc.com".into(),
             username: "limited".into(),
             password_hash: "hashed".into(),
             reset_token: None,

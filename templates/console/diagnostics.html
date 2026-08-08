@@ -2,7 +2,7 @@
 {% block js_ext %}
 <script src="{{jssip_js|default('//jssip.net/download/releases/jssip-3.10.0.js')}}"></script>
 {% endblock %}
-{% block title %}{{ "diagnostics.title" | t }} · {{site_name|default('RustPBX')}}{% endblock %}
+{% block title %}{{ "diagnostics.title" | t }} · {{site_name|default('SuperSBC')}}{% endblock %}
 {% block content %}
 <div class="p-6">
     <div class="mx-auto max-w-7xl space-y-6"
@@ -383,7 +383,7 @@
                             "diagnostics.label_caller_sip_uri" | t }}</span>
                         <input type="text" x-model.trim="routingCaller"
                             class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
-                            placeholder="sip:caller@rustpbx.com">
+                            placeholder="sip:caller@supersbc.com">
                     </label>
                     <label class="flex flex-col gap-2">
                         <span class="text-xs font-semibold uppercase tracking-wide text-slate-400">{{
@@ -409,7 +409,7 @@
                                     "diagnostics.label_request_uri" | t }}</span>
                                 <input type="text" x-model.trim="routingRequestUri"
                                     class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
-                                    placeholder="sip:destination@rustpbx.com">
+                                    placeholder="sip:destination@supersbc.com">
                             </label>
                             <label class="flex flex-col gap-2">
                                 <span class="text-xs font-semibold uppercase tracking-wide text-slate-400">{{
@@ -789,13 +789,13 @@
                             | t }}</span>
                         <input type="text" x-model.trim="locatorUser"
                             class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
-                            placeholder="e.g. 1001 or 1001@rustpbx.com">
+                            placeholder="e.g. 1001 or 1001@supersbc.com">
                     </label>
                     <label class="flex flex-col gap-2">
                         <span class="text-xs font-semibold uppercase tracking-wide text-slate-400">SIP URI</span>
                         <input type="text" x-model.trim="locatorUri"
                             class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
-                            placeholder="sip:1001@rustpbx.com">
+                            placeholder="sip:1001@supersbc.com">
                     </label>
                     <div class="md:col-span-2 flex flex-wrap items-center gap-3">
                         <button type="submit"
@@ -1026,7 +1026,7 @@
                                         "diagnostics.label_websocket_url" | t }}</span>
                                     <input type="text" x-model.trim="sipForm.wsServer"
                                         class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
-                                        placeholder="wss://pbx.rustpbx.com/ws">
+                                        placeholder="wss://pbx.supersbc.com/ws">
                                     <span class="text-[11px] text-slate-400">{{ "diagnostics.prefer_secure_wss" | t
                                         }}</span>
                                 </label>
@@ -1035,7 +1035,7 @@
                                         "diagnostics.label_sip_uri" | t }}</span>
                                     <input type="text" x-model.trim="sipForm.uri"
                                         class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
-                                        placeholder="sip:1001@rustpbx.com">
+                                        placeholder="sip:1001@supersbc.com">
                                 </label>
                                 <label class="flex flex-col gap-1.5">
                                     <span class="text-xs font-semibold uppercase tracking-wide text-slate-400">{{
@@ -1124,7 +1124,7 @@
                                 <div class="flex gap-2">
                                     <input type="text" x-model.trim="sipForm.target"
                                         class="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
-                                        placeholder="1000 or sip:1000@rustpbx.com">
+                                        placeholder="1000 or sip:1000@supersbc.com">
                                     <div class="relative" x-data="{ open: false }" @click.outside="open = false">
                                         <button type="button" @click="open = !open"
                                             class="inline-flex h-10 w-10 items-center justify-center rounded-lg border border-slate-200 text-slate-500 transition hover:border-sky-300 hover:text-sky-700">
@@ -1342,7 +1342,7 @@
             Alpine.data('testingConsole', (payload) => {
                 let sipUa = null;
                 let sipSession = null;
-                const RECENT_TARGETS_KEY = 'rustpbx.console.sipRecentTargets';
+                const RECENT_TARGETS_KEY = 'supersbc.console.sipRecentTargets';
                 const FALLBACK_ICE_SERVERS = [{ urls: ['stun:stun.l.google.com:19302'] }];
                 return {
                     t: {},
@@ -1400,8 +1400,8 @@
                             this.updateSipDomain(value);
                         });
 
-                        if (window.RustPBX && window.RustPBX.plugins) {
-                            this.activePlugins = window.RustPBX.plugins.map(p => {
+                        if (window.SuperSBC && window.SuperSBC.plugins) {
+                            this.activePlugins = window.SuperSBC.plugins.map(p => {
                                 if (typeof p.init === 'function') {
                                     p.init(this);
                                 }
@@ -1859,7 +1859,7 @@
                             const gatherTimeoutMs = 10000;
                             pc = new RTCPeerConnection(config);
                             try {
-                                dataChannel = pc.createDataChannel('rustpbx-probe');
+                                dataChannel = pc.createDataChannel('supersbc-probe');
                             } catch (err) {
                                 // ignore data channel errors (not critical for ICE gathering)
                             }
@@ -2106,7 +2106,7 @@
                         }
                         const parsed = this.parseSipUri(rawUri);
                         if (!parsed) {
-                            this.sipRegisterError = this.t.err_invalid_sip_uri || 'Invalid SIP URI (expected sip:1001@rustpbx.com).';
+                            this.sipRegisterError = this.t.err_invalid_sip_uri || 'Invalid SIP URI (expected sip:1001@supersbc.com).';
                             return;
                         }
                         if (this.sipIceEnable) {
@@ -2469,7 +2469,7 @@
                         }
 
                         // For quick reconnects, clean up old receivers if PC is being reused
-                        if (pc.__rustpbxAttached) {
+                        if (pc.__supersbcAttached) {
                             // PC is being reused - stop old receiver tracks and return
                             // (event listener already attached)
                             try {
@@ -2485,7 +2485,7 @@
                             }
                             return; // Don't re-attach event listener
                         }
-                        pc.__rustpbxAttached = true;
+                        pc.__supersbcAttached = true;
 
                         pc.addEventListener('track', (ev) => {
                             const track = ev?.track;
@@ -2712,10 +2712,10 @@
                         const ws = socketInterface?.__socket || socketInterface?._ws || transport._ws || socketInterface || null;
                         const rawWs = ws && ws.readyState !== undefined ? ws : ws?._ws || null;
                         const targetWs = rawWs || ws;
-                        if (!targetWs || targetWs.__rustpbxTap) {
+                        if (!targetWs || targetWs.__supersbcTap) {
                             return;
                         }
-                        targetWs.__rustpbxTap = true;
+                        targetWs.__supersbcTap = true;
                         const originalSend = typeof targetWs.send === 'function' ? targetWs.send.bind(targetWs) : null;
                         if (originalSend) {
                             targetWs.send = (data) => {

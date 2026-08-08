@@ -1041,7 +1041,7 @@ async fn probe_trunk_options(
         .proxy_config
         .useragent
         .clone()
-        .unwrap_or_else(|| format!("RustPBX diagnostics/{}", env!("CARGO_PKG_VERSION")));
+        .unwrap_or_else(|| format!("SuperSBC diagnostics/{}", env!("CARGO_PKG_VERSION")));
 
     let mut attempts = Vec::new();
     let mut success = false;

@@ -144,7 +144,7 @@ pub struct SipTrunkForm {
     pub livekit_jwt_ttl_secs: Option<u64>,
     // ---- ExternalMedia kind fields. Populated only when
     // ---- `kind = "external_media"`. ----
-    /// Command used to spawn the per-call sidecar. rustpbx appends
+    /// Command used to spawn the per-call sidecar. supersbc appends
     /// `--call-id/--did/--caller/--port`. Required for this kind.
     pub external_media_command: Option<String>,
     /// SIP-side voice codec to negotiate. Allowed: opus, g722, pcmu, pcma.

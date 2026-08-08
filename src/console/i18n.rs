@@ -440,7 +440,7 @@ save = "保存"
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(
             axum::http::header::COOKIE,
-            "locale=zh; rustpbx_session=abc".parse().unwrap(),
+            "locale=zh; supersbc_session=abc".parse().unwrap(),
         );
         let available = vec![
             LocaleInfo {

@@ -4,7 +4,7 @@
 {% set model_data = model if has_model else {} %}
 {% block title %}{{ model_data.display_name | default(model_data.name | default("sip_trunk_detail.new_trunk" | t)) }} ·
 {{ site_name |
-default('RustPBX') }}{% endblock %}
+default('SuperSBC') }}{% endblock %}
 {% block content %}
 {% set base_url = base_path | safe %}
 <div class="p-6" x-data='sipTrunkDetailPage({
@@ -750,7 +750,7 @@ default('RustPBX') }}{% endblock %}
                                 class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
                                 placeholder="voice-agent">
                             <span class="text-xs font-normal text-slate-400">
-                                Name registered by your LiveKit agent worker. After the caller joins, rustpbx
+                                Name registered by your LiveKit agent worker. After the caller joins, supersbc
                                 calls <code>CreateAgentDispatch</code> so LiveKit spins that named agent into
                                 the same room. Zero external infrastructure required.
                             </span>
@@ -914,7 +914,7 @@ default('RustPBX') }}{% endblock %}
                             <span class="text-xs font-normal text-slate-400">
                                 The rendered <code>request_body_template</code> (after <code>{var}</code> substitution)
                                 becomes the <strong>entire HTTP POST body</strong>, not a metadata field. Leave blank
-                                to use rustpbx's built-in default body.
+                                to use supersbc's built-in default body.
                             </span>
                         </label>
                         <label class="md:col-span-2 flex flex-col gap-1 text-sm">
@@ -925,7 +925,7 @@ default('RustPBX') }}{% endblock %}
                                 <span class="font-medium text-slate-700">Delete LiveKit room on hangup</span>
                             </div>
                             <span class="text-xs font-normal text-slate-400 pl-6">
-                                After the SIP call ends and rustpbx disconnects its participant, also call
+                                After the SIP call ends and supersbc disconnects its participant, also call
                                 LiveKit's <code>DeleteRoom</code> admin RPC. <strong>Kicks any remaining
                                 participants</strong> — use only for single-use rooms (one call per room).
                                 Default OFF leaves the room alive for other participants / lets it idle-timeout
@@ -991,7 +991,7 @@ default('RustPBX') }}{% endblock %}
 
                 <section class="rounded-xl bg-white p-6 shadow-sm ring-1 ring-black/5">
                     <h2 class="text-sm font-semibold text-slate-900">Sidecar bridge</h2>
-                    <p class="mt-1 text-sm text-slate-500">rustpbx terminates SIP/RTP and pipes 48&nbsp;kHz mono PCM over
+                    <p class="mt-1 text-sm text-slate-500">supersbc terminates SIP/RTP and pipes 48&nbsp;kHz mono PCM over
                         localhost UDP to the sidecar process, which owns the far-end media (e.g. a LiveKit room
                         participant). LiveKit credentials live in the sidecar's own environment, not here.</p>
                     <div class="mt-4 grid gap-4 md:grid-cols-2">
@@ -1001,7 +1001,7 @@ default('RustPBX') }}{% endblock %}
                                 class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
                                 placeholder="python3 /opt/livekit/sip_bridge_sidecar.py">
                             <span class="text-xs font-normal text-slate-400">
-                                Spawn command for the per-call sidecar. rustpbx appends
+                                Spawn command for the per-call sidecar. supersbc appends
                                 <code>--call-id &lt;id&gt; --did &lt;to&gt; --caller &lt;from&gt; --port &lt;P&gt;</code>.
                             </span>
                         </label>
@@ -1013,7 +1013,7 @@ default('RustPBX') }}{% endblock %}
                                     <option :value="opt" x-text="opt"></option>
                                 </template>
                             </select>
-                            <span class="text-xs font-normal text-slate-400">SIP-side voice codec rustpbx negotiates and transcodes.</span>
+                            <span class="text-xs font-normal text-slate-400">SIP-side voice codec supersbc negotiates and transcodes.</span>
                         </label>
                         <label class="flex flex-col gap-1 text-sm font-medium text-slate-700">
                             Bot join timeout (ms)
@@ -1134,7 +1134,7 @@ default('RustPBX') }}{% endblock %}
                 livekit_audio_codec: 'opus',
                 livekit_dispatch_endpoint: '',
                 livekit_dispatch_endpoint_auth_header: '',
-                // Pre-filled template that produces the SAME body rustpbx
+                // Pre-filled template that produces the SAME body supersbc
                 // would send when this field is left empty — operators
                 // can edit / add fields without breaking the contract.
                 // The string assigned to `request_body_template` is itself
