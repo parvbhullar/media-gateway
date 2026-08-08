@@ -23,7 +23,7 @@ async fn test_http_backend_creation() -> Result<()> {
 #[tokio::test]
 async fn test_http_backend_with_custom_headers() -> Result<()> {
     let mut headers = HashMap::new();
-    headers.insert("User-Agent".to_string(), "RustPBX-Test".to_string());
+    headers.insert("User-Agent".to_string(), "SuperSBC-Test".to_string());
     headers.insert("X-Auth-Token".to_string(), "test-token".to_string());
 
     let _backend = HttpUserBackend::new(

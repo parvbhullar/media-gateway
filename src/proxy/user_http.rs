@@ -207,7 +207,7 @@ mod tests {
 
         // Test with custom headers
         let mut headers = HashMap::new();
-        headers.insert("User-Agent".to_string(), "RustPBX-Test".to_string());
+        headers.insert("User-Agent".to_string(), "SuperSBC-Test".to_string());
 
         let backend = HttpUserBackend::new(
             "http://rustpbx.com/auth",
