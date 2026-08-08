@@ -58,6 +58,10 @@ pub struct TrunkView {
     pub is_active: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Owning org (org-level multi-tenancy), label/attribution only — this
+    /// model has no relation to org-disable/CPS/concurrent-call enforcement
+    /// (that reads `trunk::Model`/`/api/v1/gateways` instead).
+    pub org_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -94,6 +98,7 @@ fn view_from(
         is_active: group.is_active,
         created_at: group.created_at,
         updated_at: group.updated_at,
+        org_id: group.org_id,
     }
 }
 
@@ -124,6 +129,8 @@ pub struct CreateTrunkRequest {
     pub nofailover_sip_codes: Option<serde_json::Value>,
     #[serde(default = "default_true")]
     pub is_active: bool,
+    #[serde(default)]
+    pub org_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -152,6 +159,9 @@ pub struct UpdateTrunkRequest {
     pub nofailover_sip_codes: Option<serde_json::Value>,
     #[serde(default)]
     pub is_active: Option<bool>,
+    /// Omitted leaves the existing org_id unchanged.
+    #[serde(default)]
+    pub org_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -472,6 +482,11 @@ async fn create_trunk(
         media_config: Set(None),
         is_active: Set(req.is_active),
         metadata: Set(None),
+        org_id: Set(req
+            .org_id
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())),
         created_at: Set(now),
         updated_at: Set(now),
         ..Default::default()
@@ -577,6 +592,10 @@ async fn update_trunk(
     }
     if let Some(v) = req.is_active {
         am.is_active = Set(v);
+    }
+    if let Some(v) = req.org_id {
+        let trimmed = v.trim().to_string();
+        am.org_id = Set(if trimmed.is_empty() { None } else { Some(trimmed) });
     }
     am.updated_at = Set(Utc::now());
 

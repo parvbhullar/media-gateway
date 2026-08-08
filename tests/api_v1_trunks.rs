@@ -358,6 +358,78 @@ async fn create_trunk_happy_path_returns_201() {
     assert_eq!(members[1]["gateway_name"], "gw-two");
     assert_eq!(members[1]["priority"], 1);
     assert_eq!(members[1]["position"], 1);
+    assert_eq!(body["org_id"], serde_json::Value::Null);
+}
+
+#[tokio::test]
+async fn create_trunk_with_org_id_persists_and_update_preserves_it() {
+    let (state, token) = test_state_with_api_key("trunks-org-id").await;
+    insert_trunk(&state, "gw-org").await;
+    let app = rustpbx::app::create_router(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/trunks")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "name": "tg-org",
+                        "members": [{"gateway_name": "gw-org"}],
+                        "org_id": "acme"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 201);
+    let body = body_json(resp).await;
+    assert_eq!(body["org_id"], "acme");
+
+    // PUT without org_id leaves the stored value unchanged.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/trunks/tg-org")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"members": [{"gateway_name": "gw-org"}], "is_active": false})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert_eq!(body["is_active"], false);
+    assert_eq!(body["org_id"], "acme");
+
+    // PUT with an explicit org_id changes it.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/trunks/tg-org")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"members": [{"gateway_name": "gw-org"}], "org_id": "globex"})
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert_eq!(body["org_id"], "globex");
 }
 
 /// Phase 3 Plan 03-01 (D-02): renamed from

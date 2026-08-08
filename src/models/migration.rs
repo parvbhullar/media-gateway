@@ -81,6 +81,9 @@ impl MigratorTrait for Migrator {
             // registered here or the table is never created in production.
             Box::new(super::organization::Migration),
             Box::new(super::add_org_id_call_record::Migration),
+            // org-level multi-tenancy (A4 follow-up) — org_id label on
+            // trunk_group (the model behind /api/v1/trunks).
+            Box::new(super::add_org_id_trunk_group::Migration),
         ]
     }
 }

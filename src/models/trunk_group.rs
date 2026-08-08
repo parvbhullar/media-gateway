@@ -81,6 +81,9 @@ pub struct Model {
     pub metadata: Option<Json>,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
+    /// Owning org (org-level multi-tenancy), label/attribution only — see
+    /// `add_org_id_trunk_group` migration doc comment. `None` = unassigned.
+    pub org_id: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
