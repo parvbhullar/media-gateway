@@ -19,7 +19,7 @@ fn create_test_proxy_config(port: u16) -> ProxyConfig {
         tcp_port: None,
         tls_port: None,
         ws_port: None,
-        useragent: Some("RustPBX-Test/0.1.0".to_string()),
+        useragent: Some("SuperSBC-Test/0.1.0".to_string()),
         modules: Some(vec![
             "auth".to_string(),
             "registrar".to_string(),
@@ -477,7 +477,7 @@ async fn test_rtp_to_webrtc_sdp_bridge() -> Result<()> {
         tcp_port: None,
         tls_port: None,
         ws_port: None,
-        useragent: Some("RustPBX-Test/0.1.0".to_string()),
+        useragent: Some("SuperSBC-Test/0.1.0".to_string()),
         modules: Some(vec![
             "auth".to_string(),
             "registrar".to_string(),

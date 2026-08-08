@@ -903,12 +903,12 @@ function mainApp() {
         },
         // Save configuration to local storage
         saveConfigToLocalStorage() {
-            localStorage.setItem('rustpbx_config', JSON.stringify(this.config));
+            localStorage.setItem('supersbc_config', JSON.stringify(this.config));
         },
 
         // Load configuration from local storage
         loadConfigFromLocalStorage() {
-            const savedConfig = localStorage.getItem('rustpbx_config');
+            const savedConfig = localStorage.getItem('supersbc_config');
             if (savedConfig) {
                 try {
                     const parsedConfig = JSON.parse(savedConfig);

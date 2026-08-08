@@ -1,5 +1,5 @@
 //! Kind-aware Trunks console page (PR 5 / Phase 10). The handlers under this
-//! module operate on the unified `rustpbx_trunks` table and route create /
+//! module operate on the unified trunks table and route create /
 //! update / delete through the `kind_schemas::validate` gate so SIP and
 //! WebRTC trunks share the same UI surface. The page URL stays
 //! `/console/sip-trunk` to avoid breaking deep links — the user-facing copy
@@ -1725,7 +1725,7 @@ mod tests {
         let now = Utc::now();
         crate::models::user::Model {
             id: 1,
-            email: "admin@rustpbx.com".into(),
+            email: "admin@supersbc.com".into(),
             username: "admin".into(),
             password_hash: "hashed".into(),
             reset_token: None,
@@ -1747,7 +1747,7 @@ mod tests {
         let now = Utc::now();
         crate::models::user::Model {
             id: 99,
-            email: "limited@rustpbx.com".into(),
+            email: "limited@supersbc.com".into(),
             username: "limited".into(),
             password_hash: "hashed".into(),
             reset_token: None,

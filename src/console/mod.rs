@@ -169,17 +169,17 @@ impl ConsoleState {
                     }
                 });
                 map.entry("site_name")
-                    .or_insert_with(|| serde_json::Value::String("RustPBX".to_string()));
+                    .or_insert_with(|| serde_json::Value::String("SuperSBC".to_string()));
                 map.entry("page_title")
-                    .or_insert_with(|| serde_json::Value::String("RustPBX admin".to_string()));
+                    .or_insert_with(|| serde_json::Value::String("SuperSBC admin".to_string()));
                 map.entry("site_description").or_insert_with(|| {
-                    serde_json::Value::String("RustPBX - A Rust-based PBX system".to_string())
+                    serde_json::Value::String("SuperSBC - A Rust-based PBX system".to_string())
                 });
                 map.entry("site_url").or_insert_with(|| {
-                    serde_json::Value::String("https://rustpbx.com".to_string())
+                    serde_json::Value::String("https://supersbc.com".to_string())
                 });
                 map.entry("site_footer").or_insert_with(|| {
-                    serde_json::Value::String("© 2025 RustPBX. All rights reserved.".to_string())
+                    serde_json::Value::String("© 2025 SuperSBC. All rights reserved.".to_string())
                 });
                 let static_path = self.config().static_path();
                 map.entry("site_logo").or_insert_with(|| {

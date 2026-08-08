@@ -1301,7 +1301,7 @@ async fn load_related_context(
         .ok()
         .flatten()
         .and_then(|row| serde_json::from_str::<String>(&row.value).ok())
-        .unwrap_or_else(|| "RustPBX".to_string());
+        .unwrap_or_else(|| "SuperSBC".to_string());
 
     Ok(RelatedContext {
         extensions,
@@ -1815,7 +1815,7 @@ fn build_participants(record: &CallRecordModel, related: &RelatedContext) -> Val
         .clone()
         .unwrap_or_else(|| "External".to_string());
 
-    // RustPBX is always the B2BUA in the middle.
+    // SuperSBC is always the B2BUA in the middle.
     // Inbound: external caller arrives via trunk → caller shows trunk, callee shows local.
     // Outbound: local agent originates → caller shows local, callee shows trunk.
     let (caller_network, callee_network_default) = if record.direction == "inbound" {
@@ -1931,7 +1931,7 @@ mod tests {
         let now = Utc::now();
         user::Model {
             id: 1,
-            email: "admin@rustpbx.com".into(),
+            email: "admin@supersbc.com".into(),
             username: "admin".into(),
             password_hash: "hashed".into(),
             reset_token: None,
@@ -1953,7 +1953,7 @@ mod tests {
         let now = Utc::now();
         user::Model {
             id: 99,
-            email: "limited@rustpbx.com".into(),
+            email: "limited@supersbc.com".into(),
             username: "limited".into(),
             password_hash: "hashed".into(),
             reset_token: None,

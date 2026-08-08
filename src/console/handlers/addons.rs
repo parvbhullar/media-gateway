@@ -223,7 +223,7 @@ pub async fn toggle_addon(
     Json(json!({
         "success": true,
         "requires_restart": true,
-        "message": "Addon state updated. Restart RustPBX to apply changes."
+        "message": "Addon state updated. Restart SuperSBC to apply changes."
     }))
     .into_response()
 }

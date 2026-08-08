@@ -1,5 +1,5 @@
 {% extends "console/layout.html" %}
-{% block title %}{{ "settings.title" | t }} · {{site_name|default('RustPBX')}}{% endblock %}
+{% block title %}{{ "settings.title" | t }} · {{site_name|default('SuperSBC')}}{% endblock %}
 {% block content %}
 <div class="p-6">
     <div class="mx-auto max-w-7xl space-y-6" x-data='settingsConsole({
@@ -339,7 +339,7 @@
                                     "settings_page.log_file" | t }}</label>
                                 <input type="text" x-model="platformDraft.log_file" :disabled="platformProcessing"
                                     class="mt-1 w-full rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
-                                    placeholder="/var/log/rustpbx.log" />
+                                    placeholder="/var/log/supersbc.log" />
                             </div>
                         </div>
                         <div>
@@ -910,7 +910,7 @@
                                     Path</label>
                                 <input type="text" x-model="storageDraft.callrecord_root" :disabled="storageProcessing"
                                     class="mt-1 w-full rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
-                                    placeholder="/var/lib/rustpbx/recordings">
+                                    placeholder="/var/lib/supersbc/recordings">
                             </div>
                         </div>
 
@@ -1252,7 +1252,7 @@
                                     "settings_page.caller_allow_list" | t }}</label>
                                 <textarea x-model="storageDraft.recording_caller_allow" :disabled="storageProcessing"
                                     class="mt-1 w-full rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
-                                    rows="3" placeholder="alice@rustpbx.com"></textarea>
+                                    rows="3" placeholder="alice@supersbc.com"></textarea>
                                 <p class="mt-1 text-[11px] text-slate-400">{{ "settings_page.pattern_glob_hint" | t }}
                                 </p>
                             </div>
@@ -1270,7 +1270,7 @@
                                     "settings_page.callee_allow_list" | t }}</label>
                                 <textarea x-model="storageDraft.recording_callee_allow" :disabled="storageProcessing"
                                     class="mt-1 w-full rounded-md border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
-                                    rows="3" placeholder="support@rustpbx.com"></textarea>
+                                    rows="3" placeholder="support@supersbc.com"></textarea>
                             </div>
                             <div>
                                 <label class="block text-xs font-semibold uppercase tracking-wide text-slate-400">{{
@@ -2799,7 +2799,7 @@
                                                         {{ "settings_page.user_email_field" | t }}
                                                         <input type="email" x-model="userDraft.email" required
                                                             class="rounded-lg border border-slate-200 px-3 py-2 text-sm text-slate-700 focus:border-sky-300 focus:outline-none focus:ring-2 focus:ring-sky-200"
-                                                            placeholder="name@rustpbx.com">
+                                                            placeholder="name@supersbc.com">
                                                     </label>
                                                     <label
                                                         class="flex flex-col gap-1 text-sm font-medium text-slate-700">

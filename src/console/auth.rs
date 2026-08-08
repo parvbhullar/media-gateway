@@ -20,8 +20,8 @@ use sha2::Sha256;
 use std::time::Duration;
 use tracing::warn;
 
-pub(super) const SESSION_COOKIE_NAME: &str = "rustpbx_session";
-pub(super) const MFA_SESSION_COOKIE_NAME: &str = "rustpbx_mfa";
+pub(super) const SESSION_COOKIE_NAME: &str = "supersbc_session";
+pub(super) const MFA_SESSION_COOKIE_NAME: &str = "supersbc_mfa";
 const SESSION_TTL_HOURS: u64 = 12;
 const RESET_TOKEN_VALID_MINUTES: u64 = 30;
 const MFA_SESSION_TTL_SECS: u64 = 300; // 5 minutes for MFA verification
@@ -442,7 +442,7 @@ impl ConsoleState {
             1,
             30,
             secret_bytes,
-            Some("RustPBX".to_string()),
+            Some("SuperSBC".to_string()),
             user.email.clone(),
         ) {
             Ok(t) => t,
@@ -495,7 +495,7 @@ impl ConsoleState {
             1,
             30,
             secret_bytes,
-            Some("RustPBX".to_string()),
+            Some("SuperSBC".to_string()),
             user.email.clone(),
         ) {
             Ok(t) => t,
@@ -549,7 +549,7 @@ mod tests {
     async fn first_user_becomes_superuser_and_blocks_when_disabled() {
         let state = setup_state(false).await;
         let first = state
-            .create_user("owner@rustpbx.com", "owner", "password123")
+            .create_user("owner@supersbc.com", "owner", "password123")
             .await
             .expect("create first user");
         assert!(first.is_superuser);
@@ -560,7 +560,7 @@ mod tests {
         assert!(!policy_after.first_user);
 
         let err = state
-            .create_user("second@rustpbx.com", "second", "password123")
+            .create_user("second@supersbc.com", "second", "password123")
             .await
             .expect_err("second user should be blocked");
         assert!(
@@ -573,7 +573,7 @@ mod tests {
     async fn additional_users_allowed_when_enabled() {
         let state = setup_state(true).await;
         let first = state
-            .create_user("root@rustpbx.com", "root", "password123")
+            .create_user("root@supersbc.com", "root", "password123")
             .await
             .expect("create first user");
         assert!(first.is_superuser);
@@ -583,7 +583,7 @@ mod tests {
         assert!(!policy_after.first_user);
 
         let second = state
-            .create_user("member@rustpbx.com", "member", "password123")
+            .create_user("member@supersbc.com", "member", "password123")
             .await
             .expect("create second user");
         assert!(!second.is_superuser);

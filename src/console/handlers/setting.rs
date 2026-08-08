@@ -1689,7 +1689,7 @@ pub(crate) async fn upsert_config_entry(
     Json(json!({
         "status": "ok",
         "requires_restart": true,
-        "message": "Entry saved. Restart RustPBX to apply.",
+        "message": "Entry saved. Restart SuperSBC to apply.",
         "key": key,
     }))
     .into_response()
@@ -1930,7 +1930,7 @@ pub(crate) async fn update_platform_settings(
     Json(json!({
         "status": "ok",
         "requires_restart": true,
-        "message": "Platform settings saved. Restart RustPBX to apply changes.",
+        "message": "Platform settings saved. Restart SuperSBC to apply changes.",
         "platform": {
             "log_level": config.log_level,
             "log_file": config.log_file,
@@ -2439,7 +2439,7 @@ pub(crate) async fn update_storage_settings(
     Json(json!({
         "status": "ok",
         "requires_restart": true,
-        "message": "Storage settings saved. Restart RustPBX to apply changes.",
+        "message": "Storage settings saved. Restart SuperSBC to apply changes.",
         "storage": storage_meta,
         "storage_profiles": storage_profiles,
     }))
@@ -3452,7 +3452,7 @@ pub(crate) async fn test_storage_connection(
     };
 
     let filename = format!("test-connection-{}.txt", Uuid::new_v4());
-    let content = b"RustPBX storage connection test";
+    let content = b"SuperSBC storage connection test";
 
     let test_fut = async {
         storage
@@ -3510,7 +3510,7 @@ pub(crate) async fn test_locator_webhook(
     let test_event = json!({
         "event": "test",
         "timestamp": Utc::now().timestamp(),
-        "message": "RustPBX locator webhook test"
+        "message": "SuperSBC locator webhook test"
     });
 
     match request.json(&test_event).send().await {

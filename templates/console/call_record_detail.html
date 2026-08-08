@@ -1,5 +1,5 @@
 {% extends "console/layout.html" %}
-{% block title %}{{ "call_record_detail.tab_overview" | t }} · {{site_name|default('RustPBX')}}{% endblock %}
+{% block title %}{{ "call_record_detail.tab_overview" | t }} · {{site_name|default('SuperSBC')}}{% endblock %}
 {% block content %}
 <div class="p-6">
     <div class="mx-auto max-w-6xl space-y-6" x-data="callRecordDetail({{ call_data | escape }})">

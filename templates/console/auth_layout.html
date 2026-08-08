@@ -4,11 +4,11 @@
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="description" content="{{site_description|default('RustPBX Admin Console')}}" />
-    <meta name="author" content="RustPBX" />
+    <meta name="description" content="{{site_description|default('SuperSBC Admin Console')}}" />
+    <meta name="author" content="SuperSBC" />
     <meta name="locale" content="{{ locale | default('en') }}" />
     <link rel="icon" href="{{favicon_url|default('/static/favicon.ico')}}" />
-    <title>{% block title %}{{page_title|default('RustPBX Admin')}}{% endblock %}</title>
+    <title>{% block title %}{{page_title|default('SuperSBC Admin')}}{% endblock %}</title>
     <script type="application/json" id="__authLocales">{{ available_locales | json | safe }}</script>
     {% block js_head %}
     <script>
@@ -118,7 +118,7 @@
             </main>
 
             <footer class="py-6 text-center text-xs text-slate-500">
-                {{site_name|default('RustPBX')}} · {{site_footer}}
+                {{site_name|default('SuperSBC')}} · {{site_footer}}
             </footer>
         </div>
     </div>

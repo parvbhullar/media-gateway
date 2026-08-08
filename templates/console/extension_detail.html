@@ -2,7 +2,7 @@
 {% set has_model = model is defined and model is not none %}
 {% set mode_text = '"edit"' if has_model else '"create"' %}
 {% set model_data = model if has_model else {} %}
-{% block title %}{{ model_data.extension | default("extension_detail.new_extension" | t) }} · {{ site_name | default('RustPBX') }}{% endblock
+{% block title %}{{ model_data.extension | default("extension_detail.new_extension" | t) }} · {{ site_name | default('SuperSBC') }}{% endblock
 %}
 {% block content %}
 {% set base_url = base_path | safe%}

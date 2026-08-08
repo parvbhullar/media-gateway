@@ -6,7 +6,7 @@ use tracing::debug;
 use tracing::info;
 
 const VERSION_INFO: &str = concat!(
-    "rustpbx ",
+    "SuperSBC ",
     env!("CARGO_PKG_VERSION"),
     "\nBuild Time: ",
     env!("BUILD_TIME_FMT"),
