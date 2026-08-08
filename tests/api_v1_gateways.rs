@@ -245,6 +245,66 @@ async fn create_gateway_happy_path_returns_201() {
     assert_eq!(body["transport"], "udp");
     assert_eq!(body["direction"], "outbound");
     assert_eq!(body["proxy_addr"], "sip.example.net:5060");
+    assert_eq!(body["org_id"], "default");
+}
+
+#[tokio::test]
+async fn create_gateway_with_org_id_persists_and_update_preserves_it() {
+    let (state, token) = test_state_with_api_key("create-org-id").await;
+    let app = rustpbx::app::create_router(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/gateways")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"name":"carrier-org","sip_server":"sip.example.net:5060","org_id":"acme"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 201);
+    let body = body_json(resp).await;
+    assert_eq!(body["org_id"], "acme");
+
+    // PUT without org_id in the body leaves the stored value unchanged.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/gateways/carrier-org")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"is_active":false}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert_eq!(body["is_active"], false);
+    assert_eq!(body["org_id"], "acme");
+
+    // PUT with an explicit org_id changes it.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/gateways/carrier-org")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"org_id":"globex"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = body_json(resp).await;
+    assert_eq!(body["org_id"], "globex");
 }
 
 #[tokio::test]

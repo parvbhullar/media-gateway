@@ -74,6 +74,12 @@ pub struct GatewayView {
     /// Whether this SIP gateway authenticates the carrier by REGISTER
     /// (from the SIP `kind_config`).
     pub register_enabled: bool,
+    /// Owning org (org-level multi-tenancy). `"default"` means unassigned.
+    /// This is the same `trunk::Model` row the org-disable/CPS/concurrent-
+    /// call enforcement gate reads (`sip_trunk` is a re-export shim over
+    /// `trunk`), so setting this is live/enforced immediately, not a
+    /// pure label.
+    pub org_id: String,
 }
 
 impl GatewayView {
@@ -114,6 +120,7 @@ impl GatewayView {
             kind_config: m.kind_config,
             allowed_ips,
             register_enabled,
+            org_id: m.org_id,
         }
     }
 }
@@ -259,6 +266,11 @@ pub struct CreateGatewayRequest {
     /// conflict for back-compat).
     #[serde(default)]
     pub kind_config: Option<JsonValue>,
+    /// Owning org (org-level multi-tenancy). Omitted or empty means
+    /// unassigned (stored as the `"default"` sentinel). See `GatewayView.org_id`
+    /// doc comment — this is live/enforced immediately, not a pure label.
+    #[serde(default)]
+    pub org_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -299,6 +311,10 @@ pub struct UpdateGatewayRequest {
     pub register_enabled: Option<bool>,
     #[serde(default)]
     pub kind_config: Option<JsonValue>,
+    /// Omitted leaves the existing org_id unchanged (PATCH-style, matching
+    /// every other field on this endpoint).
+    #[serde(default)]
+    pub org_id: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -488,6 +504,13 @@ async fn create_gateway(
 
     let (kind, kind_config) = build_kind_and_config_for_create(&req)?;
 
+    let org_id = req
+        .org_id
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| crate::models::organization::UNASSIGNED_ORG_ID.to_string());
+
     let now = Utc::now();
     let am = TrunkActiveModel {
         name: Set(req.name.clone()),
@@ -505,6 +528,7 @@ async fn create_gateway(
         recovery_threshold: Set(req.recovery_threshold),
         consecutive_failures: Set(0),
         consecutive_successes: Set(0),
+        org_id: Set(org_id),
         created_at: Set(now),
         updated_at: Set(now),
         kind_config: Set(kind_config),
@@ -564,6 +588,14 @@ async fn update_gateway(
     }
     if req.allowed_ips.is_some() {
         am.allowed_ips = Set(req.allowed_ips);
+    }
+    if let Some(org_id) = req.org_id {
+        let trimmed = org_id.trim();
+        am.org_id = Set(if trimmed.is_empty() {
+            crate::models::organization::UNASSIGNED_ORG_ID.to_string()
+        } else {
+            trimmed.to_string()
+        });
     }
     am.updated_at = Set(Utc::now());
 
